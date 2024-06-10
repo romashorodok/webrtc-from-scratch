@@ -1,7 +1,10 @@
 import asyncio
 import logging
 import threading
-from typing import Coroutine, override, Any
+import signal
+import functools
+
+import ice
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -11,23 +14,6 @@ logging.basicConfig(level=logging.DEBUG)
 
 # To make a coroutine from a different OS thread, must be used run_coroutine_threadsafe()
 # It return concurrent.futures.Future
-
-
-class UDPMux(asyncio.DatagramProtocol):
-    @override
-    def connection_made(self, transport: asyncio.transports.DatagramTransport) -> None:
-        self._transport = transport
-
-    @override
-    def datagram_received(self, data: bytes, addr: tuple[str | Any, int]) -> None:
-        message = data.decode()
-        print(f"Received message: {message} from {addr}")
-
-        # You can send a response if needed
-        response = f"Received your message: {message}"
-        self._transport.sendto(response.encode(), addr)
-
-        return super().datagram_received(data, addr)
 
 
 async def coro_func() -> int:
@@ -41,8 +27,37 @@ def start_loop(loop: asyncio.AbstractEventLoop):
     loop.run_forever()
 
 
+# https://stackoverflow.com/questions/5815675/what-is-sock-dgram-and-sock-stream
+
+
+async def start_agent():
+    agent_params = ice.AgentOptions(
+        True,
+        [ice.CandidateType.Host],
+    )
+    agent = ice.Agent(agent_params)
+    agent.gather_candidates()
+
+    try:
+        await asyncio.sleep(3600)
+    finally:
+        loop = asyncio.get_running_loop()
+        loop.call_soon_threadsafe(loop.stop)
+
+    print(agent)
+
+
 async def main():
     loop = asyncio.new_event_loop()
+
+    def ask_exit(signame, loop):
+        print("got signal %s: exit" % signame)
+        loop.stop()
+
+    for signame in {"SIGINT", "SIGTERM"}:
+        loop.add_signal_handler(
+            getattr(signal, signame), functools.partial(ask_exit, signame, loop)
+        )
 
     t = threading.Thread(target=start_loop, args=(loop,))
     t.start()
@@ -50,15 +65,15 @@ async def main():
     # In terms coro_func is scheduled task on the event loop
     future = asyncio.run_coroutine_threadsafe(coro_func(), loop)
 
-    def create_udp_endpoint() -> Coroutine:
-        return loop.create_datagram_endpoint(UDPMux, local_addr=("127.0.0.1", 9999))
+    # def create_udp_endpoint():
+    #     return loop.create_datagram_endpoint(UDPMux, local_addr=("127.0.0.1", 9999))
 
     # Schedule the creation of the UDP endpoint on the new event loop
-    transport, protocol = await asyncio.wrap_future(
-        asyncio.run_coroutine_threadsafe(create_udp_endpoint(), loop)
-    )
+    # transport, protocol = await asyncio.wrap_future(
+    #     asyncio.run_coroutine_threadsafe(create_udp_endpoint(), loop)
+    # )
 
-    _ = protocol
+    # _ = protocol
 
     print("Run test")
     result = future.result()
@@ -68,10 +83,10 @@ async def main():
     try:
         await asyncio.sleep(3600)
     finally:
-        transport.close()
+        # transport.close()
         loop.call_soon_threadsafe(loop.stop)
         t.join()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(start_agent())
