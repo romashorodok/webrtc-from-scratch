@@ -49,7 +49,7 @@ class Agent:
             transport, protocol = await asyncio.wrap_future(
                 asyncio.run_coroutine_threadsafe(
                     self._loop.create_datagram_endpoint(
-                        lambda: udp_mux.UDPMux(candidate),
+                        lambda: udp_mux.UDPMux(interface, candidate),
                         local_addr=(interface.address, 9999),
                     ),
                     self._loop,
@@ -63,7 +63,7 @@ class Agent:
             try:
                 while True:
                     await asyncio.sleep(2)
-                    data = await candidate._queue.get()
+                    data = await candidate._pkt_queue.get()
                     msg = data.decode()
                     print(f"Received message: {msg}")
             finally:

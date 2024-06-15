@@ -1,14 +1,18 @@
 import asyncio
 from typing import override, Any
 
+from .interface import Interface
+
 from .types import InboundHandlerProtocol
 
 
 class UDPMux(asyncio.DatagramProtocol):
     def __init__(
         self,
+        interface: Interface,
         inbound_handler: InboundHandlerProtocol,
     ) -> None:
+        self._interface = interface
         self._transport: asyncio.DatagramTransport | None = None
         self._inbound_handler = inbound_handler
 
@@ -26,4 +30,3 @@ class UDPMux(asyncio.DatagramProtocol):
 
     def error_received(self, exc):
         print(f"Error received: {exc}")
-
