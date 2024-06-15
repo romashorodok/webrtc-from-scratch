@@ -18,7 +18,7 @@ class UDPMux(asyncio.DatagramProtocol):
 
     @override
     def datagram_received(self, data: bytes, addr: tuple[str | Any, int]) -> None:
-        self._inbound_handler.on_recv(data, addr)
+        self._inbound_handler.on_inbound_pkt(data, addr)
 
     @override
     def connection_lost(self, exc: Exception | None) -> None:

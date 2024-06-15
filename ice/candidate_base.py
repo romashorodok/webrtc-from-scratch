@@ -9,7 +9,7 @@ class CandidateBase:
         # TODO: use not hardcoded
         self._addr: tuple[str, int] | None = None
 
-    def on_recv(self, data: bytes, addr: tuple[str | Any, int]):
+    def on_inbound_pkt(self, data: bytes, addr: tuple[str | Any, int]):
         self._addr = addr
-        print("recv from packer from candidate", addr)
+        print("recv from packet from candidate", addr)
         self._queue.put_nowait(data)

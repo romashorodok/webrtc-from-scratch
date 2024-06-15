@@ -1,10 +1,12 @@
 import asyncio
 import logging
+import socket
 import threading
 import signal
 import functools
 
 import ice
+from ice import net
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -31,10 +33,15 @@ def start_loop(loop: asyncio.AbstractEventLoop):
 
 
 async def start_agent():
-    agent_params = ice.AgentOptions(
+    interfaces = net.interface_factory(
+        net.InterfaceProvider.PSUTIL,
+        [
+            socket.AF_INET,
+        ],
         True,
-        [ice.CandidateType.Host],
     )
+
+    agent_params = ice.AgentOptions(True, [ice.CandidateType.Host], interfaces)
     agent = ice.Agent(agent_params)
     agent.gather_candidates()
 
