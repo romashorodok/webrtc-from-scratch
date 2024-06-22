@@ -38,7 +38,6 @@ def set_length(data: bytearray, length: int):
 
 
 ATTRIBUTE_HEADER_SIZE = 4
-ATTRIBUTE_PADDING = 4
 
 
 class Message:
@@ -70,38 +69,14 @@ class Message:
         buf[8:HEADER_LENGTH] = self.transaction_id
 
         for attr in self.attributes:
-            attr_data = attr.marshal()
-            attr_alloc_len = ATTRIBUTE_HEADER_SIZE + len(attr_data) - 1
-            attr_buf = bytearray(attr_alloc_len)
-
-            attr_buf[0:2] = attr.type_to_uint16_bytes()
-            attr_len = len(attr_data)
-
-            set_length(attr_buf, attr_len)
-            attr_buf[4:attr_len] = attr_data
-
-            buf += attr_buf
+            buf += attr.write_to_buf()
 
         if pwd:
             integrity = stun.MessageIntegrity(message_integrity(buf, pwd))
-            integrity_data = integrity.marshal()
-            integrity_len = len(integrity_data)
-
-            buf += (
-                integrity.type_to_uint16_bytes()
-                + integrity_len.to_bytes(2, "big")
-                + integrity_data
-            )
+            integrity.write_to_buf(buf)
 
         fingerprint = stun.Fingerprint(message_fingerprint(buf))
-        fingerprint_data = fingerprint.marshal()
-        fingerprint_len = len(fingerprint_data)
-
-        buf += (
-            fingerprint.TYPE.to_bytes(2, "big")
-            + fingerprint_len.to_bytes(2, "big")
-            + fingerprint_data
-        )
+        fingerprint.write_to_buf(buf)
 
         length = len(buf) - HEADER_LENGTH
         set_length(buf, length)
@@ -117,8 +92,6 @@ class Message:
         message_length = int.from_bytes(data[2:4], "big")
         cookie = int.from_bytes(data[4:8], "big")
         transaction_id = data[8:20]
-
-        print("Length", message_length)
 
         if cookie != COOKIE:
             raise ValueError("Invalid magic cookie")
@@ -183,16 +156,42 @@ def is_stun(b: bytes) -> bool:
 
 msg = Message(stun.MessageType(stun.Method.Binding, stun.MessageClass.Request))
 msg.add_attribute(stun.Username("username", "password"))
+msg_encoded_msg = msg.encode(b"test")
 
-encoded_message = msg.encode(b"test")
+stun_msg = stun.Message(
+    stun.MessageType(stun.Method.Binding, stun.MessageClass.Request), msg.transaction_id
+)
+stun_msg.add_attribute(stun.Username("username", "password"))
+stun_encoded_msg = stun_msg.encode(b"test")
 
-data = encoded_message
-print(list(data))
 print(msg)
+print(stun_msg)
 
-resp = Message.parse(data, b"test")
+print(list(msg_encoded_msg))
+print(list(stun_encoded_msg))
 
-print(resp)
+if (
+    list(msg_encoded_msg) != list(stun_encoded_msg)
+    and msg_encoded_msg != stun_encoded_msg
+):
+    raise ValueError("Invalid STUN msg")
+else:
+    print("first test pass")
 
-# msg = stun.MessageType(stun.Method.Binding, stun.MessageClass.Request)
-# print(list(msg.to_uint16_bytes()))
+
+msg = Message.parse(msg_encoded_msg, b"test")
+stun_msg = stun.Message.parse(stun_encoded_msg, b"test")
+
+msg_encoded_msg = msg.encode(b"test")
+stun_encoded_msg = stun_msg.encode(b"test")
+
+print(list(msg_encoded_msg))
+print(list(stun_encoded_msg))
+
+if (
+    list(msg_encoded_msg) != list(stun_encoded_msg)
+    and msg_encoded_msg != stun_encoded_msg
+):
+    raise ValueError("Invalid STUN msg")
+else:
+    print("second test pass")

@@ -1,10 +1,54 @@
 import ipaddress
+import binascii
+import hmac
 from typing import Tuple
 
 
+MESSAGE_HEADER_LENGTH = 20
+ATTRIBUTE_HEADER_SIZE = 4
+
 COOKIE = 0x2112A442
+COOKIE_UINT32_BYTES = COOKIE.to_bytes(4, "big")
+
 IPV4_PROTOCOL = 1
 IPV6_PROTOCOL = 2
+
+
+def is_stun(b: bytes) -> bool:
+    if len(b) < MESSAGE_HEADER_LENGTH:
+        return False
+    extracted_value = (b[4] << 24) | (b[5] << 16) | (b[6] << 8) | b[7]
+    return extracted_value == COOKIE
+
+
+def assoc_body_length(data: bytes, length: int) -> bytes:
+    return data[0:2] + length.to_bytes(2, "big") + data[4:]
+
+
+def mutate_body_length(data: bytearray, length: int):
+    length_bytes = length.to_bytes(2, "big")
+    data[2:4] = length_bytes
+
+
+_FINGERPRINT_LENGTH = 8  # Type 2 byte + Header 2 byte + Value 4 byte
+_FINGERPRINT_XOR = 0x5354554E
+
+
+def message_fingerprint(data: bytes) -> int:
+    check_data = assoc_body_length(
+        data, len(data) - MESSAGE_HEADER_LENGTH + _FINGERPRINT_LENGTH
+    )
+    return binascii.crc32(check_data) ^ _FINGERPRINT_XOR
+
+
+_INTEGRITY_LENGTH = 24
+
+
+def message_integrity(data: bytes, key: bytes) -> bytes:
+    check_data = assoc_body_length(
+        data, len(data) - MESSAGE_HEADER_LENGTH + _INTEGRITY_LENGTH
+    )
+    return hmac.new(key, check_data, "sha1").digest()
 
 
 def xor_address(data: bytes, transaction_id: bytes) -> bytes:
@@ -121,4 +165,3 @@ def unpack_unsigned_short(data: bytes) -> int:
 
 def unpack_unsigned_64(data: bytes) -> int:
     return int.from_bytes(data[:8], "big")
-
