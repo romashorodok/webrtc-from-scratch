@@ -8,3 +8,4 @@ from .attr import (
     ATTRIBUTE_REGISTRY,
     get_attribute_from_registry,
 )
+from .utils import is_stun

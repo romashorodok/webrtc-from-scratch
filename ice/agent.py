@@ -2,14 +2,12 @@ import asyncio
 
 from dataclasses import dataclass
 from enum import Enum
-from datetime import datetime
 
-from .net import udp_mux, Interface
+import ice.net
+from ice.net.udp_mux import MultiUDPMux
+
 from .candidate_base import CandidateBase
-
-# TODO: make selectors for controling and controlled agent type
-
-# Component-- candidate weight to build ice priority
+from .utils import generate_pwd, generate_ufrag
 
 
 class CandidateType(Enum):
@@ -20,59 +18,53 @@ class CandidateType(Enum):
 class AgentOptions:
     is_controlling: bool
     candidate_types: list[CandidateType]
-    interfaces: list[Interface]
+    interfaces: list[ice.net.Interface]
 
 
-async def coro_echo(transport: asyncio.DatagramTransport, candidate: CandidateBase):
-    try:
-        while True:
-            await asyncio.sleep(1)
-            if candidate._addr:
-                transport.sendto("echo from agent".encode(), candidate._addr)
-    except RuntimeError as e:
-        _ = e
+class AgentCredentials:
+    @property
+    def pwd(self) -> str:
+        return self._pwd
+
+    @pwd.setter
+    def pwd(self, value: str):
+        # TODO: When None must stop agent and restart with new ufraw/pwd
+        print("pwd", value)
+        self._pwd = value
+
+    @property
+    def ufrag(self) -> str:
+        return self._ufrag
+
+    @ufrag.setter
+    def ufrag(self, value: str):
+        # TODO: When None must stop agent and restart with new ufraw/pwd
+        print("ufrag", value)
+        self._ufrag = value
 
 
-class Agent:
+class Agent(AgentCredentials):
     def __init__(self, options: AgentOptions) -> None:
         self._options = options
         self._loop = asyncio.get_event_loop()
+        self.ufrag = generate_ufrag()
+        self.pwd = generate_pwd()
+        self.udp = MultiUDPMux(options.interfaces, self._loop)
 
-    async def _gather_candidates_local(self):
-        for interface in self._options.interfaces:
-            candidate = CandidateBase()
-            print(
-                "Gather host base candidate",
-                datetime.now(),
-            )
+    async def _gather_host_candidate(self):
+        candidate = CandidateBase()
 
-            transport, protocol = await asyncio.wrap_future(
-                asyncio.run_coroutine_threadsafe(
-                    self._loop.create_datagram_endpoint(
-                        lambda: udp_mux.UDPMux(interface, candidate),
-                        local_addr=(interface.address, 9999),
-                    ),
-                    self._loop,
-                )
-            )
-            print("Listen at", interface.address, 9999)
-            _ = protocol
+        port = 9999
+        muxers = await self.udp.bind(self.ufrag, candidate, port)
+        for _, muxer in muxers.items():
+            print("Listen at", muxer.addr_str(), "port:", port)
 
-            self._loop.create_task(coro_echo(transport, candidate))
-
-            try:
-                while True:
-                    await asyncio.sleep(2)
-                    data = await candidate._pkt_queue.get()
-                    msg = data.decode()
-                    print(f"Received message: {msg}")
-            finally:
-                transport.close()
+        self._loop.create_task(candidate.accept(self.ufrag.encode()))
 
     def gather_candidates(self):
         for candidate_type in self._options.candidate_types:
             match candidate_type:
                 case CandidateType.Host:
-                    self._loop.create_task(self._gather_candidates_local())
+                    self._loop.create_task(self._gather_host_candidate())
                 case _:
                     pass

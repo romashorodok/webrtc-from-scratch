@@ -5,12 +5,29 @@ import sys
 from enum import Enum
 
 
+class Address:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def __str__(self) -> str:
+        return self.value
+
+
 class Interface:
     def __init__(self, name: str, mtu: int, address: str, family: socket.AddressFamily):
         self.address = address
+
         self.family = family
         self.name = name
         self.mtu = mtu
+
+    @property
+    def address(self) -> Address:
+        return self._address
+
+    @address.setter
+    def address(self, value: str):
+        self._address = Address(value)
 
 
 class InterfaceProvider(Enum):
