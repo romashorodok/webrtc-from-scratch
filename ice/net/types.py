@@ -1,15 +1,120 @@
-import asyncio
-from typing import Protocol, Any
+from enum import StrEnum, Enum
+from typing import Protocol
+
+
+class NetworkType(StrEnum):
+    UDP = "udp"
+    TCP = "tcp"
+
+
+class CandidateType(Enum):
+    Unspecified = 0
+    Host = 1
+    PeerReflexive = 2
+    ServerReflexive = 3
+    Relay = 4
+
+
+def get_network_type_from_str(value: str) -> NetworkType:
+    match value:
+        case "udp":
+            return NetworkType.UDP
+        case "tcp":
+            return NetworkType.TCP
+        case _:
+            raise ValueError("Not supported network type")
+
+
+class Address:
+    def __init__(self, address: str, port: int) -> None:
+        self.address = address
+        self.port = port
+
+
+class Packet:
+    def __init__(self, source: Address, data: memoryview) -> None:
+        self._data = data
+        self._source = source
+
+    @property
+    def data(self) -> memoryview:
+        return self._data
+
+    @property
+    def source(self) -> Address:
+        return self._source
+
+
+class MuxConnProtocol(Protocol):
+    def sendto(self, data: memoryview | bytearray | bytes): ...
+    async def recvfrom(self) -> Packet: ...
+
+
+class CandidateProtocol(Protocol):
+    """
+    Related to string representation of the ICECandidate
+    """
+
+    def to_ice_str(self) -> str: ...
+    def set_candidate_type(self, candidate_type: CandidateType): ...
+    def set_network_type(self, network_type: NetworkType): ...
+    def set_port(self, port: int): ...
+    def set_address(self, address: str): ...
+    def set_priority(self, priority: int): ...
+    def set_component(self, component: int): ...
+
+    def get_network_type(self) -> NetworkType: ...
+
+    @property
+    def priority(self) -> int: ...
+
+    @property
+    def address(self) -> str: ...
+
+    @property
+    def port(sefl) -> int: ...
 
 
 class MuxProtocol(Protocol):
-    def addr_str(self) -> str: ...
-    def get_transport(self) -> asyncio.DatagramTransport: ...
+    """
+    Represent local candidate at networking protocols to provide traffic
+    from remote candidate.
+    """
 
-
-class InboundHandlerProtocol(Protocol):
-    def on_inbound_pkt(
-        self, origin_muxer: MuxProtocol, data: bytes, addr: tuple[str | Any, int]
-    ):
-        "On recv queue"
+    def intercept(self, remote: CandidateProtocol) -> MuxConnProtocol:
+        """
+        Local candidate must intercept remote candidate traffic
+        """
         ...
+
+
+class LocalCandidate:
+    def __init__(self, candidate: CandidateProtocol, mux: MuxProtocol) -> None:
+        self._candidate = candidate
+        self._mux = mux
+
+    @property
+    def unwrap(self) -> CandidateProtocol:
+        return self._candidate
+
+    @property
+    def mux(self) -> MuxProtocol:
+        return self._mux
+
+
+class RemoteCandidate:
+    def __init__(
+        self,
+        candidate: CandidateProtocol,
+        conn: MuxConnProtocol,
+    ) -> None:
+        self._candidate = candidate
+        self._conn = conn
+
+    @property
+    def unwrap(self) -> CandidateProtocol:
+        return self._candidate
+
+    @property
+    def conn(self) -> MuxConnProtocol:
+        return self._conn

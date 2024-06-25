@@ -1,0 +1,5 @@
+cffi==1.16.0
+cryptography==42.0.8
+psutil==5.9.8
+pycparser==2.22
+pyOpenSSL==24.1.0

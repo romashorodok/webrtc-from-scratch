@@ -10,15 +10,27 @@ ATTRIBUTE_HEADER_SIZE = 4
 COOKIE = 0x2112A442
 COOKIE_UINT32_BYTES = COOKIE.to_bytes(4, "big")
 
-IPV4_PROTOCOL = 1
-IPV6_PROTOCOL = 2
+IPV4_PROTOCOL = 0x01
+IPV6_PROTOCOL = 0x02
 
 
-def is_stun(b: bytes) -> bool:
+def is_stun(b: memoryview) -> bool:
     if len(b) < MESSAGE_HEADER_LENGTH:
         return False
     extracted_value = (b[4] << 24) | (b[5] << 16) | (b[6] << 8) | b[7]
     return extracted_value == COOKIE
+
+
+# STUN aligns attributes on 32-bit boundaries, attributes whose content
+# is not a multiple of 4 bytes are padded with 1, 2, or 3 bytes of
+# padding so that its value contains a multiple of 4 bytes.  The
+# padding bits are ignored, and may be any value.
+# https://tools.ietf.org/html/rfc5389#section-15
+PADDING = 4
+
+
+def nearest_padded_value_length(length: int) -> int:
+    return (PADDING - (length % PADDING)) % PADDING
 
 
 def assoc_body_length(data: bytes, length: int) -> bytes:
@@ -51,30 +63,6 @@ def message_integrity(data: bytes, key: bytes) -> bytes:
     return hmac.new(key, check_data, "sha1").digest()
 
 
-def xor_address(data: bytes, transaction_id: bytes) -> bytes:
-    xpad = (
-        (COOKIE >> 16).to_bytes(2, "big") + COOKIE.to_bytes(4, "big") + transaction_id
-    )
-    xdata = data[0:2]
-    for i in range(2, len(data)):
-        xdata += (data[i] ^ xpad[i - 2]).to_bytes(1, "big")
-    return xdata
-
-
-def pack_address(value: Tuple[str, int]) -> bytes:
-    ip_address = ipaddress.ip_address(value[0])
-    if isinstance(ip_address, ipaddress.IPv4Address):
-        protocol = IPV4_PROTOCOL
-    else:
-        protocol = IPV6_PROTOCOL
-    return (
-        b"\x00"
-        + protocol.to_bytes(1, "big")
-        + value[1].to_bytes(2, "big")
-        + ip_address.packed
-    )
-
-
 def pack_bytes(value: bytes) -> bytes:
     return value
 
@@ -88,7 +76,7 @@ def pack_error_code(value: Tuple[int, str]) -> bytes:
     )
 
 
-def pack_none(value: None) -> bytes:
+def pack_none() -> bytes:
     return b""
 
 
@@ -108,11 +96,35 @@ def pack_unsigned_64(value: int) -> bytes:
     return value.to_bytes(8, "big")
 
 
-def pack_xor_address(value: Tuple[str, int], transaction_id: bytes) -> bytes:
+def xor_address(data: bytes, transaction_id: bytes) -> bytes:
+    xpad = (
+        (COOKIE >> 16).to_bytes(2, "big") + COOKIE.to_bytes(4, "big") + transaction_id
+    )
+    xdata = data[:2]  # Copy the first 2 bytes without change
+    for i in range(2, len(data)):
+        xdata += (data[i] ^ xpad[i - 2]).to_bytes(1, "big")
+    return xdata
+
+
+def pack_address(value: tuple[str, int]) -> bytes:
+    ip_address = ipaddress.ip_address(value[0])
+    if isinstance(ip_address, ipaddress.IPv4Address):
+        protocol = IPV4_PROTOCOL
+    else:
+        protocol = IPV6_PROTOCOL
+    return (
+        b"\x00"
+        + protocol.to_bytes(1, "big")
+        + value[1].to_bytes(2, "big")
+        + ip_address.packed
+    )
+
+
+def pack_xor_address(value: tuple[str, int], transaction_id: bytes) -> bytes:
     return xor_address(pack_address(value), transaction_id)
 
 
-def unpack_address(data: bytes) -> Tuple[str, int]:
+def unpack_address(data: bytes) -> tuple[str, int]:
     if len(data) < 4:
         raise ValueError("STUN address length is less than 4 bytes")
     protocol = data[1]
@@ -130,8 +142,11 @@ def unpack_address(data: bytes) -> Tuple[str, int]:
         raise ValueError("STUN address has unknown protocol")
 
 
-def unpack_xor_address(data: bytes, transaction_id: bytes) -> Tuple[str, int]:
+def unpack_xor_address(data: bytes, transaction_id: bytes) -> tuple[str, int]:
     return unpack_address(xor_address(data, transaction_id))
+
+
+###
 
 
 def unpack_bytes(data: bytes) -> bytes:
