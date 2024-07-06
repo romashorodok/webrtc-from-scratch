@@ -12,6 +12,9 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
 from OpenSSL import SSL, crypto
 
+# TODO: remove this lib
+from pylibsrtp import Policy, Session, Error
+
 
 def certificate_digest(x509: crypto.X509) -> str:
     return x509.digest("SHA256").decode("ascii")
@@ -46,6 +49,55 @@ CERTIFICATE_T = TypeVar("CERTIFICATE_T", bound="Certificate")
 class Fingerprint:
     algorithm: str
     value: str
+
+
+@dataclass(frozen=True)
+class SRTPProtectionProfile:
+    libsrtp_profile: int
+    openssl_profile: bytes
+    key_length: int
+    salt_length: int
+
+    def get_key_and_salt(self, src, idx: int) -> bytes:
+        key_start = idx * self.key_length
+        salt_start = 2 * self.key_length + idx * self.salt_length
+        return (
+            src[key_start : key_start + self.key_length]
+            + src[salt_start : salt_start + self.salt_length]
+        )
+
+
+SRTP_AEAD_AES_256_GCM = SRTPProtectionProfile(
+    libsrtp_profile=Policy.SRTP_PROFILE_AEAD_AES_256_GCM,
+    openssl_profile=b"SRTP_AEAD_AES_256_GCM",
+    key_length=32,
+    salt_length=12,
+)
+SRTP_AEAD_AES_128_GCM = SRTPProtectionProfile(
+    libsrtp_profile=Policy.SRTP_PROFILE_AEAD_AES_128_GCM,
+    openssl_profile=b"SRTP_AEAD_AES_128_GCM",
+    key_length=16,
+    salt_length=12,
+)
+SRTP_AES128_CM_SHA1_80 = SRTPProtectionProfile(
+    libsrtp_profile=Policy.SRTP_PROFILE_AES128_CM_SHA1_80,
+    openssl_profile=b"SRTP_AES128_CM_SHA1_80",
+    key_length=16,
+    salt_length=14,
+)
+
+SRTP_PROFILES: list[SRTPProtectionProfile] = []
+for srtp_profile in [
+    SRTP_AEAD_AES_256_GCM,
+    SRTP_AEAD_AES_128_GCM,
+    SRTP_AES128_CM_SHA1_80,
+]:
+    try:
+        Policy(srtp_profile=srtp_profile.libsrtp_profile)
+    except Error:
+        pass
+    else:
+        SRTP_PROFILES.append(srtp_profile)
 
 
 class Certificate:
@@ -83,8 +135,9 @@ class Certificate:
             cert=crypto.X509.from_cryptography(cert),
         )
 
-    def _create_ssl_context(
+    def create_ssl_context(
         self,
+        srtp_profiles: list[SRTPProtectionProfile],
     ) -> SSL.Context:
         ctx = SSL.Context(SSL.DTLS_METHOD)
         ctx.set_verify(
@@ -95,4 +148,6 @@ class Certificate:
         ctx.set_cipher_list(
             b"ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA"
         )
+        ctx.set_tlsext_use_srtp(b":".join(x.openssl_profile for x in srtp_profiles))
+
         return ctx

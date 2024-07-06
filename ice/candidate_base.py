@@ -252,8 +252,8 @@ def parse_candidate_str(raw: str) -> CandidateBase:
     port = int(parts[5])
     typ = parts[7]
 
-    if len(parts) > 8:
-        raise ValueError("Not supported rich candidate types")
+    # if len(parts) > 8:
+        # raise ValueError("Not supported rich candidate types")
 
     candidate_type = get_candidate_type_from_str(typ)
     network_type = get_network_type_from_str(protocol)
@@ -261,7 +261,11 @@ def parse_candidate_str(raw: str) -> CandidateBase:
     match candidate_type:
         case CandidateType.Host:
             candidate = CandidateBase()
-            candidate.set_network_type(network_type)
+            if network_type:
+                candidate.set_network_type(network_type)
+            else:
+                candidate.set_network_type(NetworkType.UDP)
+
             candidate.set_address(address)
             candidate.set_port(port)
             candidate.set_component(component)

@@ -2,14 +2,17 @@ from abc import abstractmethod
 import asyncio
 from dataclasses import dataclass
 import datetime
-from typing import Any, Callable, Generic, TypeVar
+from typing import Any, Callable, Generic, Self, TypeVar
+import re
 
 import secrets
 import string
 
 from OpenSSL.SSL import Session
+from dtls.dtlstransport import ICETransportDTLS
 import ice
 import ice.net
+
 import dtls
 
 import socket
@@ -17,6 +20,7 @@ import socket
 from enum import Enum, IntEnum
 
 import ice.stun.utils as byteops
+from utils.types import impl_protocol
 
 
 nic_interfaces = ice.net.interface_factory(
@@ -100,9 +104,12 @@ class ICEGatherer:
 
     async def gather(self):
         try:
-            agent = await self._create_agent()
+            agent = self._agent
+            if agent is None:
+                self._agent = await self._create_agent()
+                agent = self._agent
+
             self._set_state(ICEGatherState.Gathering)
-            self._agent = agent
 
             agent.set_on_candidate(self._on_candidate)
             await agent.gather_candidates()
@@ -131,11 +138,19 @@ class ICETransportState(Enum):
     Closed = "closed"
 
 
+@impl_protocol(dtls.ICETransportDTLS)
 class ICETransport:
     def __init__(self, gatherer: ICEGatherer) -> None:
         self._gatherer = gatherer
         self._loop = asyncio.get_event_loop()
         self._state: ICETransportState = ICETransportState.NEW
+
+    def get_ice_pair_transports(self) -> list[ice.CandidatePairTransport]:
+        agent = self._gatherer.agent
+        return agent._candidate_pair_transports
+
+    def get_ice_role(self) -> ice.AgentRole:
+        return self._gatherer.agent.get_role()
 
     # Same as iceTransport.internalOnConnectionStateChangeHandler
     def _on_connection_state_changed(self):
@@ -196,10 +211,10 @@ class MID:
         return str(self._mid)
 
 
-class RTPCodecKind(IntEnum):
-    Unknown = 0
-    Audio = 1
-    Video = 2
+class RTPCodecKind(Enum):
+    Unknown = "unknown"
+    Audio = "audio"
+    Video = "video"
 
 
 # RTCPFeedback signals the connection to use additional RTCP packet types.
@@ -244,6 +259,14 @@ class RTPTransceiverDirection(Enum):
     Sendonly = "sendonly"
     Recvonly = "recvonly"
     Inactive = "inactive"
+
+
+RTPTransceiverDirectionList = [
+    RTPTransceiverDirection.Sendrecv.value,
+    RTPTransceiverDirection.Sendonly.value,
+    RTPTransceiverDirection.Recvonly.value,
+    RTPTransceiverDirection.Inactive.value,
+]
 
 
 # RTPHeaderExtensionParameter represents a negotiated RFC5285 RTP header extension.
@@ -577,8 +600,6 @@ class RTPTransceiver:
             if item := codecs_params_fuzzy_search(codec, codecs):
                 filtered_codecs.append(item)
 
-        print("filtered", filtered_codecs)
-
         return filtered_codecs
 
     @property
@@ -714,6 +735,8 @@ class SessionDescriptionAttrKey(Enum):
     FMTP = "fmtp"
     RTCPfb = "rtcp-fb"
     RID = "rid"
+    ICEUfrag = "ice-ufrag"
+    ICEPwd = "ice-pwd"
 
 
 class SessionDescriptionAttr:
@@ -820,27 +843,37 @@ class MediaDescription:
         media: str,
         port: int,
         protocols: list[str],
-        formats: list[str],
-        network_type: str,
-        address_type: str,
-        address: str,
+        # formats: list[str],
+        # network_type: str,
+        # address_type: str,
+        # address: str,
     ) -> None:
         self.media = media
         self.port = port
-        self.port_end: int | None = port
+        self.port_end: int | None = None
         self.protocols = protocols
-        self.formats = formats
-        self.network_type = network_type
-        self.address_type = address_type
-        self.address = address
+        # Mean which codec payload formats may be used
+        self.formats = list[str]()
+
+        self.network_type = "IN"
+        self.address_type = "IP4"
+        self.address_host = "0.0.0.0"
+
+        self.ice_ufrag: str | None = None
+        self.ice_pwd: str | None = None
 
         # a=<attribute>
         # a=<attribute>:<value>
         # https://tools.ietf.org/html/rfc4566#section-5.13
         self._attributes = list[SessionDescriptionAttr]()
 
+        self.direction: RTPTransceiverDirection = RTPTransceiverDirection.Unknown
+        self.candidates = list[ice.CandidateProtocol]()
+        self.codecs = list[RTPCodecParameters]()
+        self.fingerprints = list[dtls.Fingerprint]()
+
     def __repr__(self) -> str:
-        return f"MediaDescription(_attributes={self._attributes})"
+        return f"MediaDescription(ice_ufrag={self.ice_ufrag}, ice_pwd={self.ice_pwd}, _attributes={self._attributes})"
 
     def add_codec(self, codec: RTPCodecParameters):
         self.formats.append(str(codec.payload_type))
@@ -849,6 +882,7 @@ class MediaDescription:
         rtpmap = f"{codec.payload_type} {name}/{codec.clock_rate}"
         if codec.channels > 0:
             rtpmap += f"/{codec.channels}"
+        self.codecs.append(codec)
         self.add_attribute(
             SessionDescriptionAttr(SessionDescriptionAttrKey.RTPMap, rtpmap)
         )
@@ -868,9 +902,12 @@ class MediaDescription:
 
     def add_media_source(self, ssrc: int, cname: str, stream_label: str, label: str):
         # Also may looks like this, but this formats deprecated
-        # "%d cname:%s", ssrc, cname
         # "%d mslabel:%s", ssrc, stream_label
         # "%d label:%s", ssrc, label
+        value = f"{ssrc} cname:{cname}"
+        self.add_attribute(
+            SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
+        )
         value = f"{ssrc} msid:{stream_label} {label}"
         self.add_attribute(
             SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
@@ -883,13 +920,87 @@ class MediaDescription:
     def add_attribute(self, attr: SessionDescriptionAttr):
         self._attributes.append(attr)
 
+    @classmethod
+    def parse(cls, media_lines: list[str]) -> Self | None:
+        # TODO: add port range matching
+        m = re.match("^m=([^ ]+) ([0-9]+) ([A-Z/]+) (.+)$", media_lines[0])
+        if not m:
+            return
+
+        media_kind = m.group(1)
+        port = int(m.group(2))
+        protocols = m.group(3).split("/")
+        fmt = m.group(4).split()
+
+        media = cls(
+            media=media_kind,
+            port=port,
+            protocols=protocols,
+        )
+
+        media.formats.extend(fmt)
+
+        for line in media_lines[1:]:
+            if line.startswith("c="):
+                address_type, address_host = ipaddress_from_sdp(line[2:])
+                media.address_type = address_type
+                media.address_host = address_host
+            elif line.startswith("a="):
+                attr, value = parse_attr(line)
+
+                if attr in RTPTransceiverDirectionList:
+                    media.direction = RTPTransceiverDirection(attr)
+                elif attr == SessionDescriptionAttrKey.Candidate.value and value:
+                    candidates = ice.parse_candidate_str(value)
+                    media.candidates.append(candidates)
+                elif attr == SessionDescriptionAttrKey.RTPMap.value and value:
+                    payload_id, payload_desc = value.split(" ", 1)
+                    bits = payload_desc.split("/")
+
+                    if media_kind == RTPCodecKind.Audio.value:
+                        if len(bits) > 2:
+                            channels = int(bits[2])
+                        else:
+                            channels = 1
+                    else:
+                        channels = 0
+
+                    payload_name = bits[0]
+                    clock_rate = bits[1]
+
+                    codec = RTPCodecParameters(
+                        mime_type=f"{media_kind}/{payload_name}",
+                        clock_rate=int(clock_rate),
+                        channels=channels,
+                        payload_type=int(payload_id),
+                        sdp_fmtp_line="",
+                        stats_id=f"RTPCodec-{current_ntp_time() >> 32}",
+                    )
+                    media.add_codec(codec)
+
+                elif attr == SessionDescriptionAttrKey.ICEUfrag.value and value:
+                    media.ice_ufrag = value
+                elif attr == SessionDescriptionAttrKey.ICEPwd.value and value:
+                    media.ice_pwd = value
+
+                elif attr == SessionDescriptionAttrKey.Fingerprint.value and value:
+                    algorithm, fingerprint = value.split()
+                    media.fingerprints.append(dtls.Fingerprint(algorithm, fingerprint))
+
+                else:
+                    media.attributes.append(
+                        SessionDescriptionAttr(key=attr, value=value)
+                    )
+
+        return media
+
     def _marshal_ports(self) -> bytes:
         m = bytearray()
 
-        m.extend(byteops.pack_unsigned(self.port))
+        m.extend(byteops.pack_string(str(self.port)))
         if self.port_end:
             m.extend(byteops.pack_string("/"))
-            m.extend(byteops.pack_unsigned(self.port_end))
+            m.extend(byteops.pack_string(str(self.port_end)))
 
         return m
 
@@ -908,9 +1019,112 @@ class MediaDescription:
     def marshal(self) -> bytes:
         m = bytearray()
         _desc_marshal_key_value(m, "m=", self._marshal_name())
+        _desc_marshal_key_value(
+            m,
+            "c=",
+            byteops.pack_string(
+                f"{self.network_type} {self.address_type} {self.address_host}"
+            ),
+        )
         for attr in self.attributes:
             _desc_marshal_key_value(m, "a=", attr.marshal())
         return m
+
+
+def grouplines(sdp: str) -> tuple[list[str], list[list[str]]]:
+    # Ensure the SDP data is a string (decode if it's a bytestring)
+    if isinstance(sdp, bytes):
+        sdp = sdp.decode()
+
+    session = []
+    media = []
+    for line in sdp.splitlines():
+        if line.startswith("m="):
+            media.append([line])
+        elif len(media):
+            media[-1].append(line)
+        else:
+            session.append(line)
+    return session, media
+
+
+def ipaddress_from_sdp(sdp: str) -> tuple[str, str]:
+    m = re.match("^IN (IP4|IP6) ([^ ]+)$", sdp)
+    assert m
+    return (m.group(1), m.group(2))
+
+
+def parse_attr(line: str) -> tuple[str, str | None]:
+    if ":" in line:
+        bits = line[2:].split(":", 1)
+        return bits[0], bits[1]
+    else:
+        return line[2:], None
+
+
+@dataclass
+class GroupDescription:
+    semantic: str
+    items: list[int | str]
+
+    def __str__(self) -> str:
+        return f"{self.semantic} {' '.join(map(str, self.items))}"
+
+
+def parse_group(dest: list[GroupDescription], value: str, type=str) -> None:
+    bits = value.split()
+    if bits:
+        dest.append(GroupDescription(semantic=bits[0], items=list(map(type, bits[1:]))))
+
+
+FMTP_INT_PARAMETERS = [
+    "apt",
+    "max-fr",
+    "max-fs",
+    "maxplaybackrate",
+    "minptime",
+    "stereo",
+    "useinbandfec",
+]
+
+
+def parameters_from_sdp(sdp: str):
+    parameters = {}
+    for param in sdp.split(";"):
+        if "=" in param:
+            k, v = param.split("=", 1)
+            if k in FMTP_INT_PARAMETERS:
+                parameters[k] = int(v)
+            else:
+                parameters[k] = v
+        else:
+            parameters[param] = None
+    return parameters
+
+
+def candidate_from_sdp(sdp: str):
+    bits = sdp.split()
+    assert len(bits) >= 8
+
+    component = int(bits[1])
+    foundation = bits[0]
+    ip = bits[4]
+    port = int(bits[5])
+    priority = int(bits[3])
+    protocol = bits[2]
+    candidate_type = bits[7]
+
+    # for i in range(8, len(bits) - 1, 2):
+    #     if bits[i] == "raddr":
+    #         relatedAddress = bits[i + 1]
+    #     elif bits[i] == "rport":
+    #         relatedPort = int(bits[i + 1])
+    #     elif bits[i] == "tcptype":
+    #         tcpType = bits[i + 1]
+
+    print(
+        f"component:{component} foundation:{foundation} ip:{ip} port:{port} priority:{priority} protocol:{protocol} candidate_type:{candidate_type}"
+    )
 
 
 # API to match draft-ietf-rtcweb-jsep.
@@ -940,6 +1154,251 @@ class SessionDescription:
 
     def add_media_description(self, desc: MediaDescription):
         self.media_descriptions.append(desc)
+
+    @classmethod
+    def parse(cls, sdp: str):
+        current_media: MediaDescription | None = None
+        dtls_fingerprints = []
+        dtls_role = None
+        ice_lite = False
+        ice_options = None
+        ice_password = None
+        ice_usernameFragment = None
+
+        session_lines, media_groups = grouplines(sdp)
+
+        print("media_groups", media_groups)
+        print("session_lines", session_lines)
+
+        name: str | None = None
+        host: str | None = None
+        time: str | None = None
+
+        sdp_attrs = []
+        groups = list[GroupDescription]()
+
+        session = cls()
+
+        for line in session_lines:
+            if line.startswith("v="):
+                session.version = int(line.strip()[2:])
+            elif line.startswith("o="):
+                session.origin = line.strip()[2:]
+            elif line.startswith("s="):
+                name = line.strip()[2:]
+            elif line.startswith("c="):
+                pass
+                # host = ipaddress_from_sdp(line[2:])
+            elif line.startswith("t="):
+                time = line.strip()[2:]
+            elif line.startswith("a="):
+                attr, value = parse_attr(line)
+                sdp_attrs.append((attr, value))
+
+                if attr == "fingerprint" and value:
+                    algorithm, fingerprint = value.split()
+                    dtls_fingerprints.append((algorithm, fingerprint))
+                elif attr == "ice-lite":
+                    ice_lite = True
+                elif attr == "ice-options":
+                    ice_options = value
+                elif attr == "ice-pwd":
+                    ice_password = value
+                elif attr == "ice-ufrag":
+                    ice_usernameFragment = value
+                elif attr == "group" and value:
+                    parse_group(groups, value)
+                elif attr == "msid-semantic" and value:
+                    parse_group(groups, value)
+                elif attr == "setup":
+                    dtls_role = value
+
+        # print("media groups", len(media_groups))
+        # parse media
+        for media_lines in media_groups:
+            # m = re.match("^m=([^ ]+) ([0-9]+) ([A-Z/]+) (.+)$", media_lines[0])
+            media = MediaDescription.parse(media_lines)
+            if media is None:
+                continue
+            session.add_media_description(media)
+
+            #
+            # print("media line matched", m)
+            # print("media line", media_lines[0])
+            # if not m:
+            #     continue
+            #
+            # # check payload types are valid
+            # # kind = m.group(1)
+            # fmt = m.group(4).split()
+            # fmt_int: list[int] | None = None
+            # #
+            # # if kind in ["audio", "video"]:
+            # #     fmt_int = [int(x) for x in fmt]
+            # #     for pt in fmt_int:
+            # #         assert pt >= 0 and pt < 256
+            # #         # assert pt not in rtp.FORBIDDEN_PAYLOAD_TYPES
+            # #
+            # print(
+            #     f"media = port:{int(m.group(2))} profile:{m.group(3)} fmt:{fmt_int or fmt}"
+            # )
+            #
+            # print(f"media_dtls fingerprint:{dtls_fingerprints[:]} role:{dtls_role}")
+            #
+            # # current_media = MediaDescription(
+            # # kind, port=int(m.group(2)), profile=m.group(3), fmt=fmt_int or fmt
+            # # )
+            # # current_media.dtls = RTCDtlsParameters(
+            # #     fingerprints=dtls_fingerprints[:], role=dtls_role
+            # # )
+            #
+            # print(
+            #     f"media_ice ice_lite:{ice_lite} ufrag:{ice_usernameFragment} pwd:{ice_password}"
+            # )
+            #
+            # print(f"ice_optionsa {ice_options}")
+            # # current_media.ice = RTCIceParameters(
+            # #     iceLite=ice_lite,
+            # #     usernameFragment=ice_usernameFragment,
+            # #     password=ice_password,
+            # # )
+            # # current_media.ice_options = ice_options
+            # # session.media.append(current_media)
+            #
+            # for line in media_lines[1:]:
+            #     if line.startswith("c="):
+            #         # host = ipaddress_from_sdp(line[2:])
+            #         print(f"media host {host}")
+            #     elif line.startswith("a="):
+            #         attr, value = parse_attr(line)
+            #         if attr == "candidate" and value:
+            #             print(f"media candidate {candidate_from_sdp(value)}")
+            #         elif attr == "end-of-candidates":
+            #             print("media candidate end")
+            #         elif attr == "extmap" and value:
+            #             ext_id, ext_uri = value.split()
+            #             if "/" in ext_id:
+            #                 ext_id, ext_direction = ext_id.split("/")
+            #
+            #             print(f"ext_id:{ext_id} ext_uri:{ext_uri}")
+            #
+            #             # extension = RTCRtpHeaderExtensionParameters(
+            #             # id=int(ext_id), uri=ext_uri
+            #             # )
+            #             # current_media.rtp.headerExtensions.append(extension)
+            #         elif attr == "fingerprint" and value:
+            #             algorithm, fingerprint = value.split()
+            #             print(f"algo:{algorithm} finger:{fingerprint}")
+            #             # current_media.dtls.fingerprints.append(
+            #             # RTCDtlsFingerprint(algorithm=algorithm, value=fingerprint)
+            #             # )
+            #         elif attr == "ice-options" and value:
+            #             print("ice-options")
+            #             # current_media.ice_options = value
+            #         elif attr == "ice-pwd" and value:
+            #             print("ice-pwd" + value)
+            #             # current_media.ice.password = value
+            #         elif attr == "ice-ufrag" and value:
+            #             print("ice-ufrag" + value)
+            #             # current_media.ice.usernameFragment = value
+            #         elif attr == "max-message-size":
+            #             print("max-message-size", value)
+            #             # current_media.sctpCapabilities = RTCSctpCapabilities(
+            #             # maxMessageSize=int(value)
+            #             # )
+            #         elif attr == "mid" and value:
+            #             print("mid" + value)
+            #             # current_media.rtp.muxId = value
+            #         elif attr == "msid" and value:
+            #             print("msid", value)
+            #             # current_media.msid = value
+            #         elif attr == "rtcp" and value:
+            #             port, rest = value.split(" ", 1)
+            #             print(f"rtcp {int(port)} {ipaddress_from_sdp(rest)}")
+            #             # current_media.rtcp_port = int(port)
+            #             # current_media.rtcp_host = ipaddress_from_sdp(rest)
+            #         elif attr == "rtcp-mux":
+            #             # current_media.rtcp_mux = True
+            #             print("rtcp-mux")
+            #         elif attr == "setup" and value:
+            #             print("DTLS role", value)
+            #             # current_media.dtls.role = DTLS_SETUP_ROLE[value]
+            #         # elif attr in DIRECTIONS:
+            #         #     current_media.direction = attr
+            #         elif attr == "rtpmap" and value:
+            #             format_id, format_desc = value.split(" ", 1)
+            #             bits = format_desc.split("/")
+            #
+            #             # print(f"channels {int(bits[2])}")
+            #             print("TODO: channels check if audio or video", bits)
+            #
+            #             # if current_media.kind == "audio":
+            #             #     if len(bits) > 2:
+            #             #         channels = int(bits[2])
+            #             #     else:
+            #             #         channels = 1
+            #             # else:
+            #             # channels = None
+            #
+            #             print(f"kind:{bits[0]} clock-rate:{bits[1]}")
+            #             # codec = RTCRtpCodecParameters(
+            #             #     mimeType=current_media.kind + "/" + bits[0],
+            #             #     channels=channels,
+            #             #     clockRate=int(bits[1]),
+            #             #     payloadType=int(format_id),
+            #             # )
+            #             # current_media.rtp.codecs.append(codec)
+            #         # elif attr == "sctpmap":
+            #         #     format_id, format_desc = value.split(" ", 1)
+            #         #     getattr(current_media, attr)[int(format_id)] = format_desc
+            #         # elif attr == "sctp-port":
+            #         #     current_media.sctp_port = int(value)
+            #         elif attr == "ssrc-group" and value:
+            #             print(f"ssrc-group {value}")
+            #             # parse_group(current_media.ssrc_group, value, type=int)
+            #         elif attr == "ssrc" and value:
+            #             ssrc_str, ssrc_desc = value.split(" ", 1)
+            #             ssrc = int(ssrc_str)
+            #             ssrc_attr, ssrc_value = ssrc_desc.split(":", 1)
+            #
+            #             print(f"ssrc: {ssrc}, {ssrc_attr} {ssrc_value}")
+            #
+            #             # try:
+            #             #     ssrc_info = next(
+            #             #         (x for x in current_media.ssrc if x.ssrc == ssrc)
+            #             #     )
+            #             # except StopIteration:
+            #             #     ssrc_info = SsrcDescription(ssrc=ssrc)
+            #             #     current_media.ssrc.append(ssrc_info)
+            #             # if ssrc_attr in SSRC_INFO_ATTRS:
+            #             #     setattr(ssrc_info, ssrc_attr, ssrc_value)
+
+            # if current_media.dtls.role is None:
+            #     current_media.dtls = None
+
+            # requires codecs to have been parsed
+            # for line in media_lines[1:]:
+            #     if line.startswith("a="):
+            #         attr, value = parse_attr(line)
+            #         if attr == "fmtp" and value:
+            #             format_id, format_desc = value.split(" ", 1)
+            #             print(f"{format_id} {format_desc}")
+            #             # codec = find_codec(int(format_id))
+            #             codec = parameters_from_sdp(format_desc)
+            #             print(f"{codec}")
+            #         elif attr == "rtcp-fb" and value:
+            #             bits = value.split(" ", 2)
+            #             print(f"rtcp-fb {bits[0]} {bits[1]} {bits[2]}")
+            #             # for codec in current_media.rtp.codecs:
+            #             # if bits[0] in ["*", str(codec.payloadType)]:
+            #             # codec.rtcpFeedback.append(
+            #             #     RTCRtcpFeedback(
+            #             #         type=bits[1],
+            #             #         parameter=bits[2] if len(bits) > 2 else None,
+            #             #     )
+            #             # )
+            #             #
+        return session
 
     def __repr__(self) -> str:
         return f"SessionDescription(media={self.media_descriptions})"
@@ -980,9 +1439,10 @@ class SessionDescription:
         # a=* (zero or more media attribute lines)
 
         m = bytearray()
-        _desc_marshal_key_value(m, "v=", byteops.pack_unsigned_64(self.version))
+        _desc_marshal_key_value(m, "v=", byteops.pack_string(str(self.version)))
         _desc_marshal_key_value(m, "o=", self.origin.marshal())
         _desc_marshal_key_value(m, "s=", byteops.pack_string(self.session_name))
+        _desc_marshal_key_value(m, "t=", byteops.pack_string("0 0"))
 
         for attr in self.attributes:
             _desc_marshal_key_value(m, "a=", attr.marshal())
@@ -990,7 +1450,13 @@ class SessionDescription:
         for media in self.media_descriptions:
             m.extend(media.marshal())
 
-        return m
+        return bytes(m)
+
+
+def parse_session_description_from_str(desc_str: str) -> SessionDescription:
+    desc = SessionDescription()
+
+    return desc
 
 
 def bundle_match_from_remote(bundle_group: str | None) -> Callable[[str], bool]:
@@ -1111,18 +1577,13 @@ def add_transceiver_media_description(
         return False
 
     codecs = t.get_codecs()
-    print("sdp", t)
     if codecs is None:
         return False
 
     media = MediaDescription(
-        media=t.mid.value,
+        media=t.kind.value,
         port=9,
         protocols=["UDP", "TLS", "RTP", "SAVPF"],
-        formats=["0"],
-        network_type="IN",
-        address_type="IP4",
-        address="0.0.0.0",
     )
 
     media.add_attribute(
@@ -1297,9 +1758,11 @@ class PeerConnection:
     def __init__(self) -> None:
         self.gatherer = ICEGatherer()
         self._transport = ICETransport(self.gatherer)
-        self._certificates: list[dtls.Certificate] = [
-            dtls.Certificate.generate_certificate()
-        ]
+
+        certificate = dtls.Certificate.generate_certificate()
+        self._certificates: list[dtls.Certificate] = [certificate]
+        self._dtls_transport = dtls.DTLSTransport(self._transport, certificate)
+
         self._caps = MediaCaps()
         set_default_caps(self._caps)
         self.origin = Origin()
@@ -1318,6 +1781,9 @@ class PeerConnection:
     def add_transceiver_from_track(
         self, track: TrackLocal, direction: RTPTransceiverDirection
     ) -> RTPTransceiver:
+        # TODO: this may contain directly transport creation
+        # gathering process may take that list/set of transports
+
         receiver: RTPReceiver | None = None
         sender: RTPSender | None = None
 
@@ -1367,6 +1833,11 @@ class PeerConnection:
             return self.add_transceiver_from_track(track, direction)
         else:
             raise ValueError("Unknown direction")
+
+    def set_remote_description(
+        self,
+    ):
+        pass
 
     def _get_sdp_role(self) -> ConnectionRole:
         # The ICE controlling role acts as the server.
@@ -1439,6 +1910,7 @@ class PeerConnection:
             is_plan_b=is_plan_b,
             fingerprints=fingerprints,
             is_extmap_allow_mixed=True,
+            # is_extmap_allow_mixed=False,
             role=self._get_sdp_role(),
             candidates=ice_candidates,
             ice_params=ice_params,

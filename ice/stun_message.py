@@ -36,7 +36,11 @@ def stun_message_parse_attrs(
             print(
                 f"STUN type not in registry or invalid deserialization: attr_type={attr_type}, attr_length={attr_length}",
             )
-            raise ValueError("Invalid STUN message deserialization or not found type")
+            total_length = stun.utils.ATTRIBUTE_HEADER_SIZE + attr_length
+            padding_bytes_to_skip = stun.utils.nearest_padded_value_length(total_length)
+            data = data[total_length + padding_bytes_to_skip :]
+            offset += total_length + padding_bytes_to_skip
+            continue
 
         attr_value = data[4 : 4 + attr_length]
 

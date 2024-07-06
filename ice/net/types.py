@@ -15,14 +15,12 @@ class CandidateType(Enum):
     Relay = 4
 
 
-def get_network_type_from_str(value: str) -> NetworkType:
+def get_network_type_from_str(value: str) -> NetworkType | None:
     match value:
         case "udp":
             return NetworkType.UDP
         case "tcp":
             return NetworkType.TCP
-        case _:
-            raise ValueError("Not supported network type")
 
 
 class Address:

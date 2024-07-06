@@ -18,7 +18,9 @@ async def main():
     if not desc:
         return
     result = desc.marshal()
-    print(str(result))
+    result = result.decode()
+
+    peer_connection.SessionDescription.parse(result)
 
 
 asyncio.run(main())

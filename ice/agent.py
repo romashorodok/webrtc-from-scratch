@@ -9,6 +9,7 @@ from ice import stun
 import ice.net
 from ice.net.types import (
     Address,
+    CandidateProtocol,
     MuxConnProtocol,
     NetworkType,
     LocalCandidate,
@@ -466,6 +467,21 @@ async def ping_routine(
         await selector.send_ping_stun_message(pair, conn)
 
 
+class CandidatePairTransport:
+    def __init__(self, conn: MuxConnProtocol) -> None:
+        self._conn: ice.MuxConnProtocol = conn
+        self._interceptor = ice.Interceptor()
+
+    def pipe(self, pkt: Packet):
+        self._interceptor.put_nowait(pkt)
+
+    async def recvfrom(self) -> Packet:
+        return await self._interceptor.get()
+
+    def sendto(self, data: memoryview | bytearray | bytes):
+        self._conn.sendto(data)
+
+
 class CandidatePairController:
     def __init__(
         self, pair: CandidatePair, selector: SelectorProtocol, tie_breaker: int
@@ -476,8 +492,10 @@ class CandidatePairController:
         self._conn = self._pair.local_candidate.mux.intercept(
             self._pair.remote_candidate.unwrap
         )
+        self._transport = CandidatePairTransport(self._conn)
 
     async def start(self):
+        print("Start candidate pair selector", self._pair)
         while True:
             pkt = await self._conn.recvfrom()
 
@@ -487,8 +505,8 @@ class CandidatePairController:
                 await self._on_inbound_pkt(pkt)
 
     async def _on_inbound_pkt(self, pkt: Packet):
-        print("Recv rtp wait 10 sec.", pkt)
-        await asyncio.sleep(10)
+        # print("Recv rtp wait 10 sec.", pkt.data.tolist())
+        self._transport.pipe(pkt)
 
     async def _on_stun_binding_request(self, pkt: Packet, msg: stun.Message):
         # print("On stun binding request", msg)
@@ -537,8 +555,17 @@ class CandidatePairController:
         # NOTE: How to make state observing/notifying
         await self._selector.send_ping_stun_message(self._pair, self._conn)
 
+    def get_transport(self) -> CandidatePairTransport:
+        return self._transport
+
 
 # Role Determination: The peers determine their roles (controlling or controlled) based on the ICE tie-breaking algorithm. The peer with the higher tie-breaker value becomes the controlling agent
+
+
+class AgentRole(Enum):
+    Unknown = "unknown"
+    Controlling = "controlling"
+    Controlled = "controlled"
 
 
 # Controlling agent must know remote user credentials
@@ -549,6 +576,7 @@ class Agent:
         self._local_pwd = generate_pwd()
         self._remote_ufrag: str | None = None
         self._remote_pwd: str | None = None
+        self._role: AgentRole = AgentRole.Unknown
 
         self._options = options
         self._udp = options.udp
@@ -562,6 +590,8 @@ class Agent:
         self._remote_candidates = dict[NetworkType, list[CandidateBase]]()
 
         self._pair_registry = CandidatePairRegistry()
+
+        self._candidate_pair_transports = list[CandidatePairTransport]()
 
     def set_on_candidate(self, on_candidate: Callable[[CandidateBase], None]):
         self._on_candidate = on_candidate
@@ -591,20 +621,28 @@ class Agent:
         await asyncio.gather(*coros)
 
     # Look at func (s *controllingSelector) ContactCandidates() to know more
-    def connect(self, controlling: bool, remote_ufrag: str, remote_pwd: str):
-        print("start connection", controlling, remote_ufrag, remote_pwd)
+    def connect(self, controlling: bool):
+        print("start connection", controlling, self._remote_ufrag, self._remote_pwd)
 
         if controlling:
+            self._role = AgentRole.Controlling
             selector = ControllingSelector(self._pair_registry, self._tie_breaker)
         else:
+            self._role = AgentRole.Controlled
             selector = ControlledSelector(self._pair_registry, self._tie_breaker)
         selector.start()
 
         # TODO: cancel all this when need stop
         controller_tasks = []
 
+        print(self._pair_registry.get_pair_list())
+
+        print("Pair registry", self._pair_registry)
+
         for pair in self._pair_registry.get_pair_list():
             pair_controller = CandidatePairController(pair, selector, self._tie_breaker)
+            self._candidate_pair_transports.append(pair_controller.get_transport())
+
             controller_tasks.append(self._loop.create_task(pair_controller.start()))
 
             self._loop.create_task(pair_controller.ping_remote_candidate())
@@ -619,12 +657,12 @@ class Agent:
 
         return
 
-    def dial(self, remote_ufrag: str, remote_pwd: str):
+    def dial(self):
         "Initiates a connection to another peer"
-        self.connect(True, remote_ufrag, remote_pwd)
+        self.connect(True)
 
-    def accept(self, remote_ufrag: str, remote_pwd: str):
-        self.connect(False, remote_ufrag, remote_pwd)
+    def accept(self):
+        self.connect(False)
 
     async def get_local_candidates(self):
         async with self._candidate_lock:
@@ -712,3 +750,6 @@ class Agent:
     def set_remote_credentials(self, ufrag: str, pwd: str):
         self._remote_ufrag = ufrag
         self._remote_pwd = pwd
+
+    def get_role(self) -> AgentRole:
+        return self._role
