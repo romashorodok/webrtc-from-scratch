@@ -467,6 +467,15 @@ class TrackLocal:
         self._stream_id = stream_id
         self._rtp_codec_params = rtp_codec_params
         self._kind = kind
+        self._writer: dtls.RTPWriterProtocol | None = None
+
+    async def write_rtp(self, pkt: ice.net.Packet) -> int:
+        if not self._writer:
+            return 0
+        return await self._writer.write_rtp(pkt)
+
+    def bind(self, writer: dtls.RTPWriterProtocol):
+        self._writer = writer
 
     @property
     def kind(self) -> RTPCodecKind:
@@ -507,26 +516,43 @@ class RTPSendParameters:
         self.rtp_parameters = rtp_parameters
 
 
+@impl_protocol(dtls.RTPWriterProtocol)
 class TrackEncoding:
-    def __init__(self, ssrc: int, track: TrackLocal | None = None) -> None:
+    def __init__(
+        self, ssrc: int, dtls: dtls.DTLSTransport, track: TrackLocal | None = None
+    ) -> None:
         self.track = track
         self.ssrc = ssrc
+        self._dtls = dtls
+        self._lock = asyncio.Lock()
+
+    async def write_rtp(self, pkt: ice.net.Packet) -> int:
+        # print("Write in encoding")
+        async with self._lock:
+            return self._dtls.write_rtp(pkt)
 
 
 class RTPSender:
-    def __init__(self, caps: MediaCaps) -> None:
+    def __init__(self, caps: MediaCaps, dtls: dtls.DTLSTransport) -> None:
         self._track_encodings = list[TrackEncoding]()
         self._payload_type: int = 0
         self._caps = caps
         self._track: TrackLocal | None = None
+        self._dtls = dtls
 
-    def add_encoding(self, track: TrackLocal):
+    async def add_encoding(self, track: TrackLocal):
         self._track_encodings.append(
-            TrackEncoding(ssrc=secrets.randbits(32), track=track)
+            TrackEncoding(ssrc=secrets.randbits(32), dtls=self._dtls, track=track)
         )
-        self.replace_track(track)
+        await self.replace_track(track)
 
-    def replace_track(self, track: TrackLocal):
+    async def replace_track(self, track: TrackLocal):
+        for encoding in self._track_encodings:
+            async with encoding._lock:
+                if enc_track := encoding.track:
+                    enc_track._writer = None
+
+                track.bind(encoding)
         self._track = track
 
     @property
@@ -567,8 +593,8 @@ class RTPSender:
 
 
 class RTPReceiver:
-    def __init__(self) -> None:
-        pass
+    def __init__(self, caps: MediaCaps) -> None:
+        self._caps = caps
 
 
 class RTPTransceiver:
@@ -601,6 +627,11 @@ class RTPTransceiver:
                 filtered_codecs.append(item)
 
         return filtered_codecs
+
+    def track_local(self) -> TrackLocal | None:
+        if not self.sender:
+            return
+        return self.sender.track
 
     @property
     def sender(self) -> RTPSender | None:
@@ -794,9 +825,9 @@ class ExtMap:
     def marshal(self) -> str:
         out = f"extmap:{self.value}"
 
-        direction = self.direction
-        if direction == RTPTransceiverDirection.Unknown or self.direction is None:
-            out += "/ "
+        # direction = self.direction
+        # if direction == RTPTransceiverDirection.Unknown or self.direction is None:
+        #     out += "/ "
 
         if self.uri:
             out += f" {self.uri}"
@@ -901,14 +932,19 @@ class MediaDescription:
         )
 
     def add_media_source(self, ssrc: int, cname: str, stream_label: str, label: str):
-        # Also may looks like this, but this formats deprecated
-        # "%d mslabel:%s", ssrc, stream_label
-        # "%d label:%s", ssrc, label
         value = f"{ssrc} cname:{cname}"
         self.add_attribute(
             SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
         )
         value = f"{ssrc} msid:{stream_label} {label}"
+        self.add_attribute(
+            SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
+        )
+        value = f"{ssrc} label:{label}"
+        self.add_attribute(
+            SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
+        )
+        value = f"{ssrc} mslabel:{stream_label}"
         self.add_attribute(
             SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
         )
@@ -1593,7 +1629,8 @@ def add_transceiver_media_description(
         )
     )
     media.add_attribute(SessionDescriptionAttr(SessionDescriptionAttrKey.MID, mid))
-    media.add_attribute(SessionDescriptionAttr(RTPTransceiverDirection.Sendrecv.value))
+    # media.add_attribute(SessionDescriptionAttr(RTPTransceiverDirection.Sendrecv.value))
+
     media.add_attribute(SessionDescriptionAttr("ice-ufrag", ice_params.local_ufrag))
     media.add_attribute(SessionDescriptionAttr("ice-pwd", ice_params.local_pwd))
     media.add_attribute(SessionDescriptionAttr(SessionDescriptionAttrKey.RTCPMux))
@@ -1601,30 +1638,39 @@ def add_transceiver_media_description(
 
     for codec in codecs:
         media.add_codec(codec)
-        for feedback in codec.rtcp_feedbacks:
-            media.add_rtcp_feedback(codec, feedback)
+        # for feedback in codec.rtcp_feedbacks:
+        #     media.add_rtcp_feedback(codec, feedback)
 
     directions = list[RTPTransceiverDirection]()
+
     if t.sender:
         directions.append(RTPTransceiverDirection.Sendonly)
-
     if t.receiver:
         directions.append(RTPTransceiverDirection.Recvonly)
 
-    negotiated_parameters = caps.get_rtp_parameters_by_kind(t.kind, directions)
-    for rtp_ext in negotiated_parameters.header_extensions:
-        ext_uri = ExtMap(value=rtp_ext.id, uri=rtp_ext.uri)
-        media.add_attribute(SessionDescriptionAttr(ext_uri.marshal()))
+    ext_map_stub = [
+        ExtMap(value=1, uri="urn:ietf:params:rtp-hdrext:sdes:mid"),
+        ExtMap(
+            value=3, uri="http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
+        ),
+    ]
+
+    # negotiated_parameters = caps.get_rtp_parameters_by_kind(t.kind, directions)
+    # for rtp_ext in negotiated_parameters.header_extensions:
+    for rtp_ext in ext_map_stub:
+        # ext_uri = ExtMap(value=rtp_ext.value, uri=rtp_ext.uri)
+        media.add_attribute(SessionDescriptionAttr(rtp_ext.marshal()))
 
     if media_section.rid_map:
         for rid in media_section.rid_map.items():
             media.add_attribute(
                 SessionDescriptionAttr(SessionDescriptionAttrKey.RID, f"{rid} recv")
             )
-        # TODO: add attr for simulcast
+    # TODO: add attr for simulcast
 
     add_sender_sdp(media, media_section, is_plan_b)
 
+    print("Current direction ", t.direction.value)
     media.add_attribute(SessionDescriptionAttr(t.direction.value))
 
     for fingerprint in fingerprints:
@@ -1736,8 +1782,8 @@ def set_default_caps(caps: MediaCaps):
         RTPCodecKind.Audio,
     )
 
-    nack_pli = RTCPFeedback(rtcp_type="nack", parameter="pli")
-    remb = RTCPFeedback(rtcp_type="goog-remb", parameter="")
+    # nack_pli = RTCPFeedback(rtcp_type="nack", parameter="pli")
+    # remb = RTCPFeedback(rtcp_type="goog-remb", parameter="")
     vp8 = RTPCodecParameters(
         mime_type="video/VP8",
         clock_rate=90000,
@@ -1747,8 +1793,8 @@ def set_default_caps(caps: MediaCaps):
         stats_id=f"RTPCodec-{current_ntp_time() >> 32}",
     )
 
-    vp8.rtcp_feedbacks.append(nack_pli)
-    vp8.rtcp_feedbacks.append(remb)
+    # vp8.rtcp_feedbacks.append(nack_pli)
+    # vp8.rtcp_feedbacks.append(remb)
 
     caps.register_codec(vp8, RTPCodecKind.Video)
 
@@ -1757,11 +1803,11 @@ def set_default_caps(caps: MediaCaps):
 class PeerConnection:
     def __init__(self) -> None:
         self.gatherer = ICEGatherer()
-        self._transport = ICETransport(self.gatherer)
 
-        certificate = dtls.Certificate.generate_certificate()
-        self._certificates: list[dtls.Certificate] = [certificate]
-        self._dtls_transport = dtls.DTLSTransport(self._transport, certificate)
+        self._certificate = dtls.Certificate.generate_certificate()
+        self._certificates: list[dtls.Certificate] = [self._certificate]
+
+        self._dtls_transports = list[dtls.DTLSTransport]()
 
         self._caps = MediaCaps()
         set_default_caps(self._caps)
@@ -1773,16 +1819,17 @@ class PeerConnection:
 
         self._transceivers = list[RTPTransceiver]()
 
-        self._controlling: bool = True
-
         self._closed: bool = False
         self._lock = asyncio.Lock()
 
-    def add_transceiver_from_track(
+    async def add_transceiver_from_track(
         self, track: TrackLocal, direction: RTPTransceiverDirection
     ) -> RTPTransceiver:
         # TODO: this may contain directly transport creation
         # gathering process may take that list/set of transports
+        transport = ICETransport(self.gatherer)
+        dtls_transport = dtls.DTLSTransport(transport, self._certificate)
+        self._dtls_transports.append(dtls_transport)
 
         receiver: RTPReceiver | None = None
         sender: RTPSender | None = None
@@ -1790,13 +1837,15 @@ class PeerConnection:
         match direction:
             case RTPTransceiverDirection.Sendrecv:
                 # TODO: add logic
-                receiver = RTPReceiver()
-                sender = RTPSender(self._caps)
+                receiver = RTPReceiver(self._caps)
+                sender = RTPSender(self._caps, dtls_transport)
             case RTPTransceiverDirection.Sendonly:
-                sender = RTPSender(self._caps)
+                sender = RTPSender(self._caps, dtls_transport)
+            case RTPTransceiverDirection.Recvonly:
+                receiver = RTPReceiver(self._caps)
 
         if sender:
-            sender.add_encoding(track)
+            await sender.add_encoding(track)
 
         transceiver = RTPTransceiver(
             caps=self._caps, kind=track.kind, direction=direction
@@ -1812,7 +1861,7 @@ class PeerConnection:
 
         return transceiver
 
-    def add_transceiver_from_kind(
+    async def add_transceiver_from_kind(
         self, kind: RTPCodecKind, direction: RTPTransceiverDirection
     ) -> RTPTransceiver:
         if (
@@ -1824,13 +1873,12 @@ class PeerConnection:
                 raise ValueError(f"Not found codecs for {kind.value}")
 
             track = TrackLocal(random_string(16), random_string(16), kind, codecs[0])
-
-            return self.add_transceiver_from_track(track, direction)
+            return await self.add_transceiver_from_track(track, direction)
         elif direction is RTPTransceiverDirection.Recvonly:
             print("TODO: make recv only")
             codecs = self._caps.get_codecs_by_kind(kind)
             track = TrackLocal(random_string(16), random_string(16), kind, codecs[0])
-            return self.add_transceiver_from_track(track, direction)
+            return await self.add_transceiver_from_track(track, direction)
         else:
             raise ValueError("Unknown direction")
 
@@ -1840,11 +1888,12 @@ class PeerConnection:
         pass
 
     def _get_sdp_role(self) -> ConnectionRole:
+        role = self.gatherer.agent.get_role()
+        print(f"Set SDP from agent {role}")
         # The ICE controlling role acts as the server.
-        if self._controlling:
+        if role == ice.AgentRole.Controlling:
             return ConnectionRole.Passive
 
-        # The ICE controlled role acts as client which connect to the server
         return ConnectionRole.Active
 
     # Generates an SDP that doesn't take remote state into account
@@ -1938,8 +1987,8 @@ class PeerConnection:
         #     raise ValueError("connection closed")
 
         try:
-            if options and options.ice_restart:
-                self._transport.restart()
+            # if options and options.ice_restart:
+            #     self._transport.restart()
 
             # This may be necessary to recompute if, for example, createOffer was called when only an
             # audio RTCRtpTransceiver was added to connection, but while performing the in-parallel

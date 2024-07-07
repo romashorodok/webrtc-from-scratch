@@ -30,7 +30,7 @@ class Message:
             f"attributes={self.attributes})"
         )
 
-    def encode(self, pwd: bytes | None = None) -> memoryview:
+    def encode(self, pwd: bytes | None = None) -> bytes:
         buf = bytearray(MESSAGE_HEADER_LENGTH)
         buf[0:2] = self.message_type.to_uint16_bytes()
         buf[4:8] = COOKIE_UINT32_BYTES
@@ -49,7 +49,7 @@ class Message:
         length = len(buf) - MESSAGE_HEADER_LENGTH
         mutate_body_length(buf, length)
 
-        return memoryview(buf)
+        return buf
 
     def _new_transaction_id(self) -> bytes:
         return os.urandom(_TRANSACTION_ID_SIZE)

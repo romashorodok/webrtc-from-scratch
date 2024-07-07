@@ -23,6 +23,10 @@ def get_network_type_from_str(value: str) -> NetworkType | None:
             return NetworkType.TCP
 
 
+def is_rtcp(msg: bytes) -> bool:
+    return len(msg) >= 2 and msg[1] >= 192 and msg[1] <= 208
+
+
 class Address:
     def __init__(self, address: str, port: int) -> None:
         self.address = address
@@ -30,12 +34,12 @@ class Address:
 
 
 class Packet:
-    def __init__(self, source: Address, data: memoryview) -> None:
+    def __init__(self, source: Address, data: bytes) -> None:
         self._data = data
         self._source = source
 
     @property
-    def data(self) -> memoryview:
+    def data(self) -> bytes:
         return self._data
 
     @property
@@ -44,7 +48,7 @@ class Packet:
 
 
 class MuxConnProtocol(Protocol):
-    def sendto(self, data: memoryview | bytearray | bytes): ...
+    def sendto(self, data: bytes | bytearray | bytes): ...
     async def recvfrom(self) -> Packet: ...
 
 

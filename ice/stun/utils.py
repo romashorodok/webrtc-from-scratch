@@ -14,7 +14,7 @@ IPV4_PROTOCOL = 0x01
 IPV6_PROTOCOL = 0x02
 
 
-def is_stun(b: memoryview) -> bool:
+def is_stun(b: bytes) -> bool:
     if len(b) < MESSAGE_HEADER_LENGTH:
         return False
     extracted_value = (b[4] << 24) | (b[5] << 16) | (b[6] << 8) | b[7]

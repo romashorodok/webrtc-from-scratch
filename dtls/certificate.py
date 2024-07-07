@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives import serialization
 from OpenSSL import SSL, crypto
 
 # TODO: remove this lib
-from pylibsrtp import Policy, Session, Error
+from pylibsrtp import Policy, Error
 
 
 def certificate_digest(x509: crypto.X509) -> str:

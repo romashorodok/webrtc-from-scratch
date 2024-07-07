@@ -244,6 +244,7 @@ class ControllingSelector:
     def start(self):
         self._start_time = datetime.now()
         self._nominated_pair = None
+        print("Start ControllingSelector agent selector")
 
     def _set_nominate_pair(self, pair: CandidatePair):
         print("TODO: Nominate piar make it more reactive or like a callback")
@@ -363,7 +364,7 @@ class ControlledSelector:
         self._local_binding_cache = BindingRequestCacheRegistry()
 
     def start(self):
-        pass
+        print("Start ControlledSelector agent selector")
 
     async def on_binding_success(
         self, pair: CandidatePair, conn: MuxConnProtocol, msg: stun.Message
@@ -462,9 +463,10 @@ class ControlledSelector:
 async def ping_routine(
     selector: SelectorProtocol, pair: CandidatePair, conn: MuxConnProtocol
 ):
-    while True:
-        await asyncio.sleep(5)
-        await selector.send_ping_stun_message(pair, conn)
+    pass
+    # while True:
+    #     await asyncio.sleep(5)
+    #     await selector.send_ping_stun_message(pair, conn)
 
 
 class CandidatePairTransport:
@@ -478,7 +480,7 @@ class CandidatePairTransport:
     async def recvfrom(self) -> Packet:
         return await self._interceptor.get()
 
-    def sendto(self, data: memoryview | bytearray | bytes):
+    def sendto(self, data: bytes | bytearray | bytes):
         self._conn.sendto(data)
 
 
@@ -659,9 +661,11 @@ class Agent:
 
     def dial(self):
         "Initiates a connection to another peer"
+        self._role = AgentRole.Controlling
         self.connect(True)
 
     def accept(self):
+        self._role = AgentRole.Controlled
         self.connect(False)
 
     async def get_local_candidates(self):

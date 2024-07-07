@@ -75,7 +75,7 @@ class InterfaceMuxUDPHandler(asyncio.DatagramProtocol):
             print(f"Unbinded datagram recv not found {address_str} port")
             return
 
-        interceptor.put_nowait(Packet(Address(address, port), memoryview(data)))
+        interceptor.put_nowait(Packet(Address(address, port), data))
 
 
 @impl_protocol(MuxConnProtocol)
@@ -90,7 +90,7 @@ class UDPMuxConn:
         self._address = address
         self._interceptor = interceptor
 
-    def sendto(self, data: memoryview | bytearray | bytes):
+    def sendto(self, data: bytes | bytearray | bytes):
         return self._transport.sendto(data, self._address)
 
     async def recvfrom(self) -> Packet:

@@ -47,7 +47,7 @@ def stun_message_parse_attrs(
         attr_cls = stun.attr.get_attribute_from_registry(attr_type)
 
         attr = attr_cls.unmarshal(
-            data=bytearray(attr_value.tobytes()), transaction_id=msg.transaction_id
+            data=bytearray(attr_value), transaction_id=msg.transaction_id
         )
 
         if isinstance(attr, stun.MessageIntegrity):
@@ -56,7 +56,7 @@ def stun_message_parse_attrs(
 
             expected_integrity = attr.value
             received_integrity = stun.utils.message_integrity(
-                pkt.data[:offset].tobytes(), key=pwd
+                pkt.data[:offset], key=pwd
             )
 
             if expected_integrity != received_integrity:
@@ -64,9 +64,7 @@ def stun_message_parse_attrs(
 
         elif isinstance(attr, stun.Fingerprint):
             expected_fingerprint = attr.value
-            received_fingerprint = stun.utils.message_fingerprint(
-                pkt.data[:offset].tobytes()
-            )
+            received_fingerprint = stun.utils.message_fingerprint(pkt.data[:offset])
             if expected_fingerprint != received_fingerprint:
                 raise ValueError("STUN message fingerprint mismatch")
         else:

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"hash/crc32"
 	"log"
+	"time"
 
 	"github.com/pion/stun/v2"
 )

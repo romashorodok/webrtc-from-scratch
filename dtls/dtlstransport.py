@@ -6,7 +6,9 @@ from OpenSSL import SSL
 from pylibsrtp import Policy, Session
 
 import ice
+import ice.net
 import dtls
+from utils.types import impl_protocol
 
 from .certificate import SRTPProtectionProfile, certificate_digest
 
@@ -22,6 +24,11 @@ class ICETransportDTLS(Protocol):
     def get_ice_pair_transports(self) -> list[ice.CandidatePairTransport]: ...
 
 
+class RTPWriterProtocol(Protocol):
+    async def write_rtp(self, pkt: ice.net.Packet) -> int: ...
+
+
+@impl_protocol(RTPWriterProtocol)
 class DTLSTransport:
     def __init__(
         self, transport: ICETransportDTLS, certificate: dtls.Certificate
@@ -48,23 +55,26 @@ class DTLSTransport:
             try:
                 ssl.do_handshake()
             except SSL.WantReadError:
-                pkt = await transport.recvfrom()
-                first_byte = pkt.data[0]
-                if first_byte > 19 and first_byte < 64:
-                    ssl.bio_write(pkt.data)
-                    try:
-                        data = ssl.recv(1500)
-                        if data:
-                            print(f"Received data: {data}")
-                    except SSL.ZeroReturnError as e:
-                        print("Zero return", e)
-                    except SSL.Error as e:
-                        print("SSL error", e)
+                try:
+                    pkt = await transport.recvfrom()
+                    first_byte = pkt.data[0]
+                    if first_byte > 19 and first_byte < 64:
+                        ssl.bio_write(pkt.data)
+                        try:
+                            data = ssl.recv(1500)
+                            if data:
+                                print(f"Received data: {data}")
+                        except SSL.ZeroReturnError as e:
+                            print("Zero return", e)
+                        except SSL.Error as e:
+                            print("SSL error", e)
 
                     flight = ssl.bio_read(1500)
                     if flight:
                         transport.sendto(flight)
                         print(f"Sent flight data: {flight}")
+                except SSL.WantReadError:
+                    pass
             else:
                 encrypted = True
 
@@ -105,12 +115,12 @@ class DTLSTransport:
             2 * (negotiated_profile.key_length + negotiated_profile.salt_length),
         )
 
-        # if self._role == "server":
-        srtp_tx_key = negotiated_profile.get_key_and_salt(view, 1)
-        srtp_rx_key = negotiated_profile.get_key_and_salt(view, 0)
-        # else:
-        #     srtp_tx_key = srtp_profile.get_key_and_salt(view, 0)
-        #     srtp_rx_key = srtp_profile.get_key_and_salt(view, 1)
+        if self._dtls_role == DTLSRole.Server:
+            srtp_tx_key = negotiated_profile.get_key_and_salt(view, 1)
+            srtp_rx_key = negotiated_profile.get_key_and_salt(view, 0)
+        else:
+            srtp_tx_key = srtp_profile.get_key_and_salt(view, 0)
+            srtp_rx_key = srtp_profile.get_key_and_salt(view, 1)
 
         rx_policy = Policy(
             key=srtp_rx_key,
@@ -133,14 +143,17 @@ class DTLSTransport:
 
     async def start(self, remote_fingerprints: list[str] | None = None):
         # assert len(remote_fingerprints)
+        print("Handshake start")
 
         transport = self.ice_transport()
 
-        # match transport.get_ice_role():
-        #     case ice.AgentRole.Controlling:
-        self._dtls_role = DTLSRole.Server
-        # case ice.AgentRole.Controlled:
-        #     self._dtls_role = DTLSRole.Client
+        match transport.get_ice_role():
+            case ice.AgentRole.Controlling:
+                self._dtls_role = DTLSRole.Server
+            case ice.AgentRole.Controlled:
+                self._dtls_role = DTLSRole.Client
+
+        print("Start DTLS role", self._dtls_role)
 
         for pair in transport.get_ice_pair_transports():
             ctx = self._certificate.create_ssl_context(dtls.SRTP_PROFILES)
@@ -154,17 +167,21 @@ class DTLSTransport:
 
             asyncio.ensure_future(self.do_handshake_for(ssl, pair))
 
-        # for pair in transport.get_ice_pair_transports():
-        #     try:
-        #         while not self.encrypted:
-        #             self._ssl.do_handshake()
-        #     except SSL.WantReadError:
-        #         pkt = await pair.recvfrom()
-        #
-        #         first_byte = pkt.data[0]
-        #         if first_byte > 19 and first_byte < 64:
-        #             print("Is dtls packet")
-        #
-        #     except ConnectionError:
-        #         print("DTLS handshake connection error")
-        #         return
+    def write_rtcp(self, pkt: ice.net.Packet) -> int:
+        if not ice.net.is_rtcp(pkt.data):
+            return 0
+
+        if not self._tx_srtp:
+            return 0
+        data = self._tx_srtp.protect_rtcp(pkt.data)
+        return len(data)
+
+    def write_rtp(self, pkt: ice.net.Packet) -> int:
+        if not self._tx_srtp:
+            return 0
+        data = self._tx_srtp.protect(bytes(pkt.data))
+
+        for pair in self.ice_transport().get_ice_pair_transports():
+            pair.sendto(data)
+
+        return len(data)
