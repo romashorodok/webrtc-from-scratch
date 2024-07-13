@@ -909,6 +909,7 @@ async def write_routine(frames: list[tuple[bytes, media.IVFFrameHeader]]):
                 for pkt in pkts:
                     data = pkt.serialize()
                     await track.write_rtp(Packet(Address("0.0.0.0", 0), data))
+
         except RuntimeError:
             pass
 

@@ -94,16 +94,15 @@ class EventEmitter:
 
 class AsyncEventEmitter(EventEmitter):
     def __init__(self, loop: asyncio.AbstractEventLoop | None = None) -> None:
-        super().__init__()
+        super(AsyncEventEmitter, self).__init__()
         self._loop = loop
         self._waiting = set[asyncio.Future]()
 
-    @override
     def _on_call_handler(
         self, f: Callable, args: tuple[Any, ...], kwargs: dict[str, Any]
     ):
         try:
-            coro = f(*args, kwargs)
+            coro = f(*args, **kwargs)
         except Exception as e:
             self.emit("error", e)
         else:

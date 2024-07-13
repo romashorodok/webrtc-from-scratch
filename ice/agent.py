@@ -2,14 +2,13 @@ import asyncio
 from datetime import datetime, timedelta
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Callable, Protocol
 
 from ice import stun
 import ice.net
 from ice.net.types import (
     Address,
-    CandidateProtocol,
     MuxConnProtocol,
     NetworkType,
     LocalCandidate,
@@ -18,7 +17,7 @@ from ice.net.types import (
 )
 from ice.net.udp_mux import MultiUDPMux
 from ice.stun_message import stun_message_parse_attrs, stun_message_parse_header
-from utils.types import impl_protocol
+from utils import impl_protocol, AsyncEventEmitter, Handler_T
 
 from .candidate_base import (
     CandidateBase,
@@ -86,6 +85,13 @@ class CandidatePair:
 
         return (1 << 32 - 1) * min(g, d) + 2 * max(g, d) + cmp(g, d)
 
+    def get_pair_id(self) -> str:
+        return (
+            f"{self.local_candidate.unwrap.to_ice_str()}"
+            ":"
+            f"{self.remote_candidate.unwrap.to_ice_str()}"
+        )
+
     @property
     def state(self) -> CandidatePairState:
         """The state property."""
@@ -122,15 +128,15 @@ class CandidatePair:
 
 class CandidatePairRegistry:
     def __init__(self) -> None:
-        self._check_list = list[CandidatePair]()
+        self._check_list = dict[str, CandidatePair]()
 
     def append(self, pair: CandidatePair):
-        self._check_list.append(pair)
+        self._check_list[pair.get_pair_id()] = pair
 
     def best_pair_priority(self, controlling: bool) -> CandidatePair | None:
         best: CandidatePair | None = None
 
-        for pair in self._check_list:
+        for _, pair in self._check_list.items():
             if pair._state != CandidatePairState.SUCCEEDED:
                 continue
 
@@ -143,8 +149,8 @@ class CandidatePairRegistry:
 
         return best
 
-    def get_pair_list(self) -> list[CandidatePair]:
-        return self._check_list
+    def get_pair_list(self) -> dict[str, CandidatePair]:
+        return self._check_list.copy()
 
 
 @dataclass
@@ -195,6 +201,10 @@ class BindingRequestCacheRegistry:
         return self._registry.get(transaction_id)
 
 
+class SelectorEvent(StrEnum):
+    NOMINATE = "Nominate candidate"
+
+
 # CandidatePairState.SUCCEEDED must be seted by connectivity checks as fast as possible
 # Or set on Binding SuccessResponse
 # Steps:
@@ -230,11 +240,19 @@ class SelectorProtocol(Protocol):
         self, pair: CandidatePair, conn: MuxConnProtocol
     ): ...
 
+    # Part of event emitter
+    def on(
+        self, event: str, f: Handler_T | None = None
+    ) -> Handler_T | Callable[[Handler_T], Handler_T]: ...
+
+    def remove_all_listeners(self, event: str | None = None): ...
+
 
 @impl_protocol(SelectorProtocol)
-class ControllingSelector:
-    # TODO: Add request cache
+class ControllingSelector(AsyncEventEmitter):
     def __init__(self, pair_registry: CandidatePairRegistry, tie_breaker: int) -> None:
+        super().__init__()
+
         self._nominated_pair: CandidatePair | None = None
         self._start_time: datetime | None = None
         self._pair_registry = pair_registry
@@ -247,9 +265,8 @@ class ControllingSelector:
         print("Start ControllingSelector agent selector")
 
     def _set_nominate_pair(self, pair: CandidatePair):
-        print("TODO: Nominate piar make it more reactive or like a callback")
-        # TODO: Nominate logic
         self._nominated_pair = pair
+        self.emit(SelectorEvent.NOMINATE, pair)
 
     async def _stun_nominate_pair(self, pair: CandidatePair, conn: MuxConnProtocol):
         msg = stun.Message(
@@ -333,7 +350,6 @@ class ControllingSelector:
         pair.state = CandidatePairState.SUCCEEDED
 
         if binding_request.use_candidate_attr and self._nominated_pair is None:
-            # TODO: this must create a task or must be observed
             self._set_nominate_pair(pair)
 
     async def send_ping_stun_message(self, pair: CandidatePair, conn: MuxConnProtocol):
@@ -356,8 +372,10 @@ class ControllingSelector:
 
 
 @impl_protocol(SelectorProtocol)
-class ControlledSelector:
+class ControlledSelector(AsyncEventEmitter):
     def __init__(self, pair_registry: CandidatePairRegistry, tie_breaker: int) -> None:
+        super().__init__()
+
         self._pair_registry = pair_registry
         self._tie_breaker = tie_breaker
         self._selected_pair: CandidatePair | None = None
@@ -561,6 +579,18 @@ class CandidatePairController:
         return self._transport
 
 
+class CandidatePairControllerRegistry:
+    def __init__(self) -> None:
+        self._check_list = dict[str, CandidatePairController]()
+
+    def append(self, controller: CandidatePairController):
+        pair = controller._pair
+        self._check_list[pair.get_pair_id()] = controller
+
+    def get(self, pair_id: str) -> CandidatePairController | None:
+        return self._check_list.get(pair_id)
+
+
 # Role Determination: The peers determine their roles (controlling or controlled) based on the ICE tie-breaking algorithm. The peer with the higher tie-breaker value becomes the controlling agent
 
 
@@ -592,6 +622,7 @@ class Agent:
         self._remote_candidates = dict[NetworkType, list[CandidateBase]]()
 
         self._pair_registry = CandidatePairRegistry()
+        self._controller_registry = CandidatePairControllerRegistry()
 
         self._candidate_pair_transports = list[CandidatePairTransport]()
 
@@ -622,33 +653,45 @@ class Agent:
                     pass
         await asyncio.gather(*coros)
 
+    def _on_nominate_pair(self, pair: CandidatePair):
+        print("TODO: _on_nominate_pair", pair)
+
+    def _start_controller(self, pair: CandidatePair):
+        if self._role:
+            selector = ControllingSelector(self._pair_registry, self._tie_breaker)
+        else:
+            selector = ControlledSelector(self._pair_registry, self._tie_breaker)
+
+        selector.start()
+        selector.on(SelectorEvent.NOMINATE, self._on_nominate_pair)
+
+        pair_controller = CandidatePairController(pair, selector, self._tie_breaker)
+        self._controller_registry.append(pair_controller)
+        self._candidate_pair_transports.append(pair_controller.get_transport())
+        self._loop.create_task(pair_controller.start())
+        self._loop.create_task(pair_controller.ping_remote_candidate())
+        self._loop.create_task(ping_routine(selector, pair, pair_controller._conn))
+
     # Look at func (s *controllingSelector) ContactCandidates() to know more
     def connect(self, controlling: bool):
         print("start connection", controlling, self._remote_ufrag, self._remote_pwd)
 
-        if controlling:
-            self._role = AgentRole.Controlling
-            selector = ControllingSelector(self._pair_registry, self._tie_breaker)
-        else:
-            self._role = AgentRole.Controlled
-            selector = ControlledSelector(self._pair_registry, self._tie_breaker)
-        selector.start()
-
-        # TODO: cancel all this when need stop
-        controller_tasks = []
-
         print(self._pair_registry.get_pair_list())
-
         print("Pair registry", self._pair_registry)
 
-        for pair in self._pair_registry.get_pair_list():
-            pair_controller = CandidatePairController(pair, selector, self._tie_breaker)
-            self._candidate_pair_transports.append(pair_controller.get_transport())
+        if controlling:
+            self._role = AgentRole.Controlling
+        else:
+            self._role = AgentRole.Controlled
 
-            controller_tasks.append(self._loop.create_task(pair_controller.start()))
+        for id, pair in self._pair_registry.get_pair_list().items():
+            controller = self._controller_registry.get(id)
 
-            self._loop.create_task(pair_controller.ping_remote_candidate())
-            self._loop.create_task(ping_routine(selector, pair, pair_controller._conn))
+            if controller:
+                print("Found already negotiated controller")
+                continue
+
+            self._start_controller(pair)
 
         # If this is in ok state this candidate is must be nominated
         # best_candidate = self.best_candidate_pair(controlling)
