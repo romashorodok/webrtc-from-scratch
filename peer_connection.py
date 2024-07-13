@@ -21,6 +21,7 @@ from enum import Enum, IntEnum
 
 import ice.stun.utils as byteops
 from utils.types import impl_protocol
+import itertools
 
 
 nic_interfaces = ice.net.interface_factory(
@@ -723,24 +724,6 @@ class Origin:
         return m
 
 
-# TimeDescription describes "t=", "r=" fields of the session description
-# which are used to specify the start and stop times for a session as well as
-# repeat intervals and durations for the scheduled session.
-# class TimeDescription:
-#     def __init__(self) -> None:
-#         # t=<start-time> <stop-time>
-#         # https://tools.ietf.org/html/rfc4566#section-5.9
-#         self.start_time: int = 0  # int64
-#         self.stop_time: int = 0  # int64
-#
-#         # r=<repeat interval> <active duration> <offsets from start-time>
-#         # https://tools.ietf.org/html/rfc4566#section-5.10
-#         self.interval: int = 0  # int64
-#         self.duration: int = 0  # int64
-#         self.offsets: list[int] | None = None  # list[int64]
-#
-
-
 class SessionDescriptionAttrKey(Enum):
     Candidate = "candidate"
     EndOfCandidates = "end-of-candidates"
@@ -841,16 +824,17 @@ class ExtMap:
 class MediaSection:
     def __init__(
         self,
-        id: str,
+        mid: str,
         transceivers: list[RTPTransceiver],
-        rid_map: dict[str, SimulcastRid] | None = None,
+        # rid_map: dict[str, SimulcastRid] | None = None,
     ) -> None:
-        self.id = id
+        self.id = mid
+        self.rid = mid
         self.transceivers = transceivers
 
         # NOTE: i not will use sctp
         self.data = False
-        self.rid_map = rid_map
+        # self.rid_map = rid_map
 
 
 def _desc_marshal_key_value(data: bytearray, key: str, value: bytes):
@@ -879,7 +863,7 @@ class MediaDescription:
         # address_type: str,
         # address: str,
     ) -> None:
-        self.media = media
+        self.kind = media
         self.port = port
         self.port_end: int | None = None
         self.protocols = protocols
@@ -932,18 +916,18 @@ class MediaDescription:
         )
 
     def add_media_source(self, ssrc: int, cname: str, stream_label: str, label: str):
-        value = f"{ssrc} cname:{cname}"
-        self.add_attribute(
-            SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
-        )
-        value = f"{ssrc} msid:{stream_label} {label}"
-        self.add_attribute(
-            SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
-        )
-        value = f"{ssrc} label:{label}"
-        self.add_attribute(
-            SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
-        )
+        # value = f"{ssrc} cname:{cname}"
+        # self.add_attribute(
+        #     SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
+        # )
+        # value = f"{ssrc} msid:{stream_label} {label}"
+        # self.add_attribute(
+        #     SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
+        # )
+        # value = f"{ssrc} label:{label}"
+        # self.add_attribute(
+        #     SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
+        # )
         value = f"{ssrc} mslabel:{stream_label}"
         self.add_attribute(
             SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
@@ -955,6 +939,12 @@ class MediaDescription:
 
     def add_attribute(self, attr: SessionDescriptionAttr):
         self._attributes.append(attr)
+
+    def get_attribute_value(self, key: str) -> str | None:
+        for attr in self.attributes:
+            if key == attr.key:
+                return attr.value
+        return
 
     @classmethod
     def parse(cls, media_lines: list[str]) -> Self | None:
@@ -1042,13 +1032,13 @@ class MediaDescription:
 
     def _marshal_name(self) -> bytes:
         m = bytearray()
-        m.extend(byteops.pack_string(self.media + " "))
+        m.extend(byteops.pack_string(self.kind + " "))
         m.extend(self._marshal_ports())
         m.extend(byteops.pack_string(" "))
         m.extend(byteops.pack_string(_append_list(self.protocols, "/")))
         m.extend(byteops.pack_string(" "))
         m.extend(byteops.pack_string(_append_list(self.formats, " ")))
-        self.media
+        self.kind
 
         return m
 
@@ -1138,31 +1128,6 @@ def parameters_from_sdp(sdp: str):
     return parameters
 
 
-def candidate_from_sdp(sdp: str):
-    bits = sdp.split()
-    assert len(bits) >= 8
-
-    component = int(bits[1])
-    foundation = bits[0]
-    ip = bits[4]
-    port = int(bits[5])
-    priority = int(bits[3])
-    protocol = bits[2]
-    candidate_type = bits[7]
-
-    # for i in range(8, len(bits) - 1, 2):
-    #     if bits[i] == "raddr":
-    #         relatedAddress = bits[i + 1]
-    #     elif bits[i] == "rport":
-    #         relatedPort = int(bits[i + 1])
-    #     elif bits[i] == "tcptype":
-    #         tcpType = bits[i + 1]
-
-    print(
-        f"component:{component} foundation:{foundation} ip:{ip} port:{port} priority:{priority} protocol:{protocol} candidate_type:{candidate_type}"
-    )
-
-
 # API to match draft-ietf-rtcweb-jsep.
 # Some settings that are required by the JSEP spec.
 class SessionDescription:
@@ -1187,6 +1152,12 @@ class SessionDescription:
 
     def add_attribute(self, attr: SessionDescriptionAttr):
         self.attributes.append(attr)
+
+    def get_attribute_value(self, key: str) -> str | None:
+        for attr in self.attributes:
+            if key == attr.key:
+                return attr.value
+        return
 
     def add_media_description(self, desc: MediaDescription):
         self.media_descriptions.append(desc)
@@ -1219,7 +1190,8 @@ class SessionDescription:
             if line.startswith("v="):
                 session.version = int(line.strip()[2:])
             elif line.startswith("o="):
-                session.origin = line.strip()[2:]
+                session.origin = Origin()
+                # int(line.strip()[2:])
             elif line.startswith("s="):
                 name = line.strip()[2:]
             elif line.startswith("c="):
@@ -1243,11 +1215,17 @@ class SessionDescription:
                 elif attr == "ice-ufrag":
                     ice_usernameFragment = value
                 elif attr == "group" and value:
-                    parse_group(groups, value)
+                    session.add_attribute(
+                        SessionDescriptionAttr(SessionDescriptionAttrKey.Group, value)
+                    )
+                    # parse_group(groups, value)
                 elif attr == "msid-semantic" and value:
-                    parse_group(groups, value)
+                    pass
+                    # parse_group(groups, value)
                 elif attr == "setup":
                     dtls_role = value
+
+        print("groups", groups)
 
         # print("media groups", len(media_groups))
         # parse media
@@ -1489,12 +1467,6 @@ class SessionDescription:
         return bytes(m)
 
 
-def parse_session_description_from_str(desc_str: str) -> SessionDescription:
-    desc = SessionDescription()
-
-    return desc
-
-
 def bundle_match_from_remote(bundle_group: str | None) -> Callable[[str], bool]:
     if bundle_group is None:
         return lambda _: True
@@ -1503,12 +1475,23 @@ def bundle_match_from_remote(bundle_group: str | None) -> Callable[[str], bool]:
     return lambda mid: mid in bundle_tags
 
 
-MEDIA_DESCRIPTION_SECTION_APPLICATION = "application"
-
-
 class RTPComponent(IntEnum):
     RTP = 1
     RTCP = 2
+
+
+def find_transceiver_by_mid(
+    mid: str, transceivers: list[RTPTransceiver]
+) -> RTPTransceiver | None:
+    for t in transceivers:
+        if t.mid and t.mid.value == mid:
+            return t
+    return
+
+
+def flatten_media_section_transceivers(media_sections: list[MediaSection]):
+    transivers = map(lambda t: t.transceivers, media_sections)
+    return list(itertools.chain(*transivers))
 
 
 def add_candidate_to_media_descriptions(
@@ -1540,9 +1523,6 @@ def add_candidate_to_media_descriptions(
 
         candidate.set_component(RTPComponent.RTP)
 
-    # if gathering_state != ICEGatherState.Complete:
-    #     return
-
     for attr in media.attributes:
         if attr.key == SessionDescriptionAttrKey.EndOfCandidates.value:
             return
@@ -1552,9 +1532,7 @@ def add_candidate_to_media_descriptions(
     )
 
 
-def add_sender_sdp(
-    desc: MediaDescription, media_section: MediaSection, is_plan_b: bool
-):
+def add_sender_sdp(desc: MediaDescription, media_section: MediaSection):
     for t in media_section.transceivers:
         sender = t.sender
         if sender is None:
@@ -1573,10 +1551,9 @@ def add_sender_sdp(
             desc.add_media_source(
                 encoding.ssrc, track.stream_id, track.stream_id, track.id
             )
-            if not is_plan_b:
-                desc.add_attribute(
-                    SessionDescriptionAttr(f"msid:{track.stream_id} {track.id}")
-                )
+            desc.add_attribute(
+                SessionDescriptionAttr(f"msid:{track.stream_id} {track.id}")
+            )
 
         if send_params.encodings:
             for encoding in send_params.encodings:
@@ -1586,14 +1563,12 @@ def add_sender_sdp(
                     )
                 )
 
-        if not is_plan_b:
-            break
+        break
 
 
 def add_transceiver_media_description(
     desc: SessionDescription,
     media_section: MediaSection,
-    is_plan_b: bool,
     should_add_candidates: bool,
     fingerprints: list[dtls.Fingerprint],
     mid: str,
@@ -1629,17 +1604,17 @@ def add_transceiver_media_description(
         )
     )
     media.add_attribute(SessionDescriptionAttr(SessionDescriptionAttrKey.MID, mid))
-    # media.add_attribute(SessionDescriptionAttr(RTPTransceiverDirection.Sendrecv.value))
 
-    media.add_attribute(SessionDescriptionAttr("ice-ufrag", ice_params.local_ufrag))
-    media.add_attribute(SessionDescriptionAttr("ice-pwd", ice_params.local_pwd))
+    # media.add_attribute(SessionDescriptionAttr("ice-ufrag", ice_params.local_ufrag))
+    # media.add_attribute(SessionDescriptionAttr("ice-pwd", ice_params.local_pwd))
+
     media.add_attribute(SessionDescriptionAttr(SessionDescriptionAttrKey.RTCPMux))
     media.add_attribute(SessionDescriptionAttr(SessionDescriptionAttrKey.RTCPRsize))
 
     for codec in codecs:
         media.add_codec(codec)
-        # for feedback in codec.rtcp_feedbacks:
-        #     media.add_rtcp_feedback(codec, feedback)
+        for feedback in codec.rtcp_feedbacks:
+            media.add_rtcp_feedback(codec, feedback)
 
     directions = list[RTPTransceiverDirection]()
 
@@ -1648,27 +1623,31 @@ def add_transceiver_media_description(
     if t.receiver:
         directions.append(RTPTransceiverDirection.Recvonly)
 
-    ext_map_stub = [
-        ExtMap(value=1, uri="urn:ietf:params:rtp-hdrext:sdes:mid"),
-        ExtMap(
-            value=3, uri="http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
-        ),
-    ]
-
+    # ext_map_stub = [
+    #     ExtMap(value=1, uri="urn:ietf:params:rtp-hdrext:sdes:mid"),
+    #     ExtMap(
+    #         value=3, uri="http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
+    #     ),
+    # ]
     # negotiated_parameters = caps.get_rtp_parameters_by_kind(t.kind, directions)
     # for rtp_ext in negotiated_parameters.header_extensions:
-    for rtp_ext in ext_map_stub:
-        # ext_uri = ExtMap(value=rtp_ext.value, uri=rtp_ext.uri)
-        media.add_attribute(SessionDescriptionAttr(rtp_ext.marshal()))
+    # for rtp_ext in ext_map_stub:
+    #     media.add_attribute(SessionDescriptionAttr(rtp_ext.marshal()))
 
-    if media_section.rid_map:
-        for rid in media_section.rid_map.items():
-            media.add_attribute(
-                SessionDescriptionAttr(SessionDescriptionAttrKey.RID, f"{rid} recv")
+    if RTPTransceiverDirection.Recvonly in directions:
+        media.add_attribute(
+            SessionDescriptionAttr(
+                SessionDescriptionAttrKey.RID, f"{media_section.rid} recv"
             )
-    # TODO: add attr for simulcast
+        )
 
-    add_sender_sdp(media, media_section, is_plan_b)
+    # if media_section.rid_map:
+    #     for rid in media_section.rid_map.items():
+    #         media.add_attribute(
+    #             SessionDescriptionAttr(SessionDescriptionAttrKey.RID, f"{rid} recv")
+    #         )
+
+    add_sender_sdp(media, media_section)
 
     print("Current direction ", t.direction.value)
     media.add_attribute(SessionDescriptionAttr(t.direction.value))
@@ -1690,7 +1669,7 @@ def add_transceiver_media_description(
 
 def populate_session_descriptor(
     desc: SessionDescription,
-    is_plan_b: bool,
+    # is_plan_b: bool,
     fingerprints: list[dtls.Fingerprint],
     is_extmap_allow_mixed: bool,
     role: ConnectionRole,
@@ -1712,10 +1691,8 @@ def populate_session_descriptor(
         bundle_count += 1
 
     for idx, media in enumerate(media_sections):
-        if not is_plan_b and len(media.transceivers) > 1:
-            raise ValueError("media section multiple track invalid")
-
-        should_add_candidates = idx == 0
+        # should_add_candidates = idx == 0
+        should_add_candidates = False
 
         if media.data:
             print("media session desc contain SCTP. Not supported")
@@ -1724,7 +1701,6 @@ def populate_session_descriptor(
         should_add_id = add_transceiver_media_description(
             desc,
             media,
-            is_plan_b,
             should_add_candidates,
             fingerprints,
             media.id,
@@ -1761,14 +1737,6 @@ def populate_session_descriptor(
     return desc
 
 
-# SessionDescription contains a MediaSection with name `audio`, `video` or `data`
-# If only one SSRC is set we can't know if it is Plan-B or Unified. If users have
-# set fallback mode assume it is Plan-B
-def description_possibly_plan_b(desc: SessionDescription) -> bool:
-    print("Implement plan b check. In description_possibly_plan_b")
-    return False
-
-
 def set_default_caps(caps: MediaCaps):
     caps.register_codec(
         RTPCodecParameters(
@@ -1782,8 +1750,8 @@ def set_default_caps(caps: MediaCaps):
         RTPCodecKind.Audio,
     )
 
-    # nack_pli = RTCPFeedback(rtcp_type="nack", parameter="pli")
-    # remb = RTCPFeedback(rtcp_type="goog-remb", parameter="")
+    nack_pli = RTCPFeedback(rtcp_type="nack", parameter="pli")
+    remb = RTCPFeedback(rtcp_type="goog-remb", parameter="")
     vp8 = RTPCodecParameters(
         mime_type="video/VP8",
         clock_rate=90000,
@@ -1915,51 +1883,27 @@ class PeerConnection:
 
         ice_candidates = await self.gatherer.get_local_candidates()
 
-        is_plan_b = self._sdp_semantic == SDPSemantic.PlanB
-        if is_plan_b and (remote_desc := self._current_remote_description):
-            is_plan_b = description_possibly_plan_b(remote_desc)
-
         media_sections = list[MediaSection]()
 
-        if is_plan_b:
-            video = list[RTPTransceiver]()
-            audio = list[RTPTransceiver]()
+        for t in transceivers:
+            if sender := t.sender:
+                sender.negotiate()
 
-            for t in transceivers:
-                match t.kind:
-                    case RTPCodecKind.Video:
-                        video.append(t)
-                    case RTPCodecKind.Audio:
-                        audio.append(t)
-                if sender := t.sender:
-                    sender.negotiate()
-
-            if len(video) > 0:
-                media_sections.append(MediaSection(id="video", transceivers=video))
-            if len(audio) > 0:
-                media_sections.append(MediaSection(id="audio", transceivers=audio))
-        else:
-            for t in transceivers:
-                if sender := t.sender:
-                    sender.negotiate()
-
-                if t.mid and t.mid.value:
-                    media_sections.append(
-                        MediaSection(
-                            id=t.mid.value, transceivers=list[RTPTransceiver]([t])
-                        )
+            if t.mid and t.mid.value:
+                media_sections.append(
+                    MediaSection(
+                        mid=t.mid.value, transceivers=list[RTPTransceiver]([t])
                     )
-                else:
-                    print("Not found transceiver mid. Must be already defined")
+                )
+            else:
+                print("Not found transceiver mid. Must be already defined")
 
         fingerprints = self._certificates[0].get_fingerprints()
 
         return populate_session_descriptor(
             desc=desc,
-            is_plan_b=is_plan_b,
             fingerprints=fingerprints,
             is_extmap_allow_mixed=True,
-            # is_extmap_allow_mixed=False,
             role=self._get_sdp_role(),
             candidates=ice_candidates,
             ice_params=ice_params,
@@ -1971,44 +1915,116 @@ class PeerConnection:
 
     # Generates a SDP and takes the remote state into account
     # this is used everytime we have a remote_description
-    def _generate_matched_sdp(
+    async def _generate_matched_sdp(
         self,
         transceivers: list[RTPTransceiver],
-        use_identity: bool,
-        include_unmatched: bool,
-        connection_role: ConnectionRole,
-    ) -> SessionDescription | None: ...
+    ) -> SessionDescription | None:
+        if not self._current_remote_description:
+            raise ValueError(
+                "Unable generate stateful desc. Set _current_remote_description"
+            )
+
+        if len(self._current_remote_description.media_descriptions) == 0:
+            raise ValueError(
+                "Unable generate stateful desc. Not found media to generate"
+            )
+
+        group = self._current_remote_description.get_attribute_value(
+            SessionDescriptionAttrKey.Group.value
+        )
+        if not group:
+            raise ValueError(
+                "Unable generate stateful desc. Desc must contain BUNDLE attr"
+            )
+
+        group = group.removeprefix("BUNDLE")
+        if len(group.split(" ")) == 0:
+            raise ValueError(
+                "Unable generate stateful desc. Desc bundle must contain at least one partition"
+            )
+
+        ice_params = self.gatherer.get_local_parameters()
+        if ice_params is None:
+            return
+
+        if not self._transceivers:
+            print("Empty transceivers")
+
+        ice_candidates = await self.gatherer.get_local_candidates()
+
+        remote_desc = self._current_remote_description
+        remote_desc.add_attribute(
+            SessionDescriptionAttr(SessionDescriptionAttrKey.MsidSemantic, "WMS*")
+        )
+
+        media_sections = list[MediaSection]()
+
+        for media in self._current_remote_description.media_descriptions:
+            mid = media.get_attribute_value(SessionDescriptionAttrKey.MID.value)
+            if not mid:
+                print("Not found mid")
+                continue
+
+            kind = RTPCodecKind(media.kind)
+            if kind != RTPCodecKind.Audio and kind != RTPCodecKind.Video:
+                print("Not found kind")
+                continue
+
+            transceiver = find_transceiver_by_mid(mid, transceivers)
+            if not transceiver or not transceiver.mid:
+                continue
+
+            if transceiver.sender:
+                transceiver.sender.negotiate()
+
+            media_sections.append(
+                MediaSection(
+                    mid=transceiver.mid.value,
+                    transceivers=list[RTPTransceiver]([transceiver]),
+                )
+            )
+
+        if len(media_sections) == 0:
+            raise ValueError(
+                "Unable generate stateful desc. Not found correct media_section"
+            )
+
+        print(media_sections)
+
+        # That approach will add flexability to decide client to assign it by own.
+        matched_transiceivers = flatten_media_section_transceivers(media_sections)
+        for t in transceivers:
+            if t in matched_transiceivers:
+                continue
+            if not t.mid:
+                continue
+            media_sections.append(MediaSection(mid=t.mid.value, transceivers=[t]))
+
+        fingerprints = self._certificates[0].get_fingerprints()
+
+        return populate_session_descriptor(
+            desc=SessionDescription(),
+            fingerprints=fingerprints,
+            is_extmap_allow_mixed=True,
+            role=self._get_sdp_role(),
+            candidates=ice_candidates,
+            ice_params=ice_params,
+            media_sections=media_sections,
+            gathering_state=self.gatherer.get_gather_state(),
+            match_bundle_group=group,
+            caps=self._caps,
+        )
 
     async def create_offer(self, options: OfferOption | None = None):
-        # TODO: what is idpLoginURL identity
-        use_identity = False
-
-        # if not self._closed:
+        # if self._closed:
         #     raise ValueError("connection closed")
 
         try:
             # if options and options.ice_restart:
             #     self._transport.restart()
 
-            # This may be necessary to recompute if, for example, createOffer was called when only an
-            # audio RTCRtpTransceiver was added to connection, but while performing the in-parallel
-            # steps to create an offer, a video RTCRtpTransceiver was added, requiring additional
-            # inspection of video system resources.
             async with self._lock:
-                count = 0
-                # Cache current transceivers to ensure they aren't mutated during offer
-                # generation. Later will check if they have been mutated and recompute if necessary
                 current_transceivers = self._transceivers.copy()
-
-                plan_b = self._sdp_semantic == SDPSemantic.PlanB
-                if plan_b and (remote_desc := self._current_remote_description):
-                    plan_b = description_possibly_plan_b(remote_desc)
-
-                if not plan_b:
-                    # update the greater mid if the remote description provides a greater one
-                    if remote_desc := self._current_remote_description:
-                        print("TODO: update mid if remote description provided")
-                        pass
 
                 for transceiver in current_transceivers:
                     if transceiver.mid and (mid := transceiver.mid.numeric_mid):
@@ -2022,9 +2038,7 @@ class PeerConnection:
                 if self._current_remote_description is None:
                     desc = await self._generate_unmatched_sdp(current_transceivers)
                 else:
-                    desc = self._generate_matched_sdp(
-                        current_transceivers, use_identity, True, self._get_sdp_role()
-                    )
+                    desc = await self._generate_matched_sdp(current_transceivers)
 
                 if desc:
                     desc.origin.session_version = self.origin.session_version

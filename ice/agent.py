@@ -601,8 +601,10 @@ class AgentRole(Enum):
 
 
 # Controlling agent must know remote user credentials
-class Agent:
+class Agent(AsyncEventEmitter):
     def __init__(self, options: AgentOptions) -> None:
+        super().__init__()
+
         self._tie_breaker = generate_tie_breaker()
         self._local_ufrag = generate_ufrag()
         self._local_pwd = generate_pwd()
@@ -692,13 +694,6 @@ class Agent:
                 continue
 
             self._start_controller(pair)
-
-        # If this is in ok state this candidate is must be nominated
-        # best_candidate = self.best_candidate_pair(controlling)
-        # if best_candidate:
-        #     raise ValueError("Handle this")
-        # else:
-        #     self._ping_all_candidates(controlling)
 
         return
 
