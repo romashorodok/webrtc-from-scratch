@@ -90,9 +90,13 @@ async def main():
     # raw = desc.marshal().decode()
     #
     # desc = peer_connection.SessionDescription.parse(raw)
-    print("offer from remote", desc.marshal())
 
+    print("offer from remote", desc.marshal())
     await pc.set_remote_description(peer_connection.SessionDescriptionType.Answer, desc)
+    desc = await pc.create_offer()
+    if not desc:
+        return
+    print(desc.marshal())
 
 
 asyncio.run(main())

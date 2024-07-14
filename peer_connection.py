@@ -776,23 +776,6 @@ class SessionDescriptionAttr:
         return m
 
 
-class SimulcastRid:
-    def __init__(self, value: str, paused: bool) -> None:
-        self.value = value
-        self.paused = paused
-
-
-# DefExtMapValueABSSendTime     = 1
-# DefExtMapValueTransportCC     = 2
-# DefExtMapValueSDESMid         = 3
-# DefExtMapValueSDESRTPStreamID = 4
-# ABSSendTimeURI     = "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
-# TransportCCURI     = "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"
-# SDESMidURI         = "urn:ietf:params:rtp-hdrext:sdes:mid"
-# SDESRTPStreamIDURI = "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id"
-# AudioLevelURI      = "urn:ietf:params:rtp-hdrext:ssrc-audio-level"
-
-
 class ExtMap:
     def __init__(
         self,
@@ -809,10 +792,6 @@ class ExtMap:
     def marshal(self) -> str:
         out = f"extmap:{self.value}"
 
-        # direction = self.direction
-        # if direction == RTPTransceiverDirection.Unknown or self.direction is None:
-        #     out += "/ "
-
         if self.uri:
             out += f" {self.uri}"
 
@@ -827,15 +806,11 @@ class MediaSection:
         self,
         mid: str,
         transceivers: list[RTPTransceiver],
-        # rid_map: dict[str, SimulcastRid] | None = None,
     ) -> None:
         self.id = mid
         self.rid = mid
         self.transceivers = transceivers
-
-        # NOTE: i not will use sctp
         self.data = False
-        # self.rid_map = rid_map
 
 
 def _desc_marshal_key_value(data: bytearray, key: str, value: bytes):
@@ -917,18 +892,18 @@ class MediaDescription:
         )
 
     def add_media_source(self, ssrc: int, cname: str, stream_label: str, label: str):
-        # value = f"{ssrc} cname:{cname}"
-        # self.add_attribute(
-        #     SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
-        # )
-        # value = f"{ssrc} msid:{stream_label} {label}"
-        # self.add_attribute(
-        #     SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
-        # )
-        # value = f"{ssrc} label:{label}"
-        # self.add_attribute(
-        #     SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
-        # )
+        value = f"{ssrc} cname:{cname}"
+        self.add_attribute(
+            SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
+        )
+        value = f"{ssrc} msid:{stream_label} {label}"
+        self.add_attribute(
+            SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
+        )
+        value = f"{ssrc} label:{label}"
+        self.add_attribute(
+            SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
+        )
         value = f"{ssrc} mslabel:{stream_label}"
         self.add_attribute(
             SessionDescriptionAttr(SessionDescriptionAttrKey.SSRC, value)
@@ -1166,25 +1141,14 @@ class SessionDescription:
 
     @classmethod
     def parse(cls, sdp: str):
-        current_media: MediaDescription | None = None
         dtls_fingerprints = []
-        dtls_role = None
-        ice_lite = False
-        ice_options = None
-        ice_password = None
-        ice_usernameFragment = None
 
         session_lines, media_groups = grouplines(sdp)
 
         print("media_groups", media_groups)
         print("session_lines", session_lines)
 
-        name: str | None = None
-        host: str | None = None
-        time: str | None = None
-
         sdp_attrs = []
-        groups = list[GroupDescription]()
 
         session = cls()
 
@@ -1193,14 +1157,12 @@ class SessionDescription:
                 session.version = int(line.strip()[2:])
             elif line.startswith("o="):
                 session.origin = Origin()
-                # int(line.strip()[2:])
             elif line.startswith("s="):
-                name = line.strip()[2:]
+                pass
             elif line.startswith("c="):
                 pass
-                # host = ipaddress_from_sdp(line[2:])
             elif line.startswith("t="):
-                time = line.strip()[2:]
+                pass
             elif line.startswith("a="):
                 attr, value = parse_attr(line)
                 sdp_attrs.append((attr, value))
@@ -1208,212 +1170,17 @@ class SessionDescription:
                 if attr == "fingerprint" and value:
                     algorithm, fingerprint = value.split()
                     dtls_fingerprints.append((algorithm, fingerprint))
-                elif attr == "ice-lite":
-                    ice_lite = True
-                elif attr == "ice-options":
-                    ice_options = value
-                elif attr == "ice-pwd":
-                    ice_password = value
-                elif attr == "ice-ufrag":
-                    ice_usernameFragment = value
                 elif attr == "group" and value:
                     session.add_attribute(
                         SessionDescriptionAttr(SessionDescriptionAttrKey.Group, value)
                     )
-                    # parse_group(groups, value)
-                elif attr == "msid-semantic" and value:
-                    pass
-                    # parse_group(groups, value)
-                elif attr == "setup":
-                    dtls_role = value
 
-        print("groups", groups)
-
-        # print("media groups", len(media_groups))
-        # parse media
         for media_lines in media_groups:
-            # m = re.match("^m=([^ ]+) ([0-9]+) ([A-Z/]+) (.+)$", media_lines[0])
             media = MediaDescription.parse(media_lines)
             if media is None:
                 continue
             session.add_media_description(media)
 
-            #
-            # print("media line matched", m)
-            # print("media line", media_lines[0])
-            # if not m:
-            #     continue
-            #
-            # # check payload types are valid
-            # # kind = m.group(1)
-            # fmt = m.group(4).split()
-            # fmt_int: list[int] | None = None
-            # #
-            # # if kind in ["audio", "video"]:
-            # #     fmt_int = [int(x) for x in fmt]
-            # #     for pt in fmt_int:
-            # #         assert pt >= 0 and pt < 256
-            # #         # assert pt not in rtp.FORBIDDEN_PAYLOAD_TYPES
-            # #
-            # print(
-            #     f"media = port:{int(m.group(2))} profile:{m.group(3)} fmt:{fmt_int or fmt}"
-            # )
-            #
-            # print(f"media_dtls fingerprint:{dtls_fingerprints[:]} role:{dtls_role}")
-            #
-            # # current_media = MediaDescription(
-            # # kind, port=int(m.group(2)), profile=m.group(3), fmt=fmt_int or fmt
-            # # )
-            # # current_media.dtls = RTCDtlsParameters(
-            # #     fingerprints=dtls_fingerprints[:], role=dtls_role
-            # # )
-            #
-            # print(
-            #     f"media_ice ice_lite:{ice_lite} ufrag:{ice_usernameFragment} pwd:{ice_password}"
-            # )
-            #
-            # print(f"ice_optionsa {ice_options}")
-            # # current_media.ice = RTCIceParameters(
-            # #     iceLite=ice_lite,
-            # #     usernameFragment=ice_usernameFragment,
-            # #     password=ice_password,
-            # # )
-            # # current_media.ice_options = ice_options
-            # # session.media.append(current_media)
-            #
-            # for line in media_lines[1:]:
-            #     if line.startswith("c="):
-            #         # host = ipaddress_from_sdp(line[2:])
-            #         print(f"media host {host}")
-            #     elif line.startswith("a="):
-            #         attr, value = parse_attr(line)
-            #         if attr == "candidate" and value:
-            #             print(f"media candidate {candidate_from_sdp(value)}")
-            #         elif attr == "end-of-candidates":
-            #             print("media candidate end")
-            #         elif attr == "extmap" and value:
-            #             ext_id, ext_uri = value.split()
-            #             if "/" in ext_id:
-            #                 ext_id, ext_direction = ext_id.split("/")
-            #
-            #             print(f"ext_id:{ext_id} ext_uri:{ext_uri}")
-            #
-            #             # extension = RTCRtpHeaderExtensionParameters(
-            #             # id=int(ext_id), uri=ext_uri
-            #             # )
-            #             # current_media.rtp.headerExtensions.append(extension)
-            #         elif attr == "fingerprint" and value:
-            #             algorithm, fingerprint = value.split()
-            #             print(f"algo:{algorithm} finger:{fingerprint}")
-            #             # current_media.dtls.fingerprints.append(
-            #             # RTCDtlsFingerprint(algorithm=algorithm, value=fingerprint)
-            #             # )
-            #         elif attr == "ice-options" and value:
-            #             print("ice-options")
-            #             # current_media.ice_options = value
-            #         elif attr == "ice-pwd" and value:
-            #             print("ice-pwd" + value)
-            #             # current_media.ice.password = value
-            #         elif attr == "ice-ufrag" and value:
-            #             print("ice-ufrag" + value)
-            #             # current_media.ice.usernameFragment = value
-            #         elif attr == "max-message-size":
-            #             print("max-message-size", value)
-            #             # current_media.sctpCapabilities = RTCSctpCapabilities(
-            #             # maxMessageSize=int(value)
-            #             # )
-            #         elif attr == "mid" and value:
-            #             print("mid" + value)
-            #             # current_media.rtp.muxId = value
-            #         elif attr == "msid" and value:
-            #             print("msid", value)
-            #             # current_media.msid = value
-            #         elif attr == "rtcp" and value:
-            #             port, rest = value.split(" ", 1)
-            #             print(f"rtcp {int(port)} {ipaddress_from_sdp(rest)}")
-            #             # current_media.rtcp_port = int(port)
-            #             # current_media.rtcp_host = ipaddress_from_sdp(rest)
-            #         elif attr == "rtcp-mux":
-            #             # current_media.rtcp_mux = True
-            #             print("rtcp-mux")
-            #         elif attr == "setup" and value:
-            #             print("DTLS role", value)
-            #             # current_media.dtls.role = DTLS_SETUP_ROLE[value]
-            #         # elif attr in DIRECTIONS:
-            #         #     current_media.direction = attr
-            #         elif attr == "rtpmap" and value:
-            #             format_id, format_desc = value.split(" ", 1)
-            #             bits = format_desc.split("/")
-            #
-            #             # print(f"channels {int(bits[2])}")
-            #             print("TODO: channels check if audio or video", bits)
-            #
-            #             # if current_media.kind == "audio":
-            #             #     if len(bits) > 2:
-            #             #         channels = int(bits[2])
-            #             #     else:
-            #             #         channels = 1
-            #             # else:
-            #             # channels = None
-            #
-            #             print(f"kind:{bits[0]} clock-rate:{bits[1]}")
-            #             # codec = RTCRtpCodecParameters(
-            #             #     mimeType=current_media.kind + "/" + bits[0],
-            #             #     channels=channels,
-            #             #     clockRate=int(bits[1]),
-            #             #     payloadType=int(format_id),
-            #             # )
-            #             # current_media.rtp.codecs.append(codec)
-            #         # elif attr == "sctpmap":
-            #         #     format_id, format_desc = value.split(" ", 1)
-            #         #     getattr(current_media, attr)[int(format_id)] = format_desc
-            #         # elif attr == "sctp-port":
-            #         #     current_media.sctp_port = int(value)
-            #         elif attr == "ssrc-group" and value:
-            #             print(f"ssrc-group {value}")
-            #             # parse_group(current_media.ssrc_group, value, type=int)
-            #         elif attr == "ssrc" and value:
-            #             ssrc_str, ssrc_desc = value.split(" ", 1)
-            #             ssrc = int(ssrc_str)
-            #             ssrc_attr, ssrc_value = ssrc_desc.split(":", 1)
-            #
-            #             print(f"ssrc: {ssrc}, {ssrc_attr} {ssrc_value}")
-            #
-            #             # try:
-            #             #     ssrc_info = next(
-            #             #         (x for x in current_media.ssrc if x.ssrc == ssrc)
-            #             #     )
-            #             # except StopIteration:
-            #             #     ssrc_info = SsrcDescription(ssrc=ssrc)
-            #             #     current_media.ssrc.append(ssrc_info)
-            #             # if ssrc_attr in SSRC_INFO_ATTRS:
-            #             #     setattr(ssrc_info, ssrc_attr, ssrc_value)
-
-            # if current_media.dtls.role is None:
-            #     current_media.dtls = None
-
-            # requires codecs to have been parsed
-            # for line in media_lines[1:]:
-            #     if line.startswith("a="):
-            #         attr, value = parse_attr(line)
-            #         if attr == "fmtp" and value:
-            #             format_id, format_desc = value.split(" ", 1)
-            #             print(f"{format_id} {format_desc}")
-            #             # codec = find_codec(int(format_id))
-            #             codec = parameters_from_sdp(format_desc)
-            #             print(f"{codec}")
-            #         elif attr == "rtcp-fb" and value:
-            #             bits = value.split(" ", 2)
-            #             print(f"rtcp-fb {bits[0]} {bits[1]} {bits[2]}")
-            #             # for codec in current_media.rtp.codecs:
-            #             # if bits[0] in ["*", str(codec.payloadType)]:
-            #             # codec.rtcpFeedback.append(
-            #             #     RTCRtcpFeedback(
-            #             #         type=bits[1],
-            #             #         parameter=bits[2] if len(bits) > 2 else None,
-            #             #     )
-            #             # )
-            #             #
         return session
 
     def __repr__(self) -> str:

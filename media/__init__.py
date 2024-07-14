@@ -1,3 +1,4 @@
-from .packetizer import Packetizer, VP8Payloader, Sequencer
+from .packetizer import Packetizer
+from .vp8_payloader import VP8Payloader
 from .ivf import IVFReader, IVFFileHeader, IVFFrameHeader
-from .types import tick
+from .types import ticker
