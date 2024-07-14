@@ -61,31 +61,38 @@ async def main():
         peer_connection.RTPCodecKind.Video,
         peer_connection.RTPTransceiverDirection.Sendrecv,
     )
-    await pc.add_transceiver_from_kind(
-        peer_connection.RTPCodecKind.Video,
-        peer_connection.RTPTransceiverDirection.Sendrecv,
-    )
+    # await pc.add_transceiver_from_kind(
+    #     peer_connection.RTPCodecKind.Video,
+    #     peer_connection.RTPTransceiverDirection.Sendrecv,
+    # )
     await pc.gatherer.gather()
     pc.gatherer.agent.dial()
     desc = await pc.create_offer()
     if not desc:
         return
-
+    await pc.set_local_description(peer_connection.SessionDescriptionType.Offer, desc)
     raw = desc.marshal()
+    print("offer", raw)
 
-    raw = raw.decode()
+    # raw = raw.decode()
 
-    desc = peer_connection.SessionDescription.parse(raw)
-    pc._current_remote_description = desc
-    await pc.add_transceiver_from_kind(
+    pc1 = peer_connection.PeerConnection()
+    await pc1.add_transceiver_from_kind(
         peer_connection.RTPCodecKind.Audio,
         peer_connection.RTPTransceiverDirection.Sendrecv,
     )
-    desc = await pc.create_offer()
+    await pc1.gatherer.gather()
+    pc1.gatherer.agent.dial()
+    desc = await pc1.create_offer()
     if not desc:
         return
 
+    # raw = desc.marshal().decode()
+    #
+    # desc = peer_connection.SessionDescription.parse(raw)
     print("offer from remote", desc.marshal())
+
+    await pc.set_remote_description(peer_connection.SessionDescriptionType.Answer, desc)
 
 
 asyncio.run(main())

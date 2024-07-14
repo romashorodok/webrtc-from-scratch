@@ -8,8 +8,6 @@ import re
 import secrets
 import string
 
-from OpenSSL.SSL import Session
-from dtls.dtlstransport import ICETransportDTLS
 import ice
 import ice.net
 
@@ -20,7 +18,7 @@ import socket
 from enum import Enum, IntEnum
 
 import ice.stun.utils as byteops
-from utils.types import impl_protocol
+from utils import AsyncEventEmitter, impl_protocol
 import itertools
 
 
@@ -629,6 +627,9 @@ class RTPTransceiver:
 
         return filtered_codecs
 
+    def stop(self):
+        print("TODO: stop transceiver")
+
     def track_local(self) -> TrackLocal | None:
         if not self.sender:
             return
@@ -975,6 +976,7 @@ class MediaDescription:
                 attr, value = parse_attr(line)
 
                 if attr in RTPTransceiverDirectionList:
+                    print("Parse direction", attr)
                     media.direction = RTPTransceiverDirection(attr)
                 elif attr == SessionDescriptionAttrKey.Candidate.value and value:
                     candidates = ice.parse_candidate_str(value)
@@ -1604,9 +1606,8 @@ def add_transceiver_media_description(
         )
     )
     media.add_attribute(SessionDescriptionAttr(SessionDescriptionAttrKey.MID, mid))
-
-    # media.add_attribute(SessionDescriptionAttr("ice-ufrag", ice_params.local_ufrag))
-    # media.add_attribute(SessionDescriptionAttr("ice-pwd", ice_params.local_pwd))
+    media.add_attribute(SessionDescriptionAttr("ice-ufrag", ice_params.local_ufrag))
+    media.add_attribute(SessionDescriptionAttr("ice-pwd", ice_params.local_pwd))
 
     media.add_attribute(SessionDescriptionAttr(SessionDescriptionAttrKey.RTCPMux))
     media.add_attribute(SessionDescriptionAttr(SessionDescriptionAttrKey.RTCPRsize))
@@ -1622,6 +1623,8 @@ def add_transceiver_media_description(
         directions.append(RTPTransceiverDirection.Sendonly)
     if t.receiver:
         directions.append(RTPTransceiverDirection.Recvonly)
+
+    media.direction = t.direction
 
     # ext_map_stub = [
     #     ExtMap(value=1, uri="urn:ietf:params:rtp-hdrext:sdes:mid"),
@@ -1767,9 +1770,126 @@ def set_default_caps(caps: MediaCaps):
     caps.register_codec(vp8, RTPCodecKind.Video)
 
 
+class SignalingState(Enum):
+    Unknown = "unknown"
+    # Stable indicates there is no offer/answer exchange in
+    # progress. This is also the initial state, in which case the local and
+    # remote descriptions are nil.
+    Stable = "stable"
+    # HaveLocalOffer indicates that a local description, of
+    # type "offer", has been successfully applied.
+    HaveLocalOffer = "have-local-offer"
+    # HaveRemoteOffer indicates that a remote description, of
+    # type "offer", has been successfully applied.
+    HaveRemoteOffer = "have-remote-offer"
+    # HaveLocalPranswer indicates that a remote description
+    # of type "offer" has been successfully applied and a local description
+    # of type "pranswer" has been successfully applied.
+    HaveLocalPranswer = "have-local-pranswer"
+    # HaveRemotePranswer indicates that a local description
+    # of type "offer" has been successfully applied and a remote description
+    # of type "pranswer" has been successfully applied.
+    HaveRemotePranswer = "have-remote-pranswer"
+    # Closed indicates The PeerConnection has been closed.
+    Closed = "closed"
+
+
+class SignalingChangeOperation(Enum):
+    SetLocal = "set-local"
+    SetRemote = "set-remote"
+
+
+class SessionDescriptionType(Enum):
+    Offer = "offer"
+    Answer = "answer"
+    Rollback = "rollback"
+    Pranswer = "pranswer"
+
+
+class SignalingStateTransitionError(Exception):
+    def __init__(self, message):
+        super().__init__(message)
+
+
+# https://www.w3.org/TR/webrtc/#rtcsignalingstate-enum
+def ensure_next_signaling_state(
+    curr_state: SignalingState,
+    next_state: SignalingState,
+    operation: SignalingChangeOperation,
+    desc_type: SessionDescriptionType,
+):
+    if (
+        desc_type == SessionDescriptionType.Rollback
+        and curr_state == SignalingState.Stable
+    ):
+        raise SignalingStateTransitionError("Cannot rollback stable state")
+
+    if curr_state == SignalingState.Stable:
+        if operation == SignalingChangeOperation.SetLocal:
+            if (
+                desc_type == SessionDescriptionType.Offer
+                and next_state == SignalingState.HaveLocalOffer
+            ):
+                return next_state
+        elif operation == SignalingChangeOperation.SetRemote:
+            if (
+                desc_type == SessionDescriptionType.Offer
+                and next_state == SignalingState.HaveRemoteOffer
+            ):
+                return next_state
+    elif curr_state == SignalingState.HaveLocalOffer:
+        if operation == SignalingChangeOperation.SetRemote:
+            if (
+                desc_type == SessionDescriptionType.Answer
+                and next_state == SignalingState.Stable
+            ):
+                return next_state
+            elif (
+                desc_type == SessionDescriptionType.Pranswer
+                and next_state == SignalingState.HaveRemotePranswer
+            ):
+                return next_state
+    elif curr_state == SignalingState.HaveRemotePranswer:
+        if operation == SignalingChangeOperation.SetRemote:
+            if (
+                desc_type == SessionDescriptionType.Answer
+                and next_state == SignalingState.Stable
+            ):
+                return next_state
+    elif curr_state == SignalingState.HaveRemoteOffer:
+        if operation == SignalingChangeOperation.SetLocal:
+            if (
+                desc_type == SessionDescriptionType.Answer
+                and next_state == SignalingState.Stable
+            ):
+                return next_state
+            elif (
+                desc_type == SessionDescriptionType.Pranswer
+                and next_state == SignalingState.HaveLocalPranswer
+            ):
+                return next_state
+    elif curr_state == SignalingState.HaveLocalPranswer:
+        if operation == SignalingChangeOperation.SetLocal:
+            if (
+                desc_type == SessionDescriptionType.Answer
+                and next_state == SignalingState.Stable
+            ):
+                return next_state
+
+    raise SignalingStateTransitionError(
+        f"Invalid state transition: {curr_state}->{operation}({desc_type})->{next_state}"
+    )
+
+
+class PeerConnectionEvent:
+    SignalingStateChange = "signaling-state-change"
+
+
 # TODO: Watch into ORTC API
-class PeerConnection:
+class PeerConnection(AsyncEventEmitter):
     def __init__(self) -> None:
+        super().__init__()
+
         self.gatherer = ICEGatherer()
 
         self._certificate = dtls.Certificate.generate_certificate()
@@ -1781,14 +1901,24 @@ class PeerConnection:
         set_default_caps(self._caps)
         self.origin = Origin()
 
+        # Start Signaling related
+        self._current_local_description: SessionDescription | None = None
+        self._pending_local_description: SessionDescription | None = None
+
+        self._current_remote_description: SessionDescription | None = None
+        self._pending_remote_description: SessionDescription | None = None
+
+        self._signaling_state: SignalingState = SignalingState.Stable
+        self._signaling_lock = asyncio.Lock()
+        # End Signaling related
+
         self._greater_mid: int = 0
         self._sdp_semantic: SDPSemantic = SDPSemantic.UnifiedPlan
-        self._current_remote_description: SessionDescription | None = None
 
         self._transceivers = list[RTPTransceiver]()
 
         self._closed: bool = False
-        self._lock = asyncio.Lock()
+        self._peer_connection_lock = asyncio.Lock()
 
     async def add_transceiver_from_track(
         self, track: TrackLocal, direction: RTPTransceiverDirection
@@ -1850,10 +1980,154 @@ class PeerConnection:
         else:
             raise ValueError("Unknown direction")
 
-    def set_remote_description(
-        self,
+    async def set_local_description(
+        self, desc_type: SessionDescriptionType, desc: SessionDescription
     ):
-        pass
+        async with self._signaling_lock:
+            try:
+                match desc_type:
+                    case SessionDescriptionType.Answer:
+                        # have-remote-offer->SetLocal(answer)->stable
+                        # have-local-pranswer->SetLocal(answer)->stable
+                        self._signaling_state = ensure_next_signaling_state(
+                            self._signaling_state,
+                            SignalingState.Stable,
+                            SignalingChangeOperation.SetLocal,
+                            desc_type,
+                        )
+
+                        self._current_local_description = desc
+                        self._current_remote_description = (
+                            self._pending_remote_description
+                        )
+
+                        self._pending_remote_description = None
+                        self._pending_local_description = None
+
+                        self.emit(
+                            PeerConnectionEvent.SignalingStateChange,
+                            self._signaling_state,
+                        )
+
+                    case SessionDescriptionType.Offer:
+                        # stable->SetLocal(offer)->have-local-offer
+                        self._signaling_state = ensure_next_signaling_state(
+                            self._signaling_state,
+                            SignalingState.HaveLocalOffer,
+                            SignalingChangeOperation.SetLocal,
+                            desc_type,
+                        )
+
+                        self._pending_local_description = desc
+
+                        self.emit(
+                            PeerConnectionEvent.SignalingStateChange,
+                            self._signaling_state,
+                        )
+
+                    case SessionDescriptionType.Pranswer:
+                        raise ValueError("unsupported pranswer desc type")
+                    case SessionDescriptionType.Rollback:
+                        raise ValueError("unsupported rollback desc type")
+            except SignalingStateTransitionError as e:
+                print("Invalid local state transition", e)
+                return
+
+    async def set_remote_description(
+        self, desc_type: SessionDescriptionType, desc: SessionDescription
+    ):
+        async with self._signaling_lock:
+            try:
+                match desc_type:
+                    case SessionDescriptionType.Answer:
+                        # have-local-offer->SetRemote(answer)->stable
+                        # have-remote-pranswer->SetRemote(answer)->stable
+                        self._signaling_state = ensure_next_signaling_state(
+                            self._signaling_state,
+                            SignalingState.Stable,
+                            SignalingChangeOperation.SetRemote,
+                            desc_type,
+                        )
+
+                        self._current_remote_description = desc
+                        self._current_local_description = (
+                            self._pending_local_description
+                        )
+
+                        self._pending_remote_description = None
+                        self._pending_local_description = None
+
+                        self.emit(
+                            PeerConnectionEvent.SignalingStateChange,
+                            self._signaling_state,
+                        )
+
+                    case SessionDescriptionType.Offer:
+                        # stable->SetRemote(offer)->have-remote-offer
+                        self._signaling_state = ensure_next_signaling_state(
+                            self._signaling_state,
+                            SignalingState.HaveRemoteOffer,
+                            SignalingChangeOperation.SetRemote,
+                            desc_type,
+                        )
+                        self._pending_remote_description = desc
+
+                        self.emit(
+                            PeerConnectionEvent.SignalingStateChange,
+                            self._signaling_state,
+                        )
+
+                    case SessionDescriptionType.Pranswer:
+                        raise ValueError("unsupported pranswer desc type")
+                    case SessionDescriptionType.Rollback:
+                        raise ValueError("unsupported rollback desc type")
+
+            except SignalingStateTransitionError as e:
+                print("Invalid remote state transition", e)
+                return
+
+            transceivers = self._transceivers.copy()
+
+            if desc_type == SessionDescriptionType.Answer:
+                print("Generate state by answer")
+                for media in desc.media_descriptions:
+                    mid = media.get_attribute_value(SessionDescriptionAttrKey.MID.value)
+                    if not mid:
+                        print("Not found mid")
+                        continue
+
+                    kind = RTPCodecKind(media.kind)
+                    if kind != RTPCodecKind.Audio and kind != RTPCodecKind.Video:
+                        print("Not found kind")
+                        continue
+
+                    transceiver = find_transceiver_by_mid(mid, transceivers)
+                    if (
+                        transceiver
+                        and transceiver.direction == RTPTransceiverDirection.Inactive
+                    ):
+                        transceiver.stop()
+
+                    # TODO: Need ensure that media transceiver same. Right now it check only kind or it None
+                    if transceiver is None or not (transceiver.kind == kind):
+                        if len(media.codecs) == 0:
+                            track = TrackLocal(
+                                random_string(16),
+                                random_string(16),
+                                kind,
+                                media.codecs[0],
+                            )
+                            await self.add_transceiver_from_track(
+                                track, media.direction
+                            )
+                            print("Create transciver from track", kind, media.codecs[0])
+                        else:
+                            print("Create transciver from kind", kind, media.direction)
+                            await self.add_transceiver_from_kind(kind, media.direction)
+
+            # NOTE: Here may be also restart and updating candidates
+            # TODO: May also start transports
+            # TODO: This also may remote all unmatched transceivers
 
     def _get_sdp_role(self) -> ConnectionRole:
         role = self.gatherer.agent.get_role()
@@ -2023,7 +2297,7 @@ class PeerConnection:
             # if options and options.ice_restart:
             #     self._transport.restart()
 
-            async with self._lock:
+            async with self._peer_connection_lock:
                 current_transceivers = self._transceivers.copy()
 
                 for transceiver in current_transceivers:
