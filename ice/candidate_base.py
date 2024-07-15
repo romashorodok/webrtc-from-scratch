@@ -233,7 +233,7 @@ class CandidateBase:
 
 
 # candidate:2130706431 1 udp 2130706431 142.250.82.212 19305 typ host generation 0
-def parse_candidate_str(raw: str) -> CandidateBase:
+def parse_candidate_str(raw: str) -> CandidateBase | None:
     parts = raw.split()
 
     if len(raw) != 0 and raw[0] == " ":
@@ -253,10 +253,13 @@ def parse_candidate_str(raw: str) -> CandidateBase:
     typ = parts[7]
 
     # if len(parts) > 8:
-        # raise ValueError("Not supported rich candidate types")
+    # raise ValueError("Not supported rich candidate types")
 
     candidate_type = get_candidate_type_from_str(typ)
     network_type = get_network_type_from_str(protocol)
+    if network_type is NetworkType.TCP:
+        print("Found unsupported tcp candidate type")
+        return
 
     match candidate_type:
         case CandidateType.Host:

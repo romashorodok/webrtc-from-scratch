@@ -722,16 +722,19 @@ class Agent(AsyncEventEmitter):
             if self._remote_ufrag is None or self._remote_pwd is None:
                 raise ValueError("Unable add canddiate ")
 
-            self._pair_registry.append(
-                CandidatePair(
-                    self._local_ufrag,
-                    self._local_pwd,
-                    self._remote_ufrag,
-                    self._remote_pwd,
-                    local,
-                    RemoteCandidate(remote, remote_conn),
-                )
+            # TODO: may be better provide some object ref that hold ufrag, pwd to make dynamic replacement of credentials
+            pair = CandidatePair(
+                self._local_ufrag,
+                self._local_pwd,
+                self._remote_ufrag,
+                self._remote_pwd,
+                local,
+                RemoteCandidate(remote, remote_conn),
             )
+
+            print("Added candidate pair", pair.get_pair_id())
+
+            self._pair_registry.append(pair)
 
     async def _add_local_candidate(self, local: LocalCandidate):
         async with self._candidate_lock:
@@ -783,6 +786,8 @@ class Agent(AsyncEventEmitter):
 
     def add_remote_candidate(self, candidate_raw: str):
         remote = parse_candidate_str(candidate_raw)
+        if not remote:
+            return
         self._loop.create_task(self._add_remote_candidate(remote))
 
     def get_local_credentials(self) -> tuple[str, str]:

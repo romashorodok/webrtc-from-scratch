@@ -2,7 +2,7 @@ from abc import abstractmethod
 import asyncio
 from dataclasses import dataclass
 import datetime
-from typing import Any, Callable, Generic, Self, TypeVar
+from typing import Any, Callable, Generator, Generic, Self, TypeVar
 import re
 
 import secrets
@@ -954,8 +954,10 @@ class MediaDescription:
                     print("Parse direction", attr)
                     media.direction = RTPTransceiverDirection(attr)
                 elif attr == SessionDescriptionAttrKey.Candidate.value and value:
-                    candidates = ice.parse_candidate_str(value)
-                    media.candidates.append(candidates)
+                    candidate = ice.parse_candidate_str(value)
+                    if not candidate:
+                        continue
+                    media.candidates.append(candidate)
                 elif attr == SessionDescriptionAttrKey.RTPMap.value and value:
                     payload_id, payload_desc = value.split(" ", 1)
                     bits = payload_desc.split("/")
@@ -1185,6 +1187,18 @@ class SessionDescription:
 
     def __repr__(self) -> str:
         return f"SessionDescription(media={self.media_descriptions})"
+
+    def get_media_credentials(self):
+        for media in self.media_descriptions:
+            if not media.ice_ufrag or not media.ice_pwd:
+                continue
+            yield (media.ice_ufrag, media.ice_pwd)
+
+    def get_media_fingerprints(self) -> list[dtls.Fingerprint]:
+        result = []
+        for media in self.media_descriptions:
+            result.extend(media.fingerprints)
+        return result
 
     def marshal(self) -> bytes:
         # https://tools.ietf.org/html/rfc4566#section-5
@@ -1804,6 +1818,7 @@ class PeerConnection(AsyncEventEmitter):
         self, desc_type: SessionDescriptionType, desc: SessionDescription
     ):
         async with self._signaling_lock:
+            print("Old state", self._transceivers)
             try:
                 match desc_type:
                     case SessionDescriptionType.Answer:
@@ -1892,6 +1907,7 @@ class PeerConnection(AsyncEventEmitter):
                             print("Create transciver from kind", kind, media.direction)
                             await self.add_transceiver_from_kind(kind, media.direction)
 
+            print("New state", self._transceivers)
             # NOTE: Here may be also restart and updating candidates
             # TODO: May also start transports
             # TODO: This also may remote all unmatched transceivers
