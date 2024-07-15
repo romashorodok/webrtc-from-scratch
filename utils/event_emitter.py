@@ -1,6 +1,6 @@
 import asyncio
 from threading import Lock
-from typing import Any, Callable, OrderedDict, TypeVar, override
+from typing import Any, Callable, OrderedDict, TypeVar
 
 
 Handler_T = TypeVar("Handler_T", bound=Callable)
