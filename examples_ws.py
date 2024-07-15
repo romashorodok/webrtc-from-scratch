@@ -9,7 +9,6 @@ from peer_connection import (
     SessionDescription,
     SessionDescriptionType,
 )
-from ice.net.types import Packet, Address
 import media
 import fractions
 import threading
@@ -47,14 +46,6 @@ async def write_routine(
     pc: PeerConnection,
     frames: list[tuple[bytes, media.IVFFrameHeader]],
 ):
-    packetizer = media.Packetizer(
-        mtu=1200,
-        pt=96,
-        ssrc=0,
-        payloader=media.VP8Payloader(),
-        clock_rate=CLOCK_RATE,
-    )
-
     frame_index = 0
 
     async for _ in media.ticker(VIDEO_PTIME / 1000):
@@ -71,29 +62,10 @@ async def write_routine(
         try:
             for t in pc._transceivers:
                 track = t.track_local()
-                sender = t._sender
-
-                if not sender or not track:
+                if not track:
                     print("Not found sender")
                     continue
-
-                encodings = sender._track_encodings
-                if not encodings:
-                    print("Not found encoding")
-                    continue
-                enc = encodings[0]
-
-                packetizer.ssrc = enc.ssrc
-
-                pts, time_base = await packetizer.next_timestamp()
-
-                pkts = packetizer.packetize(
-                    frame, convert_timebase(pts, time_base, VIDEO_TIME_BASE)
-                )
-
-                for pkt in pkts:
-                    data = pkt.serialize()
-                    await track.write_rtp(Packet(Address("0.0.0.0", 0), data))
+                await track.write_frame(frame)
 
         except RuntimeError:
             pass

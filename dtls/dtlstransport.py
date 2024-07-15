@@ -8,7 +8,6 @@ from pylibsrtp import Policy, Session
 import ice
 import ice.net
 import dtls
-from utils.types import impl_protocol
 
 from .certificate import SRTPProtectionProfile, certificate_digest
 
@@ -25,10 +24,9 @@ class ICETransportDTLS(Protocol):
 
 
 class RTPWriterProtocol(Protocol):
-    async def write_rtp(self, pkt: ice.net.Packet) -> int: ...
+    async def write_frame(self, frame: bytes) -> int: ...
 
 
-@impl_protocol(RTPWriterProtocol)
 class DTLSTransport:
     def __init__(
         self, transport: ICETransportDTLS, certificate: dtls.Certificate
@@ -176,10 +174,10 @@ class DTLSTransport:
         data = self._tx_srtp.protect_rtcp(pkt.data)
         return len(data)
 
-    def write_rtp(self, pkt: ice.net.Packet) -> int:
+    def write_rtp_bytes(self, data: bytes) -> int:
         if not self._tx_srtp:
             return 0
-        data = self._tx_srtp.protect(bytes(pkt.data))
+        data = self._tx_srtp.protect(data)
 
         for pair in self.ice_transport().get_ice_pair_transports():
             pair.sendto(data)

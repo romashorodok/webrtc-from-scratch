@@ -7,6 +7,7 @@ import re
 
 import secrets
 import string
+import fractions
 
 import ice
 import ice.net
@@ -18,6 +19,8 @@ import socket
 from enum import Enum, IntEnum
 
 import ice.stun.utils as byteops
+from media.packetizer import Packetizer, get_payloader_by_payload_type
+
 from utils import AsyncEventEmitter, impl_protocol
 import itertools
 
@@ -238,6 +241,7 @@ class RTPCodecParameters:
         self,
         mime_type: str,
         clock_rate: int,
+        refresh_rate: float,
         channels: int,
         sdp_fmtp_line: str,
         payload_type: int,
@@ -245,6 +249,7 @@ class RTPCodecParameters:
     ) -> None:
         self.mime_type = mime_type
         self.clock_rate = clock_rate
+        self.refresh_rate = refresh_rate
         self.channels = channels
         self.sdp_fmtp_line = sdp_fmtp_line
         self.payload_type = payload_type
@@ -468,10 +473,10 @@ class TrackLocal:
         self._kind = kind
         self._writer: dtls.RTPWriterProtocol | None = None
 
-    async def write_rtp(self, pkt: ice.net.Packet) -> int:
+    async def write_frame(self, frame: bytes) -> int:
         if not self._writer:
             return 0
-        return await self._writer.write_rtp(pkt)
+        return await self._writer.write_frame(frame)
 
     def bind(self, writer: dtls.RTPWriterProtocol):
         self._writer = writer
@@ -517,18 +522,44 @@ class RTPSendParameters:
 
 @impl_protocol(dtls.RTPWriterProtocol)
 class TrackEncoding:
-    def __init__(
-        self, ssrc: int, dtls: dtls.DTLSTransport, track: TrackLocal | None = None
-    ) -> None:
+    def __init__(self, ssrc: int, dtls: dtls.DTLSTransport, track: TrackLocal) -> None:
+        # TODO: remove track from this place
         self.track = track
+        self.codec = track._rtp_codec_params
         self.ssrc = ssrc
         self._dtls = dtls
-        self._lock = asyncio.Lock()
 
-    async def write_rtp(self, pkt: ice.net.Packet) -> int:
-        # print("Write in encoding")
-        async with self._lock:
-            return self._dtls.write_rtp(pkt)
+        payloader = get_payloader_by_payload_type(self.codec.payload_type)
+        if not payloader:
+            raise ValueError("Unknown payloader type")
+
+        self._packetizer = Packetizer(
+            mtu=1200,
+            pt=self.codec.payload_type,
+            ssrc=self.ssrc,
+            payloader=payloader,
+            clock_rate=self.codec.clock_rate,
+            refresh_rate=self.codec.refresh_rate,
+        )
+
+    def convert_timebase(
+        self, pts: int, from_base: fractions.Fraction, to_base: fractions.Fraction
+    ) -> int:
+        if from_base != to_base:
+            pts = int(pts * from_base / to_base)
+        return pts
+
+    async def write_frame(self, frame: bytes) -> int:
+        pts, time_base = await self._packetizer.next_timestamp()
+
+        pkts = self._packetizer.packetize(
+            frame, self.convert_timebase(pts, time_base, time_base)
+        )
+
+        n = 0
+        for pkt in pkts:
+            n += self._dtls.write_rtp_bytes(pkt.serialize())
+        return n
 
 
 class RTPSender:
@@ -540,6 +571,7 @@ class RTPSender:
         self._dtls = dtls
 
     async def add_encoding(self, track: TrackLocal):
+        track._rtp_codec_params
         self._track_encodings.append(
             TrackEncoding(ssrc=secrets.randbits(32), dtls=self._dtls, track=track)
         )
@@ -547,11 +579,10 @@ class RTPSender:
 
     async def replace_track(self, track: TrackLocal):
         for encoding in self._track_encodings:
-            async with encoding._lock:
-                if enc_track := encoding.track:
-                    enc_track._writer = None
+            if enc_track := encoding.track:
+                enc_track._writer = None
 
-                track.bind(encoding)
+            track.bind(encoding)
         self._track = track
 
     @property
@@ -961,14 +992,17 @@ class MediaDescription:
                 elif attr == SessionDescriptionAttrKey.RTPMap.value and value:
                     payload_id, payload_desc = value.split(" ", 1)
                     bits = payload_desc.split("/")
+                    refresh_rate = 1 / 30
 
                     if media_kind == RTPCodecKind.Audio.value:
+                        refresh_rate = 0.020
                         if len(bits) > 2:
                             channels = int(bits[2])
                         else:
                             channels = 1
                     else:
                         channels = 0
+                        refresh_rate = 1 / 30
 
                     payload_name = bits[0]
                     clock_rate = bits[1]
@@ -976,6 +1010,7 @@ class MediaDescription:
                     codec = RTPCodecParameters(
                         mime_type=f"{media_kind}/{payload_name}",
                         clock_rate=int(clock_rate),
+                        refresh_rate=refresh_rate,
                         channels=channels,
                         payload_type=int(payload_id),
                         sdp_fmtp_line="",
@@ -1526,6 +1561,7 @@ def set_default_caps(caps: MediaCaps):
         RTPCodecParameters(
             mime_type="audio/opus",
             clock_rate=48000,
+            refresh_rate=0.020,
             channels=2,
             sdp_fmtp_line="minptime=10;useinbandfec=1",
             payload_type=111,
@@ -1539,6 +1575,7 @@ def set_default_caps(caps: MediaCaps):
     vp8 = RTPCodecParameters(
         mime_type="video/VP8",
         clock_rate=90000,
+        refresh_rate=1 / 30,
         channels=0,
         sdp_fmtp_line="",
         payload_type=96,

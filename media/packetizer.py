@@ -5,6 +5,7 @@ import fractions
 
 from .types import PayloaderProtocol
 from .rtp_packet import RtpPacket
+from .vp8_payloader import VP8Payloader
 
 
 class Sequencer:
@@ -17,10 +18,13 @@ class Sequencer:
         return self.sequence_number
 
 
-VIDEO_CLOCK_RATE = 90000
-VIDEO_TIME_BASE = fractions.Fraction(1, VIDEO_CLOCK_RATE)
-
-VIDEO_PTIME = 1 / 30  # 30fps
+def get_payloader_by_payload_type(pt: int) -> PayloaderProtocol | None:
+    match pt:
+        case 96:
+            return VP8Payloader()
+        case _:
+            print(f"Unknown payload {pt} type")
+            return
 
 
 class Packetizer:
@@ -31,6 +35,7 @@ class Packetizer:
         ssrc: int,
         payloader: PayloaderProtocol,
         clock_rate: int,
+        refresh_rate: float,
     ):
         self.mtu = mtu
         self.payload_type = pt
@@ -38,6 +43,7 @@ class Packetizer:
         self.payloader = payloader
         self.sequencer = Sequencer()
         self.clock_rate = clock_rate
+        self.refresh_rate = refresh_rate
         self._timestamp = None
         self.picture_id = 0
 
@@ -46,21 +52,22 @@ class Packetizer:
 
     async def next_timestamp(self) -> tuple[int, fractions.Fraction]:
         if self._timestamp is not None:
-            self._timestamp += int(VIDEO_PTIME * VIDEO_CLOCK_RATE)
-            wait = self._start + (self._timestamp / VIDEO_CLOCK_RATE) - time.time()
+            self._timestamp += int(self.refresh_rate * self.clock_rate)
+            wait = self._start + (self._timestamp / self.clock_rate) - time.time()
             if wait > 0:
                 await asyncio.sleep(wait)
         else:
             self._start = time.time()
             self._timestamp = 0
 
+        VIDEO_TIME_BASE = fractions.Fraction(1, self.clock_rate)
         return self._timestamp, VIDEO_TIME_BASE
 
     async def ticker(self):
         while True:
             yield await self.next_timestamp()
 
-    def packetize(self, payload: bytes, samples: int) -> list:
+    def packetize(self, payload: bytes, samples: int) -> list[RtpPacket]:
         if not payload:
             return []
 
