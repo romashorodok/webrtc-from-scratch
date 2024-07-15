@@ -25,14 +25,6 @@ async def on_recv(ws: WebSocket, on_close: Callable | None = None):
             _on_close()
 
 
-FRAME_RATE = 30  # frames per second
-FRAME_DURATION = 1 / FRAME_RATE  # duration of each frame in seconds
-CLOCK_RATE = 90000  # RTP clock rate for video
-VIDEO_CLOCK_RATE = 90000
-VIDEO_PTIME = 1 / 30  # 30fps
-VIDEO_TIME_BASE = fractions.Fraction(1, VIDEO_CLOCK_RATE)
-
-
 def convert_timebase(
     pts: int, from_base: fractions.Fraction, to_base: fractions.Fraction
 ) -> int:
@@ -47,8 +39,17 @@ async def write_routine(
     frames: list[tuple[bytes, media.IVFFrameHeader]],
 ):
     frame_index = 0
+    transceiver = pc._transceivers[0]
+    sender = transceiver.sender
+    track = transceiver.track_local()
+    if not sender or not track:
+        raise ValueError("Something goes wrong with track")
 
-    async for _ in media.ticker(VIDEO_PTIME / 1000):
+    encoding = sender._track_encodings[0]
+    ptime = encoding.codec.refresh_rate
+    ms = 1000
+
+    async for _ in media.ticker(ptime / ms):
         if done.is_set():
             raise asyncio.CancelledError()
 
@@ -60,13 +61,7 @@ async def write_routine(
         frame_index += 1
 
         try:
-            for t in pc._transceivers:
-                track = t.track_local()
-                if not track:
-                    print("Not found sender")
-                    continue
-                await track.write_frame(frame)
-
+            await track.write_frame(frame)
         except RuntimeError:
             pass
 
