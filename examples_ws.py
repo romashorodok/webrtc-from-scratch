@@ -1,7 +1,7 @@
 import asyncio
 import json
-from typing import Any
-from fastapi import FastAPI, WebSocket
+from typing import Any, Callable
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from peer_connection import (
     PeerConnection,
     RTPCodecKind,
@@ -17,9 +17,13 @@ import threading
 app = FastAPI()
 
 
-async def on_recv(ws: WebSocket):
-    while True:
-        yield await ws.receive_text()
+async def on_recv(ws: WebSocket, on_close: Callable | None = None):
+    try:
+        while True:
+            yield await ws.receive_text()
+    except WebSocketDisconnect:
+        if _on_close := on_close:
+            _on_close()
 
 
 FRAME_RATE = 30  # frames per second
@@ -39,7 +43,9 @@ def convert_timebase(
 
 
 async def write_routine(
-    pc: PeerConnection, frames: list[tuple[bytes, media.IVFFrameHeader]]
+    done: threading.Event,
+    pc: PeerConnection,
+    frames: list[tuple[bytes, media.IVFFrameHeader]],
 ):
     packetizer = media.Packetizer(
         mtu=1200,
@@ -52,6 +58,9 @@ async def write_routine(
     frame_index = 0
 
     async for _ in media.ticker(VIDEO_PTIME / 1000):
+        if done.is_set():
+            raise asyncio.CancelledError()
+
         if frame_index >= len(frames):
             print("All frames sent. Replay from beginning.")
             frame_index = 0
@@ -99,13 +108,19 @@ async def pre_read_frames(file_path: str):
     return frames
 
 
-def start_writer_loop(pc: PeerConnection):
+def start_writer_loop(pc: PeerConnection, done: threading.Event):
     writer_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(writer_loop)
     frames = writer_loop.run_until_complete(pre_read_frames("output.ivf"))
     print("done reading frames")
-    writer_loop.create_task(write_routine(pc, frames))
-    writer_loop.run_forever()
+    try:
+        writer_loop.run_until_complete(write_routine(done, pc, frames))
+    except asyncio.CancelledError:
+        print("Stop of writer_loop")
+    finally:
+        writer_loop.run_until_complete(writer_loop.shutdown_asyncgens())
+        writer_loop.close()
+        print("Graceful shutdown of writer_loop")
 
 
 @app.websocket("/ws")
@@ -117,9 +132,17 @@ async def ws_endpoint(ws: WebSocket):
     )
     await pc.gatherer.gather()
     pc.gatherer.agent.dial()
-    writer_thread = threading.Thread(target=start_writer_loop, daemon=False, args=(pc,))
 
-    async for data in on_recv(ws):
+    done = threading.Event()
+    writer_thread = threading.Thread(
+        target=start_writer_loop, daemon=False, args=(pc, done)
+    )
+
+    def on_close():
+        done.set()
+        print("Done thread")
+
+    async for data in on_recv(ws, on_close):
         msg: dict[str, Any] = json.loads(data)
 
         match msg.get("event"):
