@@ -1,4 +1,5 @@
 import asyncio
+import queue
 from datetime import datetime, timedelta
 
 from dataclasses import dataclass
@@ -490,13 +491,28 @@ async def ping_routine(
 class CandidatePairTransport:
     def __init__(self, conn: MuxConnProtocol) -> None:
         self._conn: ice.MuxConnProtocol = conn
-        self._interceptor = ice.Interceptor()
+
+        self._rtp = queue.Queue[Packet]()
+        self._rtcp = queue.Queue[Packet]()
+        self._dtls = ice.Interceptor()
 
     def pipe(self, pkt: Packet):
-        self._interceptor.put_nowait(pkt)
+        first_byte = pkt.data[0]
+        if first_byte > 19 and first_byte < 64:
+            self._dtls.put_nowait(pkt)
+        elif ice.net.is_rtcp(pkt.data):
+            self._rtcp.put_nowait(pkt)
+        else:
+            self._rtp.put_nowait(pkt)
 
-    async def recvfrom(self) -> Packet:
-        return await self._interceptor.get()
+    async def recv_dtls(self) -> Packet:
+        return await self._dtls.get()
+
+    def recv_rtp_sync(self) -> Packet:
+        return self._rtp.get()
+
+    def recv_rtcp_sync(self) -> Packet:
+        return self._rtcp.get()
 
     def sendto(self, data: bytes | bytearray | bytes):
         self._conn.sendto(data)

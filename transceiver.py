@@ -1,7 +1,12 @@
+import asyncio
+from dataclasses import dataclass
 import fractions
+import queue
 import secrets
 from enum import Enum
+import threading
 
+import media
 from utils import impl_protocol
 from media.packetizer import Packetizer, get_payloader_by_payload_type
 
@@ -134,18 +139,37 @@ class TrackEncoding:
         return n
 
 
+# RTPRtxParameters dictionary contains information relating to retransmission (RTX) settings.
+# https://draft.ortc.org/#dom-rtcrtprtxparameters
+@dataclass
+class RTPRtxParameters:
+    ssrc: int
+
+
 # RTPEncodingParameters provides information relating to both encoding and decoding.
 # This is a subset of the RFC since Pion WebRTC doesn't implement encoding itself
 # http://draft.ortc.org/#dom-rtcrtpencodingparameters
 class RTPEncodingParameters:
     def __init__(
-        self, rid: str, ssrc: int, payload_type: int, rtx: int | None = None
+        self,
+        rid: str,
+        ssrc: int,
+        payload_type: int,
+        rtx: RTPRtxParameters | None = None,
     ) -> None:
         self.rid = rid
         self.ssrc = ssrc
         self.payload_type = payload_type
         # https://draft.ortc.org/#dom-rtcrtprtxparameters
         self.rtx = rtx
+
+
+@dataclass
+class RTPDecodingParameters:
+    rid: str
+    ssrc: int
+    payload_type: int
+    rtx: RTPRtxParameters
 
 
 # RTPHeaderExtensionParameter represents a negotiated RFC5285 RTP header extension.
@@ -360,9 +384,74 @@ class RTPSender:
         print("TODO: Add negotiate in RTPSender")
 
 
+class TrackRemote:
+    def __init__(
+        self,
+        kind: RTPCodecKind,
+        ssrc: int,  # uint32
+        rtx_ssrc: int,  # uint32
+        rid: str,
+    ) -> None:
+        self.kind = kind
+        self.ssrc = ssrc
+        self.rtx_ssrc = rtx_ssrc
+        self.rid = rid
+
+        self._rtp_packet_queue = queue.Queue[media.RtpPacket]()
+
+    def write_rtp_bytes_sync(self, data: bytes):
+        self._rtp_packet_queue.put(media.RtpPacket.parse(data))
+
+    def recv_rtp_pkt_sync(self) -> media.RtpPacket:
+        return self._rtp_packet_queue.get()
+
+
+def _receive_worker(
+    done_signal: threading.Event, dtls: dtls.DTLSTransport, track: TrackRemote
+):
+    while True:
+        try:
+            if done_signal.is_set():
+                return
+
+            for t in dtls.ice_transport().get_ice_pair_transports():
+                # NOTE: here may be droping of old packetsa or other processing
+                pkt = t.recv_rtp_sync()
+                track.write_rtp_bytes_sync(pkt.data)
+        except ValueError:
+            pass
+
+
 class RTPReceiver:
-    def __init__(self, caps: MediaCaps) -> None:
+    def __init__(
+        self, caps: MediaCaps, kind: RTPCodecKind, dtls: dtls.DTLSTransport
+    ) -> None:
         self._caps = caps
+        self._kind = kind
+        self._dtls = dtls
+        self._track: TrackRemote | None = None
+        self._receive_thread: threading.Thread | None = None
+        self._done_signal = threading.Event()
+
+    def receive(self, params: RTPDecodingParameters):
+        if self._receive_thread:
+            print("Receiver already started")
+            return
+
+        self._track = TrackRemote(self._kind, params.ssrc, params.rtx.ssrc, params.rid)
+        self._done_signal.clear()
+        self._receive_thread = threading.Thread(
+            # TODO: pass into worker queue and send None if worker should stop
+            target=_receive_worker,
+            name=f"RTPReceiver-{self._track.ssrc}",
+            args=(self._done_signal, self._dtls, self._track),
+        )
+        self._receive_thread.start()
+
+    def stop(self):
+        if self._receive_thread:
+            self._receive_thread.join()
+            self._done_signal.set()
 
 
 class MID:

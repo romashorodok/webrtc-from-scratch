@@ -25,12 +25,15 @@ from transceiver import (
     RTPCodecParameters,
     RTPCodecKind,
     RTCPFeedback,
+    RTPDecodingParameters,
+    RTPRtxParameters,
     RTPTransceiver,
     RTPTransceiverDirection,
     RTPReceiver,
     RTPSender,
     TrackLocal,
     find_transceiver_by_mid,
+    RTPEncodingParameters,
 )
 from signaling import (
     SignalingChangeOperation,
@@ -311,25 +314,41 @@ class PeerConnection(AsyncEventEmitter):
         receiver: RTPReceiver | None = None
         sender: RTPSender | None = None
 
+        codec = track._rtp_codec_params
+        kind = track.kind
+
         match direction:
-            case RTPTransceiverDirection.Sendrecv:
-                # TODO: add logic
-                receiver = RTPReceiver(self._caps)
-                sender = RTPSender(self._caps, dtls_transport)
             case RTPTransceiverDirection.Sendonly:
                 sender = RTPSender(self._caps, dtls_transport)
+
+            case RTPTransceiverDirection.Sendrecv:
+                sender = RTPSender(self._caps, dtls_transport)
+                receiver = RTPReceiver(self._caps, kind, dtls_transport)
+                receiver.receive(
+                    RTPDecodingParameters(
+                        rid=random_string(12),
+                        ssrc=secrets.randbits(32),
+                        payload_type=codec.payload_type,
+                        rtx=RTPRtxParameters(ssrc=secrets.randbits(32)),
+                    )
+                )
+
             case RTPTransceiverDirection.Recvonly:
-                receiver = RTPReceiver(self._caps)
+                receiver = RTPReceiver(self._caps, kind, dtls_transport)
+                receiver.receive(
+                    RTPDecodingParameters(
+                        rid=random_string(12),
+                        ssrc=secrets.randbits(32),
+                        payload_type=codec.payload_type,
+                        rtx=RTPRtxParameters(ssrc=secrets.randbits(32)),
+                    )
+                )
+
+        transceiver = RTPTransceiver(caps=self._caps, kind=kind, direction=direction)
+        transceiver.set_prefered_codec(codec)
 
         if sender:
             await sender.add_encoding(track)
-
-        transceiver = RTPTransceiver(
-            caps=self._caps, kind=track.kind, direction=direction
-        )
-        transceiver.set_prefered_codec(track._rtp_codec_params)
-
-        if sender:
             transceiver.set_sender(sender)
         if receiver:
             transceiver.set_receiver(receiver)
@@ -352,10 +371,31 @@ class PeerConnection(AsyncEventEmitter):
             track = TrackLocal(random_string(16), random_string(16), kind, codecs[0])
             return await self.add_transceiver_from_track(track, direction)
         elif direction is RTPTransceiverDirection.Recvonly:
-            print("TODO: make recv only")
             codecs = self._caps.get_codecs_by_kind(kind)
-            track = TrackLocal(random_string(16), random_string(16), kind, codecs[0])
-            return await self.add_transceiver_from_track(track, direction)
+            if not codecs:
+                raise ValueError(f"Not found codecs for {kind.value}")
+
+            transport = ICETransport(self.gatherer)
+            dtls_transport = dtls.DTLSTransport(transport, self._certificate)
+            self._dtls_transports.append(dtls_transport)
+
+            receiver = RTPReceiver(self._caps, kind, dtls_transport)
+            receiver.receive(
+                RTPDecodingParameters(
+                    rid=random_string(12),
+                    ssrc=secrets.randbits(32),
+                    payload_type=codecs[0].payload_type,
+                    rtx=RTPRtxParameters(ssrc=secrets.randbits(32)),
+                )
+            )
+
+            transceiver = RTPTransceiver(
+                caps=self._caps, kind=kind, direction=direction
+            )
+            transceiver.set_receiver(receiver)
+            transceiver.set_prefered_codec(codecs[0])
+            self._transceivers.append(transceiver)
+            return transceiver
         else:
             raise ValueError("Unknown direction")
 

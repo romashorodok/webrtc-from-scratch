@@ -13,6 +13,8 @@ import media
 import fractions
 import threading
 
+from transceiver import TrackRemote
+
 app = FastAPI()
 
 
@@ -77,7 +79,7 @@ async def pre_read_frames(file_path: str):
 
 def start_writer_loop(pc: PeerConnection, done: threading.Event):
     writer_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(writer_loop)
+    # asyncio.set_event_loop(writer_loop)
     frames = writer_loop.run_until_complete(pre_read_frames("output.ivf"))
     print("done reading frames")
     try:
@@ -90,6 +92,20 @@ def start_writer_loop(pc: PeerConnection, done: threading.Event):
         print("Graceful shutdown of writer_loop")
 
 
+def start_reader_loop(pc: PeerConnection):
+    receiver = pc._transceivers[0].receiver
+    if not receiver:
+        raise ValueError("Not found expected receiver")
+
+    track = receiver._track
+    if not track:
+        raise ValueError("Not found expected track")
+
+    while True:
+        pkt = track.recv_rtp_pkt_sync()
+        print("Recv pkt from reader loop", pkt)
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
@@ -97,6 +113,9 @@ async def ws_endpoint(ws: WebSocket):
     await pc.add_transceiver_from_kind(
         RTPCodecKind.Video, RTPTransceiverDirection.Sendrecv
     )
+    # await pc.add_transceiver_from_kind(
+    #     RTPCodecKind.Video, RTPTransceiverDirection.Recvonly
+    # )
     await pc.gatherer.gather()
     pc.gatherer.agent.dial()
 
@@ -104,6 +123,8 @@ async def ws_endpoint(ws: WebSocket):
     writer_thread = threading.Thread(
         target=start_writer_loop, daemon=False, args=(pc, done)
     )
+
+    reader_thread = threading.Thread(target=start_reader_loop, daemon=False, args=(pc,))
 
     def on_close():
         done.set()
@@ -120,6 +141,7 @@ async def ws_endpoint(ws: WebSocket):
                 for dtls in pc._dtls_transports:
                     await dtls.start()
                 writer_thread.start()
+                reader_thread.start()
 
             case "offer":
                 if offer := await pc.create_offer():

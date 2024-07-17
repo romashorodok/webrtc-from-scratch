@@ -27,6 +27,10 @@ class RTPWriterProtocol(Protocol):
     async def write_frame(self, frame: bytes) -> int: ...
 
 
+class RTPReaderProtocol(Protocol):
+    async def recv_rtp_bytes(self) -> bytes: ...
+
+
 class DTLSTransport:
     def __init__(
         self, transport: ICETransportDTLS, certificate: dtls.Certificate
@@ -54,18 +58,17 @@ class DTLSTransport:
                 ssl.do_handshake()
             except SSL.WantReadError:
                 try:
-                    pkt = await transport.recvfrom()
-                    first_byte = pkt.data[0]
-                    if first_byte > 19 and first_byte < 64:
-                        ssl.bio_write(pkt.data)
-                        try:
-                            data = ssl.recv(1500)
-                            if data:
-                                print(f"Received data: {data}")
-                        except SSL.ZeroReturnError as e:
-                            print("Zero return", e)
-                        except SSL.Error as e:
-                            print("SSL error", e)
+                    dtls_pkt = await transport.recv_dtls()
+                    ssl.bio_write(dtls_pkt.data)
+
+                    try:
+                        data = ssl.recv(1500)
+                        if data:
+                            print(f"Received data: {data}")
+                    except SSL.ZeroReturnError as e:
+                        print("Zero return", e)
+                    except SSL.Error as e:
+                        print("SSL error", e)
 
                     flight = ssl.bio_read(1500)
                     if flight:
@@ -165,21 +168,35 @@ class DTLSTransport:
 
             asyncio.ensure_future(self.do_handshake_for(ssl, pair))
 
-    def write_rtcp(self, pkt: ice.net.Packet) -> int:
-        if not ice.net.is_rtcp(pkt.data):
-            return 0
-
-        if not self._tx_srtp:
-            return 0
-        data = self._tx_srtp.protect_rtcp(pkt.data)
-        return len(data)
+    def write_rtcp_bytes(self, data: bytes) -> int:
+        # if not ice.net.is_rtcp(pkt.data):
+        #     return 0
+        #
+        # if not self._tx_srtp:
+        #     return 0
+        # data = self._tx_srtp.protect_rtcp(pkt.data)
+        # return len(data)
+        print("TODO: Handle rtcp")
+        return 0
 
     def write_rtp_bytes(self, data: bytes) -> int:
         if not self._tx_srtp:
             return 0
         data = self._tx_srtp.protect(data)
 
+        # TODO: Refactor to be as a signle transport
         for pair in self.ice_transport().get_ice_pair_transports():
             pair.sendto(data)
 
         return len(data)
+
+    async def read_rtp_bytes(self):
+        # TODO: Refactor one transport for one candidate
+        for t in self.ice_transport().get_ice_pair_transports():
+            if not self._tx_srtp:
+                print("Not found tx srtp")
+                continue
+
+            print("read rtp?? from srtp")
+            pkt = await t.recv_rtp()
+            yield self._tx_srtp.unprotect(pkt.data)
