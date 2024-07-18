@@ -1,7 +1,14 @@
+import asyncio
+from dataclasses import dataclass
 import fractions
+import queue
 import secrets
 from enum import Enum
+import threading
+from typing import Any, Callable, Coroutine
 
+from dtls.dtlstransport import DTLSTransport
+import media
 from utils import impl_protocol
 from media.packetizer import Packetizer, get_payloader_by_payload_type
 
@@ -94,12 +101,12 @@ class TrackLocal:
 
 @impl_protocol(dtls.RTPWriterProtocol)
 class TrackEncoding:
-    def __init__(self, ssrc: int, dtls: dtls.DTLSTransport, track: TrackLocal) -> None:
+    def __init__(self, ssrc: int, track: TrackLocal) -> None:
         # TODO: remove track from this place
         self.track = track
         self.codec = track._rtp_codec_params
         self.ssrc = ssrc
-        self._dtls = dtls
+        self._dtls: dtls.DTLSTransport | None = None
 
         payloader = get_payloader_by_payload_type(self.codec.payload_type)
         if not payloader:
@@ -114,6 +121,9 @@ class TrackEncoding:
             refresh_rate=self.codec.refresh_rate,
         )
 
+    def bind(self, transport: dtls.DTLSTransport):
+        self._dtls = transport
+
     def convert_timebase(
         self, pts: int, from_base: fractions.Fraction, to_base: fractions.Fraction
     ) -> int:
@@ -122,6 +132,10 @@ class TrackEncoding:
         return pts
 
     async def write_frame(self, frame: bytes) -> int:
+        if not self._dtls:
+            print("TrackEncoding | Not found transport")
+            return 0
+
         pts, time_base = await self._packetizer.next_timestamp()
 
         pkts = self._packetizer.packetize(
@@ -130,8 +144,15 @@ class TrackEncoding:
 
         n = 0
         for pkt in pkts:
-            n += self._dtls.write_rtp_bytes(pkt.serialize())
+            n += await self._dtls.write_rtp_bytes(pkt.serialize())
         return n
+
+
+# RTPRtxParameters dictionary contains information relating to retransmission (RTX) settings.
+# https://draft.ortc.org/#dom-rtcrtprtxparameters
+@dataclass
+class RTPRtxParameters:
+    ssrc: int
 
 
 # RTPEncodingParameters provides information relating to both encoding and decoding.
@@ -139,13 +160,25 @@ class TrackEncoding:
 # http://draft.ortc.org/#dom-rtcrtpencodingparameters
 class RTPEncodingParameters:
     def __init__(
-        self, rid: str, ssrc: int, payload_type: int, rtx: int | None = None
+        self,
+        rid: str,
+        ssrc: int,
+        payload_type: int,
+        rtx: RTPRtxParameters | None = None,
     ) -> None:
         self.rid = rid
         self.ssrc = ssrc
         self.payload_type = payload_type
         # https://draft.ortc.org/#dom-rtcrtprtxparameters
         self.rtx = rtx
+
+
+@dataclass
+class RTPDecodingParameters:
+    rid: str
+    ssrc: int
+    payload_type: int
+    rtx: RTPRtxParameters
 
 
 # RTPHeaderExtensionParameter represents a negotiated RFC5285 RTP header extension.
@@ -301,18 +334,27 @@ class MediaCaps:
 
 
 class RTPSender:
-    def __init__(self, caps: MediaCaps, dtls: dtls.DTLSTransport) -> None:
+    def __init__(self, caps: MediaCaps) -> None:
         self._track_encodings = list[TrackEncoding]()
         self._payload_type: int = 0
         self._caps = caps
         self._track: TrackLocal | None = None
-        self._dtls = dtls
+        self.__transport: dtls.DTLSTransport | None = None
+        self.__transport_lock = asyncio.Lock()
+
+    async def bind(self, transport: dtls.DTLSTransport):
+        async with self.__transport_lock:
+            self.__transport = transport
+            for enc in self._track_encodings:
+                enc.bind(transport)
 
     async def add_encoding(self, track: TrackLocal):
-        track._rtp_codec_params
-        self._track_encodings.append(
-            TrackEncoding(ssrc=secrets.randbits(32), dtls=self._dtls, track=track)
-        )
+        async with self.__transport_lock:
+            enc = TrackEncoding(ssrc=secrets.randbits(32), track=track)
+            if self.__transport:
+                enc.bind(self.__transport)
+            self._track_encodings.append(enc)
+
         await self.replace_track(track)
 
     async def replace_track(self, track: TrackLocal):
@@ -360,9 +402,99 @@ class RTPSender:
         print("TODO: Add negotiate in RTPSender")
 
 
+class TrackRemote:
+    def __init__(
+        self,
+        kind: RTPCodecKind,
+        ssrc: int,  # uint32
+        rtx_ssrc: int,  # uint32
+        rid: str,
+    ) -> None:
+        self.kind = kind
+        self.ssrc = ssrc
+        self.rtx_ssrc = rtx_ssrc
+        self.rid = rid
+
+        self._rtp_packet_queue = queue.Queue[media.RtpPacket]()
+
+    def write_rtp_bytes_sync(self, data: bytes):
+        self._rtp_packet_queue.put(media.RtpPacket.parse(data))
+
+    def recv_rtp_pkt_sync(self) -> media.RtpPacket:
+        return self._rtp_packet_queue.get()
+
+
+def _receive_worker(
+    done_signal: threading.Event,
+    reader: Callable[[], Coroutine[Any, Any, tuple[bytes, int]]],
+    track: TrackRemote,
+):
+    loop = asyncio.new_event_loop()
+
+    while True:
+        try:
+            if done_signal.is_set():
+                return
+
+            future = reader()
+            if not asyncio.iscoroutine(future):
+                raise TypeError(
+                    f"Reader expected to be a coroutine, got {type(future)}"
+                )
+
+            data, n = loop.run_until_complete(future)
+            if n == 0:
+                print("__rtp_reader EOF")
+                loop.run_until_complete(asyncio.sleep(1))
+                continue
+
+            track.write_rtp_bytes_sync(data)
+
+        except ValueError:
+            pass
+
+
 class RTPReceiver:
-    def __init__(self, caps: MediaCaps) -> None:
+    def __init__(self, caps: MediaCaps, kind: RTPCodecKind) -> None:
         self._caps = caps
+        self._kind = kind
+        self._dtls: dtls.DTLSTransport | None = None
+        self._track: TrackRemote | None = None
+        self._receive_thread: threading.Thread | None = None
+        self._done_signal = threading.Event()
+
+    def bind(self, transport: dtls.DTLSTransport):
+        self._dtls = transport
+
+    def __rtp_reader(self) -> Callable[[], Coroutine[Any, Any, tuple[bytes, int]]]:
+        async def read() -> tuple[bytes, int]:
+            reader = self._dtls
+            if not reader:
+                print("Not found dtls transport for __rtp_reader")
+                return (bytes(), 0)
+            return await reader.read_rtp_bytes()
+
+        return read
+
+    def receive(self, params: RTPDecodingParameters):
+        if self._receive_thread:
+            print("Receiver already started")
+            return
+
+        self._track = TrackRemote(self._kind, params.ssrc, params.rtx.ssrc, params.rid)
+        self._done_signal.clear()
+        self._receive_thread = threading.Thread(
+            # TODO: pass into worker queue and send None if worker should stop
+            target=_receive_worker,
+            name=f"RTPReceiver-{self._track.ssrc}",
+            args=(self._done_signal, self.__rtp_reader(), self._track),
+        )
+        self._receive_thread.start()
+
+    def stop(self):
+        if self._receive_thread:
+            self._receive_thread.join()
+            self._done_signal.set()
 
 
 class MID:
@@ -454,6 +586,13 @@ class RTPTransceiver:
         self._kind: RTPCodecKind = kind
         self._prefered_codecs = list[RTPCodecParameters]()
         self._direction = direction
+        self.__dtls: dtls.DTLSTransport | None = None
+
+    async def bind(self, transport: dtls.DTLSTransport):
+        if self._sender:
+            await self._sender.bind(transport)
+        if self._receiver:
+            self._receiver.bind(transport)
 
     def set_prefered_codec(self, codec: RTPCodecParameters):
         self._prefered_codecs.append(codec)
@@ -483,7 +622,9 @@ class RTPTransceiver:
     def sender(self) -> RTPSender | None:
         return self._sender
 
-    def set_sender(self, sender: RTPSender):
+    async def set_sender(self, sender: RTPSender):
+        if self.__dtls:
+            await sender.bind(self.__dtls)
         self._sender = sender
 
     @property
@@ -491,6 +632,9 @@ class RTPTransceiver:
         return self._receiver
 
     def set_receiver(self, receiver: RTPReceiver):
+        if self.__dtls:
+            receiver.bind(self.__dtls)
+
         self._receiver = receiver
 
     @property

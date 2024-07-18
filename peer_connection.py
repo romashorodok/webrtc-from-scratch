@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import dataclass
+from enum import Enum, StrEnum
 import secrets
 import string
 import ice
@@ -25,12 +26,15 @@ from transceiver import (
     RTPCodecParameters,
     RTPCodecKind,
     RTCPFeedback,
+    RTPDecodingParameters,
+    RTPRtxParameters,
     RTPTransceiver,
     RTPTransceiverDirection,
     RTPReceiver,
     RTPSender,
     TrackLocal,
     find_transceiver_by_mid,
+    RTPEncodingParameters,
 )
 from signaling import (
     SignalingChangeOperation,
@@ -60,36 +64,83 @@ def random_string(length: int) -> str:
     return "".join(secrets.choice(allchar) for _ in range(length))
 
 
-class ICEGatherer:
+class ICEGathererEvent(StrEnum):
+    CANDIDATE_PAIR_CONTROLLER = "candidate-pair-controller"
+
+
+class ICEGatherer(AsyncEventEmitter):
     def __init__(self) -> None:
-        self._loop = asyncio.get_event_loop()
+        super().__init__()
 
-        self._policy: ICEGatherPolicy = ICEGatherPolicy.All
-        self._state: ICEGatherState = ICEGatherState.NEW
+        self._loop = asyncio.get_running_loop()
+        self.__agent: ice.Agent | None = None
 
+        # self._policy: ICEGatherPolicy = ICEGatherPolicy.All
+        # self._state: ICEGatherState = ICEGatherState.NEW
         # TODO: Add support for dedicated stun server
-        self._stun_servers = []
-        self._agent: ice.Agent | None = None
+        # self._stun_servers = []
 
-    @property
-    def agent(self) -> ice.Agent:
-        if self._agent:
-            return self._agent
-        raise ValueError("Agent is None, start it firstly")
+    # @property
+    # def agent(self) -> ice.Agent:
+    #     if self.__agent:
+    #         return self.__agent
+    #     raise ValueError("Agent is None, start it firstly")
+    async def start(self):
+        if not self.__agent:
+            await self.gather()
 
-    def get_local_parameters(self) -> ICEParameters:
-        ufrag, pwd = self.agent.get_local_credentials()
+        if not self.__agent:
+            return
+
+        self.__agent.on(
+            ice.AgentEvent.CANDIDATE_PAIR_CONTROLLER,
+            lambda x: self.emit(ICEGathererEvent.CANDIDATE_PAIR_CONTROLLER, x),
+        )
+
+    async def get_local_parameters(self) -> ICEParameters | None:
+        if not self.__agent:
+            await self.gather()
+
+        if not self.__agent:
+            return
+
+        ufrag, pwd = self.__agent.get_local_credentials()
         return ICEParameters(ufrag, pwd)
 
-    def get_gather_state(self) -> ICEGatherState:
-        return self._state
+    def get_role(self) -> ice.AgentRole | None:
+        if not self.__agent:
+            return
+        return self.__agent.get_role()
 
-    async def get_local_candidates(self) -> list[ice.CandidateProtocol]:
-        candidates = await self.agent.get_local_candidates()
+    async def get_local_candidates(self) -> list[ice.CandidateProtocol] | None:
+        if not self.__agent:
+            await self.gather()
 
+        if not self.__agent:
+            return
+
+        candidates = await self.__agent.get_local_candidates()
         return list(map(lambda c: c.unwrap, candidates))
 
-    async def _create_agent(
+    async def set_remote_credentials(self, ufrag: str, pwd: str):
+        if not self.__agent:
+            await self.gather()
+
+        if not self.__agent:
+            return
+
+        self.__agent.set_remote_credentials(ufrag, pwd)
+
+    async def add_remote_candidate(self, candidate_str: str):
+        if not self.__agent:
+            await self.gather()
+
+        if not self.__agent:
+            return
+
+        self.__agent.add_remote_candidate(candidate_str)
+
+    async def __create_agent(
         self, port: int = 0, interfaces: list[ice.net.Interface] = nic_interfaces
     ) -> ice.Agent:
         udp_mux = ice.net.MultiUDPMux(interfaces, self._loop)
@@ -98,50 +149,85 @@ class ICEGatherer:
         options = ice.AgentOptions([ice.CandidateType.Host], udp_mux, interfaces)
         return ice.Agent(options)
 
-    def _on_candidate(self, candidate: ice.CandidateBase):
-        print("ICEGatherer on candidate", candidate)
+    # def _on_candidate(self, candidate: ice.CandidateBase):
+    #     print("ICEGatherer on candidate", candidate)
+    async def dial(self):
+        if not self.__agent:
+            await self.gather()
+
+        if not self.__agent:
+            return
+
+        self.__agent.dial()
 
     async def gather(self):
         try:
-            agent = self._agent
-            if agent is None:
-                self._agent = await self._create_agent()
-                agent = self._agent
+            if not self.__agent:
+                self.__agent = await self.__create_agent()
 
-            self._set_state(ICEGatherState.Gathering)
+            await self.__agent.gather_candidates()
 
-            agent.set_on_candidate(self._on_candidate)
-            await agent.gather_candidates()
+            # agent = self.__agent
+            # if agent is None:
+            #     self.__agent = await self.__create_agent()
+            #     agent = self.__agent
+
+            # self._set_state(ICEGatherState.Gathering)
+
+            # agent.set_on_candidate(self._on_candidate)
+            # await agent.gather_candidates()
         except RuntimeError as e:
             print("ICE gather error. Err:", e)
 
-    def _set_state(self, state: ICEGatherState):
-        # TODO: Make it reactive
-        self._state = state
+    # def _set_state(self, state: ICEGatherState):
+    #     # TODO: Make it reactive
+    #     self._state = state
 
 
 @impl_protocol(dtls.ICETransportDTLS)
 class ICETransport:
-    def __init__(self, gatherer: ICEGatherer) -> None:
-        self._gatherer = gatherer
-        self._loop = asyncio.get_event_loop()
-        self._state: ICETransportState = ICETransportState.NEW
+    def __init__(
+        self,
+        gatherer: ICEGatherer,
+    ) -> None:
+        self.__gatherer = gatherer
+        self.__transport: ice.CandidatePairTransport | None = None
+        self.__transport_lock = asyncio.Lock()
+        # self.__running_transport = running_transport
 
-    def get_ice_pair_transports(self) -> list[ice.CandidatePairTransport]:
-        agent = self._gatherer.agent
-        return agent._candidate_pair_transports
+        # self.__gatherer = gatherer
+        # self._state: ICETransportState = ICETransportState.NEW
+
+    async def bind(self, transport: ice.CandidatePairTransport):
+        async with self.__transport_lock:
+            self.__transport = transport
+
+    async def get_ice_pair_transport(self) -> ice.CandidatePairTransport | None:
+        async with self.__transport_lock:
+            return self.__transport
 
     def get_ice_role(self) -> ice.AgentRole:
-        return self._gatherer.agent.get_role()
+        role = self.__gatherer.get_role()
+        if not role or ice.AgentRole.Unknown:
+            return ice.AgentRole.Controlling
+        return role
+
+    # def get_ice_pair_transports(self) -> list[ice.CandidatePairTransport]:
+    #     agent = self.__gatherer.agent
+    #     return agent._candidate_pair_transports
+
+    # def get_ice_role(self) -> ice.AgentRole:
+    #     if
+    #     return self._gatherer.agent.get_role()
 
     # Same as iceTransport.internalOnConnectionStateChangeHandler
-    def _on_connection_state_changed(self):
-        # pc.onICEConnectionStateChange(cs)
-        # pc.updateConnectionState(cs, pc.dtlsTransport.State())
-        pass
+    # def _on_connection_state_changed(self):
+    #     # pc.onICEConnectionStateChange(cs)
+    #     # pc.updateConnectionState(cs, pc.dtlsTransport.State())
+    #     pass
 
-    def restart(self):
-        raise ValueError("Implement agent restart")
+    # def restart(self):
+    #     raise ValueError("Implement agent restart")
 
 
 @dataclass
@@ -150,82 +236,6 @@ class OfferOption:
     # about whether it wishes voice detection feature to be enabled or disabled.
     voice_activity_detection: bool = False
     ice_restart: bool = False
-
-
-# class SDPSemantic(Enum):
-#     # SDPSemanticsUnifiedPlan uses unified-plan offers and answers
-#     # (the default in Chrome since M72)
-#     # https://tools.ietf.org/html/draft-roach-mmusic-unified-plan-00
-#     UnifiedPlan = "unified plan"
-#     # Uses plan-b offers and answers NB: This format should be considered deprecated
-#     # https://tools.ietf.org/html/draft-uberti-rtcweb-plan-00
-#     PlanB = "plan b"
-#     # Prefers unified-plan offers and answers, but will respond to a plan-b offer  with a plan-b answer
-#     UnifiedPlanWithFallback = "unified plan with fallback"
-
-
-# class ExtMap:
-#     def __init__(
-#         self,
-#         value: int,
-#         direction: RTPTransceiverDirection | None = None,
-#         uri: str | None = None,
-#         ext_attr: str | None = None,
-#     ) -> None:
-#         self.value = value
-#         self.direction = direction
-#         self.uri = uri
-#         self.ext_attr = ext_attr
-#
-#     def marshal(self) -> str:
-#         out = f"extmap:{self.value}"
-#
-#         if self.uri:
-#             out += f" {self.uri}"
-#
-#         if self.ext_attr:
-#             out += f" {self.ext_attr}"
-#
-#         return out
-
-# @dataclass
-# class GroupDescription:
-#     semantic: str
-#     items: list[int | str]
-#
-#     def __str__(self) -> str:
-#         return f"{self.semantic} {' '.join(map(str, self.items))}"
-#
-#
-# def parse_group(dest: list[GroupDescription], value: str, type=str) -> None:
-#     bits = value.split()
-#     if bits:
-#         dest.append(GroupDescription(semantic=bits[0], items=list(map(type, bits[1:]))))
-
-
-# FMTP_INT_PARAMETERS = [
-#     "apt",
-#     "max-fr",
-#     "max-fs",
-#     "maxplaybackrate",
-#     "minptime",
-#     "stereo",
-#     "useinbandfec",
-# ]
-#
-#
-# def parameters_from_sdp(sdp: str):
-#     parameters = {}
-#     for param in sdp.split(";"):
-#         if "=" in param:
-#             k, v = param.split("=", 1)
-#             if k in FMTP_INT_PARAMETERS:
-#                 parameters[k] = int(v)
-#             else:
-#                 parameters[k] = v
-#         else:
-#             parameters[param] = None
-#     return parameters
 
 
 def set_default_caps(caps: MediaCaps):
@@ -260,7 +270,7 @@ def set_default_caps(caps: MediaCaps):
     caps.register_codec(vp8, RTPCodecKind.Video)
 
 
-class PeerConnectionEvent:
+class PeerConnectionEvent(StrEnum):
     SignalingStateChange = "signaling-state-change"
 
 
@@ -269,12 +279,14 @@ class PeerConnection(AsyncEventEmitter):
     def __init__(self) -> None:
         super().__init__()
 
+        self.__loop = asyncio.get_running_loop()
         self.gatherer = ICEGatherer()
 
-        self._certificate = dtls.Certificate.generate_certificate()
-        self._certificates: list[dtls.Certificate] = [self._certificate]
+        self.__certificate = dtls.Certificate.generate_certificate()
+        self._certificates = [self.__certificate]
+        self.__media_fingerprints = list[dtls.Fingerprint]()
 
-        self._dtls_transports = list[dtls.DTLSTransport]()
+        self.dtls_transports = list[dtls.DTLSTransport]()
 
         self._caps = MediaCaps()
         set_default_caps(self._caps)
@@ -299,38 +311,83 @@ class PeerConnection(AsyncEventEmitter):
         self._closed: bool = False
         self._peer_connection_lock = asyncio.Lock()
 
+    async def __on_ice_pair_controller(self, pair_ctrl: ice.CandidatePairController):
+        # TODO: check if this already started
+        pair_ctrl.remove_all_listeners()
+
+        ice_transport = ICETransport(self.gatherer)
+        dtls_transport = dtls.DTLSTransport(ice_transport, self.__certificate)
+        await dtls_transport.bind(pair_ctrl.get_transport())
+
+        @pair_ctrl.on(ice.CandidatePairControllerEvent.NOMINATE_TRANSPORT)
+        async def __bind_transport_on_nominated_to_transceivers(
+            transport: ice.CandidatePairTransport,
+        ):
+            print("on __bind_transport_on_nominated_to_transceivers")
+
+            for t in self.dtls_transports:
+                await t.bind(transport)
+
+            for t in self._transceivers:
+                await t.bind(dtls_transport)
+
+        self.__loop.create_task(dtls_transport.start(self.__media_fingerprints))
+        self.__loop.create_task(pair_ctrl.start())
+        self.dtls_transports.append(dtls_transport)
+
+    def start(self):
+        self.gatherer.on(
+            ICEGathererEvent.CANDIDATE_PAIR_CONTROLLER, self.__on_ice_pair_controller
+        )
+        self.__loop.create_task(self.gatherer.start())
+
     async def add_transceiver_from_track(
         self, track: TrackLocal, direction: RTPTransceiverDirection
     ) -> RTPTransceiver:
         # TODO: this may contain directly transport creation
         # gathering process may take that list/set of transports
-        transport = ICETransport(self.gatherer)
-        dtls_transport = dtls.DTLSTransport(transport, self._certificate)
-        self._dtls_transports.append(dtls_transport)
+        # transport = ICETransport(self.__gatherer)
+        # dtls_transport = dtls.DTLSTransport(transport, self.__certificate)
+        # self.__dtls_transports.append(dtls_transport)
 
         receiver: RTPReceiver | None = None
         sender: RTPSender | None = None
 
+        codec = track._rtp_codec_params
+        kind = track.kind
+
         match direction:
-            case RTPTransceiverDirection.Sendrecv:
-                # TODO: add logic
-                receiver = RTPReceiver(self._caps)
-                sender = RTPSender(self._caps, dtls_transport)
             case RTPTransceiverDirection.Sendonly:
-                sender = RTPSender(self._caps, dtls_transport)
+                sender = RTPSender(self._caps)
+            case RTPTransceiverDirection.Sendrecv:
+                sender = RTPSender(self._caps)
+                receiver = RTPReceiver(self._caps, kind)
+                receiver.receive(
+                    RTPDecodingParameters(
+                        rid=random_string(12),
+                        ssrc=secrets.randbits(32),
+                        payload_type=codec.payload_type,
+                        rtx=RTPRtxParameters(ssrc=secrets.randbits(32)),
+                    )
+                )
+
             case RTPTransceiverDirection.Recvonly:
-                receiver = RTPReceiver(self._caps)
+                receiver = RTPReceiver(self._caps, kind)
+                receiver.receive(
+                    RTPDecodingParameters(
+                        rid=random_string(12),
+                        ssrc=secrets.randbits(32),
+                        payload_type=codec.payload_type,
+                        rtx=RTPRtxParameters(ssrc=secrets.randbits(32)),
+                    )
+                )
+
+        transceiver = RTPTransceiver(caps=self._caps, kind=kind, direction=direction)
+        transceiver.set_prefered_codec(codec)
 
         if sender:
             await sender.add_encoding(track)
-
-        transceiver = RTPTransceiver(
-            caps=self._caps, kind=track.kind, direction=direction
-        )
-        transceiver.set_prefered_codec(track._rtp_codec_params)
-
-        if sender:
-            transceiver.set_sender(sender)
+            await transceiver.set_sender(sender)
         if receiver:
             transceiver.set_receiver(receiver)
 
@@ -352,169 +409,185 @@ class PeerConnection(AsyncEventEmitter):
             track = TrackLocal(random_string(16), random_string(16), kind, codecs[0])
             return await self.add_transceiver_from_track(track, direction)
         elif direction is RTPTransceiverDirection.Recvonly:
-            print("TODO: make recv only")
             codecs = self._caps.get_codecs_by_kind(kind)
-            track = TrackLocal(random_string(16), random_string(16), kind, codecs[0])
-            return await self.add_transceiver_from_track(track, direction)
+            if not codecs:
+                raise ValueError(f"Not found codecs for {kind.value}")
+
+            transport = ICETransport(self.gatherer)
+            dtls_transport = dtls.DTLSTransport(transport, self.__certificate)
+            self.dtls_transports.append(dtls_transport)
+
+            receiver = RTPReceiver(self._caps, kind)
+            receiver.receive(
+                RTPDecodingParameters(
+                    rid=random_string(12),
+                    ssrc=secrets.randbits(32),
+                    payload_type=codecs[0].payload_type,
+                    rtx=RTPRtxParameters(ssrc=secrets.randbits(32)),
+                )
+            )
+
+            transceiver = RTPTransceiver(
+                caps=self._caps, kind=kind, direction=direction
+            )
+            transceiver.set_receiver(receiver)
+            transceiver.set_prefered_codec(codecs[0])
+            self._transceivers.append(transceiver)
+            return transceiver
         else:
             raise ValueError("Unknown direction")
 
     async def set_local_description(
         self, desc_type: SessionDescriptionType, desc: SessionDescription
     ):
-        async with self._signaling_lock:
-            try:
-                match desc_type:
-                    case SessionDescriptionType.Answer:
-                        # have-remote-offer->SetLocal(answer)->stable
-                        # have-local-pranswer->SetLocal(answer)->stable
-                        self._signaling_state = ensure_next_signaling_state(
-                            self._signaling_state,
-                            SignalingState.Stable,
-                            SignalingChangeOperation.SetLocal,
-                            desc_type,
-                        )
+        try:
+            match desc_type:
+                case SessionDescriptionType.Answer:
+                    # have-remote-offer->SetLocal(answer)->stable
+                    # have-local-pranswer->SetLocal(answer)->stable
+                    self._signaling_state = ensure_next_signaling_state(
+                        self._signaling_state,
+                        SignalingState.Stable,
+                        SignalingChangeOperation.SetLocal,
+                        desc_type,
+                    )
 
-                        self._current_local_description = desc
-                        self._current_remote_description = (
-                            self._pending_remote_description
-                        )
+                    self._current_local_description = desc
+                    self._current_remote_description = self._pending_remote_description
 
-                        self._pending_remote_description = None
-                        self._pending_local_description = None
+                    self._pending_remote_description = None
+                    self._pending_local_description = None
 
-                        self.emit(
-                            PeerConnectionEvent.SignalingStateChange,
-                            self._signaling_state,
-                        )
+                    self.emit(
+                        PeerConnectionEvent.SignalingStateChange,
+                        self._signaling_state,
+                    )
 
-                    case SessionDescriptionType.Offer:
-                        # stable->SetLocal(offer)->have-local-offer
-                        self._signaling_state = ensure_next_signaling_state(
-                            self._signaling_state,
-                            SignalingState.HaveLocalOffer,
-                            SignalingChangeOperation.SetLocal,
-                            desc_type,
-                        )
+                case SessionDescriptionType.Offer:
+                    # stable->SetLocal(offer)->have-local-offer
+                    self._signaling_state = ensure_next_signaling_state(
+                        self._signaling_state,
+                        SignalingState.HaveLocalOffer,
+                        SignalingChangeOperation.SetLocal,
+                        desc_type,
+                    )
 
-                        self._pending_local_description = desc
+                    self._pending_local_description = desc
 
-                        self.emit(
-                            PeerConnectionEvent.SignalingStateChange,
-                            self._signaling_state,
-                        )
+                    self.emit(
+                        PeerConnectionEvent.SignalingStateChange,
+                        self._signaling_state,
+                    )
 
-                    case SessionDescriptionType.Pranswer:
-                        raise ValueError("unsupported pranswer desc type")
-                    case SessionDescriptionType.Rollback:
-                        raise ValueError("unsupported rollback desc type")
-            except SignalingStateTransitionError as e:
-                print("Invalid local state transition", e)
-                return
+                case SessionDescriptionType.Pranswer:
+                    raise ValueError("unsupported pranswer desc type")
+                case SessionDescriptionType.Rollback:
+                    raise ValueError("unsupported rollback desc type")
+        except SignalingStateTransitionError as e:
+            print("Invalid local state transition", e)
+            return
 
     async def set_remote_description(
         self, desc_type: SessionDescriptionType, desc: SessionDescription
     ):
-        async with self._signaling_lock:
-            print("Old state", self._transceivers)
-            try:
-                match desc_type:
-                    case SessionDescriptionType.Answer:
-                        # have-local-offer->SetRemote(answer)->stable
-                        # have-remote-pranswer->SetRemote(answer)->stable
-                        self._signaling_state = ensure_next_signaling_state(
-                            self._signaling_state,
-                            SignalingState.Stable,
-                            SignalingChangeOperation.SetRemote,
-                            desc_type,
+        print("Old state", self._transceivers)
+        try:
+            match desc_type:
+                case SessionDescriptionType.Answer:
+                    # have-local-offer->SetRemote(answer)->stable
+                    # have-remote-pranswer->SetRemote(answer)->stable
+                    self._signaling_state = ensure_next_signaling_state(
+                        self._signaling_state,
+                        SignalingState.Stable,
+                        SignalingChangeOperation.SetRemote,
+                        desc_type,
+                    )
+
+                    self._current_remote_description = desc
+                    self._current_local_description = self._pending_local_description
+
+                    self._pending_remote_description = None
+                    self._pending_local_description = None
+
+                    self.emit(
+                        PeerConnectionEvent.SignalingStateChange,
+                        self._signaling_state,
+                    )
+
+                case SessionDescriptionType.Offer:
+                    # stable->SetRemote(offer)->have-remote-offer
+                    self._signaling_state = ensure_next_signaling_state(
+                        self._signaling_state,
+                        SignalingState.HaveRemoteOffer,
+                        SignalingChangeOperation.SetRemote,
+                        desc_type,
+                    )
+                    self._pending_remote_description = desc
+
+                    self.emit(
+                        PeerConnectionEvent.SignalingStateChange,
+                        self._signaling_state,
+                    )
+
+                case SessionDescriptionType.Pranswer:
+                    raise ValueError("unsupported pranswer desc type")
+                case SessionDescriptionType.Rollback:
+                    raise ValueError("unsupported rollback desc type")
+
+        except SignalingStateTransitionError as e:
+            print("Invalid remote state transition", e)
+            return
+
+        transceivers = self._transceivers.copy()
+
+        if desc_type == SessionDescriptionType.Answer:
+            print("Generate state by answer")
+            for media in desc.media_descriptions:
+                mid = media.get_attribute_value(SessionDescriptionAttrKey.MID.value)
+                if not mid:
+                    print("Not found mid")
+                    continue
+
+                kind = RTPCodecKind(media.kind)
+                if kind != RTPCodecKind.Audio and kind != RTPCodecKind.Video:
+                    print("Not found kind")
+                    continue
+
+                transceiver = find_transceiver_by_mid(mid, transceivers)
+                if (
+                    transceiver
+                    and transceiver.direction == RTPTransceiverDirection.Inactive
+                ):
+                    transceiver.stop()
+
+                # TODO: Need ensure that media transceiver same. Right now it check only kind or it None
+                if transceiver is None or not (transceiver.kind == kind):
+                    if len(media.codecs) == 0:
+                        track = TrackLocal(
+                            random_string(16),
+                            random_string(16),
+                            kind,
+                            media.codecs[0],
                         )
+                        await self.add_transceiver_from_track(track, media.direction)
+                        print("Create transciver from track", kind, media.codecs[0])
+                    else:
+                        print("Create transciver from kind", kind, media.direction)
+                        await self.add_transceiver_from_kind(kind, media.direction)
 
-                        self._current_remote_description = desc
-                        self._current_local_description = (
-                            self._pending_local_description
-                        )
+        print("New state", self._transceivers)
+        # NOTE: Here may be also restart and updating candidates
+        # TODO: May also start transports
+        # TODO: This also may remote all unmatched transceivers
 
-                        self._pending_remote_description = None
-                        self._pending_local_description = None
+        self.__media_fingerprints.extend(desc.get_media_fingerprints())
 
-                        self.emit(
-                            PeerConnectionEvent.SignalingStateChange,
-                            self._signaling_state,
-                        )
+    def __get_sdp_role(self) -> ConnectionRole:
+        role = self.gatherer.get_role()
 
-                    case SessionDescriptionType.Offer:
-                        # stable->SetRemote(offer)->have-remote-offer
-                        self._signaling_state = ensure_next_signaling_state(
-                            self._signaling_state,
-                            SignalingState.HaveRemoteOffer,
-                            SignalingChangeOperation.SetRemote,
-                            desc_type,
-                        )
-                        self._pending_remote_description = desc
-
-                        self.emit(
-                            PeerConnectionEvent.SignalingStateChange,
-                            self._signaling_state,
-                        )
-
-                    case SessionDescriptionType.Pranswer:
-                        raise ValueError("unsupported pranswer desc type")
-                    case SessionDescriptionType.Rollback:
-                        raise ValueError("unsupported rollback desc type")
-
-            except SignalingStateTransitionError as e:
-                print("Invalid remote state transition", e)
-                return
-
-            transceivers = self._transceivers.copy()
-
-            if desc_type == SessionDescriptionType.Answer:
-                print("Generate state by answer")
-                for media in desc.media_descriptions:
-                    mid = media.get_attribute_value(SessionDescriptionAttrKey.MID.value)
-                    if not mid:
-                        print("Not found mid")
-                        continue
-
-                    kind = RTPCodecKind(media.kind)
-                    if kind != RTPCodecKind.Audio and kind != RTPCodecKind.Video:
-                        print("Not found kind")
-                        continue
-
-                    transceiver = find_transceiver_by_mid(mid, transceivers)
-                    if (
-                        transceiver
-                        and transceiver.direction == RTPTransceiverDirection.Inactive
-                    ):
-                        transceiver.stop()
-
-                    # TODO: Need ensure that media transceiver same. Right now it check only kind or it None
-                    if transceiver is None or not (transceiver.kind == kind):
-                        if len(media.codecs) == 0:
-                            track = TrackLocal(
-                                random_string(16),
-                                random_string(16),
-                                kind,
-                                media.codecs[0],
-                            )
-                            await self.add_transceiver_from_track(
-                                track, media.direction
-                            )
-                            print("Create transciver from track", kind, media.codecs[0])
-                        else:
-                            print("Create transciver from kind", kind, media.direction)
-                            await self.add_transceiver_from_kind(kind, media.direction)
-
-            print("New state", self._transceivers)
-            # NOTE: Here may be also restart and updating candidates
-            # TODO: May also start transports
-            # TODO: This also may remote all unmatched transceivers
-
-    def _get_sdp_role(self) -> ConnectionRole:
-        role = self.gatherer.agent.get_role()
         print(f"Set SDP from agent {role}")
         # The ICE controlling role acts as the server.
-        if role == ice.AgentRole.Controlling:
+        if role == ice.AgentRole.Controlling or not role:
             return ConnectionRole.Passive
 
         return ConnectionRole.Active
@@ -529,8 +602,9 @@ class PeerConnection(AsyncEventEmitter):
             SessionDescriptionAttr(SessionDescriptionAttrKey.MsidSemantic, "WMS*")
         )
 
-        ice_params = self.gatherer.get_local_parameters()
+        ice_params = await self.gatherer.get_local_parameters()
         if ice_params is None:
+            print("_generate_unmatched_sdp not found ice params")
             return
 
         if not self._transceivers:
@@ -555,15 +629,16 @@ class PeerConnection(AsyncEventEmitter):
 
         fingerprints = self._certificates[0].get_fingerprints()
 
+        print("media sections", media_sections)
+
         return populate_session_descriptor(
             desc=desc,
             fingerprints=fingerprints,
             is_extmap_allow_mixed=True,
-            role=self._get_sdp_role(),
+            role=self.__get_sdp_role(),
             candidates=ice_candidates,
             ice_params=ice_params,
             media_sections=media_sections,
-            gathering_state=self.gatherer.get_gather_state(),
             match_bundle_group=None,
             caps=self._caps,
         )
@@ -661,11 +736,10 @@ class PeerConnection(AsyncEventEmitter):
             desc=SessionDescription(),
             fingerprints=fingerprints,
             is_extmap_allow_mixed=True,
-            role=self._get_sdp_role(),
+            role=self.__get_sdp_role(),
             candidates=ice_candidates,
             ice_params=ice_params,
             media_sections=media_sections,
-            gathering_state=self.gatherer.get_gather_state(),
             match_bundle_group=group,
             caps=self._caps,
         )
@@ -678,28 +752,28 @@ class PeerConnection(AsyncEventEmitter):
             # if options and options.ice_restart:
             #     self._transport.restart()
 
-            async with self._peer_connection_lock:
-                current_transceivers = self._transceivers.copy()
+            # async with self._peer_connection_lock:
+            current_transceivers = self._transceivers.copy()
 
-                for transceiver in current_transceivers:
-                    if transceiver.mid and (mid := transceiver.mid.numeric_mid):
-                        if mid > self._greater_mid:
-                            self._greater_mid = mid
-                        continue
+            for transceiver in current_transceivers:
+                if transceiver.mid and (mid := transceiver.mid.numeric_mid):
+                    if mid > self._greater_mid:
+                        self._greater_mid = mid
+                    continue
 
-                    self._greater_mid += 1
-                    transceiver.set_mid(self._greater_mid)
+                self._greater_mid += 1
+                transceiver.set_mid(self._greater_mid)
 
-                if self._current_remote_description is None:
-                    desc = await self._generate_unmatched_sdp(current_transceivers)
-                else:
-                    desc = await self._generate_matched_sdp(current_transceivers)
+            if self._current_remote_description is None:
+                desc = await self._generate_unmatched_sdp(current_transceivers)
+            else:
+                desc = await self._generate_matched_sdp(current_transceivers)
 
-                if desc:
-                    desc.origin.session_version = self.origin.session_version
-                    self.origin.session_version += 1
+            if desc:
+                desc.origin.session_version = self.origin.session_version
+                self.origin.session_version += 1
 
-                return desc
+            return desc
 
         except RuntimeError as e:
             print("Create offer error", e)

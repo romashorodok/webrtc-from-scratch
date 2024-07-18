@@ -13,6 +13,8 @@ import media
 import fractions
 import threading
 
+from transceiver import TrackRemote
+
 app = FastAPI()
 
 
@@ -77,7 +79,7 @@ async def pre_read_frames(file_path: str):
 
 def start_writer_loop(pc: PeerConnection, done: threading.Event):
     writer_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(writer_loop)
+    # asyncio.set_event_loop(writer_loop)
     frames = writer_loop.run_until_complete(pre_read_frames("output.ivf"))
     print("done reading frames")
     try:
@@ -90,23 +92,51 @@ def start_writer_loop(pc: PeerConnection, done: threading.Event):
         print("Graceful shutdown of writer_loop")
 
 
+def start_reader_loop(pc: PeerConnection):
+    receiver = pc._transceivers[0].receiver
+    if not receiver:
+        raise ValueError("Not found expected receiver")
+
+    track = receiver._track
+    if not track:
+        raise ValueError("Not found expected track")
+
+    while True:
+        pkt = track.recv_rtp_pkt_sync()
+        print("Recv pkt from reader loop", pkt)
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     pc = PeerConnection()
+    pc.start()
+    await pc.gatherer.dial()
+
     await pc.add_transceiver_from_kind(
         RTPCodecKind.Video, RTPTransceiverDirection.Sendrecv
     )
-    await pc.gatherer.gather()
-    pc.gatherer.agent.dial()
+
+    # await pc.add_transceiver_from_kind(
+    #     RTPCodecKind.Video, RTPTransceiverDirection.Sendonly
+    # )
+
+    # await pc.add_transceiver_from_kind(
+    #     RTPCodecKind.Video, RTPTransceiverDirection.Recvonly
+    # )
+
+    # await pc.__gatherer.gather()
+    # pc.__gatherer.agent.dial()
 
     done = threading.Event()
     writer_thread = threading.Thread(
         target=start_writer_loop, daemon=False, args=(pc, done)
     )
 
+    reader_thread = threading.Thread(target=start_reader_loop, daemon=False, args=(pc,))
+
     def on_close():
-        done.set()
+        # done.set()
         print("Done thread")
 
     async for data in on_recv(ws, on_close):
@@ -115,18 +145,27 @@ async def ws_endpoint(ws: WebSocket):
         match msg.get("event"):
             case "negotiate":
                 print("Start all webrtc")
-                await pc.gatherer.gather()
-                pc.gatherer.agent.dial()
-                for dtls in pc._dtls_transports:
-                    await dtls.start()
-                writer_thread.start()
+                # await pc.gatherer.gather()
+                await pc.gatherer.dial()
+
+                # await pc.__gatherer.gather()
+                # pc.__gatherer.agent.dial()
+                try:
+                    writer_thread.start()
+                    reader_thread.start()
+                except RuntimeError:
+                    pass
 
             case "offer":
+                print("recv offer")
                 if offer := await pc.create_offer():
+                    print("offer offer")
                     await pc.set_local_description(SessionDescriptionType.Offer, offer)
+                    print("set offer")
                     await ws.send_json(
                         {"event": "offer", "data": offer.marshal().decode()}
                     )
+
             case "answer":
                 data = msg.get("data")
                 if not data:
@@ -153,11 +192,13 @@ async def ws_endpoint(ws: WebSocket):
                 print(f"Set remote description desc:{desc}")
 
                 for ufrag, pwd in desc.get_media_credentials():
-                    pc.gatherer.agent.set_remote_credentials(ufrag, pwd)
+                    await pc.gatherer.set_remote_credentials(ufrag, pwd)
+                    # pc.__gatherer.agent.set_remote_credentials(ufrag, pwd)
 
-                for dtls_t in pc._dtls_transports:
-                    print("fingerprints", desc.get_media_fingerprints())
-                    dtls_t._media_fingerprints.extend(desc.get_media_fingerprints())
+                # for dtls_t in pc.__dtls_transports:
+                #     print("fingerprints", desc.get_media_fingerprints())
+                #
+                #     dtls_t.P_media_fingerprints.extend(desc.get_media_fingerprints())
 
                 await pc.set_remote_description(desc_type, desc)
 
@@ -172,6 +213,7 @@ async def ws_endpoint(ws: WebSocket):
                 if not candidate_str:
                     continue
 
-                pc.gatherer.agent.add_remote_candidate(candidate_str)
+                await pc.gatherer.add_remote_candidate(candidate_str)
+
             case _:
                 print("Unknown event")

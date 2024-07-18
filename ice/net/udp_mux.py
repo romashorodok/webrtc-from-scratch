@@ -21,6 +21,9 @@ class Interceptor:
     def put_nowait(self, pkt: Packet):
         self._queue.put_nowait(pkt)
 
+    async def put(self, pkt: Packet):
+        return await self._queue.put(pkt)
+
     async def get(self) -> Packet:
         return await self._queue.get()
 

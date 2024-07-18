@@ -95,7 +95,7 @@ class EventEmitter:
 class AsyncEventEmitter(EventEmitter):
     def __init__(self, loop: asyncio.AbstractEventLoop | None = None) -> None:
         super(AsyncEventEmitter, self).__init__()
-        self._loop = loop
+        self.__loop = loop
         self._waiting = set[asyncio.Future]()
 
     def _on_call_handler(
@@ -107,8 +107,8 @@ class AsyncEventEmitter(EventEmitter):
             self.emit("error", e)
         else:
             if asyncio.iscoroutine(coro):
-                if self._loop:
-                    future = asyncio.ensure_future(coro, loop=self._loop)
+                if self.__loop:
+                    future = asyncio.ensure_future(coro, loop=self.__loop)
                 else:
                     future = asyncio.ensure_future(coro)
             elif isinstance(coro, asyncio.Future):

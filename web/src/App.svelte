@@ -78,6 +78,12 @@
   const pc = new RTCPeerConnection();
 
   onMount(async () => {
+    const streams = await navigator.mediaDevices.getUserMedia({
+      video: true,
+    });
+    const [track] = streams.getVideoTracks();
+    pc.addTrack(track, streams);
+
     pc.onicecandidate = (c) => {
       const candidate = c.candidate?.toJSON();
       if (!candidate) {
@@ -89,17 +95,17 @@
     };
 
     signal.on("offer", async function (desc) {
-      console.log(desc);
+      console.log("offer", desc);
       const session = new RTCSessionDescription({
         type: "offer",
         sdp: desc,
       });
 
       await pc.setRemoteDescription(session);
+
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      console.log(answer);
-
+      console.log("answer", answer);
       signal.send("answer", answer);
     });
 
@@ -113,14 +119,14 @@
   let videoRef: HTMLVideoElement;
   $: if (videoRef && pc) {
     pc.ontrack = (track) => {
-      videoRef.srcObject = track.streams[0]
-      console.log("Got receiver", track)
-    }
+      videoRef.srcObject = track.streams[0];
+      console.log("Got receiver", track);
+    };
   }
 </script>
 
 <main>
-  <video  bind:this={videoRef} controls autoplay>
+  <video bind:this={videoRef} controls autoplay>
     <track kind="captions" />
   </video>
   <div>
