@@ -12,7 +12,6 @@ from session_description import (
 )
 from peer_connection_types import (
     ConnectionRole,
-    ICEGatherState,
     ICEParameters,
     RTPComponent,
 )
@@ -37,8 +36,7 @@ def flatten_media_section_transceivers(media_sections: list[MediaSection]):
 
 def add_candidate_to_media_descriptions(
     media: MediaDescription,
-    candidates: list[ice.CandidateProtocol],
-    gathering_state: ICEGatherState,
+    candidates: list[ice.CandidateProtocol] | None,
 ):
     def append_candidate_if_new(
         candidate: ice.CandidateProtocol, attributes: list[SessionDescriptionAttr]
@@ -54,6 +52,9 @@ def add_candidate_to_media_descriptions(
                 SessionDescriptionAttrKey.Candidate, candidate.to_ice_str()
             )
         )
+
+    if not candidates:
+        return
 
     for candidate in candidates:
         candidate.set_component(RTPComponent.RTP)
@@ -114,9 +115,8 @@ def add_transceiver_media_description(
     fingerprints: list[dtls.Fingerprint],
     mid: str,
     ice_params: ICEParameters,
-    candidates: list[ice.CandidateProtocol],
+    candidates: list[ice.CandidateProtocol] | None,
     role: ConnectionRole,
-    gathering_state: ICEGatherState,
     caps: MediaCaps,
 ) -> bool:
     transceivers = media_section.transceivers
@@ -201,8 +201,8 @@ def add_transceiver_media_description(
             )
         )
 
-    if should_add_candidates:
-        add_candidate_to_media_descriptions(media, candidates, gathering_state)
+    if should_add_candidates and candidates:
+        add_candidate_to_media_descriptions(media, candidates)
 
     desc.add_media_description(media)
 
@@ -223,10 +223,9 @@ def populate_session_descriptor(
     fingerprints: list[dtls.Fingerprint],
     is_extmap_allow_mixed: bool,
     role: ConnectionRole,
-    candidates: list[ice.CandidateProtocol],
+    candidates: list[ice.CandidateProtocol] | None,
     ice_params: ICEParameters,
     media_sections: list[MediaSection],
-    gathering_state: ICEGatherState,
     match_bundle_group: str | None,
     caps: MediaCaps,
 ):
@@ -257,7 +256,6 @@ def populate_session_descriptor(
             ice_params,
             candidates,
             role,
-            gathering_state,
             caps,
         )
 

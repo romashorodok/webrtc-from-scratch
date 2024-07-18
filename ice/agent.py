@@ -203,7 +203,7 @@ class BindingRequestCacheRegistry:
 
 
 class SelectorEvent(StrEnum):
-    NOMINATE = "Nominate candidate"
+    NOMINATE = "nominate"
 
 
 # CandidatePairState.SUCCEEDED must be seted by connectivity checks as fast as possible
@@ -518,22 +518,36 @@ class CandidatePairTransport:
         self._conn.sendto(data)
 
 
-class CandidatePairController:
+class CandidatePairControllerEvent(StrEnum):
+    NOMINATE_TRANSPORT = "nominate-transport"
+
+
+class CandidatePairController(AsyncEventEmitter):
     def __init__(
         self, pair: CandidatePair, selector: SelectorProtocol, tie_breaker: int
     ) -> None:
+        super().__init__()
+
         self._pair = pair
-        self._selector = selector
-        self._tie_breaker = tie_breaker
-        self._conn = self._pair.local_candidate.mux.intercept(
+
+        self.__selector = selector
+        self.__tie_breaker = tie_breaker
+        self.__conn = pair.local_candidate.mux.intercept(
             self._pair.remote_candidate.unwrap
         )
-        self._transport = CandidatePairTransport(self._conn)
+        self.__transport = CandidatePairTransport(self.__conn)
+
+    def __pair_nominate(self, _: CandidatePair):
+        self.emit(CandidatePairControllerEvent.NOMINATE_TRANSPORT, self.__transport)
 
     async def start(self):
+        self.__selector.start()
+        self.__selector.on(SelectorEvent.NOMINATE, self.__pair_nominate)
+        await self.ping_remote_candidate()
+
         print("Start candidate pair selector", self._pair)
         while True:
-            pkt = await self._conn.recvfrom()
+            pkt = await self.__conn.recvfrom()
 
             if stun.is_stun(pkt.data):
                 await self._on_inbound_stun(pkt)
@@ -542,16 +556,16 @@ class CandidatePairController:
 
     async def _on_inbound_pkt(self, pkt: Packet):
         # print("Recv rtp wait 10 sec.", pkt.data.tolist())
-        self._transport.pipe(pkt)
+        self.__transport.pipe(pkt)
 
     async def _on_stun_binding_request(self, pkt: Packet, msg: stun.Message):
         # print("On stun binding request", msg)
-        await self._selector.on_binding_success(self._pair, self._conn, msg)
+        await self.__selector.on_binding_success(self._pair, self.__conn, msg)
         # print("On stun binding request", self._pair.state)
 
     async def _on_stun_success_response(self, pkt: Packet, msg: stun.Message):
-        await self._selector.on_success_response(
-            self._pair, self._conn, msg, pkt.source
+        await self.__selector.on_success_response(
+            self._pair, self.__conn, msg, pkt.source
         )
         # print("On stun binding success response", self._pair.state)
 
@@ -589,10 +603,10 @@ class CandidatePairController:
         """
         # TODO: wait some time if candidate state will not changed retry ping
         # NOTE: How to make state observing/notifying
-        await self._selector.send_ping_stun_message(self._pair, self._conn)
+        await self.__selector.send_ping_stun_message(self._pair, self.__conn)
 
     def get_transport(self) -> CandidatePairTransport:
-        return self._transport
+        return self.__transport
 
 
 class CandidatePairControllerRegistry:
@@ -616,6 +630,10 @@ class AgentRole(Enum):
     Controlled = "controlled"
 
 
+class AgentEvent:
+    CANDIDATE_PAIR_CONTROLLER = "candidate-pair-controller"
+
+
 # Controlling agent must know remote user credentials
 class Agent(AsyncEventEmitter):
     def __init__(self, options: AgentOptions) -> None:
@@ -632,9 +650,6 @@ class Agent(AsyncEventEmitter):
         self._udp = options.udp
         self._loop = asyncio.get_event_loop()
         self._on_candidate: Callable[[CandidateBase], None] | None = None
-
-        self._candidate_lock = asyncio.Lock()
-        self._candidate_pair_lock = asyncio.Lock()
 
         self._local_candidates = dict[NetworkType, list[LocalCandidate]]()
         self._remote_candidates = dict[NetworkType, list[CandidateBase]]()
@@ -680,15 +695,21 @@ class Agent(AsyncEventEmitter):
         else:
             selector = ControlledSelector(self._pair_registry, self._tie_breaker)
 
-        selector.start()
-        selector.on(SelectorEvent.NOMINATE, self._on_nominate_pair)
+        # selector.start()
+        # selector.on(SelectorEvent.NOMINATE, self._on_nominate_pair)
 
-        pair_controller = CandidatePairController(pair, selector, self._tie_breaker)
-        self._controller_registry.append(pair_controller)
-        self._candidate_pair_transports.append(pair_controller.get_transport())
-        self._loop.create_task(pair_controller.start())
-        self._loop.create_task(pair_controller.ping_remote_candidate())
-        self._loop.create_task(ping_routine(selector, pair, pair_controller._conn))
+        # pair_controller =
+        print("Emit controller??")
+        self.emit(
+            AgentEvent.CANDIDATE_PAIR_CONTROLLER,
+            CandidatePairController(pair, selector, self._tie_breaker),
+        )
+
+        # self._controller_registry.append(pair_controller)
+        # self._candidate_pair_transports.append(pair_controller.get_transport())
+        # self._loop.create_task(pair_controller.start())
+        # self._loop.create_task(pair_controller.ping_remote_candidate())
+        # self._loop.create_task(ping_routine(selector, pair, pair_controller._conn))
 
     # Look at func (s *controllingSelector) ContactCandidates() to know more
     def connect(self, controlling: bool):
@@ -701,6 +722,8 @@ class Agent(AsyncEventEmitter):
             self._role = AgentRole.Controlling
         else:
             self._role = AgentRole.Controlled
+
+        print("pair list", self._pair_registry.get_pair_list().items())
 
         for id, pair in self._pair_registry.get_pair_list().items():
             controller = self._controller_registry.get(id)
@@ -723,82 +746,84 @@ class Agent(AsyncEventEmitter):
         self.connect(False)
 
     async def get_local_candidates(self):
-        async with self._candidate_lock:
-            buf = list[LocalCandidate]()
+        # async with self._candidate_lock:
+        buf = list[LocalCandidate]()
 
-            for _, candidates in self._local_candidates.items():
-                buf.extend(candidates)
+        for _, candidates in self._local_candidates.items():
+            buf.extend(candidates)
 
-            return buf
+        return buf
 
     async def _add_candidate_pair(self, local: LocalCandidate, remote: CandidateBase):
-        async with self._candidate_pair_lock:
-            remote_conn = local.mux.intercept(remote)
+        # async with self._candidate_pair_lock:
+        remote_conn = local.mux.intercept(remote)
 
-            if self._remote_ufrag is None or self._remote_pwd is None:
-                raise ValueError("Unable add canddiate ")
+        if self._remote_ufrag is None or self._remote_pwd is None:
+            raise ValueError("Unable add canddiate ")
 
-            # TODO: may be better provide some object ref that hold ufrag, pwd to make dynamic replacement of credentials
-            pair = CandidatePair(
-                self._local_ufrag,
-                self._local_pwd,
-                self._remote_ufrag,
-                self._remote_pwd,
-                local,
-                RemoteCandidate(remote, remote_conn),
-            )
+        # TODO: may be better provide some object ref that hold ufrag, pwd to make dynamic replacement of credentials
+        pair = CandidatePair(
+            self._local_ufrag,
+            self._local_pwd,
+            self._remote_ufrag,
+            self._remote_pwd,
+            local,
+            RemoteCandidate(remote, remote_conn),
+        )
 
-            print("Added candidate pair", pair.get_pair_id())
+        print("Added candidate pair", pair.get_pair_id())
 
-            self._pair_registry.append(pair)
+        self._pair_registry.append(pair)
 
     async def _add_local_candidate(self, local: LocalCandidate):
-        async with self._candidate_lock:
-            net_type = local.unwrap.get_network_type()
-            pool = self._local_candidates.get(net_type)
-            if pool is None:
-                pool = list[LocalCandidate]()
-                self._local_candidates[net_type] = pool
+        # async with self._candidate_lock:
+        net_type = local.unwrap.get_network_type()
+        pool = self._local_candidates.get(net_type)
+        if pool is None:
+            pool = list[LocalCandidate]()
+            self._local_candidates[net_type] = pool
 
-            found = False
-            for c in pool:
-                if c == local:
-                    found = True
-                    break
+        found = False
+        for c in pool:
+            if c == local:
+                found = True
+                break
 
-            if not found:
-                pool.append(local)
-            else:
-                return
+        if not found:
+            pool.append(local)
+        else:
+            return
 
-            remotes = self._remote_candidates.get(net_type)
-            if remotes:
-                for remote in remotes:
-                    self._loop.create_task(self._add_candidate_pair(local, remote))
+        remotes = self._remote_candidates.get(net_type)
+        if remotes:
+            for remote in remotes:
+                self._loop.create_task(self._add_candidate_pair(local, remote))
 
     async def _add_remote_candidate(self, remote: CandidateBase):
-        async with self._candidate_lock:
-            net_type = remote.get_network_type()
-            pool = self._remote_candidates.get(net_type)
-            if pool is None:
-                pool = list[CandidateBase]()
-                self._remote_candidates[net_type] = pool
+        # print("add remote candidate befre lock")
+        # async with self._candidate_lock:
+        print("add remote candidate after lock")
+        net_type = remote.get_network_type()
+        pool = self._remote_candidates.get(net_type)
+        if pool is None:
+            pool = list[CandidateBase]()
+            self._remote_candidates[net_type] = pool
 
-            found = False
-            for c in pool:
-                if c == remote:
-                    found = True
-                    break
+        found = False
+        for c in pool:
+            if c == remote:
+                found = True
+                break
 
-            if not found:
-                pool.append(remote)
-            else:
-                return
+        if not found:
+            pool.append(remote)
+        else:
+            return
 
-            locals = self._local_candidates.get(net_type)
-            if locals:
-                for local in locals:
-                    self._loop.create_task(self._add_candidate_pair(local, remote))
+        locals = self._local_candidates.get(net_type)
+        if locals:
+            for local in locals:
+                self._loop.create_task(self._add_candidate_pair(local, remote))
 
     def add_remote_candidate(self, candidate_raw: str):
         remote = parse_candidate_str(candidate_raw)

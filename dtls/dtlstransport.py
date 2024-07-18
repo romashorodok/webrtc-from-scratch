@@ -20,7 +20,10 @@ class DTLSRole(Enum):
 
 class ICETransportDTLS(Protocol):
     def get_ice_role(self) -> ice.AgentRole: ...
-    def get_ice_pair_transports(self) -> list[ice.CandidatePairTransport]: ...
+    async def get_ice_pair_transport(self) -> ice.CandidatePairTransport | None: ...
+    async def bind(self, transport: ice.CandidatePairTransport): ...
+
+    # def get_ice_pair_transports(self) -> list[ice.CandidatePairTransport]: ...
 
 
 class RTPWriterProtocol(Protocol):
@@ -35,32 +38,37 @@ class DTLSTransport:
     def __init__(
         self, transport: ICETransportDTLS, certificate: dtls.Certificate
     ) -> None:
-        self._transport = transport
-        self._dtls_role: DTLSRole = DTLSRole.Auto
-        self._certificate = certificate
-        self.encrypted: bool = False
+        self.__transport = transport
 
-        self._media_fingerprints = list[dtls.Fingerprint]()
+        self.__dtls_role: DTLSRole = DTLSRole.Auto
+        self.__certificate = certificate
+        # self.__media_fingerprints = list[dtls.Fingerprint]()
 
-        self._rx_srtp: Session | None = None
-        self._tx_srtp: Session | None = None
+        self.__rx_srtp: Session | None = None
+        self.__tx_srtp: Session | None = None
+
+    async def bind(self, transport: ice.CandidatePairTransport):
+        await self.__transport.bind(transport)
 
     def ice_transport(self) -> ICETransportDTLS:
-        return self._transport
+        return self.__transport
 
     async def do_handshake_for(
-        self, ssl: SSL.Connection, transport: ice.CandidatePairTransport
+        self,
+        ssl: SSL.Connection,
+        transport: ice.CandidatePairTransport,
+        media_fingerprints: list[dtls.Fingerprint],
     ):
         print("Start candidate handshake")
-        encrypted = False
-        while not encrypted:
+        __encrypted = False
+        while not __encrypted:
             try:
                 ssl.do_handshake()
             except SSL.WantReadError:
                 try:
+                    print("Wait for dtls??")
                     dtls_pkt = await transport.recv_dtls()
                     ssl.bio_write(dtls_pkt.data)
-
                     try:
                         data = ssl.recv(1500)
                         if data:
@@ -77,7 +85,7 @@ class DTLSTransport:
                 except SSL.WantReadError:
                     pass
             else:
-                encrypted = True
+                __encrypted = True
 
         x509 = ssl.get_peer_certificate()
         if x509 is None:
@@ -86,7 +94,7 @@ class DTLSTransport:
 
         remote_fingerprint = certificate_digest(x509)
         remote_fingerprint_valid = False
-        for f in self._media_fingerprints:
+        for f in media_fingerprints:
             print("media", f.value.lower(), "remote", remote_fingerprint.lower())
             if f.value.lower() == remote_fingerprint.lower():
                 remote_fingerprint_valid = True
@@ -116,7 +124,7 @@ class DTLSTransport:
             2 * (negotiated_profile.key_length + negotiated_profile.salt_length),
         )
 
-        if self._dtls_role == DTLSRole.Server:
+        if self.__dtls_role == DTLSRole.Server:
             srtp_tx_key = negotiated_profile.get_key_and_salt(view, 1)
             srtp_rx_key = negotiated_profile.get_key_and_salt(view, 0)
         else:
@@ -130,7 +138,7 @@ class DTLSTransport:
         )
         rx_policy.allow_repeat_tx = True
         rx_policy.window_size = 1024
-        self._rx_srtp = Session(rx_policy)
+        self.__rx_srtp = Session(rx_policy)
 
         tx_policy = Policy(
             key=srtp_tx_key,
@@ -139,10 +147,10 @@ class DTLSTransport:
         )
         tx_policy.allow_repeat_tx = True
         tx_policy.window_size = 1024
-        self._tx_srtp = Session(tx_policy)
+        self.__tx_srtp = Session(tx_policy)
         print("Handshake completed??")
 
-    async def start(self, remote_fingerprints: list[str] | None = None):
+    async def start(self, media_fingerprints: list[dtls.Fingerprint]):
         # assert len(remote_fingerprints)
         print("Handshake start")
 
@@ -150,23 +158,26 @@ class DTLSTransport:
 
         match transport.get_ice_role():
             case ice.AgentRole.Controlling:
-                self._dtls_role = DTLSRole.Server
+                self.__dtls_role = DTLSRole.Server
             case ice.AgentRole.Controlled:
-                self._dtls_role = DTLSRole.Client
+                self.__dtls_role = DTLSRole.Client
 
-        print("Start DTLS role", self._dtls_role)
+        print("Start DTLS role", self.__dtls_role)
 
-        for pair in transport.get_ice_pair_transports():
-            ctx = self._certificate.create_ssl_context(dtls.SRTP_PROFILES)
-            ssl = SSL.Connection(ctx)
+        pair = await self.__transport.get_ice_pair_transport()
+        if not pair:
+            raise ValueError("Not found ice pair transport for dtls")
 
-            match self._dtls_role:
-                case DTLSRole.Server:
-                    ssl.set_accept_state()
-                case DTLSRole.Client:
-                    ssl.set_connect_state()
+        ctx = self.__certificate.create_ssl_context(dtls.SRTP_PROFILES)
+        ssl = SSL.Connection(ctx)
 
-            asyncio.ensure_future(self.do_handshake_for(ssl, pair))
+        match self.__dtls_role:
+            case DTLSRole.Server:
+                ssl.set_accept_state()
+            case DTLSRole.Client:
+                ssl.set_connect_state()
+
+        asyncio.ensure_future(self.do_handshake_for(ssl, pair, media_fingerprints))
 
     def write_rtcp_bytes(self, data: bytes) -> int:
         # if not ice.net.is_rtcp(pkt.data):
@@ -179,24 +190,28 @@ class DTLSTransport:
         print("TODO: Handle rtcp")
         return 0
 
-    def write_rtp_bytes(self, data: bytes) -> int:
-        if not self._tx_srtp:
+    async def write_rtp_bytes(self, data: bytes) -> int:
+        if not self.__tx_srtp:
             return 0
-        data = self._tx_srtp.protect(data)
 
-        # TODO: Refactor to be as a signle transport
-        for pair in self.ice_transport().get_ice_pair_transports():
-            pair.sendto(data)
+        transport = await self.__transport.get_ice_pair_transport()
+        if not transport:
+            return 0
+
+        data = self.__tx_srtp.protect(data)
+        transport.sendto(data)
 
         return len(data)
 
-    async def read_rtp_bytes(self):
-        # TODO: Refactor one transport for one candidate
-        for t in self.ice_transport().get_ice_pair_transports():
-            if not self._tx_srtp:
-                print("Not found tx srtp")
-                continue
+    async def read_rtp_bytes(self) -> tuple[bytes, int]:
+        if not self.__rx_srtp:
+            return bytes(), 0
 
-            print("read rtp?? from srtp")
-            pkt = await t.recv_rtp()
-            yield self._tx_srtp.unprotect(pkt.data)
+        transport = await self.__transport.get_ice_pair_transport()
+        if not transport:
+            return bytes(), 0
+
+        pkt = transport.recv_rtp_sync()
+        data = self.__rx_srtp.unprotect(pkt.data)
+
+        return data, len(data)
