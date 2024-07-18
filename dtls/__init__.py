@@ -1,2 +1,2 @@
 from .certificate import Certificate, Fingerprint, SRTP_PROFILES
-from .dtlstransport import DTLSTransport, ICETransportDTLS, RTPWriterProtocol
+from .dtlstransport import DTLSTransport, ICETransportDTLS

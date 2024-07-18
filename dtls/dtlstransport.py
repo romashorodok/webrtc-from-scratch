@@ -26,10 +26,6 @@ class ICETransportDTLS(Protocol):
     # def get_ice_pair_transports(self) -> list[ice.CandidatePairTransport]: ...
 
 
-class RTPWriterProtocol(Protocol):
-    async def write_frame(self, frame: bytes) -> int: ...
-
-
 class RTPReaderProtocol(Protocol):
     async def recv_rtp_bytes(self) -> bytes: ...
 
