@@ -5,9 +5,8 @@ import queue
 import secrets
 from enum import Enum
 import threading
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable, Coroutine, Protocol
 
-from dtls.dtlstransport import DTLSTransport
 import media
 from utils import impl_protocol
 from media.packetizer import Packetizer, get_payloader_by_payload_type
@@ -59,6 +58,11 @@ class RTPCodecParameters:
         self.rtcp_feedbacks = list[RTCPFeedback]()
 
 
+class RTPWriterProtocol(Protocol):
+    async def write_frame(self, frame: bytes) -> int: ...
+    async def write_rtp_bytes(self, rtp_packet: media.RtpPacket) -> int: ...
+
+
 class TrackLocal:
     def __init__(
         self,
@@ -72,14 +76,19 @@ class TrackLocal:
         self._stream_id = stream_id
         self._rtp_codec_params = rtp_codec_params
         self._kind = kind
-        self._writer: dtls.RTPWriterProtocol | None = None
+        self._writer: RTPWriterProtocol | None = None
 
     async def write_frame(self, frame: bytes) -> int:
         if not self._writer:
             return 0
         return await self._writer.write_frame(frame)
 
-    def bind(self, writer: dtls.RTPWriterProtocol):
+    async def write_rtp_packet(self, pkt: media.RtpPacket) -> int:
+        if not self._writer:
+            return 0
+        return await self._writer.write_rtp_bytes(pkt)
+
+    def bind(self, writer: RTPWriterProtocol):
         self._writer = writer
 
     @property
@@ -99,7 +108,7 @@ class TrackLocal:
         return self._stream_id
 
 
-@impl_protocol(dtls.RTPWriterProtocol)
+@impl_protocol(RTPWriterProtocol)
 class TrackEncoding:
     def __init__(self, ssrc: int, track: TrackLocal) -> None:
         # TODO: remove track from this place
@@ -131,9 +140,18 @@ class TrackEncoding:
             pts = int(pts * from_base / to_base)
         return pts
 
+    async def write_rtp_bytes(self, rtp_packet: media.RtpPacket) -> int:
+        if not self._dtls:
+            print("write_rtp | Not found transport")
+            return 0
+
+        rtp_packet.ssrc = self.ssrc
+
+        return await self._dtls.write_rtp_bytes(rtp_packet.serialize())
+
     async def write_frame(self, frame: bytes) -> int:
         if not self._dtls:
-            print("TrackEncoding | Not found transport")
+            print("write_frame | Not found transport")
             return 0
 
         pts, time_base = await self._packetizer.next_timestamp()
@@ -495,6 +513,10 @@ class RTPReceiver:
         if self._receive_thread:
             self._receive_thread.join()
             self._done_signal.set()
+
+    @property
+    def track(self) -> TrackRemote | None:
+        return self._track
 
 
 class MID:

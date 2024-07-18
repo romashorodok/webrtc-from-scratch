@@ -106,6 +106,26 @@ def start_reader_loop(pc: PeerConnection):
         print("Recv pkt from reader loop", pkt)
 
 
+def start_read_write_loop(pc: PeerConnection):
+    rw_loop = asyncio.new_event_loop()
+
+    sender = pc._transceivers[0].sender
+    receiver = pc._transceivers[0].receiver
+    if not sender or not receiver:
+        raise ValueError("Not found sender/receiver")
+
+    remote_track = receiver.track
+    local_track = sender.track
+
+    if not remote_track or not local_track:
+        return
+
+    while True:
+        pkt = remote_track.recv_rtp_pkt_sync()
+        result = rw_loop.run_until_complete(local_track.write_rtp_packet(pkt))
+        print("Write result", result)
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
@@ -128,12 +148,12 @@ async def ws_endpoint(ws: WebSocket):
     # await pc.__gatherer.gather()
     # pc.__gatherer.agent.dial()
 
-    done = threading.Event()
-    writer_thread = threading.Thread(
-        target=start_writer_loop, daemon=False, args=(pc, done)
-    )
-
-    reader_thread = threading.Thread(target=start_reader_loop, daemon=False, args=(pc,))
+    # done = threading.Event()
+    # writer_thread = threading.Thread(
+    #     target=start_writer_loop, daemon=False, args=(pc, done)
+    # )
+    # reader_thread = threading.Thread(target=start_reader_loop, daemon=False, args=(pc,))
+    rw_thread = threading.Thread(target=start_read_write_loop, args=(pc,))
 
     def on_close():
         # done.set()
@@ -145,14 +165,12 @@ async def ws_endpoint(ws: WebSocket):
         match msg.get("event"):
             case "negotiate":
                 print("Start all webrtc")
-                # await pc.gatherer.gather()
                 await pc.gatherer.dial()
 
-                # await pc.__gatherer.gather()
-                # pc.__gatherer.agent.dial()
                 try:
-                    writer_thread.start()
-                    reader_thread.start()
+                    # writer_thread.start()
+                    # reader_thread.start()
+                    rw_thread.start()
                 except RuntimeError:
                     pass
 
