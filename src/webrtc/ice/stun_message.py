@@ -1,5 +1,5 @@
-from ice import stun
-from ice import net
+from . import stun
+from . import net
 
 
 def stun_message_parse_header(pkt: net.types.Packet) -> stun.Message:

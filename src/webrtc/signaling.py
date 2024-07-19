@@ -1,6 +1,6 @@
 from enum import Enum
 
-from session_description import SessionDescriptionType
+from .session_description import SessionDescriptionType
 
 
 class SignalingState(Enum):

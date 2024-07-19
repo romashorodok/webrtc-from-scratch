@@ -1,12 +1,12 @@
 import binascii
 
-from ice.net.types import (
+from .net.types import (
     CandidateProtocol,
     NetworkType,
     get_network_type_from_str,
     CandidateType,
 )
-from utils.types import impl_protocol
+from webrtc.utils.types import impl_protocol
 from . import stun as stun
 
 

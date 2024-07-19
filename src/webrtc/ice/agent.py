@@ -6,19 +6,21 @@ from dataclasses import dataclass
 from enum import Enum, StrEnum
 from typing import Callable, Protocol
 
-from ice import stun
-import ice.net
-from ice.net.types import (
+from . import stun
+from . import net
+
+from .net.types import (
     Address,
     MuxConnProtocol,
+    MuxProtocol,
     NetworkType,
     LocalCandidate,
     Packet,
     RemoteCandidate,
 )
-from ice.net.udp_mux import MultiUDPMux
-from ice.stun_message import stun_message_parse_attrs, stun_message_parse_header
-from utils import impl_protocol, AsyncEventEmitter, Handler_T
+from .net.udp_mux import Interceptor, MultiUDPMux
+from .stun_message import stun_message_parse_attrs, stun_message_parse_header
+from webrtc.utils import impl_protocol, AsyncEventEmitter, Handler_T
 
 from .candidate_base import (
     CandidateBase,
@@ -32,7 +34,7 @@ from .utils import generate_pwd, generate_tie_breaker, generate_ufrag, cmp
 class AgentOptions:
     candidate_types: list[CandidateType]
     udp: MultiUDPMux
-    interfaces: list[ice.net.Interface]
+    interfaces: list[net.Interface]
 
 
 class CandidatePairState(Enum):
@@ -490,17 +492,17 @@ async def ping_routine(
 
 class CandidatePairTransport:
     def __init__(self, conn: MuxConnProtocol) -> None:
-        self._conn: ice.MuxConnProtocol = conn
+        self._conn: MuxConnProtocol = conn
 
         self._rtp = queue.Queue[Packet]()
         self._rtcp = queue.Queue[Packet]()
-        self._dtls = ice.Interceptor()
+        self._dtls = Interceptor()
 
     def pipe(self, pkt: Packet):
         first_byte = pkt.data[0]
         if first_byte > 19 and first_byte < 64:
             self._dtls.put_nowait(pkt)
-        elif ice.net.is_rtcp(pkt.data):
+        elif net.is_rtcp(pkt.data):
             self._rtcp.put_nowait(pkt)
         else:
             self._rtp.put_nowait(pkt)

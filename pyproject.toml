@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "webrtc"
+version = "0.1.0"
+description = ""
+authors = ["romashorodok <108732029+romashorodok@users.noreply.github.com>"]
+readme = "README.md"
+packages = [{include = "webrtc", from = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+psutil = "^6.0.0"
+cryptography = "^42.0.8"
+pyopenssl = "^24.1.0"
+pylibsrtp = "^0.10.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

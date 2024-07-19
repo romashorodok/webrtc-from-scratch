@@ -1,7 +1,7 @@
 import asyncio
 from typing import override, Any
 
-from utils.types import impl_protocol
+from webrtc.utils.types import impl_protocol
 
 from .interface import Interface
 from .types import (

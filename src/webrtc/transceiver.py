@@ -7,11 +7,10 @@ from enum import Enum
 import threading
 from typing import Any, Callable, Coroutine, Protocol
 
-import media
-from utils import impl_protocol
-from media.packetizer import Packetizer, get_payloader_by_payload_type
-
-import dtls
+from . import media
+from .utils import impl_protocol
+from .media.packetizer import Packetizer, get_payloader_by_payload_type
+from . import dtls
 
 
 class RTPCodecKind(Enum):

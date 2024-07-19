@@ -1,27 +1,29 @@
 import asyncio
 from dataclasses import dataclass
-from enum import Enum, StrEnum
+from enum import StrEnum
 import secrets
 import string
-import ice
-import ice.net
-import dtls
-import socket
-from utils import AsyncEventEmitter, impl_protocol, current_ntp_time
 
-from session_description import (
+from . import ice
+from .ice import net
+from . import dtls
+
+import socket
+from .utils import AsyncEventEmitter, impl_protocol, current_ntp_time
+
+from .session_description import (
     Origin,
     SessionDescription,
     SessionDescriptionType,
     SessionDescriptionAttr,
     SessionDescriptionAttrKey,
 )
-from session_description_populate import (
+from .session_description_populate import (
     flatten_media_section_transceivers,
     populate_session_descriptor,
     MediaSection,
 )
-from transceiver import (
+from .transceiver import (
     MediaCaps,
     RTPCodecParameters,
     RTPCodecKind,
@@ -34,28 +36,24 @@ from transceiver import (
     RTPSender,
     TrackLocal,
     find_transceiver_by_mid,
-    RTPEncodingParameters,
 )
-from signaling import (
+from .signaling import (
     SignalingChangeOperation,
     SignalingState,
     ensure_next_signaling_state,
     SignalingStateTransitionError,
 )
-from peer_connection_types import (
-    ICEGatherState,
-    ICEGatherPolicy,
+from .peer_connection_types import (
     ICEParameters,
-    ICETransportState,
     ConnectionRole,
 )
 
-nic_interfaces = ice.net.interface_factory(
-    ice.net.InterfaceProvider.PSUTIL, [socket.AF_INET], False
+nic_interfaces = net.interface_factory(
+    net.InterfaceProvider.PSUTIL, [socket.AF_INET], False
 )
 if len(nic_interfaces) <= 0:
-    nic_interfaces = ice.net.interface_factory(
-        ice.net.InterfaceProvider.PSUTIL, [socket.AF_INET], True
+    nic_interfaces = net.interface_factory(
+        net.InterfaceProvider.PSUTIL, [socket.AF_INET], True
     )
 
 
@@ -141,9 +139,9 @@ class ICEGatherer(AsyncEventEmitter):
         self.__agent.add_remote_candidate(candidate_str)
 
     async def __create_agent(
-        self, port: int = 0, interfaces: list[ice.net.Interface] = nic_interfaces
+        self, port: int = 0, interfaces: list[net.Interface] = nic_interfaces
     ) -> ice.Agent:
-        udp_mux = ice.net.MultiUDPMux(interfaces, self._loop)
+        udp_mux = net.MultiUDPMux(interfaces, self._loop)
         await udp_mux.accept(port)
 
         options = ice.AgentOptions([ice.CandidateType.Host], udp_mux, interfaces)

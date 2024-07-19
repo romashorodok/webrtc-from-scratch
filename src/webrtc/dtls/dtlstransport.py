@@ -5,11 +5,10 @@ from typing import Protocol
 from OpenSSL import SSL
 from pylibsrtp import Policy, Session
 
-import ice
-import ice.net
-import dtls
+from webrtc import ice
+from webrtc.ice import net
 
-from .certificate import SRTPProtectionProfile, certificate_digest
+from .certificate import SRTPProtectionProfile, certificate_digest, Certificate, Fingerprint, SRTP_PROFILES
 
 
 class DTLSRole(Enum):
@@ -32,7 +31,7 @@ class RTPReaderProtocol(Protocol):
 
 class DTLSTransport:
     def __init__(
-        self, transport: ICETransportDTLS, certificate: dtls.Certificate
+        self, transport: ICETransportDTLS, certificate: Certificate
     ) -> None:
         self.__transport = transport
 
@@ -53,7 +52,7 @@ class DTLSTransport:
         self,
         ssl: SSL.Connection,
         transport: ice.CandidatePairTransport,
-        media_fingerprints: list[dtls.Fingerprint],
+        media_fingerprints: list[Fingerprint],
     ):
         print("Start candidate handshake")
         __encrypted = False
@@ -103,7 +102,7 @@ class DTLSTransport:
         openssl_profile = ssl.get_selected_srtp_profile()
         negotiated_profile: SRTPProtectionProfile
 
-        for srtp_profile in dtls.SRTP_PROFILES:
+        for srtp_profile in SRTP_PROFILES:
             if srtp_profile.openssl_profile == openssl_profile:
                 print(
                     "DTLS handshake negotiated with",
@@ -146,7 +145,7 @@ class DTLSTransport:
         self.__tx_srtp = Session(tx_policy)
         print("Handshake completed??")
 
-    async def start(self, media_fingerprints: list[dtls.Fingerprint]):
+    async def start(self, media_fingerprints: list[Fingerprint]):
         # assert len(remote_fingerprints)
         print("Handshake start")
 
@@ -164,7 +163,7 @@ class DTLSTransport:
         if not pair:
             raise ValueError("Not found ice pair transport for dtls")
 
-        ctx = self.__certificate.create_ssl_context(dtls.SRTP_PROFILES)
+        ctx = self.__certificate.create_ssl_context(SRTP_PROFILES)
         ssl = SSL.Connection(ctx)
 
         match self.__dtls_role:

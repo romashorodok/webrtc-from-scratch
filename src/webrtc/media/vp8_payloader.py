@@ -1,7 +1,7 @@
 from struct import pack
 
-from media.types import PayloaderProtocol
-from utils.types import impl_protocol
+from .types import PayloaderProtocol
+from webrtc.utils.types import impl_protocol
 
 
 class VpxPayloadDescriptor:

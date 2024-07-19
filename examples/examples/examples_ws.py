@@ -2,18 +2,16 @@ import asyncio
 import json
 from typing import Any, Callable
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from peer_connection import (
+
+from webrtc.peer_connection import (
     PeerConnection,
-    RTPCodecKind,
-    RTPTransceiverDirection,
-    SessionDescription,
-    SessionDescriptionType,
 )
-import media
+from webrtc import media
+from webrtc.session_description import SessionDescription, SessionDescriptionType
+from webrtc.transceiver import RTPCodecKind, RTPTransceiverDirection
+
 import fractions
 import threading
-
-from transceiver import TrackRemote
 
 app = FastAPI()
 
