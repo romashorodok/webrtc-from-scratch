@@ -1,8 +1,8 @@
 
 services:
-  examples-ws:
+  examples-runtime:
     build:
-      target: examples-ws
-    command: ["sh", "-c", "uvicorn examples_ws:app --host 0.0.0.0 --port 9000"]
+      target: examples-runtime
+    command: [ "sh", "-c", "source .venv/bin/activate && uvicorn examples.examples_ws:app --host 0.0.0.0 --port 9000" ]
     ports:
       - 9000:9000
