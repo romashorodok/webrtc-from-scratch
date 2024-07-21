@@ -6,6 +6,14 @@ Proof of concept that a WebRTC backend can be implemented without too much code,
 - Sending/Receiving media in the Chrome browser
 - Reading IVF container format with VP8 codec
 
+### Install
+```bash
+docker compose up
+```
+```bash
+cd web && npm install && npm run dev
+```
+
 ## Architecture
 ![](./docs/architecture_sendrecv.png)
 
