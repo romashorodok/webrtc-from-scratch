@@ -33,3 +33,6 @@ The problem with WebRTC is that you can't control the browser client side. I com
 With this in mind, I tried to compile Python with Cython and then compile it to WASM with [Emscripten](https://github.com/emscripten-core/emscripten) and link the Python interpreter. However, these attempts were unsuccessful due to incorrect platform configuration for compiling Python.
 
 Also browsers has WebCodecs which may helps with decoding/encoding media. But with WASM may be used native codecs implementations or even custom codecs based on ML
+
+## License
+MIT License - see [LICENSE](LICENSE) for full text
