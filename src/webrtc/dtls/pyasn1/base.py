@@ -2,6 +2,7 @@
 # This file is part of pyasn1 software.
 #
 
+from typing import Any, Sized, TypeAlias, TypeVar
 from . import error
 from . import constraint
 
@@ -270,7 +271,7 @@ class SimpleAsn1Type(Asn1Type):
     #: Default payload value
     defaultValue = noValue
 
-    def __init__(self, value=noValue, **kwargs):
+    def __init__(self, value: Asn1Type | NoValue | Any = noValue, **kwargs):
         Asn1Type.__init__(self, **kwargs)
         if value is noValue:
             value = self.defaultValue

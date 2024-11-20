@@ -15,6 +15,7 @@ from . import namedtype
 from . import namedval
 from . import tag
 from . import tagmap
+from typing import Any
 
 NoValue = base.NoValue
 noValue = NoValue()
@@ -2456,7 +2457,7 @@ class SequenceAndSetBase(base.ConstructedAsn1Type):
     def setComponentByName(
         self,
         name,
-        value=noValue,
+        value: NoValue | Any | str = noValue,
         verifyConstraints=True,
         matchTags=True,
         matchConstraints=True,
