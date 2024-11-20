@@ -7,11 +7,11 @@ readme = "README.md"
 packages = [{include = "webrtc", from = "src"}]
 
 [tool.poetry.dependencies]
-python = "^3.12"
+python = "^3.13"
 psutil = "^6.0.0"
-cryptography = "^42.0.8"
-pyopenssl = "^24.1.0"
-pylibsrtp = "^0.10.0"
+# cryptography = "^42.0.8"
+# pyopenssl = "^24.1.0"
+# pylibsrtp = "^0.10.0"
 
 
 [tool.poetry.group.dev.dependencies]
