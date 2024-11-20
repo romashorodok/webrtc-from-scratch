@@ -1,66 +1,65 @@
 from asn1crypto import pem, x509, keys, algos
-from ellipticcurve.privateKey import PrivateKey
-from ellipticcurve.ecdsa import Ecdsa
+from ecdsa import SigningKey, SECP256k1
 import datetime
 import os
 
 
-def generate_starkbank_keys():
-    # Generate ECDSA keys using starkbank-ecdsa
-    private_key = PrivateKey()
-    public_key = private_key.publicKey()
+def generate_ecdsa_keys():
+    # Generate ECDSA keys using ecdsa library (secp256k1)
+    sk = SigningKey.generate(curve=SECP256k1)
+    pk = sk.get_verifying_key()
 
-    # Export keys in DER format
-    public_key_der = public_key.toDer()
+    # Get public key in compressed format
+    public_key_compressed = pk.to_string()
 
-    return private_key, public_key_der
+    # Convert compressed to uncompressed format (0x04 prefix + X and Y coordinates)
+    public_key_uncompressed = b"\x04" + public_key_compressed
+
+    return (
+        sk,
+        public_key_uncompressed,
+    )
 
 
-def create_self_signed_cert_with_starkbank():
-    # Generate ECDSA keys
-    private_key, public_key_der = generate_starkbank_keys()
+def create_self_signed_cert_with_ecdsa():
+    sk, public_key_der = generate_ecdsa_keys()
 
-    # Define the curve OID for P-256 (NIST curve)
+    ecdomain_params = keys.ECDomainParameters(("named", "secp256k1"))
 
-    # Correctly create the ECDomainParameters using the curve OID
+    ec_point_bit_string = keys.ECPointBitString(public_key_der)
 
-    ecdomain_params = keys.ECDomainParameters(("named", "secp256r1"))
+    if public_key_der[0] != 0x04:
+        raise ValueError("Public key is not in uncompressed format")
 
-    # Create ASN.1 PublicKeyInfo
     public_key_info = keys.PublicKeyInfo(
         {
             "algorithm": {
-                "algorithm": "1.2.840.10045.2.1",  # OID for id-ecPublicKey
+                "algorithm": "1.2.840.10045.2.1",
                 "parameters": ecdomain_params,
             },
-            "public_key": keys.ECPointBitString(public_key_der),
+            "public_key": ec_point_bit_string,
         }
     )
 
-    # Define certificate fields
     subject = x509.Name.build(
         {
-            "common_name": "My Self-Signed Starkbank Cert",
+            "common_name": "My Self-Signed ECDSA Cert",
             "country_name": "US",
             "organization_name": "Example Org",
         }
     )
 
-    issuer = subject  # Self-signed certificate
+    issuer = subject
 
-    # Validity period
     not_before = x509.Time({"utc_time": datetime.datetime.now(datetime.UTC)})
     not_after = x509.Time(
         {"utc_time": datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=365)}
     )
 
-    # Construct the TBS (to-be-signed) certificate
     tbs_certificate = x509.TbsCertificate(
         {
             "version": "v3",
-            "serial_number": int.from_bytes(
-                os.urandom(16), "big"
-            ),  # Random serial number
+            "serial_number": int.from_bytes(os.urandom(16), "big"),
             "signature": algos.SignedDigestAlgorithm({"algorithm": "sha256_ecdsa"}),
             "issuer": issuer,
             "validity": x509.Validity(
@@ -71,34 +70,43 @@ def create_self_signed_cert_with_starkbank():
         }
     )
 
-    # Sign the TBS certificate using the private key
-    tbs_certificate_bytes = str(tbs_certificate.dump())
+    signature = sk.sign(tbs_certificate.dump())
 
-    signature = Ecdsa.sign(tbs_certificate_bytes, private_key)
-    signature._toString()
-    # print(signature._toString())
-
-    # Construct the final X.509 certificate
     certificate = x509.Certificate(
         {
             "tbs_certificate": tbs_certificate,
             "signature_algorithm": algos.SignedDigestAlgorithm(
                 {"algorithm": "sha256_ecdsa"}
             ),
-            # "signature_value": x509.BitString(signature.toDer()),
-            "signature_value": signature.toDer(),
+            "signature_value": signature,
         }
     )
 
-    # Export the certificate to PEM format
     cert_pem = pem.armor("CERTIFICATE", certificate.dump())
 
     return cert_pem
 
 
-# Example usage
-cert_pem = create_self_signed_cert_with_starkbank()
+cert_pem = create_self_signed_cert_with_ecdsa()
 print("Certificate:\n", cert_pem)
 
 with open("test.pem", "wb") as f:
     f.write(cert_pem)
+
+with open("test.pem", "rb") as cert_file:
+    cert_data = cert_file.read()
+
+_, _, pem_body = pem.unarmor(cert_data)
+print(pem_body)
+certificate = x509.Certificate.load(pem_body)
+
+print("Issuer:", certificate["tbs_certificate"]["issuer"])
+print("Subject:", certificate["tbs_certificate"]["subject"])
+print("Serial Number:", certificate["tbs_certificate"]["serial_number"])
+print("Not Before:", certificate["tbs_certificate"]["validity"]["not_before"])
+print("Not After:", certificate["tbs_certificate"]["validity"]["not_after"])
+
+public_key = certificate["tbs_certificate"]["subject_public_key_info"][
+    "public_key"
+].native
+print("Public Key (Raw Bytes):", public_key)
