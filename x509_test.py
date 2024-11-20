@@ -1,207 +1,104 @@
-import sys
+from asn1crypto import pem, x509, keys, algos
+from ellipticcurve.privateKey import PrivateKey
+from ellipticcurve.ecdsa import Ecdsa
+import datetime
 import os
-import unittest
-import abc
-
-from webrtc.dtls.pyasn1 import der_encoder, useful
-from webrtc.dtls.pyasn1 import der_decoder
-
-from webrtc.dtls.pyasn1.base_test_case import BaseTestCase
-from webrtc.dtls.x509 import (
-    AlgorithmIdentifier,
-    AttributeType,
-    AttributeTypeAndValue,
-    AttributeValue,
-    Certificate,
-    RDNSequence,
-    RelativeDistinguishedName,
-    TBSCertificate,
-    armor,
-)
 
 
-def random_serial_number() -> int:
-    return int.from_bytes(os.urandom(20), "big") >> 1
+def generate_starkbank_keys():
+    # Generate ECDSA keys using starkbank-ecdsa
+    private_key = PrivateKey()
+    public_key = private_key.publicKey()
+
+    # Export keys in DER format
+    public_key_der = public_key.toDer()
+
+    return private_key, public_key_der
 
 
-VERSION = 0
-SERIAL_NUMBER = 1
-SERIAL_NUMBER_STATIC = 447692783348576470343654504716430034303219343191
-SIGNATURE = 2
-SIGNATURE_ALGORITHM = 0
-ISSUER = 3
-VALIDITY = 4
-SUBJECT = 5
-SUBJECT_PUBLIC_KEY_INFO = 6
+def create_self_signed_cert_with_starkbank():
+    # Generate ECDSA keys
+    private_key, public_key_der = generate_starkbank_keys()
 
-CERTIFICATE_SIGNATURE_ALGORITHM = 1
+    # Define the curve OID for P-256 (NIST curve)
 
+    # Correctly create the ECDomainParameters using the curve OID
 
-class EllipticCurve(metaclass=abc.ABCMeta):
-    _name: str
-    _key_size: int
-    _oid: str
+    ecdomain_params = keys.ECDomainParameters(("named", "secp256r1"))
 
-    @property
-    def name(self) -> str:
-        """
-        The name of the curve. e.g. secp256r1.
-        """
-        return self._name
+    # Create ASN.1 PublicKeyInfo
+    public_key_info = keys.PublicKeyInfo(
+        {
+            "algorithm": {
+                "algorithm": "1.2.840.10045.2.1",  # OID for id-ecPublicKey
+                "parameters": ecdomain_params,
+            },
+            "public_key": keys.ECPointBitString(public_key_der),
+        }
+    )
 
-    @property
-    def key_size(self) -> int:
-        """
-        Bit size of a secret scalar for the curve.
-        """
-        return self._key_size
+    # Define certificate fields
+    subject = x509.Name.build(
+        {
+            "common_name": "My Self-Signed Starkbank Cert",
+            "country_name": "US",
+            "organization_name": "Example Org",
+        }
+    )
 
-    @property
-    def oid(self) -> str:
-        return self._oid
+    issuer = subject  # Self-signed certificate
 
+    # Validity period
+    not_before = x509.Time({"utc_time": datetime.datetime.now(datetime.UTC)})
+    not_after = x509.Time(
+        {"utc_time": datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=365)}
+    )
 
-class EllipticCurveOID:
-    SECP256R1 = "1.2.840.10045.3.1.7"
+    # Construct the TBS (to-be-signed) certificate
+    tbs_certificate = x509.TbsCertificate(
+        {
+            "version": "v3",
+            "serial_number": int.from_bytes(
+                os.urandom(16), "big"
+            ),  # Random serial number
+            "signature": algos.SignedDigestAlgorithm({"algorithm": "sha256_ecdsa"}),
+            "issuer": issuer,
+            "validity": x509.Validity(
+                {"not_before": not_before, "not_after": not_after}
+            ),
+            "subject": subject,
+            "subject_public_key_info": public_key_info,
+        }
+    )
 
+    # Sign the TBS certificate using the private key
+    tbs_certificate_bytes = str(tbs_certificate.dump())
 
-class SECP256R1(EllipticCurve):
-    _name = "secp256r1"
-    _key_size = 256
-    _oid = EllipticCurveOID.SECP256R1
+    signature = Ecdsa.sign(tbs_certificate_bytes, private_key)
+    signature._toString()
+    # print(signature._toString())
 
+    # Construct the final X.509 certificate
+    certificate = x509.Certificate(
+        {
+            "tbs_certificate": tbs_certificate,
+            "signature_algorithm": algos.SignedDigestAlgorithm(
+                {"algorithm": "sha256_ecdsa"}
+            ),
+            # "signature_value": x509.BitString(signature.toDer()),
+            "signature_value": signature.toDer(),
+        }
+    )
 
-OID_TO_CURVE = {
-    EllipticCurveOID.SECP256R1: SECP256R1().name,
-}
+    # Export the certificate to PEM format
+    cert_pem = pem.armor("CERTIFICATE", certificate.dump())
 
-OID_CN_NAME = "2.5.4.3"
-
-PUBLIC_KEY_VALUE = "04:ed:58:c9:c1:96:f1:49:6f:1a:4a:3c:19:15:c6:4a:45:3a:3c:23:fe:ec:1a:aa:af:04:5f:7b:d3:7f:1f:8b:44:fe:d4:75:1a:b9:46:fb:9d:93:cf:98:bd:00:b7:00:2d:df:e4:8b:ae:5d:e0:59:88:3a:c1:02:f6:e5:f9:51:78"
-
-SIGNATURE_VALUE = "30:44:02:20:26:4c:f0:cc:69:d1:36:ad:42:01:71:6a:44:bc:7d:5f:af:6b:74:df:0e:b1:2d:40:bf:06:f8:a0:ee:65:38:5b:02:20:6c:6c:9e:7c:a8:c2:f0:cd:5b:37:12:19:f0:03:38:05:46:96:05:9c:f6:65:5e:e1:bb:df:10:1f:b4:8e:fc:f4"
-
-
-class CertificateTestCase(BaseTestCase):
-    def setUp(self):
-        BaseTestCase.setUp(self)
-
-        self.cert = TBSCertificate()
-
-    # def test_encode_certificate(self):
-    #     self.cert[VERSION] = 2  # "v2 == 1 or v3 == 2"
-    #     self.cert[SERIAL_NUMBER] = random_serial_number()
-    #     self.cert[SERIAL_NUMBER] = SERIAL_NUMBER_STATIC
-    #
-    #     alg = SECP256R1()
-    #
-    #     self.cert[SIGNATURE][SIGNATURE_ALGORITHM] = alg.oid
-    #
-    #     issuer_cn_name_attr = AttributeTypeAndValue()
-    #     issuer_cn_name_attr.setComponentByName("type", OID_CN_NAME)
-    #     issuer_cn_name_attr.setComponentByName("value", "Test Certificate")
-    #
-    #     issuer_rdn = RelativeDistinguishedName()
-    #     issuer_rdn.append(issuer_cn_name_attr)
-    #
-    #     # issuer_rdn_seq = RDNSequence()
-    #     # issuer_rdn_seq.append(issuer_rdn)
-    #
-    #     # result = der_encoder.encode(issuer_rdn_seq)
-    #     # print(result)
-    #     # print(der_decoder.decode(result, asn1Spec=RDNSequence()))
-    #
-    #     self.cert[ISSUER][0].append(issuer_rdn)
-    #
-    #     self.cert[VALIDITY].getComponentByName("notBefore").setComponentByName(
-    #         "utcTime", useful.UTCTime("990801120112Z")
-    #     )
-    #     self.cert[VALIDITY].getComponentByName("notBefore").setComponentByName(
-    #         "generalTime", useful.GeneralizedTime("20170801120112.000Z")
-    #     )
-    #
-    #     self.cert[VALIDITY].getComponentByName("notAfter").setComponentByName(
-    #         "utcTime", useful.UTCTime("999801120112Z")
-    #     )
-    #     self.cert[VALIDITY].getComponentByName("notAfter").setComponentByName(
-    #         "generalTime", useful.GeneralizedTime("20190801120112.000Z")
-    #     )
-    #
-    #     self.cert[SUBJECT][0].append(issuer_rdn)
-    #
-    #     self.cert[SUBJECT_PUBLIC_KEY_INFO].setComponentByName(
-    #         "subjectPublicKey",
-    #         PUBLIC_KEY_VALUE,
-    #     )
-    #
-    #     result: bytes = bytes(der_encoder.encode(self.cert))
-    #
-    #     print(result)
-    #
-    #     self.cert.clear()
-    #     spec, ok = der_decoder.decode(result, asn1Spec=self.cert)
-    #     print(spec, ok)
-
-    # with open("certificate.der", "wb") as f:
-    #     f.write(result)
-
-    def test_certificate(self):
-        certificate = Certificate()
-        cert = certificate[0]
-
-        cert[VERSION] = 2  # "v2 == 1 or v3 == 2"
-        cert[SERIAL_NUMBER] = random_serial_number()
-        cert[SERIAL_NUMBER] = SERIAL_NUMBER_STATIC
-
-        alg = SECP256R1()
-
-        cert[SIGNATURE][SIGNATURE_ALGORITHM] = alg.oid
-
-        issuer_cn_name_attr = AttributeTypeAndValue()
-        issuer_cn_name_attr.setComponentByName("type", OID_CN_NAME)
-        issuer_cn_name_attr.setComponentByName("value", "Test Certificate")
-
-        issuer_rdn = RelativeDistinguishedName()
-        issuer_rdn.append(issuer_cn_name_attr)
-
-        cert[ISSUER][0].append(issuer_rdn)
-
-        cert[VALIDITY].getComponentByName("notBefore").setComponentByName(
-            "utcTime", useful.UTCTime("990801120112Z")
-        )
-        cert[VALIDITY].getComponentByName("notBefore").setComponentByName(
-            "generalTime", useful.GeneralizedTime("20170801120112.000Z")
-        )
-
-        cert[VALIDITY].getComponentByName("notAfter").setComponentByName(
-            "utcTime", useful.UTCTime("999801120112Z")
-        )
-        cert[VALIDITY].getComponentByName("notAfter").setComponentByName(
-            "generalTime", useful.GeneralizedTime("20190801120112.000Z")
-        )
-
-        cert[SUBJECT][0].append(issuer_rdn)
-
-        cert[SUBJECT_PUBLIC_KEY_INFO].setComponentByName(
-            "subjectPublicKey",
-            PUBLIC_KEY_VALUE,
-        )
-
-        certificate.getComponentByName("signatureAlgorithm").setComponentByName(
-            "algorithm", "ecdsa-with-SHA256"
-        )
-        certificate.setComponentByName("signatureValue", SIGNATURE_VALUE)
-
-        result: bytes = bytes(der_encoder.encode(certificate))
-
-        with open("test.pem", "wb") as f:
-            result = armor("CERTIFICATE", result)
-            f.write(result)
-
-        print("x509 cert:", result)
+    return cert_pem
 
 
-suite = unittest.TestLoader().loadTestsFromModule(sys.modules[__name__])
+# Example usage
+cert_pem = create_self_signed_cert_with_starkbank()
+print("Certificate:\n", cert_pem)
 
-if __name__ == "__main__":
-    unittest.TextTestRunner(verbosity=2).run(suite)
+with open("test.pem", "wb") as f:
+    f.write(cert_pem)

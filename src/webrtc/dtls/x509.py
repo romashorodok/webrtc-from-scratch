@@ -6,6 +6,9 @@ from .pyasn1 import useful
 from .pyasn1 import tag
 from .pyasn1 import char
 
+import datetime
+from .pyasn1 import der_encoder
+
 import base64
 import inspect
 import textwrap
@@ -279,7 +282,8 @@ class TBSCertificate(univ.Sequence):
 
 class Certificate(univ.Sequence):
     componentType = namedtype.NamedTypes(
-        namedtype.NamedType("tbsCertificate", TBSCertificate()),
+        # namedtype.NamedType("tbsCertificate", TBSCertificate()),
+        namedtype.NamedType("tbsCertificate", univ.OctetString()),
         namedtype.NamedType("signatureAlgorithm", AlgorithmIdentifier()),
         # namedtype.NamedType("signatureValue", ConvertibleBitString()),
         namedtype.NamedType("signatureValue", univ.OctetString()),
@@ -408,3 +412,76 @@ def armor(type_name, der_bytes, headers=None):
     output.write(b"-----\n")
 
     return output.getvalue()
+
+
+def create_self_signed_certificate():
+    # Create a TBS Certificate
+    tbs_certificate = TBSCertificate()
+    tbs_certificate.setComponentByName("version", 2)  # Version v3
+    tbs_certificate.setComponentByName("serialNumber", 123456789)
+
+    # Set Signature Algorithm
+    signature_algorithm = AlgorithmIdentifier()
+    signature_algorithm.setComponentByName(
+        "algorithm", b"1.2.840.113549.1.1.11"
+    )  # SHA256 with RSA
+    tbs_certificate.setComponentByName("signature", signature_algorithm)
+
+    issuer_cn_name_attr = AttributeTypeAndValue()
+    issuer_cn_name_attr.setComponentByName("type", b"2.5.4.3")
+    issuer_cn_name_attr.setComponentByName("value", b"Test Certificate")
+
+    issuer_rdn = RelativeDistinguishedName()
+    issuer_rdn.append(issuer_cn_name_attr)
+
+    tbs_certificate[3][0].append(issuer_rdn)
+
+    # tbs_certificate.setComponentByName("issuer", issuer_name)
+
+    # Set Validity
+    validity = Validity()
+    not_before = Time()
+    not_before.setComponentByName(
+        "utcTime", datetime.datetime.utcnow().strftime("%y%m%d%H%M%SZ")
+    )
+
+    not_after = Time()
+    not_after.setComponentByName(
+        "utcTime",
+        (datetime.datetime.utcnow() + datetime.timedelta(days=365)).strftime(
+            "%y%m%d%H%M%SZ"
+        ),
+    )
+    validity.setComponentByName("notBefore", not_before)
+    validity.setComponentByName("notAfter", not_after)
+    tbs_certificate.setComponentByName("validity", validity)
+
+    # Set Subject (same as issuer for self-signed cert)
+    # tbs_certificate.setComponentByName("subject", issuer_rdn)
+    tbs_certificate[5][0].append(issuer_rdn)
+
+    # Set Public Key Info
+    subject_public_key_info = SubjectPublicKeyInfo()
+    subject_public_key_info.setComponentByName(
+        "subjectPublicKey", b"PublicKeyBytes"
+    )  # Replace with real key bytes
+    tbs_certificate.setComponentByName("subjectPublicKeyInfo", subject_public_key_info)
+
+    # Sign the TBS Certificate
+    tbs_certificate = der_encoder.encode(tbs_certificate)
+    signature = b"FakeSignatureBytes"  # Replace with a real signature generated from the private key
+
+    # Create the final Certificate
+    certificate = Certificate()
+    certificate.setComponentByName("tbsCertificate", tbs_certificate)
+    certificate.setComponentByName("signatureAlgorithm", signature_algorithm)
+    certificate.setComponentByName("signatureValue", signature)
+
+    # Encode and Wrap as PEM
+    der_bytes = der_encoder.encode(certificate)
+    pem_certificate = armor("CERTIFICATE", der_bytes)
+
+    return pem_certificate
+
+
+# Generate the certificate
