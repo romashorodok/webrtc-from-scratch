@@ -92,6 +92,19 @@ def pack_unsigned_short(value: int) -> bytes:
     return value.to_bytes(2, "big") + b"\x00\x00"
 
 
+def pack_unsigned_24(value: int) -> bytes:
+    # Mask the value to ensure it fits within 24 bits (0 to 0xFFFFFF)
+    value &= 0xFFFFFF
+
+    # Extract the 3 bytes using bitwise operations
+    byte1 = (value >> 16) & 0xFF  # Most significant byte (8 bits)
+    byte2 = (value >> 8) & 0xFF  # Middle byte (8 bits)
+    byte3 = value & 0xFF  # Least significant byte (8 bits)
+
+    # Return as a tuple of 3 bytes
+    return bytes([byte1, byte2, byte3])
+
+
 def pack_unsigned_64(value: int) -> bytes:
     return value.to_bytes(8, "big")
 
@@ -176,6 +189,12 @@ def unpack_unsigned(data: bytes) -> int:
 
 def unpack_unsigned_short(data: bytes) -> int:
     return int.from_bytes(data[:2], "big")
+
+
+def unpack_unsigned_24(data: bytes) -> int:
+    if len(data) != 3:
+        raise ValueError("Packed data must be exactly 3 bytes")
+    return (data[0] << 16) | (data[1] << 8) | data[2]
 
 
 def unpack_unsigned_64(data: bytes) -> int:

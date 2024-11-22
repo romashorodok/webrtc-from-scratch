@@ -14,6 +14,7 @@ psutil = "^6.0.0"
 # pylibsrtp = "^0.10.0"
 asn1crypto = "^1.5.1"
 starkbank-ecdsa = "^2.2.0"
+pycryptodome = "^3.21.0"
 
 
 [tool.poetry.group.dev.dependencies]
