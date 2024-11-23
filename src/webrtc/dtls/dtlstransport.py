@@ -101,6 +101,14 @@ class CipherSuiteID(IntEnum):
 
     TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA256 = 0xC037
 
+    TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 = 0xCCA9
+    TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 = 0xCCA8
+    TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA = 0xC009
+    TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA = 0xC013
+    TLS_RSA_WITH_AES_128_GCM_SHA256 = 0x009C
+    TLS_RSA_WITH_AES_128_CBC_SHA = 0x002F
+    TLS_RSA_WITH_AES_256_CBC_SHA = 0x0035
+
 
 class CompressionMethod(IntEnum):
     Null = 0
@@ -198,7 +206,15 @@ class SupportedGroups(Extension):
 
     supported_groups: list[EllipticCurveGroup] | None = None
 
-    def marshal(self) -> bytes: ...
+    def marshal(self) -> bytes:
+        if not self.supported_groups or len(self.supported_groups) == 0:
+            raise ValueError("supported groups must not be nullable")
+
+        result = bytes()
+        for supported_group in self.supported_groups:
+            result += byteops.pack_unsigned_short(supported_group)
+
+        return byteops.pack_unsigned_short(len(result)) + result
 
     def unmarshal_supported_groups(self) -> Self:
         supported_groups_list_length = self.buf.next_uint16()
@@ -238,7 +254,18 @@ class SignatureAlgorithms(Extension):
 
     signature_hash_algorithms: list[SignatureHashAlgorithm] | None = None
 
-    def marshal(self) -> bytes: ...
+    def marshal(self) -> bytes:
+        if (
+            not self.signature_hash_algorithms
+            or len(self.signature_hash_algorithms) == 0
+        ):
+            raise ValueError("signature hash algorithms must not be nullable")
+
+        result = bytes()
+        for signature_hash_algorithm in self.signature_hash_algorithms:
+            result += byteops.pack_unsigned_short(signature_hash_algorithm)
+
+        return byteops.pack_unsigned_short(len(result)) + result
 
     def unmarshal_signature_hash_algorithms(self) -> Self:
         signature_hash_algorithms_length = self.buf.next_uint16()
@@ -268,7 +295,19 @@ class UseSRTP(Extension):
 
     srtp_protection_profiles: list[SRTPProtectionProfile] | None = None
 
-    def marshal(self) -> bytes: ...
+    def marshal(self) -> bytes:
+        if not self.srtp_protection_profiles or len(self.srtp_protection_profiles) == 0:
+            raise ValueError("srtp protection profiles must not be nullable")
+
+        result = bytes()
+        for srtp_protection_profile in self.srtp_protection_profiles:
+            result += byteops.pack_unsigned_short(srtp_protection_profile)
+
+        return (
+            byteops.pack_unsigned_short(len(result))
+            + result
+            + byteops.pack_byte_int(0)  # MKI
+        )
 
     def unmarshal_srtp_protection_profiles(self) -> Self:
         srtp_protection_profiles_length = self.buf.next_uint16()
@@ -304,7 +343,15 @@ class EcPointFormats(Extension):
 
     ec_point_formats: list[EllipticCurvePointFormat] | None = None
 
-    def marshal(self) -> bytes: ...
+    def marshal(self) -> bytes:
+        if not self.ec_point_formats or len(self.ec_point_formats) == 0:
+            raise ValueError("ec point formats must not be nullable")
+
+        result = bytes()
+        for ec_point_format in self.ec_point_formats:
+            result += byteops.pack_byte_int(ec_point_format)
+
+        return byteops.pack_byte_int(len(result)) + result
 
     def unmarshal_ec_point_formats(self) -> Self:
         ec_point_formats_count = self.buf.next_uint8()
@@ -331,7 +378,8 @@ class EcPointFormats(Extension):
 class RegonitiationInfo(Extension):
     extension_type = 0xFF01
 
-    def marshal(self) -> bytes: ...
+    def marshal(self) -> bytes:
+        return byteops.pack_byte_int(0)
 
     def unmarshal_regonitiation_info(self) -> Self:
         self.buf.next_uint8()
@@ -406,11 +454,79 @@ class Message:
         self.cookie: bytes | None = None
         self.cipher_suites: list[CipherSuiteID] | None = None
         self.compression_methods: list[CompressionMethod] | None = None
-        self.extension: list[Extension] | None = None
+        self.extensions: list[Extension] | None = None
 
         # ServerHello
         self.cipher_suite: CipherSuiteID | None = None
         self.compression_method: CompressionMethod | None = None
+
+    def marshal_version(self) -> bytes:
+        if not self.version:
+            raise ValueError("Require a version specified")
+
+        return byteops.pack_unsigned_short(self.version)
+
+    def marshal_random(self) -> bytes:
+        if not self.random:
+            self.__random_gen.populate()
+            self.random = self.__random_gen.marshal_fixed()
+
+        return self.random
+
+    def marshal_session_id(self) -> bytes:
+        if not self.session_id or len(self.session_id):
+            return byteops.pack_byte_int(0)
+
+        return byteops.pack_byte_int(len(self.session_id)) + self.session_id
+
+    def marshal_cookie(self) -> bytes:
+        if not self.cookie or len(self.cookie) == 0:
+            return byteops.pack_byte_int(0)
+
+        return byteops.pack_byte_int(len(self.cookie)) + self.cookie
+
+    def marshal_cipher_suites(self) -> bytes:
+        if not self.cipher_suites or len(self.cipher_suites) == 0:
+            raise ValueError("cipher suites must not be nullable")
+
+        result = bytes()
+        for suite_id in self.cipher_suites:
+            result += byteops.pack_unsigned_short(suite_id)
+
+        print("cipher suites", len(result))
+
+        return byteops.pack_unsigned_short(len(result)) + result
+
+    def marshal_compression_methods(self) -> bytes:
+        if not self.compression_methods or len(self.compression_methods) == 0:
+            raise ValueError("compression methods must not be nullable")
+
+        result = bytes()
+        for compression_method in self.compression_methods:
+            result += byteops.pack_byte_int(compression_method)
+
+        return byteops.pack_byte_int(len(result)) + result
+
+    def marshal_extensions(self) -> bytes:
+        if not self.extensions or len(self.extensions) == 0:
+            raise ValueError("extensions must not be nullable")
+
+        result = bytes()
+        for extension in self.extensions:
+            payload = extension.marshal()
+            if not payload:
+                result += byteops.pack_unsigned_short(
+                    extension.extension_type
+                ) + byteops.pack_unsigned_short(0)
+                continue
+
+            result += (
+                byteops.pack_unsigned_short(extension.extension_type)
+                + byteops.pack_unsigned_short(len(payload))
+                + payload
+            )
+
+        return byteops.pack_unsigned_short(len(result)) + result
 
     def unmarshal_version(self) -> Self:
         self.version = DTLSVersion(self.buf.next_uint16())
@@ -461,7 +577,8 @@ class Message:
         for _ in range(cipher_suites_count):
             try:
                 result.append(CipherSuiteID(self.buf.next_uint16()))
-            except Exception:
+            except Exception as e:
+                print("not found cipher sute", e)
                 pass
 
         self.cipher_suites = result
@@ -534,15 +651,29 @@ class Message:
 
             offset += 4 + ext_length
 
-        self.extension = result
+        self.extensions = result
 
         return self
+
+    def marshal(self) -> bytes: ...
+
+    @classmethod
+    def unmarshal(cls, data: bytes) -> Self: ...
 
 
 class ClientHello(Message):
     message_type = HandshakeMessageType.ClientHello
 
-    def marshal(self) -> bytes: ...
+    def marshal(self) -> bytes:
+        return bytes(
+            self.marshal_version()
+            + self.marshal_random()
+            + self.marshal_session_id()
+            + self.marshal_cookie()
+            + self.marshal_cipher_suites()
+            + self.marshal_compression_methods()
+            + self.marshal_extensions()
+        )
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self:
@@ -555,6 +686,10 @@ class ClientHello(Message):
         i.unmarshal_compression_methods()
         i.unmarshal_extensions()
         return i
+
+    def __repr__(self) -> str:
+        full_name = f"{self.__class__.__module__}.{self.__class__.__qualname__}"
+        return f"<{full_name} object at {hex(id(self))} version={self.version}, random={self.random}, session_id={self.session_id}, cookie={self.cookie}, cipher_suites={self.cipher_suites}, compression_methods={self.compression_methods}, extensions={self.extensions}>"
 
 
 class HelloVerifyRequest(Message):
@@ -654,7 +789,7 @@ class ChangeCipherSpec(Message):
     def unmarshal(cls, data: bytes) -> Self: ...
 
 
-MESSAGE_CLASSES: dict[HandshakeMessageType, type[Marshallable]] = {
+MESSAGE_CLASSES: dict[HandshakeMessageType, type[Message]] = {
     ClientHello.message_type: ClientHello,
     HelloVerifyRequest.message_type: HelloVerifyRequest,
     ServerHello.message_type: ServerHello,
@@ -700,11 +835,27 @@ class Handshake(RecordContentType):
 
     HEADER_LENGHT = 12
 
-    def __init__(self, header: HandshakeHeader, message: Marshallable) -> None:
+    def __init__(self, header: HandshakeHeader, message: Message) -> None:
         self.header = header
         self.message = message
 
-    def marshal(self) -> bytes: ...
+    def marshal(self) -> bytes:
+        payload = self.message.marshal()
+        print("handshake payload", len(payload))
+
+        length = byteops.pack_unsigned_24(len(payload))
+        message_sequence = byteops.pack_unsigned_short(self.header.message_sequence)
+        fragment_offset = byteops.pack_unsigned_24(self.header.fragment_offset)
+        fragment_length = byteops.pack_unsigned_24(len(payload))
+
+        return bytes(
+            byteops.pack_byte_int(self.message.message_type)
+            + length
+            + message_sequence
+            + fragment_offset
+            + fragment_length
+            + payload
+        )
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self:
@@ -724,6 +875,10 @@ class Handshake(RecordContentType):
         message = message_cls.unmarshal(data)
 
         return cls(header, message)
+
+    def __repr__(self) -> str:
+        full_name = f"{self.__class__.__module__}.{self.__class__.__qualname__}"
+        return f"<{full_name} object at {hex(id(self))} message={self.message}>"
 
 
 CONTENT_TYPE_CLASSES: dict[ContentType, type[RecordContentType]] = {
@@ -777,15 +932,16 @@ class RecordLayer:
         self.content = content
 
     def marshal(self) -> bytes:
-        header_bytes = bytearray()
-
-        header_bytes.append(self.header.content_type.value)
-        header_bytes.extend(self.header.version.value.to_bytes(2, byteorder="big"))
-        header_bytes.extend(self.header.epoch.to_bytes(2, byteorder="big"))
-        header_bytes.extend(self.header.sequence_number.to_bytes(6, byteorder="big"))
-        header_bytes.extend(self.header.length.to_bytes(2, byteorder="big"))
-
-        return bytes(header_bytes)
+        payload = self.content.marshal()
+        print("handshake", len(payload))
+        return bytes(
+            byteops.pack_byte_int(self.content.content_type)
+            + byteops.pack_unsigned_short(self.header.version)
+            + byteops.pack_unsigned_short(self.header.epoch)
+            + self.header.sequence_number.to_bytes(6, byteorder="big")
+            + byteops.pack_unsigned_short(len(payload))
+            + payload
+        )
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self:
@@ -821,7 +977,7 @@ class RecordLayer:
         except Exception as e:
             raise e
 
-        print(content)
+        # print(content)
 
         return cls(header, content)
 

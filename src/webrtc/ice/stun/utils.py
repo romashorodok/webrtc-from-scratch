@@ -88,8 +88,16 @@ def pack_unsigned(value: int) -> bytes:
     return value.to_bytes(4, "big")
 
 
+def pack_byte_int(value: int) -> bytes:
+    return value.to_bytes(1, "big")
+
+
+# def pack_unsigned_short(value: int) -> bytes:
+#     return value.to_bytes(2, "big") + b"\x00\x00"
+
+
 def pack_unsigned_short(value: int) -> bytes:
-    return value.to_bytes(2, "big") + b"\x00\x00"
+    return value.to_bytes(2, "big")
 
 
 def pack_unsigned_24(value: int) -> bytes:

@@ -4,4 +4,9 @@ from webrtc.dtls.dtlstransport import RecordLayer
 
 data = b"16feff0000000000000000008c010000800000000000000080fefd13b3ac327e56ae1c96882705b7e69b21cbc30df1695e244570eb7943635866b000000016c02bc02fcca9cca8c009c013c00ac014009c002f003501000040000a00080006001d0017001800170000000d00140012040308040401050308050501080606010201000e0009000600010008000700000b00020100ff01000100"
 
-RecordLayer.unmarshal(binascii.unhexlify(data))
+result = RecordLayer.unmarshal(binascii.unhexlify(data))
+
+result = result.marshal()
+
+print("result:", binascii.hexlify(result))
+print("except:", data)
