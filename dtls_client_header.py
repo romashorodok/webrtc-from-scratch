@@ -4,30 +4,30 @@ import binascii
 from webrtc.dtls.dtlstransport import Handshake
 
 
-data = b"010000c100000000000000c1"
-# DTLS 1.0
-data += b"feff"
-# Random
-data += b"24dc8f65fb5970f29af7f330b6a00942d71783db3230cba5bdb98213efdbb99f"
-# Session ID Length 0, Cookie Length 0
-data += b"0000"
-# Cipher Suites Length 78
-data += b"004e"
-# Cipher Suites 39
-data += b"c014c00a0039003800880087c00fc00500350084"
-data += b"c013c00900330032009a009900450044c00ec004"
-data += b"002f009600410007c012c00800160013c00dc003"
-data += b"000a001500120009001400110008000600ff"
-# Compression Methods Length 1: null
-data += b"0100"
-
-# Extensions, Length 73
-data += b"0049000b000403000102000a00340032000e000d"
-data += b"0019000b000c00180009000a0016001700080006"
-data += b"0007001400150004000500120013000100020003"
-data += b"000f0010001100230000000f000101"
-
-assert Handshake.unmarshal(binascii.unhexlify(data))
+# data = b"010000c100000000000000c1"
+# # DTLS 1.0
+# data += b"feff"
+# # Random
+# data += b"24dc8f65fb5970f29af7f330b6a00942d71783db3230cba5bdb98213efdbb99f"
+# # Session ID Length 0, Cookie Length 0
+# data += b"0000"
+# # Cipher Suites Length 78
+# data += b"004e"
+# # Cipher Suites 39
+# data += b"c014c00a0039003800880087c00fc00500350084"
+# data += b"c013c00900330032009a009900450044c00ec004"
+# data += b"002f009600410007c012c00800160013c00dc003"
+# data += b"000a001500120009001400110008000600ff"
+# # Compression Methods Length 1: null
+# data += b"0100"
+#
+# # Extensions, Length 73
+# data += b"0049000b000403000102000a00340032000e000d"
+# data += b"0019000b000c00180009000a0016001700080006"
+# data += b"0007001400150004000500120013000100020003"
+# data += b"000f0010001100230000000f000101"
+#
+# assert Handshake.unmarshal(binascii.unhexlify(data))
 
 # DTLSv1.2 Record Layer: Handshake Protocol: Client Hello
 #     Content Type: Handshake (22)

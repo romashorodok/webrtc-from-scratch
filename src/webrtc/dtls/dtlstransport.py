@@ -80,17 +80,26 @@ class DTLSVersion(IntEnum):
     V1_2 = 0xFEFD
 
 
-def unpack_version(data: bytes) -> DTLSVersion:
-    version = DTLSVersion(byteops.unpack_unsigned_short(data))
-    if version == DTLSVersion.V1_0:
-        print("Catch DTLS 1.0 version. May not support it!")
-    elif version == DTLSVersion.V1_2:
-        pass
-    else:
-        raise ValueError(
-            f"Unsupported DTLS version: {hex(version)}. DTLS 1.2 (0xFEFD) required."
-        )
-    return version
+class CipherSuiteID(IntEnum):
+    TLS_ECDHE_ECDSA_WITH_AES_128_CCM = 0xC0AC
+    TLS_ECDHE_ECDSA_WITH_AES_128_CCM_8 = 0xC0AE
+
+    TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 = 0xC02B
+    TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 = 0xC02F
+
+    TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 = 0xC02C
+    TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 = 0xC030
+
+    TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA = 0xC00A
+    TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA = 0xC014
+
+    TLS_PSK_WITH_AES_128_CCM = 0xC0A4
+    TLS_PSK_WITH_AES_128_CCM_8 = 0xC0A8
+    TLS_PSK_WITH_AES_256_CCM_8 = 0xC0A9
+    TLS_PSK_WITH_AES_128_GCM_SHA256 = 0x00A8
+    TLS_PSK_WITH_AES_128_CBC_SHA256 = 0x00AE
+
+    TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA256 = 0xC037
 
 
 class CompressionMethod(IntEnum):
@@ -111,6 +120,34 @@ class HandshakeMessageType(IntEnum):
     ChangeCipherSpec = 20  # Finished
 
 
+class EllipticCurveGroup(IntEnum):
+    X25519 = 0x001D
+    SECP256R1 = 0x0017
+    SECP384R1 = 0x0018
+
+
+class SignatureHashAlgorithm(IntEnum):
+    ECDSA_SECP256R1_SHA256 = 0x0403
+    RSA_PSS_RSAE_SHA256 = 0x0804
+    RSA_PKCS1_SHA256 = 0x0401
+    ECDSA_SECP384R1_SHA384 = 0x0503
+    RSA_PSS_RSAE_SHA384 = 0x0805
+    RSA_PKCS1_SHA384 = 0x0501
+    RSA_PSS_RSAE_SHA512 = 0x0806
+    RSA_PKCS1_SHA512 = 0x0601
+    RSA_PKCS1_SHA1 = 0x0201
+
+
+class SRTPProtectionProfile(IntEnum):
+    SRTP_AES128_CM_HMAC_SHA1_80 = 0x0001
+    SRTP_AEAD_AES_256_GCM = 0x0008
+    SRTP_AEAD_AES_128_GCM = 0x0007
+
+
+class EllipticCurvePointFormat(IntEnum):
+    UNCOMPRESSED = 0x00
+
+
 class Marshallable(Protocol):
     def marshal(self) -> bytes: ...
 
@@ -118,38 +155,196 @@ class Marshallable(Protocol):
     def unmarshal(cls, data: bytes) -> Self: ...
 
 
-@dataclass
+class MessageBuffer:
+    def __init__(self, data: bytes) -> None:
+        self.offset: int = 0
+        self.data = data
+
+    @property
+    def length(self) -> int:
+        return len(self.data)
+
+    def read_bytes(self, length: int) -> bytes:
+        if len(self.data) < self.offset + length:
+            raise ValueError("Buffer too small for read operation")
+
+        value = self.data[self.offset : self.offset + length]
+
+        self.offset += len(value)
+
+        return value
+
+    def next_uint8(self) -> int:
+        return int.from_bytes(self.read_bytes(1), "big")
+
+    def next_uint16(self):
+        return byteops.unpack_unsigned_short(self.read_bytes(2))
+
+
 class Extension:
     extension_type: int
-    length: int
-    data: bytes
+
+    def __init__(self, data: bytes) -> None:
+        self.buf = MessageBuffer(data)
+
+    def marshal(self) -> bytes: ...
+
+    @classmethod
+    def unmarshal(cls, data: bytes) -> Self: ...
 
 
 class SupportedGroups(Extension):
     extension_type = 0x0A
 
+    supported_groups: list[EllipticCurveGroup] | None = None
+
+    def marshal(self) -> bytes: ...
+
+    def unmarshal_supported_groups(self) -> Self:
+        supported_groups_list_length = self.buf.next_uint16()
+        supported_groups_list_count = supported_groups_list_length >> 1
+
+        result = list[EllipticCurveGroup]()
+        for _ in range(supported_groups_list_count):
+            try:
+                result.append(EllipticCurveGroup(self.buf.next_uint16()))
+            except Exception:
+                pass
+
+        self.supported_groups = result
+        # print("supported groups", result)
+
+        return self
+
+    @classmethod
+    def unmarshal(cls, data: bytes) -> Self:
+        c = cls(data)
+        c.unmarshal_supported_groups()
+        return c
+
 
 class ExtendedMasterSecret(Extension):
     extension_type = 0x17
+
+    def marshal(self) -> bytes: ...
+
+    @classmethod
+    def unmarshal(cls, data: bytes) -> Self:
+        return cls(data)
 
 
 class SignatureAlgorithms(Extension):
     extension_type = 0x0D
 
+    signature_hash_algorithms: list[SignatureHashAlgorithm] | None = None
+
+    def marshal(self) -> bytes: ...
+
+    def unmarshal_signature_hash_algorithms(self) -> Self:
+        signature_hash_algorithms_length = self.buf.next_uint16()
+        signature_hash_algorithms_count = signature_hash_algorithms_length >> 1
+
+        result = list[SignatureHashAlgorithm]()
+        try:
+            for _ in range(signature_hash_algorithms_count):
+                result.append(SignatureHashAlgorithm(self.buf.next_uint16()))
+        except Exception:
+            pass
+
+        self.signature_hash_algorithms = result
+        # print("signature hash algo:" ,len(self.signature_hash_algorithms), self.signature_hash_algorithms)
+
+        return self
+
+    @classmethod
+    def unmarshal(cls, data: bytes) -> Self:
+        c = cls(data)
+        c.unmarshal_signature_hash_algorithms()
+        return c
+
 
 class UseSRTP(Extension):
     extension_type = 0x0E
+
+    srtp_protection_profiles: list[SRTPProtectionProfile] | None = None
+
+    def marshal(self) -> bytes: ...
+
+    def unmarshal_srtp_protection_profiles(self) -> Self:
+        srtp_protection_profiles_length = self.buf.next_uint16()
+        srtp_protection_profiles_count = srtp_protection_profiles_length >> 1
+
+        result = list[SRTPProtectionProfile]()
+        for _ in range(srtp_protection_profiles_count):
+            try:
+                result.append(SRTPProtectionProfile(self.buf.next_uint16()))
+            except Exception:
+                pass
+
+        self.srtp_protection_profiles = result
+        # print("srtp protection profiles", self.srtp_protection_profiles)
+
+        return self
+
+    def unmarshal_master_key_identifier(self) -> Self:
+        mki_length = self.buf.next_uint8()
+        _ = mki_length
+        return self
+
+    @classmethod
+    def unmarshal(cls, data: bytes) -> Self:
+        c = cls(data)
+        c.unmarshal_srtp_protection_profiles()
+        c.unmarshal_master_key_identifier()
+        return c
 
 
 class EcPointFormats(Extension):
     extension_type = 0x0B
 
+    ec_point_formats: list[EllipticCurvePointFormat] | None = None
+
+    def marshal(self) -> bytes: ...
+
+    def unmarshal_ec_point_formats(self) -> Self:
+        ec_point_formats_count = self.buf.next_uint8()
+
+        result = list[EllipticCurvePointFormat]()
+        for _ in range(ec_point_formats_count):
+            try:
+                result.append(EllipticCurvePointFormat(self.buf.next_uint8()))
+            except Exception:
+                pass
+
+        self.ec_point_formats = result
+        # print(self.ec_point_formats)
+
+        return self
+
+    @classmethod
+    def unmarshal(cls, data: bytes) -> Self:
+        c = cls(data)
+        c.unmarshal_ec_point_formats()
+        return c
+
 
 class RegonitiationInfo(Extension):
     extension_type = 0xFF01
 
+    def marshal(self) -> bytes: ...
 
-EXTENSION_CLASSES = {
+    def unmarshal_regonitiation_info(self) -> Self:
+        self.buf.next_uint8()
+        return self
+
+    @classmethod
+    def unmarshal(cls, data: bytes) -> Self:
+        c = cls(data)
+        c.unmarshal_regonitiation_info()
+        return c
+
+
+EXTENSION_CLASSES: dict[int, type[Extension]] = {
     SupportedGroups.extension_type: SupportedGroups,
     ExtendedMasterSecret.extension_type: ExtendedMasterSecret,
     SignatureAlgorithms.extension_type: SignatureAlgorithms,
@@ -157,45 +352,6 @@ EXTENSION_CLASSES = {
     EcPointFormats.extension_type: EcPointFormats,
     RegonitiationInfo.extension_type: RegonitiationInfo,
 }
-
-
-class ExtensionList:
-    @staticmethod
-    def unmarshal(data: bytes) -> list[Extension]:
-        if len(data) == 0 or len(data) < 2:
-            return list()
-
-        extensions_length = byteops.unpack_unsigned_short(data[0:2])
-        if len(data) - 2 != extensions_length:
-            raise ValueError("extensions violation or length mismatch")
-        print("extensions_length", extensions_length)
-
-        extensions = data[2 : 2 + extensions_length]
-
-        result = list[Extension]()
-        offset = 0
-
-        while offset < len(extensions):
-            ext_type = int.from_bytes(extensions[offset : offset + 2], "big")
-            ext_length = int.from_bytes(extensions[offset + 2 : offset + 4], "big")
-
-            ext_data = extensions[offset + 4 : offset + 4 + ext_length]
-            if len(ext_data) != ext_length:
-                raise ValueError("Extension length mismatch")
-
-            result.append(
-                Extension(
-                    extension_type=ext_type,
-                    length=ext_length,
-                    data=ext_data,
-                )
-            )
-
-            offset += 4 + ext_length
-
-        print("extension result", len(result))
-
-        return result
 
 
 class Random:
@@ -239,131 +395,179 @@ class Random:
 class Message:
     message_type: HandshakeMessageType
 
+    __random_gen = Random()
+
+    def __init__(self, data: bytes) -> None:
+        self.buf = MessageBuffer(data)
+
+        self.version: DTLSVersion | None = None
+        self.random: bytes | None = None
+        self.session_id: bytes | None = None
+        self.cookie: bytes | None = None
+        self.cipher_suites: list[CipherSuiteID] | None = None
+        self.compression_methods: list[CompressionMethod] | None = None
+        self.extension: list[Extension] | None = None
+
+        # ServerHello
+        self.cipher_suite: CipherSuiteID | None = None
+        self.compression_method: CompressionMethod | None = None
+
+    def unmarshal_version(self) -> Self:
+        self.version = DTLSVersion(self.buf.next_uint16())
+
+        if self.version == DTLSVersion.V1_0:
+            print("Catch DTLS 1.0 version. May not support it!")
+        elif self.version == DTLSVersion.V1_2:
+            pass
+        else:
+            raise ValueError(
+                f"Unsupported DTLS version: {hex(self.version)}. DTLS 1.2 (0xFEFD) required."
+            )
+
+        return self
+
+    def unmarshal_random(self) -> Self:
+        self.random = self.buf.read_bytes(self.__random_gen.RANDOM_LENGTH)
+        # print("random", binascii.hexlify(self.random))
+        return self
+
+    def unmarshal_session_id(self) -> Self:
+        session_id_length = self.buf.next_uint8()
+        if self.buf.length < self.buf.offset + session_id_length:
+            raise ValueError("insufficient data for session id")
+        self.session_id = self.buf.read_bytes(session_id_length)
+        # print("session_id_length", session_id_length)
+        # print("session_id", self.session_id)
+        return self
+
+    def unmarshal_cookie(self) -> Self:
+        cookie_length = self.buf.next_uint8()
+        if self.buf.length < self.buf.offset + cookie_length:
+            raise ValueError("insufficient data for cookie")
+        self.cookie = self.buf.read_bytes(cookie_length)
+        # print("cookie_length", cookie_length)
+        # print("cookie", self.cookie)
+        return self
+
+    def unmarshal_cipher_suites(self) -> Self:
+        cipher_suite_length = self.buf.next_uint16()
+        if self.buf.length < self.buf.offset + cipher_suite_length:
+            raise ValueError("insufficient data for cipher suite")
+
+        # One suite == 2 bytes
+        cipher_suites_count = cipher_suite_length // 2
+
+        result = list[CipherSuiteID]()
+        for _ in range(cipher_suites_count):
+            try:
+                result.append(CipherSuiteID(self.buf.next_uint16()))
+            except Exception:
+                pass
+
+        self.cipher_suites = result
+        # print("cipher_suites", self.cipher_suites)
+
+        return self
+
+    def unmarshal_cipher_suite(self) -> Self:
+        try:
+            self.cipher_suite = CipherSuiteID(self.buf.next_uint16())
+        except Exception:
+            pass
+
+        return self
+
+    def unmarshal_compression_methods(self) -> Self:
+        compression_methods_count = self.buf.next_uint8()
+        if self.buf.length < self.buf.offset + compression_methods_count:
+            raise ValueError("insufficient data for compression methods")
+
+        result = list[CompressionMethod]()
+        for _ in range(compression_methods_count):
+            try:
+                result.append(CompressionMethod(self.buf.next_uint8()))
+            except Exception:
+                pass
+
+        self.compression_methods = result
+
+        return self
+
+    def unmarshal_compression_method(self) -> Self:
+        try:
+            self.compression_method = CompressionMethod(self.buf.next_uint8())
+        except Exception:
+            pass
+        return self
+
+    def unmarshal_extensions(self) -> Self:
+        extensions_length = self.buf.next_uint16()
+        if self.buf.length < self.buf.offset + extensions_length:
+            raise ValueError("insufficient data for extensions")
+
+        extensions = self.buf.read_bytes(extensions_length)
+
+        offset = 0
+        result = list[Extension]()
+
+        while offset < len(extensions):
+            ext_type = int.from_bytes(extensions[offset : offset + 2], "big")
+            ext_length = int.from_bytes(extensions[offset + 2 : offset + 4], "big")
+
+            ext_data = extensions[offset + 4 : offset + 4 + ext_length]
+            if len(ext_data) != ext_length:
+                raise ValueError("Extension length mismatch")
+
+            try:
+                extension_cls = EXTENSION_CLASSES.get(ext_type)
+
+                if not extension_cls:
+                    raise ValueError("Not found extension class")
+
+                result.append(
+                    extension_cls.unmarshal(ext_data),
+                )
+
+            except Exception as e:
+                print("Not found extension", ext_type, e)
+                pass
+
+            offset += 4 + ext_length
+
+        self.extension = result
+
+        return self
+
 
 class ClientHello(Message):
     message_type = HandshakeMessageType.ClientHello
-
-    random = Random()
 
     def marshal(self) -> bytes: ...
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self:
-        if len(data) < 2 + cls.random.RANDOM_LENGTH:
-            raise ValueError("Invalid client hello message format")
-
-        version = unpack_version(data[0:2])
-        print(version)
-
-        random = data[2 : 2 + cls.random.RANDOM_LENGTH]
-        print(binascii.hexlify(random))
-
-        curr_offset = 2 + cls.random.RANDOM_LENGTH
-
-        if len(data) <= curr_offset:
-            raise ValueError("insufficient data for SessionID length")
-
-        session_id_length = int.from_bytes(
-            data[curr_offset : curr_offset + 1], byteorder="big"
-        )
-        curr_offset += 1
-
-        if len(data) <= curr_offset + session_id_length:
-            raise ValueError("insufficient data for SessionID")
-
-        session_id = data[curr_offset : curr_offset + session_id_length]
-        curr_offset += len(session_id)
-        curr_offset += 1
-        print("session_id", session_id)
-
-        if len(data) < curr_offset:
-            raise ValueError("insufficient data for cookie")
-
-        cookie_length = int.from_bytes(data[curr_offset:curr_offset], byteorder="big")
-
-        cookie = data[curr_offset : curr_offset + cookie_length]
-        print("cookie", cookie)
-        curr_offset += len(cookie)
-
-        if len(data) <= curr_offset:
-            raise ValueError("insufficient data for cipher suites")
-
-        cipher_suie_length = int.from_bytes(
-            data[curr_offset : curr_offset + 2], byteorder="big"
-        )
-        curr_offset += 2
-
-        cipher_suites = data[curr_offset : curr_offset + cipher_suie_length]
-
-        # One suite == 2 bytes
-        cipher_suites_count = len(cipher_suites) // 2
-
-        # TODO: Add cipher suites enum
-        rtrn = list[int]()
-
-        # TODO: marshal cipher suites
-        for i in range(cipher_suites_count):
-            if len(cipher_suites) < (i * 2 + 2):
-                raise ValueError("Buffer too small for cipher suites decoding")
-
-            rtrn.append(int.from_bytes(cipher_suites[(i * 2) : (i * 2) + 2], "big"))
-
-        curr_offset += len(cipher_suites)
-
-        compression_methods_count = int.from_bytes(data[curr_offset : curr_offset + 1])
-        curr_offset += 1
-
-        compression_methods = data[
-            curr_offset : curr_offset + compression_methods_count
-        ]
-
-        cmpn = list[CompressionMethod]()
-
-        # TODO: compression_method encodings
-        for i in range(compression_methods_count):
-            if len(compression_methods) <= i:
-                raise ValueError("Buffer too small for compression methods decoding")
-
-            cmpn.append(
-                CompressionMethod(int.from_bytes(compression_methods[i : i + 1]))
-            )
-
-        curr_offset += len(cmpn)
-
-        extensions = ExtensionList.unmarshal(data[curr_offset:])
-
-        print(extensions)
-
-        return cls()
+        i = cls(data)
+        i.unmarshal_version()
+        i.unmarshal_random()
+        i.unmarshal_session_id()
+        i.unmarshal_cookie()
+        i.unmarshal_cipher_suites()
+        i.unmarshal_compression_methods()
+        i.unmarshal_extensions()
+        return i
 
 
 class HelloVerifyRequest(Message):
     message_type = HandshakeMessageType.HelloVerifyRequest
 
-    def __init__(self, version: DTLSVersion, cookie_length: int, cookie: bytes) -> None:
-        self.version = version
-        self.cookie_length = cookie_length
-        self.cookie = cookie
-
     def marshal(self) -> bytes: ...
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self:
-        if len(data) < 2:
-            raise ValueError("Invalid hello verify request message format")
-
-        version = unpack_version(data[0:2])
-        curr_offset = 2
-
-        if len(data) < curr_offset:
-            raise ValueError("insufficient data for cookie")
-
-        cookie_length = int.from_bytes(data[curr_offset : curr_offset + 1], "big")
-        curr_offset += 1
-
-        cookie = data[curr_offset : curr_offset + cookie_length]
-
-        return cls(version, cookie_length, cookie)
+        i = cls(data)
+        i.unmarshal_version()
+        i.unmarshal_cookie()
+        return i
 
 
 class ServerHello(Message):
@@ -372,7 +576,15 @@ class ServerHello(Message):
     def marshal(self) -> bytes: ...
 
     @classmethod
-    def unmarshal(cls, data: bytes) -> Self: ...
+    def unmarshal(cls, data: bytes) -> Self:
+        i = cls(data)
+        i.unmarshal_version()
+        i.unmarshal_random()
+        i.unmarshal_session_id()
+        i.unmarshal_cipher_suite()
+        i.unmarshal_compression_method()
+        i.unmarshal_extensions()
+        return i
 
 
 class Certificate(Message):
@@ -381,7 +593,9 @@ class Certificate(Message):
     def marshal(self) -> bytes: ...
 
     @classmethod
-    def unmarshal(cls, data: bytes) -> Self: ...
+    def unmarshal(cls, data: bytes) -> Self:
+        # TODO: certificate
+        ...
 
 
 class KeyServerExchange(Message):
@@ -390,7 +604,9 @@ class KeyServerExchange(Message):
     def marshal(self) -> bytes: ...
 
     @classmethod
-    def unmarshal(cls, data: bytes) -> Self: ...
+    def unmarshal(cls, data: bytes) -> Self:
+        # TODO: EC Diffie-Hellman Server Params
+        ...
 
 
 class CertificateRequest(Message):
@@ -461,7 +677,16 @@ class HandshakeHeader:
     fragment_length: int
 
 
-class Handshake:
+class RecordContentType:
+    content_type: ContentType
+
+    def marshal(self) -> bytes: ...
+
+    @classmethod
+    def unmarshal(cls, data: bytes) -> Self: ...
+
+
+class Handshake(RecordContentType):
     """
     Header is the static first 12 bytes of each RecordLayer
     of type Handshake. These fields allow us to support message loss, reordering, and
@@ -471,11 +696,15 @@ class Handshake:
 
     """
 
+    content_type = ContentType.HANDSHAKE
+
     HEADER_LENGHT = 12
 
     def __init__(self, header: HandshakeHeader, message: Marshallable) -> None:
         self.header = header
         self.message = message
+
+    def marshal(self) -> bytes: ...
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self:
@@ -497,6 +726,11 @@ class Handshake:
         return cls(header, message)
 
 
+CONTENT_TYPE_CLASSES: dict[ContentType, type[RecordContentType]] = {
+    Handshake.content_type: Handshake,
+}
+
+
 @dataclass
 class RecordHeader:
     content_type: ContentType
@@ -504,6 +738,19 @@ class RecordHeader:
     epoch: int
     sequence_number: int
     length: int
+
+
+def unpack_version(data: bytes) -> DTLSVersion:
+    version = DTLSVersion(byteops.unpack_unsigned_short(data))
+    if version == DTLSVersion.V1_0:
+        print("Catch DTLS 1.0 version. May not support it!")
+    elif version == DTLSVersion.V1_2:
+        pass
+    else:
+        raise ValueError(
+            f"Unsupported DTLS version: {hex(version)}. DTLS 1.2 (0xFEFD) required."
+        )
+    return version
 
 
 class RecordLayer:
@@ -525,9 +772,9 @@ class RecordLayer:
 
     FIXED_HEADER_SIZE = 13
 
-    def __init__(self, header: RecordHeader, payload: bytes) -> None:
+    def __init__(self, header: RecordHeader, content: RecordContentType) -> None:
         self.header = header
-        self.payload = payload
+        self.content = content
 
     def marshal(self) -> bytes:
         header_bytes = bytearray()
@@ -538,7 +785,7 @@ class RecordLayer:
         header_bytes.extend(self.header.sequence_number.to_bytes(6, byteorder="big"))
         header_bytes.extend(self.header.length.to_bytes(2, byteorder="big"))
 
-        return bytes(header_bytes) + self.payload
+        return bytes(header_bytes)
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self:
@@ -566,7 +813,17 @@ class RecordLayer:
 
         header = RecordHeader(content_type, version, epoch, sequence_number, length)
 
-        return cls(header, data)
+        try:
+            content_cls = CONTENT_TYPE_CLASSES.get(content_type)
+            if not content_cls:
+                raise ValueError("Unsupported content type")
+            content = content_cls.unmarshal(data)
+        except Exception as e:
+            raise e
+
+        print(content)
+
+        return cls(header, content)
 
 
 class GaloisCounterMode:

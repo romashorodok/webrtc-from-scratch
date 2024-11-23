@@ -2,27 +2,6 @@ import binascii
 
 from webrtc.dtls.dtlstransport import RecordLayer
 
-# Handshake, DTLSv1.0, Epoch 0, Sequence Number 2, Length 78
-# data = b"16feff0000000000000002004e"
-# Handshake, DTLSv1.2, Epoch 0, Sequence Number 2, Length 78
-data = b"16fefd0000000000000002004e"
+data = b"16feff0000000000000000008c010000800000000000000080fefd13b3ac327e56ae1c96882705b7e69b21cbc30df1695e244570eb7943635866b000000016c02bc02fcca9cca8c009c013c00ac014009c002f003501000040000a00080006001d0017001800170000000d00140012040308040401050308050501080606010201000e0009000600010008000700000b00020100ff01000100"
 
-# Client Key Exchange, Length 66, Message Sequence 2, Fragment Offset 0, Fragment Length 66
-data += b"100000420002000000000042"
-
-# Pubkey Length: 65
-data += b"41"
-# Pubkey
-data += (
-    b"0466c160c0cc7a657c0dbd19be373922ffed1e78315706332c17ccb79b"
-    b"3b7d9050fd55bc74c37f36a8d4c6773b95314fe268e0385e490ef73079"
-    b"c405f54c61265e"
-)
-
-
-record = RecordLayer.unmarshal(binascii.unhexlify(data))
-
-d = record.marshal()
-
-print(data)
-print(binascii.hexlify(d))
+RecordLayer.unmarshal(binascii.unhexlify(data))
