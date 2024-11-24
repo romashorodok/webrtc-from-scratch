@@ -75,6 +75,14 @@ class ContentType(IntEnum):
     CONNECTION_ID = 0x19
 
 
+def is_dtls_record_layer(data: bytes) -> bool:
+    try:
+        ContentType(int.from_bytes(data[0:1], "big"))
+        return True
+    except Exception:
+        return False
+
+
 class DTLSVersion(IntEnum):
     V1_0 = 0xFEFF
     V1_2 = 0xFEFD
@@ -409,8 +417,12 @@ class Random:
     RANDOM_BYTES_LENGTH = 28
     RANDOM_LENGTH = RANDOM_BYTES_LENGTH + 4
 
-    def __init__(self):
+    def __init__(
+        self, random_bytes_length=RANDOM_BYTES_LENGTH, random_length=RANDOM_LENGTH
+    ):
         self.gmt_unix_time = datetime.now()
+        self.RANDOM_BYTES_LENGTH = random_bytes_length
+        self.RANDOM_LENGTH = random_length
         self.random_bytes = bytearray(self.RANDOM_BYTES_LENGTH)
 
     def marshal_fixed(self):
@@ -493,7 +505,7 @@ class Message:
         for suite_id in self.cipher_suites:
             result += byteops.pack_unsigned_short(suite_id)
 
-        print("cipher suites", len(result))
+        # print("cipher suites", len(result))
 
         return byteops.pack_unsigned_short(len(result)) + result
 
@@ -532,7 +544,8 @@ class Message:
         self.version = DTLSVersion(self.buf.next_uint16())
 
         if self.version == DTLSVersion.V1_0:
-            print("Catch DTLS 1.0 version. May not support it!")
+            pass
+            # print("Catch DTLS 1.0 version. May not support it!")
         elif self.version == DTLSVersion.V1_2:
             pass
         else:
@@ -695,7 +708,8 @@ class ClientHello(Message):
 class HelloVerifyRequest(Message):
     message_type = HandshakeMessageType.HelloVerifyRequest
 
-    def marshal(self) -> bytes: ...
+    def marshal(self) -> bytes:
+        return bytes(self.marshal_version() + self.marshal_cookie())
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self:
@@ -708,7 +722,8 @@ class HelloVerifyRequest(Message):
 class ServerHello(Message):
     message_type = HandshakeMessageType.ServerHello
 
-    def marshal(self) -> bytes: ...
+    def marshal(self) -> bytes:
+        return bytes()
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self:
@@ -806,10 +821,10 @@ MESSAGE_CLASSES: dict[HandshakeMessageType, type[Message]] = {
 @dataclass
 class HandshakeHeader:
     handshake_type: HandshakeMessageType
-    length: int
     message_sequence: int
     fragment_offset: int
-    fragment_length: int
+    fragment_length: int = 0
+    length: int = 0
 
 
 class RecordContentType:
@@ -841,7 +856,7 @@ class Handshake(RecordContentType):
 
     def marshal(self) -> bytes:
         payload = self.message.marshal()
-        print("handshake payload", len(payload))
+        # print("handshake payload", len(payload))
 
         length = byteops.pack_unsigned_24(len(payload))
         message_sequence = byteops.pack_unsigned_short(self.header.message_sequence)
@@ -892,13 +907,14 @@ class RecordHeader:
     version: DTLSVersion
     epoch: int
     sequence_number: int
-    length: int
+    length: int = 0
 
 
 def unpack_version(data: bytes) -> DTLSVersion:
     version = DTLSVersion(byteops.unpack_unsigned_short(data))
     if version == DTLSVersion.V1_0:
-        print("Catch DTLS 1.0 version. May not support it!")
+        pass
+        # print("Catch DTLS 1.0 version. May not support it!")
     elif version == DTLSVersion.V1_2:
         pass
     else:
@@ -933,7 +949,7 @@ class RecordLayer:
 
     def marshal(self) -> bytes:
         payload = self.content.marshal()
-        print("handshake", len(payload))
+        # print("handshake", len(payload))
         return bytes(
             byteops.pack_byte_int(self.content.content_type)
             + byteops.pack_unsigned_short(self.header.version)
@@ -1201,9 +1217,286 @@ class CipherSuite(Protocol):
     pass
 
 
-class DTLSConn:
+#                     [RFC6347 Section-4.2.4]
+#                      +-----------+
+#                +---> | PREPARING | <--------------------+
+#                |     +-----------+                      |
+#                |           |                            |
+#                |           | Buffer next flight         |
+#                |           |                            |
+#                |          \|/                           |
+#                |     +-----------+                      |
+#                |     |  SENDING  |<------------------+  | Send
+#                |     +-----------+                   |  | HelloRequest
+#        Receive |           |                         |  |
+#           next |           | Send flight             |  | or
+#         flight |  +--------+                         |  |
+#                |  |        | Set retransmit timer    |  | Receive
+#                |  |       \|/                        |  | HelloRequest
+#                |  |  +-----------+                   |  | Send
+#                +--)--|  WAITING  |-------------------+  | ClientHello
+#                |  |  +-----------+   Timer expires   |  |
+#                |  |         |                        |  |
+#                |  |         +------------------------+  |
+#        Receive |  | Send           Read retransmit      |
+#           last |  | last                                |
+#         flight |  | flight                              |
+#                |  |                                     |
+#               \|/\|/                                    |
+#            +-----------+                                |
+#            | FINISHED  | -------------------------------+
+#            +-----------+
+#                 |  /|\
+#                 |   |
+#                 +---+
+#              Read retransmit
+#           Retransmit last flight
+
+
+class HandshakeState(IntEnum):
+    Errored = 0
+    Preparing = 1
+    Sending = 2
+    Waiting = 3
+    Finished = 4
+
+
+class Flight(IntEnum):
+    FLIGHT0 = 0
+    FLIGHT1 = 1
+    FLIGHT2 = 2
+    FLIGHT3 = 3
+    FLIGHT4 = 4
+    FLIGHT4B = 5
+    FLIGHT5 = 6
+    FLIGHT5B = 7
+    FLIGHT6 = 8
+
+
+# @dataclass(frozen=True)
+# class StateTransition:
+#     FROM: Flight
+#     TO: Flight
+
+# flight_transitions: dict[StateTransition, FlightTransitionHandler] = {
+#     StateTransition(Flight.FLIGHT0, Flight.FLIGHT1): lambda: print("test"),
+#     StateTransition(Flight.FLIGHT1, Flight.FLIGHT2): lambda: print("test1"),
+# }
+
+
+class State:
+    INITIAL_EPOCH = 0
+    DEFAULT_CURVE: EllipticCurveGroup = EllipticCurveGroup.X25519
+
     def __init__(self) -> None:
-        self.__cipher_suites = list[CipherSuite]()
+        self.local_epoch = self.remote_epoch = 0
+        self.local_random = Random()
+        self.remote_random = Random()
+        self.local_sequence_number = 0
+        self.handshake_sequence_number = 0
+
+        self.cooike_random = Random(20, 20)
+        self.cooike_random.populate()
+        self.cookie = self.cooike_random.marshal_fixed()
+
+        self.master_secret: bytes | None = None
+        self.srtp_protection_profile: SRTPProtectionProfile | None = None
+        self.elliptic_curve: EllipticCurveGroup | None = None
+
+
+class FlightTransition(Protocol):
+    def generate(self, state: State) -> list[RecordLayer] | None: ...
+
+    def parse(self, state: State) -> Flight: ...
+
+
+class Flight0:
+    def generate(self, state: State) -> list[RecordLayer] | None:
+        state.elliptic_curve = state.DEFAULT_CURVE
+        state.local_epoch = 0
+        state.remote_epoch = 0
+        state.local_random.populate()
+
+    def parse(self, state: State) -> Flight:
+        return Flight.FLIGHT2
+
+
+class Flight2:
+    def generate(self, state: State) -> list[RecordLayer] | None:
+        state.handshake_sequence_number = 0
+        hello_verify_request = HelloVerifyRequest(bytes())
+        hello_verify_request.version = DTLSVersion.V1_2
+        hello_verify_request.cookie = state.cookie
+
+        return [
+            RecordLayer(
+                RecordHeader(
+                    ContentType.HANDSHAKE,
+                    DTLSVersion.V1_0,
+                    state.local_epoch,
+                    state.local_sequence_number,
+                ),
+                Handshake(
+                    HandshakeHeader(
+                        handshake_type=HandshakeMessageType.HelloVerifyRequest,
+                        message_sequence=0,
+                        fragment_offset=0,
+                    ),
+                    hello_verify_request,
+                ),
+            ),
+        ]
+
+    def parse(self, state: State) -> Flight:
+        return Flight.FLIGHT4
+
+
+class Flight4:
+    def generate(self, state: State) -> list[RecordLayer] | None: ...
+
+    def parse(self, state: State) -> Flight: ...
+
+
+FLIGHT_TRANSITIONS: dict[Flight, FlightTransition] = {
+    Flight.FLIGHT0: Flight0(),
+    Flight.FLIGHT2: Flight2(),
+    Flight.FLIGHT4: Flight4(),
+}
+
+
+class DTLSRemote(Protocol):
+    def sendto(self, data: bytes): ...
+
+
+class FSM:
+    def __init__(
+        self,
+        remote: DTLSRemote,
+        chan_transition: asyncio.Queue[HandshakeState],
+    ) -> None:
+        self.remote = remote
+        self.transition_chan = chan_transition
+
+        self.state = State()
+        self.handshake_state: HandshakeState = HandshakeState.Preparing
+        self.flight = Flight.FLIGHT0
+
+        self.pending_record_layers: list[RecordLayer] | None = None
+
+    async def dispatch(self):
+        await self.transition_chan.put(self.handshake_state)
+
+    async def run(self):
+        # print("Start DTLS fsm")
+        while True:
+            next_state = await self.transition_chan.get()
+            # print("Iterate DTLS fsm")
+
+            match next_state:
+                case HandshakeState.Preparing:
+                    next_state = await self.prepare()
+                    await self.transition_chan.put(next_state)
+                case HandshakeState.Sending:
+                    next_state = await self.send()
+                    await self.transition_chan.put(next_state)
+                case HandshakeState.Waiting:
+                    next_state = await self.wait()
+                    await self.transition_chan.put(next_state)
+                    pass
+                case HandshakeState.Finished:
+                    pass
+                case _:
+                    pass
+
+    async def prepare(self) -> HandshakeState:
+        print("Prepare state", self.flight)
+        flight = FLIGHT_TRANSITIONS.get(self.flight)
+        if not flight:
+            # TODO: DTLS alerting
+            return HandshakeState.Errored
+
+        self.pending_record_layers = flight.generate(self.state)
+        epoch = self.state.INITIAL_EPOCH
+        next_epoch = epoch
+        if self.pending_record_layers:
+            for record in self.pending_record_layers:
+                record.header.epoch += epoch
+
+                if record.header.epoch > next_epoch:
+                    next_epoch = record.header.epoch
+
+                if record.header.content_type == ContentType.HANDSHAKE:
+                    record.header.sequence_number = self.state.handshake_sequence_number
+                    self.state.handshake_sequence_number += 1
+
+        if epoch != next_epoch:
+            self.state.local_epoch = next_epoch
+
+        return HandshakeState.Sending
+
+    async def send(self) -> HandshakeState:
+        print("Send state", self.flight, "pending", self.pending_record_layers)
+        if not self.pending_record_layers:
+            return HandshakeState.Waiting
+
+        for layer in self.pending_record_layers:
+            try:
+                self.remote.sendto(layer.marshal())
+            except Exception as e:
+                # TODO: backoff
+                print("Unable send inconsistent packet. Err:", e, "layer", layer)
+                await asyncio.sleep(1)
+                return HandshakeState.Sending
+
+        return HandshakeState.Waiting
+
+    async def wait(self) -> HandshakeState:
+        flight = FLIGHT_TRANSITIONS.get(self.flight)
+        if not flight:
+            return HandshakeState.Errored
+
+        next_flight = flight.parse(self.state)
+        self.flight = next_flight
+
+        return HandshakeState.Preparing
+
+    async def finish(self) -> HandshakeState: ...
+
+
+# TODO: Validate epoch
+# TODO: Anti-replay protection
+# TODO: Decrypt
+class DTLSConn:
+    def __init__(
+        self,
+        remote: DTLSRemote,
+        layer_chan: asyncio.Queue[RecordLayer],
+    ) -> None:
+        # self.__cipher_suites = list[CipherSuite]()
+
+        self.transition_chan = asyncio.Queue[HandshakeState]()
+        self.record_layer_chan = layer_chan
+
+        self.fsm = FSM(remote, self.transition_chan)
+
+    async def handshake(self, flight: Flight, state: HandshakeState):
+        fsm_runnable = asyncio.create_task(self.fsm.run())
+        try:
+            await self.transition_chan.put(state)
+
+            while True:
+                record_layer = await self.record_layer_chan.get()
+
+                match record_layer.header.content_type:
+                    case ContentType.HANDSHAKE:
+                        await self.fsm.dispatch()
+
+                # record_layer.header.content_type
+                # await self.transition_chan.put(self.fsm.flight)
+
+                print("recv layer", record_layer)
+        finally:
+            fsm_runnable.cancel()
 
 
 class DTLSTransport:
