@@ -9,7 +9,8 @@ import hmac
 import math
 import struct
 import os
-from datetime import datetime, time
+from datetime import datetime, time, UTC, timedelta
+
 
 import six
 
@@ -22,6 +23,10 @@ from webrtc.ice import net
 
 from Crypto.Cipher import AES
 
+from asn1crypto import pem, x509, keys, algos
+from ecdsa import Ed25519, SigningKey, SECP256k1, SECP128r1, VerifyingKey, NIST256p
+
+
 from webrtc.ice.stun import utils as byteops
 
 
@@ -32,6 +37,82 @@ from webrtc.ice.stun import utils as byteops
 #     Fingerprint,
 #     SRTP_PROFILES,
 # )
+
+
+def generate_ecdsa_keys():
+    sk = SigningKey.generate(curve=NIST256p)
+
+    pk = sk.get_verifying_key()
+    if not isinstance(pk, VerifyingKey):
+        raise ValueError("test")
+
+    public_key_uncompressed = b"\x04" + pk.to_string()
+    return (
+        sk,
+        public_key_uncompressed,
+    )
+
+
+def create_self_signed_cert_with_ecdsa():
+    sk, public_key_der = generate_ecdsa_keys()
+
+    ecdomain_params = keys.ECDomainParameters(("named", "secp256r1"))
+
+    ec_point_bit_string = keys.ECPointBitString(public_key_der)
+
+    if public_key_der[0] != 0x04:
+        raise ValueError("Public key is not in uncompressed format")
+
+    public_key_info = keys.PublicKeyInfo(
+        {
+            "algorithm": {
+                "algorithm": "1.2.840.10045.2.1",
+                "parameters": ecdomain_params,
+            },
+            "public_key": ec_point_bit_string,
+        }
+    )
+
+    subject = x509.Name.build(
+        {
+            "common_name": "My Self-Signed ECDSA Cert",
+            "country_name": "US",
+            "organization_name": "Example Org",
+        }
+    )
+
+    issuer = subject
+
+    not_before = x509.Time({"utc_time": datetime.now(UTC)})
+    not_after = x509.Time({"utc_time": datetime.now(UTC) + timedelta(days=365)})
+
+    tbs_certificate = x509.TbsCertificate(
+        {
+            "version": "v3",
+            "serial_number": int.from_bytes(os.urandom(16), "big"),
+            "signature": algos.SignedDigestAlgorithm({"algorithm": "sha256_ecdsa"}),
+            "issuer": issuer,
+            "validity": x509.Validity(
+                {"not_before": not_before, "not_after": not_after}
+            ),
+            "subject": subject,
+            "subject_public_key_info": public_key_info,
+        }
+    )
+
+    signature = sk.sign(tbs_certificate.dump())
+
+    certificate = x509.Certificate(
+        {
+            "tbs_certificate": tbs_certificate,
+            "signature_algorithm": algos.SignedDigestAlgorithm(
+                {"algorithm": "sha256_ecdsa"}
+            ),
+            "signature_value": signature,
+        }
+    )
+
+    return certificate
 
 
 class DTLSRole(Enum):
@@ -250,7 +331,8 @@ class SupportedGroups(Extension):
 class ExtendedMasterSecret(Extension):
     extension_type = 0x17
 
-    def marshal(self) -> bytes: ...
+    def marshal(self) -> bytes:
+        return bytes()
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self:
@@ -509,6 +591,12 @@ class Message:
 
         return byteops.pack_unsigned_short(len(result)) + result
 
+    def marshal_cipher_suite(self) -> bytes:
+        if not self.cipher_suite:
+            raise ValueError("cipher suite must not be a nullable")
+
+        return byteops.pack_unsigned_short(self.cipher_suite)
+
     def marshal_compression_methods(self) -> bytes:
         if not self.compression_methods or len(self.compression_methods) == 0:
             raise ValueError("compression methods must not be nullable")
@@ -518,6 +606,11 @@ class Message:
             result += byteops.pack_byte_int(compression_method)
 
         return byteops.pack_byte_int(len(result)) + result
+
+    def marshal_compression_method(self) -> bytes:
+        if self.compression_method is None:
+            raise ValueError("compresssion method must not be a nullable")
+        return byteops.pack_byte_int(self.compression_method)
 
     def marshal_extensions(self) -> bytes:
         if not self.extensions or len(self.extensions) == 0:
@@ -723,7 +816,14 @@ class ServerHello(Message):
     message_type = HandshakeMessageType.ServerHello
 
     def marshal(self) -> bytes:
-        return bytes()
+        return bytes(
+            self.marshal_version()
+            + self.marshal_random()
+            + self.marshal_session_id()
+            + self.marshal_cipher_suite()
+            + self.marshal_compression_method()
+            + self.marshal_extensions()
+        )
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self:
@@ -1352,9 +1452,50 @@ class Flight2:
 
 
 class Flight4:
-    def generate(self, state: State) -> list[RecordLayer] | None: ...
+    def generate(self, state: State) -> list[RecordLayer] | None:
+        server_hello = ServerHello(bytes())
+        server_hello.version = DTLSVersion.V1_2
 
-    def parse(self, state: State) -> Flight: ...
+        # TODO: Don't hard code
+        server_hello.cipher_suite = (
+            CipherSuiteID.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        )
+        server_hello.compression_method = CompressionMethod.Null
+
+        use_srtp = UseSRTP(bytes())
+        use_srtp.srtp_protection_profiles = [
+            SRTPProtectionProfile.SRTP_AES128_CM_HMAC_SHA1_80,
+        ]
+        ec_point_formats = EcPointFormats(bytes())
+        ec_point_formats.ec_point_formats = [EllipticCurvePointFormat.UNCOMPRESSED]
+        server_hello.extensions = [
+            RegonitiationInfo(bytes()),
+            ExtendedMasterSecret(bytes()),
+            use_srtp,
+            ec_point_formats,
+        ]
+
+        return [
+            RecordLayer(
+                RecordHeader(
+                    ContentType.HANDSHAKE,
+                    DTLSVersion.V1_0,
+                    state.local_epoch,
+                    state.local_sequence_number,
+                ),
+                Handshake(
+                    HandshakeHeader(
+                        handshake_type=HandshakeMessageType.ServerHello,
+                        message_sequence=1,
+                        fragment_offset=0,
+                    ),
+                    server_hello,
+                ),
+            ),
+        ]
+
+    def parse(self, state: State) -> Flight:
+        return Flight.FLIGHT5
 
 
 FLIGHT_TRANSITIONS: dict[Flight, FlightTransition] = {
@@ -1372,41 +1513,53 @@ class FSM:
     def __init__(
         self,
         remote: DTLSRemote,
-        chan_transition: asyncio.Queue[HandshakeState],
+        handshake_messages_chan: asyncio.Queue[Message],
     ) -> None:
         self.remote = remote
-        self.transition_chan = chan_transition
+        self.handshake_message_chan = handshake_messages_chan
 
         self.state = State()
+
+        self.handshake_state_transition = asyncio.Queue[HandshakeState]()
+        self.handshake_state_transition_lock = asyncio.Lock()
+
         self.handshake_state: HandshakeState = HandshakeState.Preparing
         self.flight = Flight.FLIGHT0
 
         self.pending_record_layers: list[RecordLayer] | None = None
 
     async def dispatch(self):
-        await self.transition_chan.put(self.handshake_state)
+        async with self.handshake_state_transition_lock:
+            await self.handshake_state_transition.put(self.handshake_state)
 
     async def run(self):
-        # print("Start DTLS fsm")
         while True:
-            next_state = await self.transition_chan.get()
-            # print("Iterate DTLS fsm")
+            # TODO: message sequence support ??
+            handshake_message = await self.handshake_message_chan.get()
 
-            match next_state:
-                case HandshakeState.Preparing:
-                    next_state = await self.prepare()
-                    await self.transition_chan.put(next_state)
-                case HandshakeState.Sending:
-                    next_state = await self.send()
-                    await self.transition_chan.put(next_state)
-                case HandshakeState.Waiting:
-                    next_state = await self.wait()
-                    await self.transition_chan.put(next_state)
-                    pass
-                case HandshakeState.Finished:
-                    pass
-                case _:
-                    pass
+            async with self.handshake_state_transition_lock:
+                while True:
+                    if self.handshake_state_transition.empty():
+                        print("Handshake state transition done")
+                        break
+
+                    handshake_state = await self.handshake_state_transition.get()
+
+                    match handshake_state:
+                        case HandshakeState.Preparing:
+                            await self.handshake_state_transition.put(
+                                await self.prepare(),
+                            )
+                        case HandshakeState.Sending:
+                            await self.handshake_state_transition.put(
+                                await self.send(),
+                            )
+                        case HandshakeState.Waiting:
+                            await self.handshake_state_transition.put(
+                                await self.wait(),
+                            )
+                        case _:
+                            continue
 
     async def prepare(self) -> HandshakeState:
         print("Prepare state", self.flight)
@@ -1474,27 +1627,38 @@ class DTLSConn:
     ) -> None:
         # self.__cipher_suites = list[CipherSuite]()
 
-        self.transition_chan = asyncio.Queue[HandshakeState]()
         self.record_layer_chan = layer_chan
 
-        self.fsm = FSM(remote, self.transition_chan)
+        self.handshake_message_chan = asyncio.Queue[Message]()
+        self.fsm = FSM(remote, self.handshake_message_chan)
 
-    async def handshake(self, flight: Flight, state: HandshakeState):
+    async def handle_inbound_record_layers(self):
         fsm_runnable = asyncio.create_task(self.fsm.run())
-        try:
-            await self.transition_chan.put(state)
 
+        try:
             while True:
                 record_layer = await self.record_layer_chan.get()
 
                 match record_layer.header.content_type:
                     case ContentType.HANDSHAKE:
+                        if not isinstance(record_layer.content, Handshake):
+                            print(
+                                "DTLS layer not is instance of Message",
+                                record_layer.content,
+                            )
+                            continue
+
+                        await self.handshake_message_chan.put(
+                            record_layer.content.message,
+                        )
                         await self.fsm.dispatch()
+                    case _:
+                        print(
+                            "Unhandled record type of", record_layer.header.content_type
+                        )
 
-                # record_layer.header.content_type
-                # await self.transition_chan.put(self.fsm.flight)
-
-                print("recv layer", record_layer)
+        except Exception as e:
+            print("DTLS handle inbound record layers err", e)
         finally:
             fsm_runnable.cancel()
 

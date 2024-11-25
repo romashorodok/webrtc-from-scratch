@@ -41,7 +41,7 @@ async def async_udp_server():
 
     dtls_local = DTLSLocal()
     dtls_conn = DTLSConn(dtls_local, record_layer_chan)
-    asyncio.create_task(dtls_conn.handshake(Flight.FLIGHT0, HandshakeState.Preparing))
+    asyncio.create_task(dtls_conn.handle_inbound_record_layers())
 
     with closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as server_socket:
         server_socket.bind((SERVER_IP, SERVER_PORT))
@@ -52,6 +52,8 @@ async def async_udp_server():
             message, client_address = await loop.sock_recvfrom(server_socket, 1280)
             dtls_local.addr = client_address
             dtls_local.socket = server_socket
+
+            print("Recv packet")
 
             if is_dtls_record_layer(message):
                 try:

@@ -1,13 +1,14 @@
 from asn1crypto import pem, x509, keys, algos
-from ecdsa import Ed25519, SigningKey, SECP256k1, SECP128r1, VerifyingKey
+from ecdsa import Ed25519, SigningKey, SECP256k1, SECP128r1, VerifyingKey, NIST256p
 import datetime
 import os
 
 
 def generate_ecdsa_keys():
     # sk = SigningKey.generate(curve=SECP256k1)
-    sk = SigningKey.generate(curve=SECP128r1)
+    # sk = SigningKey.generate(curve=SECP128r1)
     # sk = SigningKey.generate(curve=Ed25519)
+    sk = SigningKey.generate(curve=NIST256p)
 
     pk = sk.get_verifying_key()
     if not isinstance(pk, VerifyingKey):
@@ -26,7 +27,8 @@ def create_self_signed_cert_with_ecdsa():
     sk, public_key_der = generate_ecdsa_keys()
 
     # cdomain_params = keys.ECDomainParameters(("named", "secp256k1"))
-    ecdomain_params = keys.ECDomainParameters(("named", "secp128r1"))
+    # ecdomain_params = keys.ECDomainParameters(("named", "secp128r1"))
+    ecdomain_params = keys.ECDomainParameters(("named", "secp256r1"))
 
     ec_point_bit_string = keys.ECPointBitString(public_key_der)
 
