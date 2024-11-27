@@ -3,7 +3,7 @@ import binascii
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 import hashlib
-from typing import Any, Protocol, Self
+from typing import Any, Coroutine, Protocol, Self
 from typing import Tuple, Callable, Optional
 import hmac
 import math
@@ -12,6 +12,7 @@ import os
 from datetime import datetime, time, UTC, timedelta
 
 
+from ecdsa.der import encode_length
 import six
 
 
@@ -233,6 +234,7 @@ class SignatureHashAlgorithm(IntEnum):
     RSA_PSS_RSAE_SHA512 = 0x0806
     RSA_PKCS1_SHA512 = 0x0601
     RSA_PKCS1_SHA1 = 0x0201
+    ED25519 = 0x0807
 
 
 class SRTPProtectionProfile(IntEnum):
@@ -840,41 +842,176 @@ class ServerHello(Message):
 class Certificate(Message):
     message_type = HandshakeMessageType.Certificate
 
-    def marshal(self) -> bytes: ...
+    certificates: list[x509.Certificate] | None = None
+
+    def marshal_certificates(self) -> bytes:
+        if not self.certificates:
+            raise ValueError("Require certificate to be specified")
+
+        result = bytes()
+        for cert in self.certificates:
+            cert_der = cert.dump()
+            if not isinstance(cert_der, bytes):
+                raise ValueError("Unable transform certificate to DER bytes")
+
+            result += byteops.pack_unsigned_24(len(cert_der)) + cert_der
+
+        return result
+
+    def marshal(self) -> bytes:
+        certificates = self.marshal_certificates()
+        return bytes(
+            byteops.pack_unsigned_24(len(certificates)) + certificates,
+        )
+
+    def unmarshal_certificates(self):
+        certificates_length = byteops.unpack_unsigned_24(self.buf.read_bytes(3))
+
+        if self.buf.length < self.buf.offset + certificates_length:
+            raise ValueError("Insufficient data for certificates")
+
+        result = list[x509.Certificate]()
+        remaining_length = certificates_length
+        while remaining_length > 0:
+            if remaining_length < 3:
+                raise ValueError("Malformed certificate data")
+
+            # Read the length of the current certificate (3 bytes)
+            cert_length = byteops.unpack_unsigned_24(self.buf.read_bytes(3))
+            remaining_length -= 3
+
+            if remaining_length < cert_length:
+                raise ValueError("Insufficient data for certificate content")
+
+            certificate = self.buf.read_bytes(cert_length)
+            remaining_length -= cert_length
+
+            certificate = x509.Certificate.load(certificate)
+            result.append(certificate)
+
+        self.certificates = result
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self:
-        # TODO: certificate
-        ...
+        c = cls(data)
+        c.unmarshal_certificates()
+        return c
 
 
 class KeyServerExchange(Message):
     message_type = HandshakeMessageType.KeyServerExchange
 
-    def marshal(self) -> bytes: ...
+    named_curve: EllipticCurveGroup | None = None
+    signature_hash_algorithm: SignatureHashAlgorithm | None = None
+    pubkey: bytes | None = None
+    signature: bytes | None = None
+
+    def marshal(self) -> bytes:
+        named_curve_type = byteops.pack_byte_int(NAMED_CURVE_TYPE)
+        if not self.named_curve:
+            raise ValueError("KeyServerExchange require a named curve")
+        named_curve = byteops.pack_unsigned_short(self.named_curve)
+        if not self.pubkey:
+            raise ValueError("KeyServerExchange require a pubkey")
+        pubkey_length = byteops.pack_byte_int(len(self.pubkey))
+        if not self.signature_hash_algorithm:
+            raise ValueError("KeyServerExchange require a signature_hash_algorithm")
+        if not self.signature:
+            raise ValueError("KeyServerExchange require a signature")
+        signature_length = byteops.pack_unsigned_short(len(self.signature))
+        return bytes(
+            named_curve_type
+            + named_curve
+            + pubkey_length
+            + self.pubkey
+            + byteops.pack_unsigned_short(self.signature_hash_algorithm)
+            + signature_length
+            + self.signature
+        )
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self:
-        # TODO: EC Diffie-Hellman Server Params
-        ...
+        c = cls(data)
+        c.buf.read_bytes(1)
+
+        c.named_curve = EllipticCurveGroup(c.buf.next_uint16())
+        pubkey_length = int.from_bytes(c.buf.read_bytes(1), "big")
+        c.pubkey = c.buf.read_bytes(pubkey_length)
+        c.signature_hash_algorithm = SignatureHashAlgorithm(c.buf.next_uint16())
+        signature_length = c.buf.next_uint16()
+        c.signature = c.buf.read_bytes(signature_length)
+
+        return c
+
+
+class CertificateType(IntEnum):
+    RSA = 0x01
+    ECDSA = 0x40
 
 
 class CertificateRequest(Message):
     message_type = HandshakeMessageType.CertificateRequest
 
-    def marshal(self) -> bytes: ...
+    certificate_types: list[CertificateType] | None = None
+    signature_hash_algorithms: list[SignatureHashAlgorithm] | None = None
+
+    def marshal(self) -> bytes:
+        if not self.certificate_types:
+            raise ValueError("CertificateRequest require certificate signs")
+        certificate_types = bytes()
+        for certificate_type in self.certificate_types:
+            certificate_types += byteops.pack_byte_int(certificate_type)
+
+        if not self.signature_hash_algorithms:
+            raise ValueError("CertificateRequest require signature hash algorithms")
+        signature_hash_algorithms = bytes()
+        for signature_hash_algorithm in self.signature_hash_algorithms:
+            signature_hash_algorithms += byteops.pack_unsigned_short(
+                signature_hash_algorithm
+            )
+
+        distinguished_names_lenght = byteops.pack_unsigned_short(0)
+
+        return bytes(
+            byteops.pack_byte_int(len(certificate_types))
+            + certificate_types
+            + byteops.pack_unsigned_short(len(signature_hash_algorithms))
+            + signature_hash_algorithms
+            + distinguished_names_lenght
+        )
 
     @classmethod
-    def unmarshal(cls, data: bytes) -> Self: ...
+    def unmarshal(cls, data: bytes) -> Self:
+        i = cls(data)
+        certificate_types_count = i.buf.next_uint8()
+        certificate_types = list[CertificateType]()
+        for _ in range(certificate_types_count):
+            certificate_types.append(CertificateType(i.buf.next_uint8()))
+
+        signature_hash_algorithms_count = i.buf.next_uint8() >> 1
+        signature_hash_algorithms = list[SignatureHashAlgorithm]()
+        for signature_hash_algorithm in range(signature_hash_algorithms_count):
+            signature_hash_algorithms.append(
+                SignatureHashAlgorithm(signature_hash_algorithm)
+            )
+
+        i.buf.next_uint8()  # distinguished_names_lenght
+
+        i.certificate_types = certificate_types
+        i.signature_hash_algorithms = signature_hash_algorithms
+
+        return i
 
 
 class ServerHelloDone(Message):
     message_type = HandshakeMessageType.ServerHelloDone
 
-    def marshal(self) -> bytes: ...
+    def marshal(self) -> bytes:
+        return bytes()
 
     @classmethod
-    def unmarshal(cls, data: bytes) -> Self: ...
+    def unmarshal(cls, data: bytes) -> Self:
+        return cls(data)
 
 
 class ClientKeyExchange(Message):
@@ -1373,15 +1510,41 @@ class Flight(IntEnum):
     FLIGHT6 = 8
 
 
-# @dataclass(frozen=True)
-# class StateTransition:
-#     FROM: Flight
-#     TO: Flight
+NAMED_CURVE_TYPE = 0x03
 
-# flight_transitions: dict[StateTransition, FlightTransitionHandler] = {
-#     StateTransition(Flight.FLIGHT0, Flight.FLIGHT1): lambda: print("test"),
-#     StateTransition(Flight.FLIGHT1, Flight.FLIGHT2): lambda: print("test1"),
-# }
+
+@dataclass
+class Keypair:
+    privateKey: SigningKey
+    publicKey: VerifyingKey
+    curve: EllipticCurveGroup
+
+    @classmethod
+    def generate_X25519(cls) -> Self:
+        pkey = SigningKey.generate(curve=Ed25519, hashfunc=hashlib.sha256)
+        pubkey = pkey.get_verifying_key()
+        if not isinstance(pubkey, VerifyingKey):
+            raise ValueError("Unable generate X25519 Keypair")
+        return cls(
+            pkey,
+            pubkey,
+            EllipticCurveGroup.X25519,
+        )
+
+    def __ecdh_params(self) -> bytes:
+        server_ecdh_params = bytearray(4)
+        server_ecdh_params[0] = NAMED_CURVE_TYPE
+        server_ecdh_params[1:3] = byteops.pack_unsigned_short(self.curve)
+        server_ecdh_params[3:4] = byteops.pack_byte_int(len(self.publicKey.to_der()))
+        return server_ecdh_params
+
+    def generate_signature(self, remote_random: bytes, local_random: bytes) -> bytes:
+        ecdh_params = self.__ecdh_params()
+        msg = bytes(
+            remote_random + local_random + ecdh_params + self.publicKey.to_der()
+        )
+        result = self.privateKey.sign(msg, hashfunc=hashlib.sha256)
+        return result
 
 
 class State:
@@ -1391,9 +1554,12 @@ class State:
     def __init__(self) -> None:
         self.local_epoch = self.remote_epoch = 0
         self.local_random = Random()
-        self.remote_random = Random()
+        self.remote_random: bytes | None = None
         self.local_sequence_number = 0
         self.handshake_sequence_number = 0
+
+        self.local_keypair: Keypair = Keypair.generate_X25519()
+        self.local_certificate: x509.Certificate | None = None
 
         self.cooike_random = Random(20, 20)
         self.cooike_random.populate()
@@ -1403,21 +1569,46 @@ class State:
         self.srtp_protection_profile: SRTPProtectionProfile | None = None
         self.elliptic_curve: EllipticCurveGroup | None = None
 
+        self.pending_remote_handshake_messages: list[Message] | None = None
+
 
 class FlightTransition(Protocol):
     def generate(self, state: State) -> list[RecordLayer] | None: ...
 
-    def parse(self, state: State) -> Flight: ...
+    async def parse(
+        self, state: State, handshake_message_ch: asyncio.Queue[Message]
+    ) -> Flight: ...
+
+
+# --- Server side flights
 
 
 class Flight0:
     def generate(self, state: State) -> list[RecordLayer] | None:
         state.elliptic_curve = state.DEFAULT_CURVE
+
         state.local_epoch = 0
         state.remote_epoch = 0
         state.local_random.populate()
 
-    def parse(self, state: State) -> Flight:
+        state.local_keypair = Keypair.generate_X25519()
+
+        state.remote_random = None
+
+    async def parse(
+        self, state: State, handshake_message_ch: asyncio.Queue[Message]
+    ) -> Flight:
+        client_hello = await handshake_message_ch.get()
+        if not isinstance(client_hello, ClientHello):
+            print("Flight 0 must receive a client hello.")
+            return Flight.FLIGHT0
+
+        if not state.remote_random and client_hello.random:
+            state.remote_random = client_hello.random
+        elif not state.remote_random:
+            print("Flight 0 client hello must contain a random.")
+            return Flight.FLIGHT0
+
         return Flight.FLIGHT2
 
 
@@ -1447,12 +1638,55 @@ class Flight2:
             ),
         ]
 
-    def parse(self, state: State) -> Flight:
+    async def parse(
+        self, state: State, handshake_message_ch: asyncio.Queue[Message]
+    ) -> Flight:
+        print("flight 2 wait")
+        client_hello = await handshake_message_ch.get()
+        print("flight 2 after wait")
+        if not isinstance(client_hello, ClientHello):
+            print(
+                "Flight 1 must receive a client hello after a HelloVerifyRequest. Reset state to Flight 0"
+            )
+            return Flight.FLIGHT0
+
+        if not client_hello.cookie:
+            print("Flight 0 client hello must contain a cookie.")
+            return Flight.FLIGHT0
+
+        if state.cookie != client_hello.cookie:
+            print("Flight 0 must contain a same remote and local cookie")
+            return Flight.FLIGHT0
+
         return Flight.FLIGHT4
 
 
 class Flight4:
     def generate(self, state: State) -> list[RecordLayer] | None:
+        if not state.remote_random:
+            raise ValueError("Not found remote random")
+
+        signature = state.local_keypair.generate_signature(
+            state.remote_random, state.local_random.marshal_fixed()
+        )
+        # print("Generated signature", signature)
+
+        key_server_exchange = KeyServerExchange(bytes())
+        key_server_exchange.named_curve = state.local_keypair.curve
+        # TODO: Don't hard code
+        key_server_exchange.signature_hash_algorithm = (
+            SignatureHashAlgorithm.ECDSA_SECP256R1_SHA256
+        )
+        key_server_exchange.pubkey = state.local_keypair.publicKey.to_der()
+        key_server_exchange.signature = signature
+
+        certificate_request = CertificateRequest(bytes())
+        certificate_request.certificate_types = [CertificateType.ECDSA]
+        certificate_request.signature_hash_algorithms = [
+            SignatureHashAlgorithm.ECDSA_SECP256R1_SHA256,
+            SignatureHashAlgorithm.ED25519,
+        ]
+
         server_hello = ServerHello(bytes())
         server_hello.version = DTLSVersion.V1_2
 
@@ -1475,6 +1709,10 @@ class Flight4:
             ec_point_formats,
         ]
 
+        state.local_certificate = create_self_signed_cert_with_ecdsa()
+        certificate = Certificate(bytes())
+        certificate.certificates = [state.local_certificate]
+
         return [
             RecordLayer(
                 RecordHeader(
@@ -1492,21 +1730,233 @@ class Flight4:
                     server_hello,
                 ),
             ),
+            RecordLayer(
+                RecordHeader(
+                    ContentType.HANDSHAKE,
+                    DTLSVersion.V1_0,
+                    state.local_epoch,
+                    state.local_sequence_number,
+                ),
+                Handshake(
+                    HandshakeHeader(
+                        handshake_type=HandshakeMessageType.Certificate,
+                        message_sequence=2,
+                        fragment_offset=0,
+                    ),
+                    certificate,
+                ),
+            ),
+            RecordLayer(
+                RecordHeader(
+                    ContentType.HANDSHAKE,
+                    DTLSVersion.V1_2,
+                    state.local_epoch,
+                    state.local_sequence_number,
+                ),
+                Handshake(
+                    HandshakeHeader(
+                        handshake_type=HandshakeMessageType.KeyServerExchange,
+                        message_sequence=3,
+                        fragment_offset=0,
+                    ),
+                    key_server_exchange,
+                ),
+            ),
+            RecordLayer(
+                RecordHeader(
+                    ContentType.HANDSHAKE,
+                    DTLSVersion.V1_2,
+                    state.local_epoch,
+                    state.local_sequence_number,
+                ),
+                Handshake(
+                    HandshakeHeader(
+                        handshake_type=HandshakeMessageType.CertificateRequest,
+                        message_sequence=4,
+                        fragment_offset=0,
+                    ),
+                    certificate_request,
+                ),
+            ),
+            RecordLayer(
+                RecordHeader(
+                    ContentType.HANDSHAKE,
+                    DTLSVersion.V1_2,
+                    state.local_epoch,
+                    state.local_sequence_number,
+                ),
+                Handshake(
+                    HandshakeHeader(
+                        handshake_type=HandshakeMessageType.ServerHelloDone,
+                        message_sequence=5,
+                        fragment_offset=0,
+                    ),
+                    ServerHelloDone(bytes()),
+                ),
+            ),
         ]
 
-    def parse(self, state: State) -> Flight:
+    async def parse(
+        self, state: State, handshake_message_ch: asyncio.Queue[Message]
+    ) -> Flight:
+        client_hello = await handshake_message_ch.get()
+        print("Flight 3 parse hello client hello", client_hello)
         return Flight.FLIGHT5
 
+
+def client_hello_factory(state: State) -> RecordLayer:
+    client_hello = ClientHello(bytes())
+    client_hello.version = DTLSVersion.V1_0
+    client_hello.random = state.local_random.marshal_fixed()
+    client_hello.cipher_suites = [CipherSuiteID.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256]
+    if state.cookie:
+        client_hello.cookie = state.cookie
+
+    client_hello.compression_methods = [CompressionMethod.Null]
+
+    supported_groups = SupportedGroups(bytes())
+    supported_groups.supported_groups = [
+        EllipticCurveGroup.X25519,
+        EllipticCurveGroup.SECP256R1,
+    ]
+
+    extended_master_secret = ExtendedMasterSecret(bytes())
+
+    signature_hash_algorithm = SignatureAlgorithms(bytes())
+    signature_hash_algorithm.signature_hash_algorithms = [
+        SignatureHashAlgorithm.ECDSA_SECP256R1_SHA256,
+    ]
+
+    use_srtp = UseSRTP(bytes())
+    use_srtp.srtp_protection_profiles = [
+        SRTPProtectionProfile.SRTP_AES128_CM_HMAC_SHA1_80,
+        SRTPProtectionProfile.SRTP_AEAD_AES_256_GCM,
+        SRTPProtectionProfile.SRTP_AEAD_AES_128_GCM,
+    ]
+
+    ec_point_formats = EcPointFormats(bytes())
+    ec_point_formats.ec_point_formats = [EllipticCurvePointFormat.UNCOMPRESSED]
+
+    regonitiation_info = RegonitiationInfo(bytes())
+
+    client_hello.extensions = [
+        supported_groups,
+        extended_master_secret,
+        signature_hash_algorithm,
+        use_srtp,
+        ec_point_formats,
+        regonitiation_info,
+    ]
+
+    return RecordLayer(
+        RecordHeader(
+            ContentType.HANDSHAKE,
+            DTLSVersion.V1_0,
+            0,
+            0,
+        ),
+        Handshake(
+            HandshakeHeader(
+                handshake_type=HandshakeMessageType.ClientHello,
+                message_sequence=1,
+                fragment_offset=0,
+            ),
+            client_hello,
+        ),
+    )
+
+
+class Flight1:
+    def generate(self, state: State) -> list[RecordLayer] | None:
+        state.elliptic_curve = state.DEFAULT_CURVE
+
+        state.local_epoch = 0
+        state.remote_epoch = 0
+        state.local_random.populate()
+
+        state.local_keypair = Keypair.generate_X25519()
+
+        return [
+            client_hello_factory(state),
+        ]
+
+    async def parse(
+        self, state: State, handshake_message_ch: asyncio.Queue[Message]
+    ) -> Flight:
+        handshake_messages = list[Message]()
+        while True:
+            # TODO: timeout and make a fallback to flight 1
+            message = await handshake_message_ch.get()
+            handshake_messages.append(message)
+
+            match message.message_type:
+                case HandshakeMessageType.HelloVerifyRequest:
+                    if not message.cookie:
+                        print("Flight 1 Server must return a cookie")
+                        return Flight.FLIGHT1
+
+                    state.cookie = message.cookie
+                    return Flight.FLIGHT3
+                case HandshakeMessageType.ServerHelloDone:
+                    if not message.cookie:
+                        print("Flight 1 Server must return a cookie")
+                        return Flight.FLIGHT1
+
+                    state.cookie = message.cookie
+                    state.pending_remote_handshake_messages = handshake_messages
+                    return Flight.FLIGHT5
+                case _:
+                    pass
+
+
+class Flight3:
+    def generate(self, state: State) -> list[RecordLayer] | None:
+        return [client_hello_factory(state)]
+
+    async def parse(
+        self, state: State, handshake_message_ch: asyncio.Queue[Message]
+    ) -> Flight:
+        handshake_messages = list[Message]()
+        while True:
+            # TODO: timeout and make a fallback to flight 1
+            print("Flight 3 wait")
+            message = await handshake_message_ch.get()
+            handshake_messages.append(message)
+
+            if message.message_type == HandshakeMessageType.ServerHelloDone:
+                state.pending_remote_handshake_messages = handshake_messages
+                print("Flight 3 done")
+                return Flight.FLIGHT5
+
+
+class Flight5:
+    def generate(self, state: State) -> list[RecordLayer] | None:
+        print("flight 5 messages", state.pending_remote_handshake_messages)
+        ...
+
+    async def parse(
+        self, state: State, handshake_message_ch: asyncio.Queue[Message]
+    ) -> Flight:
+        #                 [ChangeCipherSpec] \ Flight 6
+        # <--------             Finished     /
+        ...
+
+
+# --- Client side flights
 
 FLIGHT_TRANSITIONS: dict[Flight, FlightTransition] = {
     Flight.FLIGHT0: Flight0(),
     Flight.FLIGHT2: Flight2(),
     Flight.FLIGHT4: Flight4(),
+    # # Client side
+    Flight.FLIGHT1: Flight1(),
+    Flight.FLIGHT3: Flight3(),
+    Flight.FLIGHT5: Flight5(),
 }
 
 
 class DTLSRemote(Protocol):
-    def sendto(self, data: bytes): ...
+    async def sendto(self, data: bytes): ...
 
 
 class FSM:
@@ -1514,6 +1964,7 @@ class FSM:
         self,
         remote: DTLSRemote,
         handshake_messages_chan: asyncio.Queue[Message],
+        flight: Flight = Flight.FLIGHT0,
     ) -> None:
         self.remote = remote
         self.handshake_message_chan = handshake_messages_chan
@@ -1524,7 +1975,7 @@ class FSM:
         self.handshake_state_transition_lock = asyncio.Lock()
 
         self.handshake_state: HandshakeState = HandshakeState.Preparing
-        self.flight = Flight.FLIGHT0
+        self.flight: Flight = flight
 
         self.pending_record_layers: list[RecordLayer] | None = None
 
@@ -1534,16 +1985,20 @@ class FSM:
 
     async def run(self):
         while True:
-            # TODO: message sequence support ??
-            handshake_message = await self.handshake_message_chan.get()
+            next_state = await self.handshake_state_transition.get()
 
             async with self.handshake_state_transition_lock:
                 while True:
-                    if self.handshake_state_transition.empty():
+                    if self.handshake_state_transition.empty() and not next_state:
                         print("Handshake state transition done")
                         break
 
-                    handshake_state = await self.handshake_state_transition.get()
+                    handshake_state = (
+                        next_state or await self.handshake_state_transition.get()
+                    )
+                    # print("after next_state lock", next_state)
+                    if next_state:
+                        next_state = None
 
                     match handshake_state:
                         case HandshakeState.Preparing:
@@ -1559,7 +2014,7 @@ class FSM:
                                 await self.wait(),
                             )
                         case _:
-                            continue
+                            break
 
     async def prepare(self) -> HandshakeState:
         print("Prepare state", self.flight)
@@ -1569,6 +2024,7 @@ class FSM:
             return HandshakeState.Errored
 
         self.pending_record_layers = flight.generate(self.state)
+
         epoch = self.state.INITIAL_EPOCH
         next_epoch = epoch
         if self.pending_record_layers:
@@ -1588,13 +2044,15 @@ class FSM:
         return HandshakeState.Sending
 
     async def send(self) -> HandshakeState:
-        print("Send state", self.flight, "pending", self.pending_record_layers)
+        # print("Send state", self.flight, "pending", self.pending_record_layers)
+        print("Send state", self.flight)
         if not self.pending_record_layers:
             return HandshakeState.Waiting
 
+        # TODO: message batch
         for layer in self.pending_record_layers:
             try:
-                self.remote.sendto(layer.marshal())
+                await self.remote.sendto(layer.marshal())
             except Exception as e:
                 # TODO: backoff
                 print("Unable send inconsistent packet. Err:", e, "layer", layer)
@@ -1607,10 +2065,12 @@ class FSM:
         flight = FLIGHT_TRANSITIONS.get(self.flight)
         if not flight:
             return HandshakeState.Errored
+        print("wait transition", flight)
 
-        next_flight = flight.parse(self.state)
-        self.flight = next_flight
-
+        # TODO: On client side I must wait and buffer from ServerHello until ServerHelloDone
+        # TODO: This waiting must support also a batch send
+        # TODO: When wait a messages make a timeout and fallback to the flight of DTLS role
+        self.flight = await flight.parse(self.state, self.handshake_message_chan)
         return HandshakeState.Preparing
 
     async def finish(self) -> HandshakeState: ...
@@ -1624,13 +2084,14 @@ class DTLSConn:
         self,
         remote: DTLSRemote,
         layer_chan: asyncio.Queue[RecordLayer],
+        flight: Flight = Flight.FLIGHT0,
     ) -> None:
         # self.__cipher_suites = list[CipherSuite]()
 
         self.record_layer_chan = layer_chan
 
         self.handshake_message_chan = asyncio.Queue[Message]()
-        self.fsm = FSM(remote, self.handshake_message_chan)
+        self.fsm = FSM(remote, self.handshake_message_chan, flight)
 
     async def handle_inbound_record_layers(self):
         fsm_runnable = asyncio.create_task(self.fsm.run())
@@ -1638,6 +2099,7 @@ class DTLSConn:
         try:
             while True:
                 record_layer = await self.record_layer_chan.get()
+                print("recv record", record_layer)
 
                 match record_layer.header.content_type:
                     case ContentType.HANDSHAKE:
@@ -1651,7 +2113,7 @@ class DTLSConn:
                         await self.handshake_message_chan.put(
                             record_layer.content.message,
                         )
-                        await self.fsm.dispatch()
+                        # await self.fsm.dispatch()
                     case _:
                         print(
                             "Unhandled record type of", record_layer.header.content_type

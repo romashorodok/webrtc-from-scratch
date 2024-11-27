@@ -11,6 +11,8 @@ from webrtc.dtls.dtlstransport import (
     is_dtls_record_layer,
 )
 
+from threading import Thread
+from typing import Optional
 
 SERVER_IP = "127.0.0.1"
 SERVER_PORT = 12345
@@ -23,25 +25,25 @@ record_layer_client_hello = RecordLayer.unmarshal(binascii.unhexlify(client_hell
 
 class DTLSLocal:
     def __init__(self) -> None:
-        self.socket: socket.socket | None = None
-        self.addr: socket._RetAddress | None = None
+        self.socket: Optional[socket.socket] = None
+        self.addr: Optional[socket._RetAddress] = None
 
-    def sendto(self, data: bytes):
+    async def sendto(self, data: bytes):
         if not self.socket or not self.addr:
-            raise ValueError("Unable send a data to remote")
+            raise ValueError("Unable to send data to remote")
 
         loop = asyncio.get_running_loop()
-        loop.create_task(loop.sock_sendto(self.socket, data, self.addr))
+        await loop.sock_sendto(self.socket, data, self.addr)
 
 
 async def async_udp_server():
     loop = asyncio.get_running_loop()
-
     record_layer_chan = asyncio.Queue[RecordLayer]()
 
     dtls_local = DTLSLocal()
-    dtls_conn = DTLSConn(dtls_local, record_layer_chan)
+    dtls_conn = DTLSConn(dtls_local, record_layer_chan, Flight.FLIGHT0)
     asyncio.create_task(dtls_conn.handle_inbound_record_layers())
+    asyncio.create_task(dtls_conn.fsm.dispatch())
 
     with closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as server_socket:
         server_socket.bind((SERVER_IP, SERVER_PORT))
@@ -53,43 +55,62 @@ async def async_udp_server():
             dtls_local.addr = client_address
             dtls_local.socket = server_socket
 
-            print("Recv packet")
+            print("Recv packet server")
 
             if is_dtls_record_layer(message):
                 try:
-                    await record_layer_chan.put(RecordLayer.unmarshal(message))
+                    test = RecordLayer.unmarshal(message)
+                    print("Try to put a record", test.header, test.content.content_type)
+                    await record_layer_chan.put(test)
+                    # await dtls_conn.fsm.dispatch()
                 except Exception as e:
                     print("DTLS record error", e)
-
-            # print(f"Server received from {client_address}: {message}")
-
-            msg = RecordLayer.unmarshal(message)
-            await loop.sock_sendto(server_socket, msg.marshal(), client_address)
 
 
 async def async_udp_client():
     loop = asyncio.get_running_loop()
+    dtls_local = DTLSLocal()
+
+    record_layer_chan = asyncio.Queue[RecordLayer]()
+    dtls_conn = DTLSConn(dtls_local, record_layer_chan, Flight.FLIGHT1)
+    asyncio.create_task(dtls_conn.handle_inbound_record_layers())
+    asyncio.create_task(dtls_conn.fsm.dispatch())
 
     with closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as client_socket:
         client_socket.bind((SERVER_IP, CLIENT_PORT))
         client_socket.setblocking(False)
         print(f"Async UDP client bound to {SERVER_IP}:{CLIENT_PORT}")
 
+        dtls_local.addr = (SERVER_IP, SERVER_PORT)
+        dtls_local.socket = client_socket
+
         while True:
-            message = record_layer_client_hello.marshal()
-            await loop.sock_sendto(client_socket, message, (SERVER_IP, SERVER_PORT))
+            message, _ = await loop.sock_recvfrom(client_socket, 1280)
 
-            response, server_address = await loop.sock_recvfrom(client_socket, 1280)
-            # print(f"Client received from {server_address}: {response}")
-            await asyncio.sleep(4)
+            print("Recv packet client")
+
+            if is_dtls_record_layer(message):
+                try:
+                    test = RecordLayer.unmarshal(message)
+                    await record_layer_chan.put(test)
+                    print("Recv packet client after put")
+                except Exception as e:
+                    print("DTLS record error", e)
 
 
-async def main():
-    server_task = asyncio.create_task(async_udp_server())
-    client_task = asyncio.create_task(async_udp_client())
+def run_in_thread(coro):
+    def wrapper():
+        asyncio.run(coro())
 
-    await asyncio.gather(server_task, client_task)
+    thread = Thread(target=wrapper)
+    thread.daemon = True
+    thread.start()
+    return thread
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    server_thread = run_in_thread(async_udp_server)
+    client_thread = run_in_thread(async_udp_client)
+
+    server_thread.join()
+    client_thread.join()
