@@ -12,6 +12,7 @@ import os
 from datetime import datetime, time, UTC, timedelta
 
 
+from asn1crypto.core import ValueMap
 from ecdsa.der import encode_length
 import six
 
@@ -25,7 +26,8 @@ from webrtc.ice import net
 from Crypto.Cipher import AES
 
 from asn1crypto import pem, x509, keys, algos
-from ecdsa import Ed25519, SigningKey, SECP256k1, SECP128r1, VerifyingKey, NIST256p
+from ecdsa import Ed25519, SigningKey, VerifyingKey, NIST256p
+from ecdsa.ecdh import ECDH
 
 
 from webrtc.ice.stun import utils as byteops
@@ -54,8 +56,79 @@ def generate_ecdsa_keys():
     )
 
 
-def create_self_signed_cert_with_ecdsa():
-    sk, public_key_der = generate_ecdsa_keys()
+class EllipticCurveGroup(IntEnum):
+    X25519 = 0x001D
+    SECP256R1 = 0x0017
+    SECP384R1 = 0x0018
+
+
+@dataclass
+class Keypair:
+    privateKey: SigningKey
+    publicKey: VerifyingKey
+    curve: EllipticCurveGroup
+
+    @classmethod
+    def generate_X25519(cls) -> Self:
+        pkey = SigningKey.generate(curve=Ed25519, hashfunc=hashlib.sha256)
+        pubkey = pkey.get_verifying_key()
+        if not isinstance(pubkey, VerifyingKey):
+            raise ValueError("Unable generate X25519 Keypair")
+        return cls(
+            pkey,
+            pubkey,
+            EllipticCurveGroup.X25519,
+        )
+
+    @classmethod
+    def generate_P256(cls) -> Self:
+        pkey = SigningKey.generate(curve=NIST256p, hashfunc=hashlib.sha256)
+        pubkey = pkey.get_verifying_key()
+        if not isinstance(pubkey, VerifyingKey):
+            raise ValueError("Unable generate SECP256R1 Keypair")
+        return cls(
+            pkey,
+            pubkey,
+            EllipticCurveGroup.SECP256R1,
+        )
+
+    def __ecdh_params(self) -> bytes:
+        server_ecdh_params = bytearray(4)
+        server_ecdh_params[0] = NAMED_CURVE_TYPE
+        server_ecdh_params[1:3] = byteops.pack_unsigned_short(self.curve)
+        server_ecdh_params[3:4] = byteops.pack_byte_int(len(self.publicKey.to_der()))
+        return server_ecdh_params
+
+    def generate_server_signature(
+        self, remote_random: bytes, local_random: bytes
+    ) -> bytes:
+        ecdh_params = self.__ecdh_params()
+        msg = bytes(
+            remote_random + local_random + ecdh_params + self.publicKey.to_der()
+        )
+        print("Expected server expected_ecdh_secret_message", binascii.hexlify(msg))
+        print(
+            "Expected server expected_ecdh_secret_message digest",
+            binascii.hexlify(hashlib.sha256(msg).digest()),
+        )
+
+        result = self.privateKey.sign(msg, hashfunc=hashlib.sha256)
+        return result
+
+    # NOTE: Must be a len(bytes(...)) == 32
+    def generate_shared_key(self) -> bytes:
+        ecdh = ECDH(
+            curve=self.privateKey.curve,
+            private_key=self.privateKey,
+            public_key=self.publicKey,
+        )
+        return ecdh.generate_sharedsecret_bytes()
+
+
+def create_self_signed_cert_with_ecdsa(keypair: Keypair):
+    sk = keypair.privateKey
+
+    public_key_der = b"\x04" + keypair.publicKey.to_string()
 
     ecdomain_params = keys.ECDomainParameters(("named", "secp256r1"))
 
@@ -216,12 +289,6 @@ class HandshakeMessageType(IntEnum):
     CertificateVerify = 15
     ClientKeyExchange = 16
     ChangeCipherSpec = 20  # Finished
-
-
-class EllipticCurveGroup(IntEnum):
-    X25519 = 0x001D
-    SECP256R1 = 0x0017
-    SECP384R1 = 0x0018
 
 
 class SignatureHashAlgorithm(IntEnum):
@@ -938,6 +1005,7 @@ class KeyServerExchange(Message):
         pubkey_length = int.from_bytes(c.buf.read_bytes(1), "big")
         c.pubkey = c.buf.read_bytes(pubkey_length)
         c.signature_hash_algorithm = SignatureHashAlgorithm(c.buf.next_uint16())
+        print("Unmarshal signature hash algo", c.signature_hash_algorithm)
         signature_length = c.buf.next_uint16()
         c.signature = c.buf.read_bytes(signature_length)
 
@@ -964,18 +1032,22 @@ class CertificateRequest(Message):
 
         if not self.signature_hash_algorithms:
             raise ValueError("CertificateRequest require signature hash algorithms")
+
         signature_hash_algorithms = bytes()
         for signature_hash_algorithm in self.signature_hash_algorithms:
             signature_hash_algorithms += byteops.pack_unsigned_short(
                 signature_hash_algorithm
             )
+        signature_hash_algorithms_count = byteops.pack_unsigned_short(
+            len(signature_hash_algorithms)
+        )
 
         distinguished_names_lenght = byteops.pack_unsigned_short(0)
 
         return bytes(
             byteops.pack_byte_int(len(certificate_types))
             + certificate_types
-            + byteops.pack_unsigned_short(len(signature_hash_algorithms))
+            + signature_hash_algorithms_count
             + signature_hash_algorithms
             + distinguished_names_lenght
         )
@@ -988,11 +1060,12 @@ class CertificateRequest(Message):
         for _ in range(certificate_types_count):
             certificate_types.append(CertificateType(i.buf.next_uint8()))
 
-        signature_hash_algorithms_count = i.buf.next_uint8() >> 1
+        signature_hash_algorithms_count = i.buf.next_uint16() >> 1
+
         signature_hash_algorithms = list[SignatureHashAlgorithm]()
-        for signature_hash_algorithm in range(signature_hash_algorithms_count):
+        for _ in range(signature_hash_algorithms_count):
             signature_hash_algorithms.append(
-                SignatureHashAlgorithm(signature_hash_algorithm)
+                SignatureHashAlgorithm(i.buf.next_uint16())
             )
 
         i.buf.next_uint8()  # distinguished_names_lenght
@@ -1017,28 +1090,61 @@ class ServerHelloDone(Message):
 class ClientKeyExchange(Message):
     message_type = HandshakeMessageType.ClientKeyExchange
 
-    def marshal(self) -> bytes: ...
+    pubkey: bytes | None = None
+
+    def marshal(self) -> bytes:
+        if not self.pubkey:
+            raise ValueError("ClientKeyExchange require pubkey")
+
+        pubkey_length = byteops.pack_byte_int(len(self.pubkey))
+        return pubkey_length + self.pubkey
 
     @classmethod
-    def unmarshal(cls, data: bytes) -> Self: ...
+    def unmarshal(cls, data: bytes) -> Self:
+        i = cls(data)
+        pubkey_length = int.from_bytes(i.buf.read_bytes(1), "big")
+        i.pubkey = i.buf.read_bytes(pubkey_length)
+        return i
 
 
 class CertificateVerify(Message):
     message_type = HandshakeMessageType.CertificateVerify
 
-    def marshal(self) -> bytes: ...
+    signature_hash_algorithm: SignatureHashAlgorithm | None = None
+    signature: bytes | None = None
+
+    def marshal(self) -> bytes:
+        if not self.signature_hash_algorithm:
+            raise ValueError("CertificateVerify require a signature_hash_algorithm")
+        if not self.signature:
+            raise ValueError("CertificateVerify require a signature")
+        signature_length = byteops.pack_unsigned_short(len(self.signature))
+        return bytes(
+            byteops.pack_unsigned_short(self.signature_hash_algorithm)
+            + signature_length
+            + self.signature
+        )
 
     @classmethod
-    def unmarshal(cls, data: bytes) -> Self: ...
+    def unmarshal(cls, data: bytes) -> Self:
+        i = cls(data)
+        i.signature_hash_algorithm = SignatureHashAlgorithm(i.buf.next_uint16())
+        signature_length = i.buf.next_uint16()
+        i.signature = i.buf.read_bytes(signature_length)
+        return i
 
 
 class ChangeCipherSpec(Message):
     message_type = HandshakeMessageType.ChangeCipherSpec
 
-    def marshal(self) -> bytes: ...
+    def marshal(self) -> bytes:
+        return bytes(0x01)
 
     @classmethod
-    def unmarshal(cls, data: bytes) -> Self: ...
+    def unmarshal(cls, data: bytes) -> Self:
+        if len(data) != 1 or not data[0] == 0x01:
+            raise ValueError("Change Cipher spec must be a 1 byte")
+        return cls(bytes())
 
 
 MESSAGE_CLASSES: dict[HandshakeMessageType, type[Message]] = {
@@ -1513,43 +1619,50 @@ class Flight(IntEnum):
 NAMED_CURVE_TYPE = 0x03
 
 
-@dataclass
-class Keypair:
-    privateKey: SigningKey
-    publicKey: VerifyingKey
-    curve: EllipticCurveGroup
+# TODO: Same as Keypair.generate_signature
+def ecdh_value_key_message(
+    client_random: bytes,
+    server_random: bytes,
+    pubkey: bytes,
+    named_curve: EllipticCurveGroup,
+) -> bytes:
+    ecdh_params = bytearray(4)
+    ecdh_params[0] = NAMED_CURVE_TYPE
+    ecdh_params[1:3] = byteops.pack_unsigned_short(named_curve)
+    ecdh_params[3:4] = byteops.pack_byte_int(len(pubkey))
+    return bytes(client_random + server_random + ecdh_params + pubkey)
 
-    @classmethod
-    def generate_X25519(cls) -> Self:
-        pkey = SigningKey.generate(curve=Ed25519, hashfunc=hashlib.sha256)
-        pubkey = pkey.get_verifying_key()
-        if not isinstance(pubkey, VerifyingKey):
-            raise ValueError("Unable generate X25519 Keypair")
-        return cls(
-            pkey,
-            pubkey,
-            EllipticCurveGroup.X25519,
-        )
 
-    def __ecdh_params(self) -> bytes:
-        server_ecdh_params = bytearray(4)
-        server_ecdh_params[0] = NAMED_CURVE_TYPE
-        server_ecdh_params[1:3] = byteops.pack_unsigned_short(self.curve)
-        server_ecdh_params[3:4] = byteops.pack_byte_int(len(self.publicKey.to_der()))
-        return server_ecdh_params
+def verify_certificate_signature(
+    ecdh_shared_secret_message: bytes,
+    signature: bytes,
+    hash_func: Callable,
+    certificates: list[x509.Certificate],
+) -> bool:
+    """
+    Why Certificates + ECDH:
+    - ECDH alone provides confidentiality:
+        * It ensures that a shared secret can be computed securely without transmitting private keys.
+    - Certificates add authentication:
+        * They ensure that the public key used in the ECDH process belongs to the intended entity (e.g., the server in a TLS session).
+        * They prevent MITM attacks by binding the public key to the server’s identity.
+    """
+    if hash_func is not hashlib.sha256:
+        raise ValueError("verify_certificate_signature support only sha256")
 
-    def generate_signature(self, remote_random: bytes, local_random: bytes) -> bytes:
-        ecdh_params = self.__ecdh_params()
-        msg = bytes(
-            remote_random + local_random + ecdh_params + self.publicKey.to_der()
-        )
-        result = self.privateKey.sign(msg, hashfunc=hashlib.sha256)
-        return result
+    for certificate in certificates:
+        pubkey: x509.PublicKeyInfo = certificate.public_key
+        verifying_key = VerifyingKey.from_der(pubkey.dump())
+        digest = hashlib.sha256(ecdh_shared_secret_message).digest()
+        if verified := verifying_key.verify_digest(signature, digest):
+            return verified
+
+    return False
 
 
 class State:
     INITIAL_EPOCH = 0
-    DEFAULT_CURVE: EllipticCurveGroup = EllipticCurveGroup.X25519
+    DEFAULT_CURVE: EllipticCurveGroup = EllipticCurveGroup.SECP256R1
 
     def __init__(self) -> None:
         self.local_epoch = self.remote_epoch = 0
@@ -1558,16 +1671,18 @@ class State:
         self.local_sequence_number = 0
         self.handshake_sequence_number = 0
 
-        self.local_keypair: Keypair = Keypair.generate_X25519()
+        self.local_keypair: Keypair = Keypair.generate_P256()
         self.local_certificate: x509.Certificate | None = None
 
         self.cooike_random = Random(20, 20)
         self.cooike_random.populate()
         self.cookie = self.cooike_random.marshal_fixed()
 
+        self.pre_master_secret: bytes | None = None
         self.master_secret: bytes | None = None
         self.srtp_protection_profile: SRTPProtectionProfile | None = None
         self.elliptic_curve: EllipticCurveGroup | None = None
+        self.remote_peer_certificates: list[x509.Certificate] | None = None
 
         self.pending_remote_handshake_messages: list[Message] | None = None
 
@@ -1591,7 +1706,7 @@ class Flight0:
         state.remote_epoch = 0
         state.local_random.populate()
 
-        state.local_keypair = Keypair.generate_X25519()
+        state.local_keypair = Keypair.generate_P256()
 
         state.remote_random = None
 
@@ -1666,7 +1781,7 @@ class Flight4:
         if not state.remote_random:
             raise ValueError("Not found remote random")
 
-        signature = state.local_keypair.generate_signature(
+        signature = state.local_keypair.generate_server_signature(
             state.remote_random, state.local_random.marshal_fixed()
         )
         # print("Generated signature", signature)
@@ -1689,6 +1804,7 @@ class Flight4:
 
         server_hello = ServerHello(bytes())
         server_hello.version = DTLSVersion.V1_2
+        server_hello.random = state.local_random.marshal_fixed()
 
         # TODO: Don't hard code
         server_hello.cipher_suite = (
@@ -1709,8 +1825,10 @@ class Flight4:
             ec_point_formats,
         ]
 
-        state.local_certificate = create_self_signed_cert_with_ecdsa()
         certificate = Certificate(bytes())
+        state.local_certificate = create_self_signed_cert_with_ecdsa(
+            state.local_keypair
+        )
         certificate.certificates = [state.local_certificate]
 
         return [
@@ -1816,7 +1934,7 @@ def client_hello_factory(state: State) -> RecordLayer:
 
     supported_groups = SupportedGroups(bytes())
     supported_groups.supported_groups = [
-        EllipticCurveGroup.X25519,
+        # EllipticCurveGroup.X25519,
         EllipticCurveGroup.SECP256R1,
     ]
 
@@ -1873,8 +1991,9 @@ class Flight1:
         state.local_epoch = 0
         state.remote_epoch = 0
         state.local_random.populate()
+        state.remote_random = None
 
-        state.local_keypair = Keypair.generate_X25519()
+        state.local_keypair = Keypair.generate_P256()
 
         return [
             client_hello_factory(state),
@@ -1913,6 +2032,27 @@ class Flight3:
     def generate(self, state: State) -> list[RecordLayer] | None:
         return [client_hello_factory(state)]
 
+    def __handle_server_key_exchange(self, state: State, message: KeyServerExchange):
+        # match message.named_curve:
+        # case EllipticCurveGroup.SECP256R1:
+        # state.local_keypair = Keypair.generate_P256()
+
+        # NOTE: This library not support generate a pre shared key with ECDH for X25519 curve
+        # case EllipticCurveGroup.X25519:
+        #     state.local_keypair = Keypair.generate_X25519()
+        # case _:
+        #     raise ValueError(
+        #         f"Unsupported {message.named_curve} curve unable create pre master secret"
+        #     )
+
+        # TODO: Is it must use a pub key instead of ?
+        state.pre_master_secret = state.local_keypair.generate_shared_key()
+        print(
+            "Shared pre master secret",
+            state.pre_master_secret,
+            len(state.pre_master_secret),
+        )
+
     async def parse(
         self, state: State, handshake_message_ch: asyncio.Queue[Message]
     ) -> Flight:
@@ -1923,16 +2063,281 @@ class Flight3:
             message = await handshake_message_ch.get()
             handshake_messages.append(message)
 
-            if message.message_type == HandshakeMessageType.ServerHelloDone:
-                state.pending_remote_handshake_messages = handshake_messages
-                print("Flight 3 done")
-                return Flight.FLIGHT5
+            match message.message_type:
+                case HandshakeMessageType.KeyServerExchange:
+                    if not isinstance(message, KeyServerExchange):
+                        raise ValueError(
+                            "Flight 3 message must be a instance of KeyServerExchange"
+                        )
+                    if (
+                        not message.named_curve
+                        and state.local_keypair.curve != message.named_curve
+                    ):
+                        raise ValueError("Flight 3 message key server must be defined")
+
+                    try:
+                        self.__handle_server_key_exchange(state, message)
+                    except Exception as e:
+                        print("Unable generate pre shared master key", e)
+
+                case HandshakeMessageType.Certificate:
+                    if not isinstance(message, Certificate):
+                        raise ValueError(
+                            "Flight 3 message must be a instance of Certificate"
+                        )
+                    if not message.certificates:
+                        raise ValueError(
+                            "Flight3 not found required remote certificates"
+                        )
+
+                    state.remote_peer_certificates = message.certificates
+
+                case HandshakeMessageType.ServerHello:
+                    state.remote_random = message.random
+                case HandshakeMessageType.ServerHelloDone:
+                    state.pending_remote_handshake_messages = handshake_messages
+                    print("Flight 3 done")
+                    return Flight.FLIGHT5
+                case _:
+                    pass
+
+
+# Client and Server use mutual authentication by default
+
+# The Finished message is the first encrypted message sent by the client. The process involves:
+#
+# Generating the message hash (MAC) of all previous handshake messages.
+# Encrypting the hash with the session key derived from the shared secret (ServerKeyExchange - pubkey).
+# Sending the encrypted Finished message to the server.
+
+MASTER_SECRET_LABEL = b"master secret"
+
+
+def prf_master_secret(
+    pre_master_secret: bytes,
+    client_random: bytes,
+    server_random: bytes,
+    hash_func: Callable,
+) -> bytes:
+    seed = MASTER_SECRET_LABEL + client_random + server_random
+    return p_hash(pre_master_secret, seed, 48, hash_func)
 
 
 class Flight5:
+    def __initialize_cipher_suite(
+        self,
+        state: State,
+        key_server_exchange: KeyServerExchange,
+        handshake_messages_merged: bytes,
+    ):
+        if not state.pre_master_secret:
+            raise ValueError("Flight5 pre master secret must be initialized")
+        if not state.remote_random:
+            raise ValueError("Flight5 must know remote random")
+
+        if (
+            not key_server_exchange.pubkey
+            or not key_server_exchange.named_curve
+            or not key_server_exchange.signature
+        ):
+            raise ValueError(
+                "Flight5 KeyServerExchange must have a pubkey, named_curve and signature  defined"
+            )
+
+        hash_func: Callable | None = None
+        match key_server_exchange.signature_hash_algorithm:
+            case SignatureHashAlgorithm.ECDSA_SECP256R1_SHA256:
+                hash_func = hashlib.sha256
+            case _:
+                raise ValueError(
+                    "Unsupported cipher suite in key_server_exchange.signature_hash_algorithm"
+                )
+
+        state.master_secret = prf_master_secret(
+            state.pre_master_secret,
+            state.local_random.marshal_fixed(),
+            state.remote_random,
+            hash_func,
+        )
+
+        # TODO: By default it expect a certificate auth type, ref it
+        if not state.remote_peer_certificates:
+            raise ValueError("Fligh5 not found remote peer certificates")
+
+        expected_ecdh_secret_message = ecdh_value_key_message(
+            state.local_random.marshal_fixed(),
+            state.remote_random,
+            key_server_exchange.pubkey,
+            key_server_exchange.named_curve,
+        )
+        print(
+            "Expected client expected_ecdh_secret_message",
+            binascii.hexlify(expected_ecdh_secret_message),
+        )
+
+        verified = verify_certificate_signature(
+            expected_ecdh_secret_message,
+            key_server_exchange.signature,
+            hash_func,
+            state.remote_peer_certificates,
+        )
+        if not verified:
+            raise ValueError("Invalid certificate signature")
+
+        print("Certificate verified success ???", verified)
+
+        # print(
+        #     "master secret", state.master_secret, "master len", len(state.master_secret)
+        # )
+
     def generate(self, state: State) -> list[RecordLayer] | None:
+        if not state.pending_remote_handshake_messages:
+            raise ValueError("Flight5 not found pending messages")
+
+        if not state.remote_random:
+            raise ValueError("Flight5 not found remote random")
+
         print("flight 5 messages", state.pending_remote_handshake_messages)
-        ...
+
+        merged = bytes()
+        seq_pred = state.handshake_sequence_number
+
+        key_server_exchange: KeyServerExchange | None = None
+        result = list[RecordLayer]()
+        for message in state.pending_remote_handshake_messages:
+            match message.message_type:
+                case HandshakeMessageType.KeyServerExchange:
+                    if not isinstance(message, KeyServerExchange):
+                        raise ValueError("Require KeyServerExchange to be present")
+                    key_server_exchange = message
+                case HandshakeMessageType.CertificateRequest:
+                    certificate = Certificate(bytes())
+                    state.local_certificate = create_self_signed_cert_with_ecdsa(
+                        state.local_keypair
+                    )
+                    certificate.certificates = [state.local_certificate]
+
+                    result.append(
+                        RecordLayer(
+                            header=RecordHeader(
+                                content_type=ContentType.HANDSHAKE,
+                                version=DTLSVersion.V1_2,
+                                epoch=state.local_epoch,
+                                sequence_number=state.local_sequence_number,
+                            ),
+                            content=Handshake(
+                                header=HandshakeHeader(
+                                    handshake_type=HandshakeMessageType.Certificate,
+                                    message_sequence=0,
+                                    fragment_offset=0,
+                                ),
+                                message=certificate,
+                            ),
+                        )
+                    )
+                case _:
+                    pass
+
+            try:
+                reconstructed = Handshake(
+                    header=HandshakeHeader(
+                        message_sequence=seq_pred,
+                        handshake_type=message.message_type,
+                        fragment_offset=0,
+                    ),
+                    message=message,
+                )
+
+                seq_pred += 1
+                merged += reconstructed.marshal()
+            except Exception as e:
+                print("Flight 5 error", e)
+
+        if not key_server_exchange:
+            raise ValueError(
+                "Require KeyServerExchange to be present for cipher suite init"
+            )
+
+        try:
+            self.__initialize_cipher_suite(state, key_server_exchange, merged)
+        except Exception as e:
+            print("Flight5 Unable init cipher suite", e)
+            raise e
+
+        print("merged data", merged)
+        print("remote state", binascii.hexlify(state.remote_random))
+
+        client_key_exchange = ClientKeyExchange(bytes())
+        client_key_exchange.pubkey = state.local_keypair.publicKey.to_der()
+        result.append(
+            RecordLayer(
+                header=RecordHeader(
+                    content_type=ContentType.HANDSHAKE,
+                    version=DTLSVersion.V1_2,
+                    epoch=state.local_epoch,
+                    sequence_number=state.local_sequence_number,
+                ),
+                content=Handshake(
+                    header=HandshakeHeader(
+                        handshake_type=HandshakeMessageType.ClientKeyExchange,
+                        message_sequence=0,
+                        fragment_offset=0,
+                    ),
+                    message=client_key_exchange,
+                ),
+            )
+        )
+
+        # TODO: Why client side separate a pubkey and signature of the cert ?
+        # KeyServerExchange sends pubkey and signature in one layer
+        certificate_verify = CertificateVerify(bytes())
+
+        # TODO: Don't hard code, get from the key_server_exchange message
+        certificate_verify.signature_hash_algorithm = (
+            SignatureHashAlgorithm.ECDSA_SECP256R1_SHA256
+        )
+        # certificate_verify.signature = state.local_keypair.generate_signature(
+        #     state.remote_random, state.local_random.marshal_fixed()
+        # )
+        result.append(
+            RecordLayer(
+                header=RecordHeader(
+                    content_type=ContentType.HANDSHAKE,
+                    version=DTLSVersion.V1_2,
+                    epoch=state.local_epoch,
+                    sequence_number=state.local_sequence_number,
+                ),
+                content=Handshake(
+                    header=HandshakeHeader(
+                        handshake_type=HandshakeMessageType.CertificateVerify,
+                        message_sequence=0,
+                        fragment_offset=0,
+                    ),
+                    message=certificate_verify,
+                ),
+            )
+        )
+
+        result.append(
+            RecordLayer(
+                header=RecordHeader(
+                    content_type=ContentType.HANDSHAKE,
+                    version=DTLSVersion.V1_2,
+                    epoch=state.local_epoch,
+                    sequence_number=state.local_sequence_number,
+                ),
+                content=Handshake(
+                    header=HandshakeHeader(
+                        handshake_type=HandshakeMessageType.ChangeCipherSpec,
+                        message_sequence=0,
+                        fragment_offset=0,
+                    ),
+                    message=ChangeCipherSpec(bytes()),
+                ),
+            )
+        )
+
+        return None
 
     async def parse(
         self, state: State, handshake_message_ch: asyncio.Queue[Message]
