@@ -117,6 +117,9 @@ class Keypair:
 
     # NOTE: Must be a len(bytes(...)) == 32
     def generate_shared_key(self) -> bytes:
+        """
+        Need for creating a pre master secret
+        """
         ecdh = ECDH(
             curve=self.privateKey.curve,
             private_key=self.privateKey,
@@ -127,6 +130,18 @@ class Keypair:
     def sign(self, data: bytes) -> bytes:
         # TODO: pass hash func as arg
         return self.privateKey.sign(data, hashfunc=hashlib.sha256)
+
+    @staticmethod
+    def pre_master_secret_from_pub_and_priv_key(
+        pubkey: VerifyingKey,
+        privkey: SigningKey,
+    ) -> bytes:
+        ecdh = ECDH(
+            curve=privkey.curve,
+            private_key=privkey,
+            public_key=pubkey,
+        )
+        return ecdh.generate_sharedsecret_bytes()
 
 
 def create_self_signed_cert_with_ecdsa(keypair: Keypair):
@@ -227,6 +242,8 @@ class ContentType(IntEnum):
     https://tools.ietf.org/html/rfc4346#section-6.2.1
     """
 
+    UNSPECIFIED = 0
+    # RFC types:
     CHANGE_CIPHER_SPEC = 0x14
     ALERT = 0x15
     HANDSHAKE = 0x16
@@ -1141,14 +1158,15 @@ class CertificateVerify(Message):
 class Finished(Message):
     message_type = HandshakeMessageType.Finished
 
+    def __init__(self, data: bytes) -> None:
+        self.encrypted_payload = data
+
     def marshal(self) -> bytes:
-        return bytes(0x01)
+        return self.encrypted_payload
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self:
-        if len(data) != 1 or not data[0] == 0x01:
-            raise ValueError("Change Cipher spec must be a 1 byte")
-        return cls(bytes())
+        return cls(data)
 
 
 MESSAGE_CLASSES: dict[HandshakeMessageType, type[Message]] = {
@@ -1191,8 +1209,8 @@ class ChangeCipherSpec(RecordContentType):
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self:
-        if len(data) != 1 or not data[0] == 0x01:
-            raise ValueError("Change Cipher spec must be a 1 byte")
+        # if len(data) != 1 or not data[0] == 0x01:
+        #     raise ValueError("Change Cipher spec must be a 1 byte")
         return cls()
 
 
@@ -1256,8 +1274,23 @@ class Handshake(RecordContentType):
         return f"<{full_name} object at {hex(id(self))} message={self.message}>"
 
 
+class EncryptedHandshakeMessage(RecordContentType):
+    content_type = ContentType.UNSPECIFIED
+
+    def __init__(self, data: bytes) -> None:
+        self.encrypted_payload = data
+
+    def marshal(self) -> bytes:
+        return self.encrypted_payload
+
+    @classmethod
+    def unmarshal(cls, data: bytes) -> Self:
+        return cls(data)
+
+
 CONTENT_TYPE_CLASSES: dict[ContentType, type[RecordContentType]] = {
     Handshake.content_type: Handshake,
+    ChangeCipherSpec.content_type: ChangeCipherSpec,
 }
 
 
@@ -1268,6 +1301,9 @@ class RecordHeader:
     epoch: int
     sequence_number: int
     length: int = 0
+
+    def header_size(self) -> int:
+        return 13
 
 
 def unpack_version(data: bytes) -> DTLSVersion:
@@ -1351,6 +1387,9 @@ class RecordLayer:
 
         header = RecordHeader(content_type, version, epoch, sequence_number, length)
 
+        if epoch > 0:
+            return cls(header, EncryptedHandshakeMessage(data))
+
         try:
             content_cls = CONTENT_TYPE_CLASSES.get(content_type)
             if not content_cls:
@@ -1358,8 +1397,6 @@ class RecordLayer:
             content = content_cls.unmarshal(data)
         except Exception as e:
             raise e
-
-        # print(content)
 
         return cls(header, content)
 
@@ -1415,11 +1452,12 @@ def decrypt_with_aes_gcm(
 ) -> bytes:
     cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
     cipher.update(additional_data)
-    ciphertext, tag = (
-        encrypted_payload[:-16],
-        encrypted_payload[-16:],
-    )
-    return cipher.decrypt_and_verify(ciphertext, tag)
+    # ciphertext, tag = (
+    #     encrypted_payload[:-16],
+    #     encrypted_payload[-16:],
+    # )
+    # return cipher.decrypt_and_verify(ciphertext, tag)
+    return cipher.decrypt(encrypted_payload)
 
 
 class GCM:
@@ -1472,7 +1510,20 @@ class GCM:
 
         return result
 
-    def decrypt(self, h: RecordHeader, raw: bytes) -> bytes | None: ...
+    def decrypt(self, h: RecordHeader, raw: bytes) -> bytes | None:
+        nonce = bytearray(self.GCM_NONCE_LENGTH)
+        nonce[:4] = self.remote_write_iv[:4]
+        nonce += raw[h.header_size() : h.header_size() + 8]
+
+        out = raw[h.header_size() + 8 :]
+
+        additional_data = generate_aead_additional_data(
+            h, len(out) - self.GCM_TAG_LENGTH
+        )
+
+        decrypted = decrypt_with_aes_gcm(self.remote_key, nonce, out, additional_data)
+
+        return raw[: h.header_size()] + decrypted
 
 
 class EncryptionKeys:
@@ -1647,7 +1698,9 @@ class CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:
 
     def decrypt(self, h: RecordHeader, raw: bytes) -> bytes | None:
         if not self.gcm:
-            raise ValueError("Unable decrypt start gcm first")
+            print("Unable decrypt start gcm first")
+            return
+            # raise ValueError("Unable decrypt start gcm first")
 
         return self.gcm.decrypt(h, raw)
 
@@ -1811,7 +1864,9 @@ class State:
 
         self.pending_remote_handshake_messages: list[Message] | None = None
 
+        self.pending_cipher_suite: CipherSuite | None = None
         self.cipher_suite: CipherSuite | None = None
+
         self.local_verify: bytes | None = None
 
         self.client_cache_messages = dict[HandshakeCacheKey, Message]()
@@ -1966,6 +2021,9 @@ class Flight4:
             CipherSuiteID.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
         )
         server_hello.compression_method = CompressionMethod.Null
+        state.pending_cipher_suite = (
+            CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256()
+        )
 
         use_srtp = UseSRTP(bytes())
         use_srtp.srtp_protection_profiles = [
@@ -2072,9 +2130,52 @@ class Flight4:
     async def parse(
         self, state: State, handshake_message_ch: asyncio.Queue[Message]
     ) -> Flight:
-        client_hello = await handshake_message_ch.get()
-        print("Flight 3 parse hello client hello", client_hello)
-        return Flight.FLIGHT5
+        while True:
+            print("Flight 4 wait")
+            message = await handshake_message_ch.get()
+            print("Flight 4 parse hello client hello", message)
+
+            match message.message_type:
+                case HandshakeMessageType.ClientKeyExchange:
+                    if not isinstance(message, ClientKeyExchange):
+                        raise ValueError("Flight 4 message must be a ClientKeyExchange")
+
+                    verifying_key = VerifyingKey.from_der(message.pubkey)
+
+                    state.pre_master_secret = (
+                        Keypair.pre_master_secret_from_pub_and_priv_key(
+                            verifying_key,
+                            state.local_keypair.privateKey,
+                        )
+                    )
+                    print("after pre master secret??")
+
+                    if not state.remote_random:
+                        raise ValueError("Flight 4 not found remote random")
+
+                    state.master_secret = prf_master_secret(
+                        state.pre_master_secret,
+                        state.local_random.marshal_fixed(),
+                        state.remote_random,
+                        hashlib.sha256,
+                    )
+
+                    if not state.pending_cipher_suite:
+                        raise ValueError("Flight 4 require a pending cipher suite")
+
+                    state.pending_cipher_suite.start(
+                        state.master_secret,
+                        state.local_random.marshal_fixed(),
+                        state.remote_random,
+                        False,
+                    )
+
+                    print("Success cipher suite")
+
+                case HandshakeMessageType.CertificateVerify:
+                    return Flight.FLIGHT6
+                case _:
+                    pass
 
 
 class Flight6:
@@ -2155,7 +2256,7 @@ class Flight1:
         state.remote_epoch = 0
         state.local_random.populate()
         state.remote_random = None
-        state.cipher_suite = None
+        state.pending_cipher_suite = None
 
         state.local_keypair = Keypair.generate_P256()
 
@@ -2272,7 +2373,7 @@ class Flight3:
                         )
 
                     state.remote_random = message.random
-                    state.cipher_suite = cipher_suite_cls()
+                    state.pending_cipher_suite = cipher_suite_cls()
 
                 case HandshakeMessageType.ServerHelloDone:
                     state.pending_remote_handshake_messages = handshake_messages
@@ -2310,7 +2411,7 @@ class Flight5:
         key_server_exchange: KeyServerExchange,
         handshake_messages_merged: bytes,
     ):
-        if not state.cipher_suite:
+        if not state.pending_cipher_suite:
             raise ValueError("Flight5 cipher suite must be defined")
 
         if not state.pre_master_secret:
@@ -2371,7 +2472,7 @@ class Flight5:
 
         # TODO: verify remote_peer_certificates from CAs/PKI or on server itself by RPC
         # TODO: verify connection. What should I do ? def verify_connection(state: State ): ...
-        state.cipher_suite.start(
+        state.pending_cipher_suite.start(
             state.master_secret,
             state.local_random.marshal_fixed(),
             state.remote_random,
@@ -2577,6 +2678,7 @@ FLIGHT_TRANSITIONS: dict[Flight, FlightTransition] = {
     Flight.FLIGHT0: Flight0(),
     Flight.FLIGHT2: Flight2(),
     Flight.FLIGHT4: Flight4(),
+    Flight.FLIGHT6: Flight6(),
     # # Client side
     Flight.FLIGHT1: Flight1(),
     Flight.FLIGHT3: Flight3(),
@@ -2691,12 +2793,12 @@ class FSM:
                 data = layer.marshal()
 
                 if layer.encrypt:
-                    if not self.state.cipher_suite:
+                    if not self.state.pending_cipher_suite:
                         raise ValueError(
                             "layer data must be encrypted but cipher suite undefined"
                         )
 
-                    data = self.state.cipher_suite.encrypt(layer, data)
+                    data = self.state.pending_cipher_suite.encrypt(layer, data)
                     if not data:
                         raise ValueError("None data after encrypt,")
 
@@ -2723,7 +2825,11 @@ class FSM:
         # TODO: On client side I must wait and buffer from ServerHello until ServerHelloDone
         # TODO: This waiting must support also a batch send
         # TODO: When wait a messages make a timeout and fallback to the flight of DTLS role
-        self.flight = await flight.parse(self.state, self.handshake_message_chan)
+        try:
+            self.flight = await flight.parse(self.state, self.handshake_message_chan)
+        except Exception as e:
+            print(f"transition Flight{flight} error", e)
+
         return HandshakeState.Preparing
 
     async def finish(self) -> HandshakeState: ...
@@ -2739,12 +2845,27 @@ class DTLSConn:
         layer_chan: asyncio.Queue[RecordLayer],
         flight: Flight = Flight.FLIGHT0,
     ) -> None:
-        # self.__cipher_suites = list[CipherSuite]()
-
         self.record_layer_chan = layer_chan
 
         self.handshake_message_chan = asyncio.Queue[Message]()
         self.fsm = FSM(remote, self.handshake_message_chan, flight)
+        self.recv_lock = asyncio.Lock()
+
+    def __handle_encrypted_message(
+        self, layer: RecordLayer, message: EncryptedHandshakeMessage
+    ):
+        if not self.fsm.state.cipher_suite:
+            return
+
+        cipher_suite = self.fsm.state.cipher_suite
+
+        if result := cipher_suite.decrypt(layer.header, message.encrypted_payload):
+            print("Got decrypted message result", result)
+            record = RecordLayer.unmarshal(result)
+            print("Recv record", record)
+            return
+
+        print("Unable decrypt message", layer, message)
 
     async def handle_inbound_record_layers(self):
         fsm_runnable = asyncio.create_task(self.fsm.run())
@@ -2755,21 +2876,44 @@ class DTLSConn:
                 print("recv record", record_layer)
 
                 match record_layer.header.content_type:
-                    case ContentType.HANDSHAKE:
-                        if not isinstance(record_layer.content, Handshake):
-                            print(
-                                "DTLS layer not is instance of Message",
-                                record_layer.content,
-                            )
-                            continue
-
-                        await self.handshake_message_chan.put(
-                            record_layer.content.message,
+                    case ContentType.CHANGE_CIPHER_SPEC:
+                        self.fsm.state.cipher_suite = (
+                            self.fsm.state.pending_cipher_suite
                         )
+
+                    case ContentType.HANDSHAKE:
+                        # if isinstance(record_layer.content, EncryptedHandshakeMessage):
+                        #     await self.__handle_encrypted_message(
+                        #         record_layer, record_layer.content
+                        #     )
+                        #     continue
+
+                        if record_layer.header.epoch > 0:
+                            if isinstance(
+                                record_layer.content, EncryptedHandshakeMessage
+                            ):
+                                self.__handle_encrypted_message(
+                                    record_layer, record_layer.content
+                                )
+                                continue
+
+                        if isinstance(record_layer.content, Handshake):
+                            await self.handshake_message_chan.put(
+                                record_layer.content.message,
+                            )
+
+                        # elif isinstance(
+                        #     record_layer.content, EncryptedHandshakeMessage
+                        # ):
+                        #     await self.__handle_encrypted_message(
+                        #         record_layer, record_layer.content
+                        #     )
+
                         # await self.fsm.dispatch()
                     case _:
                         print(
-                            "Unhandled record type of", record_layer.header.content_type
+                            "Unhandled record type of",
+                            record_layer.header.content_type,
                         )
 
         except Exception as e:
