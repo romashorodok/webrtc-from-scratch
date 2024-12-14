@@ -124,6 +124,10 @@ class Keypair:
         )
         return ecdh.generate_sharedsecret_bytes()
 
+    def sign(self, data: bytes) -> bytes:
+        # TODO: pass hash func as arg
+        return self.privateKey.sign(data, hashfunc=hashlib.sha256)
+
 
 def create_self_signed_cert_with_ecdsa(keypair: Keypair):
     sk = keypair.privateKey
@@ -288,7 +292,7 @@ class HandshakeMessageType(IntEnum):
     ServerHelloDone = 14
     CertificateVerify = 15
     ClientKeyExchange = 16
-    ChangeCipherSpec = 20  # Finished
+    Finished = 20
 
 
 class SignatureHashAlgorithm(IntEnum):
@@ -1134,8 +1138,8 @@ class CertificateVerify(Message):
         return i
 
 
-class ChangeCipherSpec(Message):
-    message_type = HandshakeMessageType.ChangeCipherSpec
+class Finished(Message):
+    message_type = HandshakeMessageType.Finished
 
     def marshal(self) -> bytes:
         return bytes(0x01)
@@ -1157,7 +1161,7 @@ MESSAGE_CLASSES: dict[HandshakeMessageType, type[Message]] = {
     ServerHelloDone.message_type: ServerHelloDone,
     ClientKeyExchange.message_type: ClientKeyExchange,
     CertificateVerify.message_type: CertificateVerify,
-    ChangeCipherSpec.message_type: ChangeCipherSpec,
+    Finished.message_type: Finished,
 }
 
 
@@ -1177,6 +1181,19 @@ class RecordContentType:
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self: ...
+
+
+class ChangeCipherSpec(RecordContentType):
+    content_type = ContentType.CHANGE_CIPHER_SPEC
+
+    def marshal(self) -> bytes:
+        return bytes(0x01)
+
+    @classmethod
+    def unmarshal(cls, data: bytes) -> Self:
+        if len(data) != 1 or not data[0] == 0x01:
+            raise ValueError("Change Cipher spec must be a 1 byte")
+        return cls()
 
 
 class Handshake(RecordContentType):
@@ -1286,9 +1303,15 @@ class RecordLayer:
 
     FIXED_HEADER_SIZE = 13
 
+    encrypt: bool = False
+
     def __init__(self, header: RecordHeader, content: RecordContentType) -> None:
         self.header = header
         self.content = content
+
+    def header_size(self) -> int:
+        # TODO: self.FIXED_HEADER_SIZE + connection_id
+        return self.FIXED_HEADER_SIZE
 
     def marshal(self) -> bytes:
         payload = self.content.marshal()
@@ -1341,11 +1364,72 @@ class RecordLayer:
         return cls(header, content)
 
 
-class GaloisCounterMode:
+def generate_aead_additional_data(header: RecordHeader, payload_len: int) -> bytes:
+    data = bytearray(13)
+
+    sequence_number = header.sequence_number & 0xFFFFFFFFFFFF  # Mask to 48 bits
+    data[0] = (sequence_number >> 40) & 0xFF
+    data[1] = (sequence_number >> 32) & 0xFF
+    data[2] = (sequence_number >> 24) & 0xFF
+    data[3] = (sequence_number >> 16) & 0xFF
+    data[4] = (sequence_number >> 8) & 0xFF
+    data[5] = sequence_number & 0xFF
+
+    # Epoch: 16-bit integer
+    data[6] = (header.epoch >> 8) & 0xFF
+    data[7] = header.epoch & 0xFF
+
+    # ContentType: 1 byte
+    data[8] = header.content_type
+
+    # Version (Major and Minor): 2 bytes
+    data[9:10] = byteops.pack_unsigned_short(header.version)
+
+    # Payload Length: 16-bit integer
+    data[11] = (payload_len >> 8) & 0xFF
+    data[12] = payload_len & 0xFF
+
+    return data
+
+
+def encrypt_with_aes_gcm(
+    key: bytes, nonce: bytes, payload: bytes, additional_data: bytes
+) -> bytes:
+    """
+    Encrypts the payload using AES-GCM with the given key, nonce, and additional data.
+
+    :param key: Encryption key (16, 24, or 32 bytes for AES-128, AES-192, AES-256)
+    :param nonce: Unique nonce for AES-GCM (recommended length is 12 bytes)
+    :param payload: The data to encrypt
+    :param additional_data: Associated additional data (AAD) for integrity verification
+    :return: Encrypted payload concatenated with the authentication tag
+    """
+    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    cipher.update(additional_data)
+    encrypted_payload, tag = cipher.encrypt_and_digest(payload)
+    return encrypted_payload + tag
+
+
+def decrypt_with_aes_gcm(
+    key: bytes, nonce: bytes, encrypted_payload: bytes, additional_data: bytes
+) -> bytes:
+    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    cipher.update(additional_data)
+    ciphertext, tag = (
+        encrypted_payload[:-16],
+        encrypted_payload[-16:],
+    )
+    return cipher.decrypt_and_verify(ciphertext, tag)
+
+
+class GCM:
     """
     https://datatracker.ietf.org/doc/html/rfc5288
     https://en.wikipedia.org/wiki/Galois/Counter_Mode
     """
+
+    GCM_NONCE_LENGTH = 12
+    GCM_TAG_LENGTH = 16
 
     def __init__(
         self,
@@ -1354,13 +1438,39 @@ class GaloisCounterMode:
         remote_key: bytes,
         remote_write_iv: bytes,
     ) -> None:
-        self._local_gcm = AES.new(local_key, AES.MODE_GCM, local_write_iv)
-        self._remote_gcm = AES.new(remote_key, AES.MODE_GCM, remote_write_iv)
+        # self._local_gcm = AES.new(local_key, AES.MODE_GCM, local_write_iv)
+        # self._remote_gcm = AES.new(remote_key, AES.MODE_GCM, remote_write_iv)
 
+        self.local_key = local_key
+        self.remote_key = remote_key
         self.local_write_iv = local_write_iv
         self.remote_write_iv = remote_write_iv
 
-    def encrypt(self, pkt: RecordLayer, raw: bytes) -> bytes | None: ...
+    def encrypt(self, pkt: RecordLayer, raw: bytes) -> bytes | None:
+        payload = raw[pkt.header_size() :]
+        raw = raw[: pkt.header_size()]
+
+        nonce = bytearray(self.GCM_NONCE_LENGTH)
+        nonce[:4] = self.local_write_iv[:4]
+        nonce[4:] = os.urandom(self.GCM_NONCE_LENGTH - 4)
+
+        additional_data = generate_aead_additional_data(pkt.header, len(payload))
+
+        encrypted = encrypt_with_aes_gcm(
+            self.local_key, nonce, payload, additional_data
+        )
+
+        total_length = len(raw) + len(nonce[4:]) + len(encrypted)
+        result = bytearray(total_length)
+        result[0 : len(raw)] = raw
+        result[len(raw) : len(raw) + len(nonce[4:])] = nonce[4:]
+        result[len(raw) + len(nonce[4:]) :] = encrypted
+
+        result[pkt.header_size() - 2 : pkt.header_size()] = byteops.pack_unsigned_short(
+            total_length - pkt.header_size()
+        )
+
+        return result
 
     def decrypt(self, h: RecordHeader, raw: bytes) -> bytes | None: ...
 
@@ -1492,8 +1602,7 @@ class CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:
     __PRF_IV_LEN = 4
 
     def __init__(self) -> None:
-        self.id = 0xC02B
-        self.gcm: GaloisCounterMode | None = None
+        self.gcm: GCM | None = None
 
     def start(
         self,
@@ -1514,14 +1623,14 @@ class CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:
             raise ValueError("Unable generate prf encryption keys")
 
         if client:
-            gcm = GaloisCounterMode(
+            gcm = GCM(
                 keys.client_write_key,
                 keys.client_write_iv,
                 keys.server_write_key,
                 keys.server_write_iv,
             )
         else:
-            gcm = GaloisCounterMode(
+            gcm = GCM(
                 keys.server_write_key,
                 keys.server_write_iv,
                 keys.client_write_key,
@@ -1533,31 +1642,33 @@ class CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:
     def encrypt(self, pkt: RecordLayer, raw: bytes) -> bytes | None:
         if not self.gcm:
             raise ValueError("Unable encrypt start gcm first")
+
         return self.gcm.encrypt(pkt, raw)
 
     def decrypt(self, h: RecordHeader, raw: bytes) -> bytes | None:
         if not self.gcm:
             raise ValueError("Unable decrypt start gcm first")
+
         return self.gcm.decrypt(h, raw)
-
-    def certificate_type_sign(self) -> bytes:
-        return _ECDSA_SIGN
-
-    def key_exchange_algorithm(self) -> int:
-        return KEY_EXCHANGE_ALGORITHM_ECDHE
-
-    def is_elliptic_curve_cryptography(self) -> bool:
-        return True
-
-    def authentication_type(self) -> AUTHENTICATION_TYPE:
-        return AUTHENTICATION_TYPE.Certificate
-
-    def __str__(self) -> str:
-        return "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
 
 
 class CipherSuite(Protocol):
-    pass
+    def start(
+        self,
+        master_secret: bytes,
+        client_random: bytes,
+        server_random: bytes,
+        client: bool,
+    ): ...
+
+    def encrypt(self, pkt: RecordLayer, raw: bytes) -> bytes | None: ...
+
+    def decrypt(self, h: RecordHeader, raw: bytes) -> bytes | None: ...
+
+
+CIPHER_SUITES_CLASSES: dict[CipherSuiteID, type[CipherSuite]] = {
+    CipherSuiteID.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256: CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+}
 
 
 #                     [RFC6347 Section-4.2.4]
@@ -1660,6 +1771,20 @@ def verify_certificate_signature(
     return False
 
 
+@dataclass
+class PullCacheOption:
+    message_type: HandshakeMessageType
+    epoch: int
+    is_client: bool
+    optional: bool
+
+
+@dataclass(frozen=True)
+class HandshakeCacheKey:
+    message_type: HandshakeMessageType
+    epoch: int
+
+
 class State:
     INITIAL_EPOCH = 0
     DEFAULT_CURVE: EllipticCurveGroup = EllipticCurveGroup.SECP256R1
@@ -1686,6 +1811,17 @@ class State:
 
         self.pending_remote_handshake_messages: list[Message] | None = None
 
+        self.cipher_suite: CipherSuite | None = None
+        self.local_verify: bytes | None = None
+
+        self.client_cache_messages = dict[HandshakeCacheKey, Message]()
+        self.server_cache_messages = dict[HandshakeCacheKey, Message]()
+
+    def push_cache(self, message: Message): ...
+
+    def pull_cache(self, options: list[PullCacheOption]) -> list[Message] | None:
+        pass
+
 
 class FlightTransition(Protocol):
     def generate(self, state: State) -> list[RecordLayer] | None: ...
@@ -1693,6 +1829,25 @@ class FlightTransition(Protocol):
     async def parse(
         self, state: State, handshake_message_ch: asyncio.Queue[Message]
     ) -> Flight: ...
+
+
+VERIFY_DATA_CLIENT_LABEL = b"client finished"
+VERIFY_DATA_SERVER_LABEL = b"server finished"
+
+
+def prf_verify_data(master_secret: bytes, handshake_bodies: bytes, label: bytes):
+    # TODO: dynamic hashfunc
+    digest = hashlib.sha256(handshake_bodies).digest()
+    seed = label + digest
+    return p_hash(master_secret, seed, 12, hashlib.sha256)
+
+
+def verify_data_client(master_secret: bytes, handshake_bodies: bytes):
+    return prf_verify_data(master_secret, handshake_bodies, VERIFY_DATA_CLIENT_LABEL)
+
+
+def verify_data_server(master_secret: bytes, handshake_bodies: bytes):
+    return prf_verify_data(master_secret, handshake_bodies, VERIFY_DATA_SERVER_LABEL)
 
 
 # --- Server side flights
@@ -1922,6 +2077,14 @@ class Flight4:
         return Flight.FLIGHT5
 
 
+class Flight6:
+    def generate(self, state: State) -> list[RecordLayer] | None: ...
+
+    async def parse(
+        self, state: State, handshake_message_ch: asyncio.Queue[Message]
+    ) -> Flight: ...
+
+
 def client_hello_factory(state: State) -> RecordLayer:
     client_hello = ClientHello(bytes())
     client_hello.version = DTLSVersion.V1_0
@@ -1992,6 +2155,7 @@ class Flight1:
         state.remote_epoch = 0
         state.local_random.populate()
         state.remote_random = None
+        state.cipher_suite = None
 
         state.local_keypair = Keypair.generate_P256()
 
@@ -2093,7 +2257,23 @@ class Flight3:
                     state.remote_peer_certificates = message.certificates
 
                 case HandshakeMessageType.ServerHello:
+                    if not isinstance(message, ServerHello):
+                        raise ValueError(
+                            "Flight 3 message must be a instance of ServerHello"
+                        )
+
+                    if not message.cipher_suite:
+                        raise ValueError("Flight 3 message must contain cipher suite")
+
+                    cipher_suite_cls = CIPHER_SUITES_CLASSES.get(message.cipher_suite)
+                    if not cipher_suite_cls:
+                        raise ValueError(
+                            f"Flight 3 not found cipher suite {message.cipher_suite}"
+                        )
+
                     state.remote_random = message.random
+                    state.cipher_suite = cipher_suite_cls()
+
                 case HandshakeMessageType.ServerHelloDone:
                     state.pending_remote_handshake_messages = handshake_messages
                     print("Flight 3 done")
@@ -2130,6 +2310,9 @@ class Flight5:
         key_server_exchange: KeyServerExchange,
         handshake_messages_merged: bytes,
     ):
+        if not state.cipher_suite:
+            raise ValueError("Flight5 cipher suite must be defined")
+
         if not state.pre_master_secret:
             raise ValueError("Flight5 pre master secret must be initialized")
         if not state.remote_random:
@@ -2186,9 +2369,14 @@ class Flight5:
 
         print("Certificate verified success ???", verified)
 
-        # print(
-        #     "master secret", state.master_secret, "master len", len(state.master_secret)
-        # )
+        # TODO: verify remote_peer_certificates from CAs/PKI or on server itself by RPC
+        # TODO: verify connection. What should I do ? def verify_connection(state: State ): ...
+        state.cipher_suite.start(
+            state.master_secret,
+            state.local_random.marshal_fixed(),
+            state.remote_random,
+            True,
+        )
 
     def generate(self, state: State) -> list[RecordLayer] | None:
         if not state.pending_remote_handshake_messages:
@@ -2202,6 +2390,8 @@ class Flight5:
         merged = bytes()
         seq_pred = state.handshake_sequence_number
 
+        print("pending messages", state.pending_remote_handshake_messages)
+
         key_server_exchange: KeyServerExchange | None = None
         result = list[RecordLayer]()
         for message in state.pending_remote_handshake_messages:
@@ -2210,31 +2400,6 @@ class Flight5:
                     if not isinstance(message, KeyServerExchange):
                         raise ValueError("Require KeyServerExchange to be present")
                     key_server_exchange = message
-                case HandshakeMessageType.CertificateRequest:
-                    certificate = Certificate(bytes())
-                    state.local_certificate = create_self_signed_cert_with_ecdsa(
-                        state.local_keypair
-                    )
-                    certificate.certificates = [state.local_certificate]
-
-                    result.append(
-                        RecordLayer(
-                            header=RecordHeader(
-                                content_type=ContentType.HANDSHAKE,
-                                version=DTLSVersion.V1_2,
-                                epoch=state.local_epoch,
-                                sequence_number=state.local_sequence_number,
-                            ),
-                            content=Handshake(
-                                header=HandshakeHeader(
-                                    handshake_type=HandshakeMessageType.Certificate,
-                                    message_sequence=0,
-                                    fragment_offset=0,
-                                ),
-                                message=certificate,
-                            ),
-                        )
-                    )
                 case _:
                     pass
 
@@ -2264,80 +2429,139 @@ class Flight5:
             print("Flight5 Unable init cipher suite", e)
             raise e
 
-        print("merged data", merged)
-        print("remote state", binascii.hexlify(state.remote_random))
+        certificate = Certificate(bytes())
+        state.local_certificate = create_self_signed_cert_with_ecdsa(
+            state.local_keypair
+        )
+        certificate.certificates = [state.local_certificate]
+        layer_certificate = RecordLayer(
+            header=RecordHeader(
+                content_type=ContentType.HANDSHAKE,
+                version=DTLSVersion.V1_2,
+                epoch=state.local_epoch,
+                sequence_number=state.local_sequence_number,
+            ),
+            content=Handshake(
+                header=HandshakeHeader(
+                    handshake_type=HandshakeMessageType.Certificate,
+                    message_sequence=seq_pred,
+                    fragment_offset=0,
+                ),
+                message=certificate,
+            ),
+        )
+        result.append(layer_certificate)
+        seq_pred += 1
+        merged += layer_certificate.content.marshal()
+
+        # print("merged data", merged)
+        # print("remote state", binascii.hexlify(state.remote_random))
 
         client_key_exchange = ClientKeyExchange(bytes())
         client_key_exchange.pubkey = state.local_keypair.publicKey.to_der()
-        result.append(
-            RecordLayer(
-                header=RecordHeader(
-                    content_type=ContentType.HANDSHAKE,
-                    version=DTLSVersion.V1_2,
-                    epoch=state.local_epoch,
-                    sequence_number=state.local_sequence_number,
+        layer_client_key_exchange = RecordLayer(
+            header=RecordHeader(
+                content_type=ContentType.HANDSHAKE,
+                version=DTLSVersion.V1_2,
+                epoch=state.local_epoch,
+                sequence_number=seq_pred,
+            ),
+            content=Handshake(
+                header=HandshakeHeader(
+                    handshake_type=HandshakeMessageType.ClientKeyExchange,
+                    message_sequence=seq_pred,
+                    fragment_offset=0,
                 ),
-                content=Handshake(
-                    header=HandshakeHeader(
-                        handshake_type=HandshakeMessageType.ClientKeyExchange,
-                        message_sequence=0,
-                        fragment_offset=0,
-                    ),
-                    message=client_key_exchange,
-                ),
-            )
+                message=client_key_exchange,
+            ),
         )
+        result.append(layer_client_key_exchange)
+        seq_pred += 1
+        merged += layer_client_key_exchange.content.marshal()
 
         # TODO: Why client side separate a pubkey and signature of the cert ?
         # KeyServerExchange sends pubkey and signature in one layer
         certificate_verify = CertificateVerify(bytes())
 
         # TODO: Don't hard code, get from the key_server_exchange message
+        # TODO: get values from local key pair
         certificate_verify.signature_hash_algorithm = (
             SignatureHashAlgorithm.ECDSA_SECP256R1_SHA256
         )
-        # certificate_verify.signature = state.local_keypair.generate_signature(
-        #     state.remote_random, state.local_random.marshal_fixed()
-        # )
-        result.append(
-            RecordLayer(
-                header=RecordHeader(
-                    content_type=ContentType.HANDSHAKE,
-                    version=DTLSVersion.V1_2,
-                    epoch=state.local_epoch,
-                    sequence_number=state.local_sequence_number,
-                ),
-                content=Handshake(
-                    header=HandshakeHeader(
-                        handshake_type=HandshakeMessageType.CertificateVerify,
-                        message_sequence=0,
-                        fragment_offset=0,
-                    ),
-                    message=certificate_verify,
-                ),
-            )
-        )
 
-        result.append(
-            RecordLayer(
-                header=RecordHeader(
-                    content_type=ContentType.HANDSHAKE,
-                    version=DTLSVersion.V1_2,
-                    epoch=state.local_epoch,
-                    sequence_number=state.local_sequence_number,
-                ),
-                content=Handshake(
-                    header=HandshakeHeader(
-                        handshake_type=HandshakeMessageType.ChangeCipherSpec,
-                        message_sequence=0,
-                        fragment_offset=0,
-                    ),
-                    message=ChangeCipherSpec(bytes()),
-                ),
-            )
-        )
+        # TODO: Check cache if this types of handshake message already sent merge before into merged and sign it with predicted merged data
+        # ClientHello
+        # ServerHello
+        # Certificate
+        # ServerKeyExchange
+        # CertificateRequest
+        # ServerHelloDone
+        # Certificate
+        # ClientKeyExchange
 
-        return None
+        certificate_verify.signature = state.local_keypair.sign(merged)
+        layer_certificate_verify_signature = RecordLayer(
+            header=RecordHeader(
+                content_type=ContentType.HANDSHAKE,
+                version=DTLSVersion.V1_2,
+                epoch=state.local_epoch,
+                sequence_number=state.local_sequence_number,
+            ),
+            content=Handshake(
+                header=HandshakeHeader(
+                    handshake_type=HandshakeMessageType.CertificateVerify,
+                    message_sequence=seq_pred,
+                    fragment_offset=0,
+                ),
+                message=certificate_verify,
+            ),
+        )
+        result.append(layer_certificate_verify_signature)
+        seq_pred += 1
+        merged += layer_certificate_verify_signature.content.marshal()
+
+        # TODO: This not a handshake
+        layer_change_cipher_spec = RecordLayer(
+            header=RecordHeader(
+                content_type=ContentType.CHANGE_CIPHER_SPEC,
+                version=DTLSVersion.V1_2,
+                epoch=state.local_epoch,
+                sequence_number=state.local_sequence_number,
+            ),
+            content=ChangeCipherSpec(),
+        )
+        result.append(layer_change_cipher_spec)
+        # seq_pred += 1
+        # merged += layer_change_cipher_spec.content.marshal()
+
+        if not state.master_secret:
+            raise ValueError("Flight 5 master_secret must be defined by cuite")
+
+        if not state.local_verify:
+            state.local_verify = verify_data_client(state.master_secret, merged)
+
+        print(state.local_verify, len(state.local_verify))
+
+        layer_finished = RecordLayer(
+            header=RecordHeader(
+                content_type=ContentType.HANDSHAKE,
+                version=DTLSVersion.V1_2,
+                epoch=1,
+                sequence_number=state.local_sequence_number,
+            ),
+            content=Handshake(
+                header=HandshakeHeader(
+                    handshake_type=HandshakeMessageType.Finished,
+                    message_sequence=seq_pred,
+                    fragment_offset=0,
+                ),
+                message=Finished(bytes()),
+            ),
+        )
+        layer_finished.encrypt = True
+        result.append(layer_finished)
+
+        return result
 
     async def parse(
         self, state: State, handshake_message_ch: asyncio.Queue[Message]
@@ -2362,6 +2586,9 @@ FLIGHT_TRANSITIONS: dict[Flight, FlightTransition] = {
 
 class DTLSRemote(Protocol):
     async def sendto(self, data: bytes): ...
+
+
+MAX_MTU = 1280
 
 
 class FSM:
@@ -2428,7 +2655,11 @@ class FSM:
             # TODO: DTLS alerting
             return HandshakeState.Errored
 
-        self.pending_record_layers = flight.generate(self.state)
+        try:
+            self.pending_record_layers = flight.generate(self.state)
+        except Exception as e:
+            print("FSM catch:", e)
+            raise e
 
         epoch = self.state.INITIAL_EPOCH
         next_epoch = epoch
@@ -2457,11 +2688,28 @@ class FSM:
         # TODO: message batch
         for layer in self.pending_record_layers:
             try:
-                await self.remote.sendto(layer.marshal())
+                data = layer.marshal()
+
+                if layer.encrypt:
+                    if not self.state.cipher_suite:
+                        raise ValueError(
+                            "layer data must be encrypted but cipher suite undefined"
+                        )
+
+                    data = self.state.cipher_suite.encrypt(layer, data)
+                    if not data:
+                        raise ValueError("None data after encrypt,")
+
+                if len(data) > MAX_MTU:
+                    raise ValueError(
+                        "layer data has too much bytes. Message must be fragmented"
+                    )
+
+                await self.remote.sendto(data)
             except Exception as e:
                 # TODO: backoff
                 print("Unable send inconsistent packet. Err:", e, "layer", layer)
-                await asyncio.sleep(1)
+                await asyncio.sleep(10)
                 return HandshakeState.Sending
 
         return HandshakeState.Waiting
