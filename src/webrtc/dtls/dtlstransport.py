@@ -97,7 +97,7 @@ class Keypair:
         server_ecdh_params[0] = NAMED_CURVE_TYPE
         server_ecdh_params[1:3] = byteops.pack_unsigned_short(self.curve)
         server_ecdh_params[3:4] = byteops.pack_byte_int(len(self.publicKey.to_der()))
-        return server_ecdh_params
+        return bytes(server_ecdh_params)
 
     def generate_server_signature(
         self, remote_random: bytes, local_random: bytes
@@ -106,11 +106,11 @@ class Keypair:
         msg = bytes(
             remote_random + local_random + ecdh_params + self.publicKey.to_der()
         )
-        print("Expected server expected_ecdh_secret_message", binascii.hexlify(msg))
-        print(
-            "Expected server expected_ecdh_secret_message digest",
-            binascii.hexlify(hashlib.sha256(msg).digest()),
-        )
+        # print("Expected server expected_ecdh_secret_message", binascii.hexlify(msg))
+        # print(
+        #     "Expected server expected_ecdh_secret_message digest",
+        #     binascii.hexlify(hashlib.sha256(msg).digest()),
+        # )
 
         result = self.privateKey.sign(msg, hashfunc=hashlib.sha256)
         return result
@@ -1367,6 +1367,7 @@ class RecordLayer:
             raise ValueError("DTLS record is too small")
 
         header = data[: cls.FIXED_HEADER_SIZE]
+        # print("content type", header[0])
         content_type = ContentType(header[0])
 
         if content_type == ContentType.CONNECTION_ID:
@@ -1426,7 +1427,7 @@ def generate_aead_additional_data(header: RecordHeader, payload_len: int) -> byt
     data[11] = (payload_len >> 8) & 0xFF
     data[12] = payload_len & 0xFF
 
-    return data
+    return bytes(data)
 
 
 def encrypt_with_aes_gcm(
@@ -1444,20 +1445,21 @@ def encrypt_with_aes_gcm(
     cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
     cipher.update(additional_data)
     encrypted_payload, tag = cipher.encrypt_and_digest(payload)
+    print("enc tag", binascii.hexlify(tag))
     return encrypted_payload + tag
 
 
 def decrypt_with_aes_gcm(
-    key: bytes, nonce: bytes, encrypted_payload: bytes, additional_data: bytes
+    key: bytes, nonce: bytes, ciphertext: bytes,  tag: bytes, additional_data: bytes
 ) -> bytes:
     cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
     cipher.update(additional_data)
-    # ciphertext, tag = (
-    #     encrypted_payload[:-16],
-    #     encrypted_payload[-16:],
-    # )
-    # return cipher.decrypt_and_verify(ciphertext, tag)
-    return cipher.decrypt(encrypted_payload)
+
+    # print("dec tag", binascii.hexlify(tag))
+    # print("dec cipher", binascii.hexlify(ciphertext))
+
+    return cipher.decrypt_and_verify(ciphertext, tag)
+    # return cipher.decrypt(ciphertext)
 
 
 class GCM:
@@ -1485,6 +1487,7 @@ class GCM:
         self.remote_write_iv = remote_write_iv
 
     def encrypt(self, pkt: RecordLayer, raw: bytes) -> bytes | None:
+        raw_copy = raw[pkt.header_size():]
         payload = raw[pkt.header_size() :]
         raw = raw[: pkt.header_size()]
 
@@ -1495,7 +1498,7 @@ class GCM:
         additional_data = generate_aead_additional_data(pkt.header, len(payload))
 
         encrypted = encrypt_with_aes_gcm(
-            self.local_key, nonce, payload, additional_data
+            self.local_key, bytes(nonce), payload, additional_data
         )
 
         total_length = len(raw) + len(nonce[4:]) + len(encrypted)
@@ -1508,42 +1511,69 @@ class GCM:
             total_length - pkt.header_size()
         )
 
-        return result
+        # print("encrypt local_key:", binascii.hexlify(self.local_key), "remote_key:", binascii.hexlify(self.remote_key))
+        # print("encrypt local_key_iv:", binascii.hexlify(self.local_write_iv), "remote_key_iv:", binascii.hexlify(self.remote_write_iv))
 
-    def decrypt(self, h: RecordHeader, raw: bytes) -> bytes | None:
-        nonce = bytearray(self.GCM_NONCE_LENGTH)
-        nonce[:4] = self.remote_write_iv[:4]
-        nonce += raw[h.header_size() : h.header_size() + 8]
+        # print("encrypt nonce", binascii.hexlify(nonce))
 
-        out = raw[h.header_size() + 8 :]
+        print("befor enc", binascii.hexlify(raw_copy))
+        print("encrypted", binascii.hexlify(result))
+        print("enc nonce", binascii.hexlify(nonce))
+        return bytes(result)
+
+    def decrypt(self, h: "RecordHeader", raw: bytes) -> bytes:
+        # nonce = raw[h.header_size():h.header_size() + self.GCM_NONCE_LENGTH]
+
+        ciphertext = raw[:-self.GCM_TAG_LENGTH]
+        tag = raw[-self.GCM_TAG_LENGTH:]
+        # print("dec ciphertext", binascii.hexlify(ciphertext),  "dec tag ", binascii.hexlify(tag))
+
+        nonce =  self.remote_write_iv[:4] + ciphertext[:-self.GCM_NONCE_LENGTH]
+        ciphertext = ciphertext[-self.GCM_NONCE_LENGTH:]
+        print("nonce", binascii.hexlify(nonce), "dec ciphertext", binascii.hexlify(ciphertext),  "dec tag ", binascii.hexlify(tag))
+
+        # print("dec nonce",  binascii.hexlify(ciphertext[:-self.GCM_NONCE_LENGTH]))
+        # print("dec remote_write_iv", binascii.hexlify(self.remote_write_iv),  "local_write_iv", binascii.hexlify(self.local_write_iv))
+        # print("dec remote_key", binascii.hexlify(self.remote_key),  "local_key", binascii.hexlify(self.local_key))
 
         additional_data = generate_aead_additional_data(
-            h, len(out) - self.GCM_TAG_LENGTH
+            h, len(ciphertext)
         )
 
-        decrypted = decrypt_with_aes_gcm(self.remote_key, nonce, out, additional_data)
+        #
+        try:
+            decrypted = decrypt_with_aes_gcm(
+                self.remote_key, nonce, ciphertext, tag, additional_data
+            )
+        except Exception as e:
+            print("decrypted error", e)
+            return bytes()
 
-        return raw[: h.header_size()] + decrypted
+        #
+        result =  decrypted
+        print("decrypted", binascii.hexlify(result))
 
+        return result 
 
+@dataclass
 class EncryptionKeys:
-    def __init__(
-        self,
-        master_secret: bytes,
-        client_mac_key: bytes,
-        server_mac_key: bytes,
-        client_write_key: bytes,
-        server_write_key: bytes,
-        client_write_iv: bytes,
-        server_write_iv: bytes,
-    ):
-        self.master_secret = master_secret
-        self.client_mac_key = client_mac_key
-        self.server_mac_key = server_mac_key
-        self.client_write_key = client_write_key
-        self.server_write_key = server_write_key
-        self.client_write_iv = client_write_iv
-        self.server_write_iv = server_write_iv
+    master_secret: bytes
+    client_mac_key: bytes
+    server_mac_key: bytes
+    client_write_key: bytes
+    server_write_key: bytes
+    client_write_iv: bytes
+    server_write_iv: bytes
+    # def __init__(
+    #     self,
+    # ):
+        # self.master_secret = master_secret
+        # self.client_mac_key = client_mac_key
+        # self.server_mac_key = server_mac_key
+        # self.client_write_key = client_write_key
+        # self.server_write_key = server_write_key
+        # self.client_write_iv = client_write_iv
+        # self.server_write_iv = server_write_iv
 
 
 def p_hash(
@@ -1614,6 +1644,7 @@ def prf_generate_encryption_keys(
             (2 * mac_len) + (2 * key_len) + (2 * iv_len),
             hashlib.sha256,
         )
+        print("key meterial", key_material)
 
         client_mac_key = key_material[:mac_len]
         key_material = key_material[mac_len:]
@@ -1672,6 +1703,12 @@ class CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:
         )
         if not keys:
             raise ValueError("Unable generate prf encryption keys")
+
+        print("Master Secret:", binascii.hexlify(master_secret))
+        print("Client Random:", binascii.hexlify(client_random))
+        print("Server Random:", binascii.hexlify(server_random))
+        print("Generated Keys:", keys)
+        print("is client", client)
 
         if client:
             gcm = GCM(
@@ -1966,9 +2003,9 @@ class Flight2:
     async def parse(
         self, state: State, handshake_message_ch: asyncio.Queue[Message]
     ) -> Flight:
-        print("flight 2 wait")
+        # print("flight 2 wait")
         client_hello = await handshake_message_ch.get()
-        print("flight 2 after wait")
+        # print("flight 2 after wait")
         if not isinstance(client_hello, ClientHello):
             print(
                 "Flight 1 must receive a client hello after a HelloVerifyRequest. Reset state to Flight 0"
@@ -2131,9 +2168,9 @@ class Flight4:
         self, state: State, handshake_message_ch: asyncio.Queue[Message]
     ) -> Flight:
         while True:
-            print("Flight 4 wait")
+            # print("Flight 4 wait")
             message = await handshake_message_ch.get()
-            print("Flight 4 parse hello client hello", message)
+            # print("Flight 4 parse hello client hello", message)
 
             match message.message_type:
                 case HandshakeMessageType.ClientKeyExchange:
@@ -2148,7 +2185,9 @@ class Flight4:
                             state.local_keypair.privateKey,
                         )
                     )
-                    print("after pre master secret??")
+                    print("Flight 4 pre master secret", binascii.hexlify(state.pre_master_secret) )
+
+                    # print("after pre master secret??")
 
                     if not state.remote_random:
                         raise ValueError("Flight 4 not found remote random")
@@ -2163,6 +2202,8 @@ class Flight4:
                     if not state.pending_cipher_suite:
                         raise ValueError("Flight 4 require a pending cipher suite")
 
+                    # print("Flight 4", binascii.hexlify(state.remote_random), binascii.hexlify(state.local_random.marshal_fixed()) )
+
                     state.pending_cipher_suite.start(
                         state.master_secret,
                         state.local_random.marshal_fixed(),
@@ -2170,10 +2211,10 @@ class Flight4:
                         False,
                     )
 
-                    print("Success cipher suite")
+                    # print("Success cipher suite")
 
                 case HandshakeMessageType.CertificateVerify:
-                    return Flight.FLIGHT6
+                    return Flight.FLIGHT5
                 case _:
                     pass
 
@@ -2313,8 +2354,8 @@ class Flight3:
         # TODO: Is it must use a pub key instead of ?
         state.pre_master_secret = state.local_keypair.generate_shared_key()
         print(
-            "Shared pre master secret",
-            state.pre_master_secret,
+            "Flight 3 Shared pre master secret",
+            binascii.hexlify(state.pre_master_secret),
             len(state.pre_master_secret),
         )
 
@@ -2454,10 +2495,10 @@ class Flight5:
             key_server_exchange.pubkey,
             key_server_exchange.named_curve,
         )
-        print(
-            "Expected client expected_ecdh_secret_message",
-            binascii.hexlify(expected_ecdh_secret_message),
-        )
+        # print(
+        #     "Expected client expected_ecdh_secret_message",
+        #     binascii.hexlify(expected_ecdh_secret_message),
+        # )
 
         verified = verify_certificate_signature(
             expected_ecdh_secret_message,
@@ -2472,6 +2513,8 @@ class Flight5:
 
         # TODO: verify remote_peer_certificates from CAs/PKI or on server itself by RPC
         # TODO: verify connection. What should I do ? def verify_connection(state: State ): ...
+
+        # print("Flight 5", binascii.hexlify(state.remote_random), binascii.hexlify(state.local_random.marshal_fixed()) )
         state.pending_cipher_suite.start(
             state.master_secret,
             state.local_random.marshal_fixed(),
@@ -2486,12 +2529,12 @@ class Flight5:
         if not state.remote_random:
             raise ValueError("Flight5 not found remote random")
 
-        print("flight 5 messages", state.pending_remote_handshake_messages)
+        # print("flight 5 messages", state.pending_remote_handshake_messages)
 
         merged = bytes()
         seq_pred = state.handshake_sequence_number
 
-        print("pending messages", state.pending_remote_handshake_messages)
+        # print("pending messages", state.pending_remote_handshake_messages)
 
         key_server_exchange: KeyServerExchange | None = None
         result = list[RecordLayer]()
@@ -2539,7 +2582,7 @@ class Flight5:
             header=RecordHeader(
                 content_type=ContentType.HANDSHAKE,
                 version=DTLSVersion.V1_2,
-                epoch=state.local_epoch,
+                epoch=0,
                 sequence_number=state.local_sequence_number,
             ),
             content=Handshake(
@@ -2564,7 +2607,7 @@ class Flight5:
             header=RecordHeader(
                 content_type=ContentType.HANDSHAKE,
                 version=DTLSVersion.V1_2,
-                epoch=state.local_epoch,
+                epoch=0,
                 sequence_number=seq_pred,
             ),
             content=Handshake(
@@ -2605,7 +2648,7 @@ class Flight5:
             header=RecordHeader(
                 content_type=ContentType.HANDSHAKE,
                 version=DTLSVersion.V1_2,
-                epoch=state.local_epoch,
+                epoch=0,
                 sequence_number=state.local_sequence_number,
             ),
             content=Handshake(
@@ -2626,7 +2669,7 @@ class Flight5:
             header=RecordHeader(
                 content_type=ContentType.CHANGE_CIPHER_SPEC,
                 version=DTLSVersion.V1_2,
-                epoch=state.local_epoch,
+                epoch=0,
                 sequence_number=state.local_sequence_number,
             ),
             content=ChangeCipherSpec(),
@@ -2661,15 +2704,16 @@ class Flight5:
         )
         layer_finished.encrypt = True
         result.append(layer_finished)
-
-        return result
+        # return result
+        return [layer_client_key_exchange, layer_change_cipher_spec, layer_finished, ]
 
     async def parse(
         self, state: State, handshake_message_ch: asyncio.Queue[Message]
     ) -> Flight:
         #                 [ChangeCipherSpec] \ Flight 6
         # <--------             Finished     /
-        ...
+        await asyncio.sleep(2)
+        return Flight.FLIGHT5
 
 
 # --- Client side flights
@@ -2751,7 +2795,7 @@ class FSM:
                             break
 
     async def prepare(self) -> HandshakeState:
-        print("Prepare state", self.flight)
+        # print("Prepare state", self.flight)
         flight = FLIGHT_TRANSITIONS.get(self.flight)
         if not flight:
             # TODO: DTLS alerting
@@ -2783,7 +2827,7 @@ class FSM:
 
     async def send(self) -> HandshakeState:
         # print("Send state", self.flight, "pending", self.pending_record_layers)
-        print("Send state", self.flight)
+        # print("Send state", self.flight)
         if not self.pending_record_layers:
             return HandshakeState.Waiting
 
@@ -2820,7 +2864,7 @@ class FSM:
         flight = FLIGHT_TRANSITIONS.get(self.flight)
         if not flight:
             return HandshakeState.Errored
-        print("wait transition", flight)
+        # print("wait transition", flight)
 
         # TODO: On client side I must wait and buffer from ServerHello until ServerHelloDone
         # TODO: This waiting must support also a batch send
@@ -2860,12 +2904,13 @@ class DTLSConn:
         cipher_suite = self.fsm.state.cipher_suite
 
         if result := cipher_suite.decrypt(layer.header, message.encrypted_payload):
-            print("Got decrypted message result", result)
-            record = RecordLayer.unmarshal(result)
-            print("Recv record", record)
+            # print("message before decrypt", binascii.hexlify(message.encrypted_payload))
+            # print("Got decrypted message result", result)
+            # record = RecordLayer.unmarshal(result)
+            # print("Recv record", record)
             return
 
-        print("Unable decrypt message", layer, message)
+        # print("Unable decrypt message", layer, message)
 
     async def handle_inbound_record_layers(self):
         fsm_runnable = asyncio.create_task(self.fsm.run())
@@ -2873,13 +2918,14 @@ class DTLSConn:
         try:
             while True:
                 record_layer = await self.record_layer_chan.get()
-                print("recv record", record_layer)
+                # print("recv record", record_layer)
 
                 match record_layer.header.content_type:
                     case ContentType.CHANGE_CIPHER_SPEC:
-                        self.fsm.state.cipher_suite = (
-                            self.fsm.state.pending_cipher_suite
-                        )
+                        if not self.fsm.state.cipher_suite:
+                            self.fsm.state.cipher_suite = (
+                                self.fsm.state.pending_cipher_suite
+                            )
 
                     case ContentType.HANDSHAKE:
                         # if isinstance(record_layer.content, EncryptedHandshakeMessage):

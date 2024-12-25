@@ -55,12 +55,12 @@ async def async_udp_server():
             dtls_local.addr = client_address
             dtls_local.socket = server_socket
 
-            print("Recv packet server")
+            # print("Recv packet server")
 
             if is_dtls_record_layer(message):
                 try:
                     test = RecordLayer.unmarshal(message)
-                    print("Try to put a record", test.header, test.content.content_type)
+                    # print("Try to put a record", test.header, test.content.content_type)
                     await record_layer_chan.put(test)
                     # await dtls_conn.fsm.dispatch()
                 except Exception as e:
