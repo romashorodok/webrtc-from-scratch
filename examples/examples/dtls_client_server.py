@@ -3,24 +3,28 @@ import asyncio
 import socket
 from contextlib import closing
 
-from webrtc.dtls.dtlstransport import (
-    DTLSConn,
-    Flight,
-    HandshakeState,
-    RecordLayer,
-    is_dtls_record_layer,
-)
+# from webrtc.dtls.dtlstransport import (
+#     DTLSConn,
+#     Flight,
+#     HandshakeState,
+#     RecordLayer,
+#     is_dtls_record_layer,
+# )
 
 from threading import Thread
 from typing import Optional
+
+from webrtc.dtls.dtls_record import RecordLayer, is_dtls_record_layer
+from webrtc.dtls.flight_state import Flight
+from webrtc.dtls.fsm import DTLSConn
 
 SERVER_IP = "127.0.0.1"
 SERVER_PORT = 12345
 CLIENT_PORT = 54321
 
-client_hello_stub = b"16feff0000000000000000008c010000800000000000000080fefd13b3ac327e56ae1c96882705b7e69b21cbc30df1695e244570eb7943635866b000000016c02bc02fcca9cca8c009c013c00ac014009c002f003501000040000a00080006001d0017001800170000000d00140012040308040401050308050501080606010201000e0009000600010008000700000b00020100ff01000100"
+# client_hello_stub = b"16feff0000000000000000008c010000800000000000000080fefd13b3ac327e56ae1c96882705b7e69b21cbc30df1695e244570eb7943635866b000000016c02bc02fcca9cca8c009c013c00ac014009c002f003501000040000a00080006001d0017001800170000000d00140012040308040401050308050501080606010201000e0009000600010008000700000b00020100ff01000100"
 
-record_layer_client_hello = RecordLayer.unmarshal(binascii.unhexlify(client_hello_stub))
+# record_layer_client_hello = RecordLayer.unmarshal(binascii.unhexlify(client_hello_stub))
 
 
 class DTLSLocal:

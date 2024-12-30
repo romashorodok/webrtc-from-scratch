@@ -1,3 +1,4 @@
+import binascii
 import os
 import hmac
 import math
@@ -7,7 +8,7 @@ from dataclasses import dataclass
 from typing import Callable
 from Crypto.Cipher import AES
 
-from webrtc.dtls.dtlstransport import RecordHeader, RecordLayer
+from webrtc.dtls.dtls_record import RecordHeader, RecordLayer
 from webrtc.ice.stun import utils as byteops
 
 
@@ -107,49 +108,44 @@ def prf_generate_encryption_keys(
     mac_len: int,
     key_len: int,
     iv_len: int,
-) -> EncryptionKeys | None:
-    try:
-        key_expansion_label = b"key expansion"
-        seed = key_expansion_label + server_random + client_random
+) -> EncryptionKeys:
+    key_expansion_label = b"key expansion"
+    seed = key_expansion_label + server_random + client_random
 
-        key_material = p_hash(
-            master_secret,
-            seed,
-            (2 * mac_len) + (2 * key_len) + (2 * iv_len),
-            hashlib.sha256,
-        )
-        print("key meterial", key_material)
+    key_material = p_hash(
+        master_secret,
+        seed,
+        (2 * mac_len) + (2 * key_len) + (2 * iv_len),
+        hashlib.sha256,
+    )
+    # print("key meterial", binascii.hexlify(key_material))
 
-        client_mac_key = key_material[:mac_len]
-        key_material = key_material[mac_len:]
+    client_mac_key = key_material[:mac_len]
+    key_material = key_material[mac_len:]
 
-        server_mac_key = key_material[:mac_len]
-        key_material = key_material[mac_len:]
+    server_mac_key = key_material[:mac_len]
+    key_material = key_material[mac_len:]
 
-        client_write_key = key_material[:key_len]
-        key_material = key_material[key_len:]
+    client_write_key = key_material[:key_len]
+    key_material = key_material[key_len:]
 
-        server_write_key = key_material[:key_len]
-        key_material = key_material[key_len:]
+    server_write_key = key_material[:key_len]
+    key_material = key_material[key_len:]
 
-        client_write_iv = key_material[:iv_len]
-        key_material = key_material[iv_len:]
+    client_write_iv = key_material[:iv_len]
+    key_material = key_material[iv_len:]
 
-        server_write_iv = key_material[:iv_len]
+    server_write_iv = key_material[:iv_len]
 
-        encryption_keys = EncryptionKeys(
-            master_secret=master_secret,
-            client_mac_key=client_mac_key,
-            server_mac_key=server_mac_key,
-            client_write_key=client_write_key,
-            server_write_key=server_write_key,
-            client_write_iv=client_write_iv,
-            server_write_iv=server_write_iv,
-        )
-        return encryption_keys
-
-    except Exception:
-        return None
+    return EncryptionKeys(
+        master_secret=master_secret,
+        client_mac_key=client_mac_key,
+        server_mac_key=server_mac_key,
+        client_write_key=client_write_key,
+        server_write_key=server_write_key,
+        client_write_iv=client_write_iv,
+        server_write_iv=server_write_iv,
+    )
 
 
 def encrypt_with_aes_gcm(
@@ -165,9 +161,12 @@ def encrypt_with_aes_gcm(
     :return: Encrypted payload concatenated with the authentication tag
     """
     cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    # additional_data = bytes(0x01)
     cipher.update(additional_data)
     encrypted_payload, tag = cipher.encrypt_and_digest(payload)
-    # print("enc tag", binascii.hexlify(tag))
+    print("ecnrypt aead", binascii.hexlify(additional_data))
+    print("encrypt tag", binascii.hexlify(tag))
+    print("encrypt payload", binascii.hexlify(encrypted_payload))
     return encrypted_payload + tag
 
 
@@ -175,19 +174,22 @@ def decrypt_with_aes_gcm(
     key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes, additional_data: bytes
 ) -> bytes:
     cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    # additional_data = bytes(0x01)
     cipher.update(additional_data)
 
-    # print("dec tag", binascii.hexlify(tag))
-    # print("dec cipher", binascii.hexlify(ciphertext))
-
-    return cipher.decrypt_and_verify(ciphertext, tag)
+    print("decrypted aead", binascii.hexlify(additional_data))
+    print("decrypted tag", binascii.hexlify(tag))
+    print("decrypted payload", binascii.hexlify(ciphertext))
+    result = cipher.decrypt_and_verify(ciphertext, tag)
+    print("dec", result)
+    return result
 
 
 GCM_NONCE_LENGTH = 12
 GCM_TAG_LENGTH = 16
 
 
-class GCM:
+class GCMCipherBytes:
     """
     https://datatracker.ietf.org/doc/html/rfc5288
     https://en.wikipedia.org/wiki/Galois/Counter_Mode
@@ -205,60 +207,122 @@ class GCM:
         self.local_write_iv = local_write_iv
         self.remote_write_iv = remote_write_iv
 
-    def encrypt(self, pkt: RecordLayer, raw: bytes) -> bytes | None:
-        payload = raw[pkt.header_size() :]
-        raw = raw[: pkt.header_size()]
+    def encrypt(self, aead_data: bytes, payload: bytes) -> tuple[bytes, bytes]:
+        nonce = self.local_write_iv[:4] + os.urandom(GCM_NONCE_LENGTH - 4)
+        print(
+            "encrypt local_key:",
+            binascii.hexlify(self.local_key),
+            "remote_key:",
+            binascii.hexlify(self.remote_key),
+        )
+        print(
+            "encrypt local_key_iv:",
+            binascii.hexlify(self.local_write_iv),
+            "remote_key_iv:",
+            binascii.hexlify(self.remote_write_iv),
+        )
+        print("encrypt nonce", binascii.hexlify(nonce))
 
-        nonce = bytearray(GCM_NONCE_LENGTH)
-        nonce[:4] = self.local_write_iv[:4]
-        nonce[4:] = os.urandom(GCM_NONCE_LENGTH - 4)
+        return nonce, encrypt_with_aes_gcm(self.local_key, nonce, payload, aead_data)
 
-        additional_data = generate_aead_additional_data(pkt.header, len(payload))
+    def decrypt(
+        self, aead_data: bytes, nonce: bytes, ciphertext: bytes, tag: bytes
+    ) -> bytes:
+        print("dec nonce", binascii.hexlify(nonce))
+        print(
+            "dec remote_write_iv",
+            binascii.hexlify(self.remote_write_iv),
+            "local_write_iv",
+            binascii.hexlify(self.local_write_iv),
+        )
+        print(
+            "dec remote_key",
+            binascii.hexlify(self.remote_key),
+            "local_key",
+            binascii.hexlify(self.local_key),
+        )
+        print()
 
-        encrypted = encrypt_with_aes_gcm(
-            self.local_key, bytes(nonce), payload, additional_data
+        return decrypt_with_aes_gcm(
+            self.remote_key,
+            nonce,
+            ciphertext,
+            tag,
+            aead_data,
         )
 
-        total_length = len(raw) + len(nonce[4:]) + len(encrypted)
-        result = bytearray(total_length)
-        result[0 : len(raw)] = raw
-        result[len(raw) : len(raw) + len(nonce[4:])] = nonce[4:]
-        result[len(raw) + len(nonce[4:]) :] = encrypted
 
-        result[pkt.header_size() - 2 : pkt.header_size()] = byteops.pack_unsigned_short(
-            total_length - pkt.header_size()
+class GCMCipherRecordLayer:
+    def __init__(
+        self,
+        local_key: bytes,
+        local_write_iv: bytes,
+        remote_key: bytes,
+        remote_write_iv: bytes,
+    ) -> None:
+        self.__gcm_bytes = GCMCipherBytes(
+            local_key,
+            local_write_iv,
+            remote_key,
+            remote_write_iv,
         )
 
-        return bytes(result)
+    def encrypt(self, pkt: RecordLayer) -> bytes:
+        """
+        Marshal a DTLS Layer and change payload with a nonce and encoded payload
 
-    def decrypt(self, h: RecordHeader, raw: bytes) -> bytes:
-        # nonce = raw[h.header_size():h.header_size() + self.GCM_NONCE_LENGTH]
+        :return Encrypted DTLS Record Layer:
+            | Header | Nonce | Encoded Payload | Tag |
+        """
+        pkt_bytes = pkt.marshal()
 
-        ciphertext = raw[:-GCM_TAG_LENGTH]
-        tag = raw[-GCM_TAG_LENGTH:]
-        # print("dec ciphertext", binascii.hexlify(ciphertext),  "dec tag ", binascii.hexlify(tag))
+        pkt_header_len = pkt.header_size()
+        payload = pkt_bytes[pkt_header_len:]
 
-        nonce = self.remote_write_iv[:4] + ciphertext[:-GCM_NONCE_LENGTH]
-        ciphertext = ciphertext[-GCM_NONCE_LENGTH:]
-        # print("nonce", binascii.hexlify(nonce), "dec ciphertext", binascii.hexlify(ciphertext),  "dec tag ", binascii.hexlify(tag))
+        nonce, encrypted = self.__gcm_bytes.encrypt(
+            generate_aead_additional_data(pkt.header, len(payload)),
+            payload,
+        )
 
-        # print("dec nonce",  binascii.hexlify(ciphertext[:-self.GCM_NONCE_LENGTH]))
-        # print("dec remote_write_iv", binascii.hexlify(self.remote_write_iv),  "local_write_iv", binascii.hexlify(self.local_write_iv))
-        # print("dec remote_key", binascii.hexlify(self.remote_key),  "local_key", binascii.hexlify(self.local_key))
+        nonce_len = len(nonce[4:])
+        pkt_enc_len = pkt_header_len + nonce_len + len(encrypted)
+        pkt_enc = bytearray(pkt_enc_len)
 
-        additional_data = generate_aead_additional_data(h, len(ciphertext))
+        pkt_enc[:pkt_header_len] = pkt_bytes[:pkt_header_len]
 
-        #
-        try:
-            decrypted = decrypt_with_aes_gcm(
-                self.remote_key, nonce, ciphertext, tag, additional_data
+        nonce_offset = pkt_header_len + nonce_len
+        pkt_enc[pkt_header_len:nonce_offset] = nonce[4:]
+
+        pkt_enc[nonce_offset:] = encrypted
+
+        layer_header_length_offset = pkt_header_len - 2
+        pkt_enc[layer_header_length_offset:pkt_header_len] = (
+            byteops.pack_unsigned_short(
+                pkt_enc_len - pkt_header_len,
             )
-        except Exception as e:
-            print("decrypted error", e)
-            return bytes()
+        )
 
-        #
-        result = decrypted
-        # print("decrypted", binascii.hexlify(result))
+        print("enc aead len", len(payload))
 
-        return result
+        return bytes(pkt_enc)
+
+    def decrypt(self, header: RecordHeader, encoded_payload: bytes) -> bytes:
+        """
+        :param encoded_payload - DTLS encoded message:
+            | Nonce | Encoded Payload | Tag |
+        """
+        tag = encoded_payload[-GCM_TAG_LENGTH:]
+        ciphertext = encoded_payload[:-GCM_TAG_LENGTH]
+
+        nonce = self.__gcm_bytes.remote_write_iv[:4] + ciphertext[:-GCM_NONCE_LENGTH]
+        ciphertext = ciphertext[-GCM_NONCE_LENGTH:]
+
+        aead_data = generate_aead_additional_data(header, len(ciphertext))
+        print("decrypt aead len", len(ciphertext))
+
+        return self.__gcm_bytes.decrypt(
+            aead_data,
+            nonce,
+            ciphertext,
+            tag,
+        )
