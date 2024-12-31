@@ -164,9 +164,9 @@ def encrypt_with_aes_gcm(
     # additional_data = bytes(0x01)
     cipher.update(additional_data)
     encrypted_payload, tag = cipher.encrypt_and_digest(payload)
-    print("ecnrypt aead", binascii.hexlify(additional_data))
-    print("encrypt tag", binascii.hexlify(tag))
-    print("encrypt payload", binascii.hexlify(encrypted_payload))
+    # print("ecnrypt aead", binascii.hexlify(additional_data))
+    # print("encrypt tag", binascii.hexlify(tag))
+    # print("encrypt payload", binascii.hexlify(encrypted_payload))
     return encrypted_payload + tag
 
 
@@ -177,11 +177,11 @@ def decrypt_with_aes_gcm(
     # additional_data = bytes(0x01)
     cipher.update(additional_data)
 
-    print("decrypted aead", binascii.hexlify(additional_data))
-    print("decrypted tag", binascii.hexlify(tag))
-    print("decrypted payload", binascii.hexlify(ciphertext))
+    # print("decrypted aead", binascii.hexlify(additional_data))
+    # print("decrypted tag", binascii.hexlify(tag))
+    # print("decrypted payload", binascii.hexlify(ciphertext))
     result = cipher.decrypt_and_verify(ciphertext, tag)
-    print("dec", result)
+    # print("dec", result)
     return result
 
 

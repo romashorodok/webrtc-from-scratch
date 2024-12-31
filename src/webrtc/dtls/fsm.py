@@ -12,6 +12,7 @@ from webrtc.dtls.flight6 import Flight6
 
 from webrtc.dtls.flight_state import FlightTransition, State, Flight
 from webrtc.dtls.dtls_record import (
+    CONTENT_TYPE_CLASSES,
     ContentType,
     Handshake,
     Message,
@@ -221,10 +222,17 @@ class DTLSConn:
 
         try:
             if result := cipher_suite.decrypt(layer.header, message.encrypted_payload):
-                # print("message before decrypt", binascii.hexlify(message.encrypted_payload))
-                print("Got decrypted message result", result)
-                # record = RecordLayer.unmarshal(result)
-                # print("Recv record", record)
+                # print("Got decrypted message result", result)
+
+                content_type_cls = CONTENT_TYPE_CLASSES.get(layer.header.content_type)
+                if not content_type_cls:
+                    raise ValueError("Unable find a content type for decrypted message")
+                content = content_type_cls.unmarshal(result)
+
+                if isinstance(content, Handshake):
+                    print("Recv record", content.message)
+                    # self.handshake_message_chan.put_nowait(content.message)
+
                 return
         except Exception as e:
             print("Decrypt error", e)

@@ -36,6 +36,9 @@ class Flight5(FlightTransition):
         if not state.pending_cipher_suite:
             raise ValueError("Flight5 cipher suite must be defined")
 
+        if not state.pre_master_secret:
+            raise ValueError("Flight5 pre master secret must be defined")
+
         if not state.remote_random:
             raise ValueError("Flight5 must know remote random")
 
@@ -56,13 +59,6 @@ class Flight5(FlightTransition):
                 raise ValueError(
                     "Unsupported cipher suite in key_server_exchange.signature_hash_algorithm"
                 )
-
-        verifying_key = VerifyingKey.from_der(key_server_exchange.pubkey)
-
-        state.pre_master_secret = Keypair.pre_master_secret_from_pub_and_priv_key(
-            verifying_key,
-            state.local_keypair.privateKey,
-        )
 
         print(
             "Flight 5 pre master secret",

@@ -1,6 +1,9 @@
 import asyncio
 import binascii
 
+from ecdsa import VerifyingKey
+
+from webrtc.dtls.dtls_cipher_suite import Keypair
 from webrtc.dtls.dtls_record import (
     Certificate,
     HandshakeMessageType,
@@ -31,31 +34,11 @@ class Flight3(FlightTransition):
         ]
 
     def __handle_server_key_exchange(self, state: State, message: KeyServerExchange):
-        # NOTE: This library not support generate a pre shared key with ECDH for X25519 curve
-        # case EllipticCurveGroup.X25519:
-        #     state.local_keypair = Keypair.generate_X25519()
-        # case _:
-        #     raise ValueError(
-        #         f"Unsupported {message.named_curve} curve unable create pre master secret"
-        #     )
-
-        # TODO: Here an error
-
-        # named_curve: EllipticCurveGroup | None = None
-        # signature_hash_algorithm: SignatureHashAlgorithm | None = None
-        # pubkey: bytes | None = None
-        # signature: bytes | None = None
-
-        # TODO: Is it must use a pub key instead of ?
-        # state.pre_master_secret = state.local_keypair.generate_shared_key()
-
-        # print(
-        #     "Flight 3 Shared pre master secret",
-        #     binascii.hexlify(state.pre_master_secret),
-        #     len(state.pre_master_secret),
-        # )
-
-        ...
+        verifying_key = VerifyingKey.from_der(message.pubkey)
+        state.pre_master_secret = Keypair.pre_master_secret_from_pub_and_priv_key(
+            verifying_key,
+            state.local_keypair.privateKey,
+        )
 
     async def parse(
         self, state: State, handshake_message_ch: asyncio.Queue[Message]
