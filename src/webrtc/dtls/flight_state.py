@@ -68,6 +68,8 @@ _DEFAULT_CURVE = EllipticCurveGroup.SECP256R1
 class State:
     def __init__(self) -> None:
         self.local_random = Random()
+        self.local_random.populate()
+
         self.remote_random: bytes | None = None
 
         self.local_keypair: Keypair = Keypair.generate_P256()

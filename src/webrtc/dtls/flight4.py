@@ -80,8 +80,8 @@ class Flight4(FlightTransition):
 
                     state.master_secret = prf_master_secret(
                         state.pre_master_secret,
-                        state.local_random.marshal_fixed(),
                         state.remote_random,
+                        state.local_random.marshal_fixed(),
                         hashlib.sha256,
                     )
 

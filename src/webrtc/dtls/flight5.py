@@ -102,8 +102,8 @@ class Flight5(FlightTransition):
 
         state.pending_cipher_suite.start(
             state.master_secret,
-            state.remote_random,
             state.local_random.marshal_fixed(),
+            state.remote_random,
             False,
         )
 
