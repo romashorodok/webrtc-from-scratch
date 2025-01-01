@@ -1,16 +1,25 @@
 import asyncio
 import binascii
 import hashlib
+from typing import Callable
 
 from ecdsa import VerifyingKey
 
-from webrtc.dtls.dtls_cipher_suite import Keypair, prf_master_secret
+from webrtc.dtls.dtls_cipher_suite import (
+    Keypair,
+    ecdh_value_key_message,
+    prf_master_secret,
+    verify_certificate_signature,
+)
 from webrtc.dtls.dtls_record import (
+    Certificate,
     CertificateType,
+    CertificateVerify,
     ClientKeyExchange,
     HandshakeMessageType,
     Message,
     RecordLayer,
+    SignatureHashAlgorithm,
 )
 from webrtc.dtls.dtls_record_factory import DEFAULT_FACTORY
 from webrtc.dtls.flight_state import Flight, FlightTransition, HandshakeCacheKey, State
@@ -48,7 +57,7 @@ class Flight4(FlightTransition):
             self.__msg.server_hello_done(),
         ]
 
-    def __handle_client_key_exchange(
+    def __setup_cipher_suite(
         self, state: State, client_key_exchange: ClientKeyExchange
     ):
         pre_master_secret = Keypair.pre_master_secret_from_pub_and_priv_key(
@@ -86,25 +95,109 @@ class Flight4(FlightTransition):
 
         print("Flight 4 Success cipher suite")
 
+    def __validate_client_certificate(
+        self,
+        state: State,
+        certificate: Certificate,
+        certificate_verify: CertificateVerify,
+    ):
+        client_certificate_sign = state.cache.pull_and_merge(
+            [
+                HandshakeCacheKey(
+                    message_type=HandshakeMessageType.ClientHello,
+                    epoch=0,
+                    is_remote=True,
+                ),
+                HandshakeCacheKey(
+                    message_type=HandshakeMessageType.ServerHello,
+                    epoch=0,
+                    is_remote=False,
+                ),
+                HandshakeCacheKey(
+                    message_type=HandshakeMessageType.Certificate,
+                    epoch=0,
+                    is_remote=False,
+                ),
+                HandshakeCacheKey(
+                    message_type=HandshakeMessageType.KeyServerExchange,
+                    epoch=0,
+                    is_remote=False,
+                ),
+                HandshakeCacheKey(
+                    message_type=HandshakeMessageType.CertificateRequest,
+                    epoch=0,
+                    is_remote=False,
+                ),
+                HandshakeCacheKey(
+                    message_type=HandshakeMessageType.ServerHelloDone,
+                    epoch=0,
+                    is_remote=False,
+                ),
+                HandshakeCacheKey(
+                    message_type=HandshakeMessageType.Certificate,
+                    epoch=0,
+                    is_remote=True,
+                ),
+                HandshakeCacheKey(
+                    message_type=HandshakeMessageType.ClientKeyExchange,
+                    epoch=0,
+                    is_remote=True,
+                ),
+            ]
+        )
+
+        if not state.remote_random:
+            raise ValueError(
+                "Flight 4 remote random must be at client validation stage"
+            )
+
+        if not (
+            certificate_verify.signature_hash_algorithm
+            == SignatureHashAlgorithm.ECDSA_SECP256R1_SHA256
+        ):
+            raise ValueError(
+                f"Flight 4 support only a secp256r1(prime256p1), current curve {state.local_keypair.curve}"
+            )
+
+        if not certificate.certificates:
+            raise ValueError("Flight 4 must contain a certificates")
+
+        if not certificate_verify.signature:
+            raise ValueError("Flight 4 must contain a certificate signature")
+
+        try:
+            print("Flight 4 fingerprint", binascii.hexlify(client_certificate_sign))
+            # client_certificate_sign = bytes(0x01)
+            verified = verify_certificate_signature(
+                client_certificate_sign,
+                certificate_verify.signature,
+                hashlib.sha256,
+                certificate.certificates,
+            )
+            print("Is client cert verified??", verified)
+        except Exception as e:
+            print("Client cert invalid with err", e)
+
     async def parse(
         self, state: State, handshake_message_ch: asyncio.Queue[Message]
     ) -> Flight:
+        print("Flight 4 block??")
         await state.cache.once(
             [
                 HandshakeCacheKey(
                     message_type=HandshakeMessageType.Certificate,
                     epoch=0,
-                    is_client=True,
+                    is_remote=True,
                 ),
                 HandshakeCacheKey(
                     message_type=HandshakeMessageType.ClientKeyExchange,
                     epoch=0,
-                    is_client=True,
+                    is_remote=True,
                 ),
                 HandshakeCacheKey(
                     message_type=HandshakeMessageType.CertificateVerify,
                     epoch=0,
-                    is_client=True,
+                    is_remote=True,
                 ),
                 # HandshakeCacheKey(
                 #     message_type=HandshakeMessageType.Finished,
@@ -115,14 +208,34 @@ class Flight4(FlightTransition):
         )
         print("Recv all needed parts")
 
-        self.__handle_client_key_exchange(
+        self.__validate_client_certificate(
+            state,
+            state.cache.pull(
+                Certificate,
+                HandshakeCacheKey(
+                    message_type=HandshakeMessageType.Certificate,
+                    epoch=0,
+                    is_remote=True,
+                ),
+            ),
+            state.cache.pull(
+                CertificateVerify,
+                HandshakeCacheKey(
+                    message_type=HandshakeMessageType.CertificateVerify,
+                    epoch=0,
+                    is_remote=True,
+                ),
+            ),
+        )
+
+        self.__setup_cipher_suite(
             state,
             state.cache.pull(
                 ClientKeyExchange,
                 HandshakeCacheKey(
                     message_type=HandshakeMessageType.ClientKeyExchange,
                     epoch=0,
-                    is_client=True,
+                    is_remote=True,
                 ),
             ),
         )

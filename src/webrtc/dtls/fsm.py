@@ -93,22 +93,23 @@ class FSM:
             raise e
 
         try:
-            epoch = 0
-            next_epoch = epoch
+            # epoch = 0
+            # next_epoch = epoch
             if self.pending_record_layers:
                 for record in self.pending_record_layers:
-                    record.header.epoch += epoch
-
-                    if record.header.epoch > next_epoch:
-                        next_epoch = record.header.epoch
+                    # if self.is_server:
+                    #     record.header.epoch += epoch
+                    #
+                    #     if record.header.epoch > next_epoch:
+                    #         next_epoch = record.header.epoch
 
                     if record.header.content_type == ContentType.HANDSHAKE:
-                        record.header.sequence_number = (
-                            self.state.handshake_sequence_number
-                        )
-                        self.state.handshake_sequence_number += 1
+                        # record.header.sequence_number = (
+                        #     self.state.handshake_sequence_number
+                        # )
+                        # self.state.handshake_sequence_number += 1
 
-                        self.state.cache.put_and_notify_once(not self.is_server, record)
+                        self.state.cache.put_and_notify_once(False, record)
 
         except Exception as e:
             print("FSM prepere err", e)
@@ -289,9 +290,7 @@ class DTLSConn:
                                 continue
 
                         if isinstance(record_layer.content, Handshake):
-                            self.fsm.state.cache.put_and_notify_once(
-                                self.fsm.is_server, record_layer
-                            )
+                            self.fsm.state.cache.put_and_notify_once(True, record_layer)
 
                             await self.handshake_message_chan.put(
                                 record_layer.content.message,

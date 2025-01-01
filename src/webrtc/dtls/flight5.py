@@ -131,48 +131,49 @@ class Flight5(FlightTransition):
             HandshakeCacheKey(
                 message_type=HandshakeMessageType.KeyServerExchange,
                 epoch=0,
-                is_client=False,
+                is_remote=True,
             ),
         )
 
         result = list[RecordLayer]()
 
+        print("Flight 5 block???")
         cache_fingerprint = state.cache.pull_and_merge(
             [
                 HandshakeCacheKey(
                     message_type=HandshakeMessageType.ClientHello,
                     epoch=0,
-                    is_client=True,
+                    is_remote=False,
                 ),
                 HandshakeCacheKey(
                     message_type=HandshakeMessageType.ServerHello,
                     epoch=0,
-                    is_client=False,
+                    is_remote=True,
                 ),
                 HandshakeCacheKey(
                     message_type=HandshakeMessageType.Certificate,
                     epoch=0,
-                    is_client=False,
+                    is_remote=True,
                 ),
                 HandshakeCacheKey(
                     message_type=HandshakeMessageType.KeyServerExchange,
                     epoch=0,
-                    is_client=False,
+                    is_remote=True,
                 ),
                 HandshakeCacheKey(
                     message_type=HandshakeMessageType.CertificateRequest,
                     epoch=0,
-                    is_client=False,
+                    is_remote=True,
                 ),
                 HandshakeCacheKey(
                     message_type=HandshakeMessageType.ServerHelloDone,
                     epoch=0,
-                    is_client=False,
+                    is_remote=True,
                 ),
             ]
         )
 
-        seq_pred += 6
+        # seq_pred += 6
 
         # for message in state.pending_remote_handshake_messages:
         #     print("client layer", HandshakeMessageType(message.message_type))
@@ -219,12 +220,12 @@ class Flight5(FlightTransition):
         # certificate.certificates = [state.local_certificate]
 
         layer_certificate = self.__msg.certificate([state.local_certificate])
-        if isinstance(layer_certificate.content, Handshake):
-            layer_certificate.content.header.message_sequence = seq_pred
+        # if isinstance(layer_certificate.content, Handshake):
+        #     layer_certificate.content.header.message_sequence = seq_pred
 
         result.append(layer_certificate)
-        seq_pred += 1
-        cache_fingerprint += layer_certificate.content.marshal()
+        # seq_pred += 1
+        cache_fingerprint += layer_certificate.marshal()
 
         # print("merged data", merged)
         # print("remote state", binascii.hexlify(state.remote_random))
@@ -232,12 +233,12 @@ class Flight5(FlightTransition):
         layer_client_key_exchange = self.__msg.client_key_exchange(
             state.local_keypair.publicKey.to_der()
         )
-        if isinstance(layer_client_key_exchange.content, Handshake):
-            layer_client_key_exchange.content.header.message_sequence = seq_pred
+        # if isinstance(layer_client_key_exchange.content, Handshake):
+        #     layer_client_key_exchange.content.header.message_sequence = seq_pred
 
         result.append(layer_client_key_exchange)
-        seq_pred += 1
-        cache_fingerprint += layer_client_key_exchange.content.marshal()
+        # seq_pred += 1
+        cache_fingerprint += layer_client_key_exchange.marshal()
 
         # TODO: Why client side separate a pubkey and signature of the cert ?
         # KeyServerExchange sends pubkey and signature in one layer
@@ -259,6 +260,8 @@ class Flight5(FlightTransition):
         # Certificate
         # ClientKeyExchange
 
+        print("Flight 5 fingerprint", binascii.hexlify(cache_fingerprint))
+        # cache_fingerprint = bytes(0x01)
         # certificate_verify.signature = state.local_keypair.sign(merged)
         layer_certificate_verify_signature = self.__msg.certificate_verify(
             state.local_keypair.sign(cache_fingerprint),

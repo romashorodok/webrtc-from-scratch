@@ -81,19 +81,19 @@ _HANDSHAKE_CACHE_MESSAGE_T = TypeVar(
 class HandshakeCacheKey:
     message_type: HandshakeMessageType
     epoch: int
-    is_client: bool
+    is_remote: bool
 
 
 class HandshakeCache:
     def __init__(self) -> None:
-        self.__dict = dict[HandshakeCacheKey, RecordLayer]()
+        self._cache = dict[HandshakeCacheKey, RecordLayer]()
 
         self.__subscribers = list[tuple[list[HandshakeCacheKey], asyncio.Event]]()
 
     def __emit_ready_at_once(self):
         to_remove = []
         for cache_keys, event in self.__subscribers:
-            if all(key in self.__dict for key in cache_keys):
+            if all(key in self._cache for key in cache_keys):
                 event.set()
                 to_remove.append((cache_keys, event))
 
@@ -106,32 +106,32 @@ class HandshakeCache:
         self.__emit_ready_at_once()
         await event.wait()
 
-    def put_and_notify_once(self, is_client: bool, record: RecordLayer):
-        self.put(is_client, record)
-        self.__emit_ready_at_once()
-
-    def put(self, is_client: bool, layer: RecordLayer):
+    def __put(self, is_remote: bool, layer: RecordLayer):
         if not isinstance(layer.content, Handshake):
             raise ValueError("put handshake require a record layer")
 
-        self.__dict[
+        self._cache[
             HandshakeCacheKey(
                 message_type=layer.content.message.message_type,
                 epoch=layer.header.epoch,
-                is_client=is_client,
+                is_remote=is_remote,
             )
         ] = layer
+
+    def put_and_notify_once(self, is_client: bool, record: RecordLayer):
+        self.__put(is_client, record)
+        self.__emit_ready_at_once()
 
     def pull_and_merge(self, cache_keys: list[HandshakeCacheKey]) -> bytes:
         merged = bytes()
 
         for key in cache_keys:
-            layer = self.__dict.get(key)
+            layer = self._cache.get(key)
             if not layer:
                 raise ValueError(
-                    "unable pull_and_merge required handshake cache record"
+                    f"unable pull_and_merge required handshake cache record {key}"
                 )
-            merged += layer.content.marshal()
+            merged += layer.marshal()
 
         return merged
 
@@ -140,8 +140,8 @@ class HandshakeCache:
         typ: type[_HANDSHAKE_CACHE_MESSAGE_T],
         cache_key: HandshakeCacheKey,
     ) -> _HANDSHAKE_CACHE_MESSAGE_T:
-        layer = self.__dict.get(cache_key)
-        print(self.__dict)
+        layer = self._cache.get(cache_key)
+        print(self._cache)
 
         if not layer:
             raise ValueError(f"unable pull required cache_key {typ}")
