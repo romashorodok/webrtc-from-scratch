@@ -48,7 +48,7 @@ class RecordFactory(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def certificate(self, certificates: list[x509.Certificate]) -> RecordLayer:
+    def certificate(self, certificates: list[bytes]) -> RecordLayer:
         raise NotImplementedError()
 
     @abc.abstractmethod
@@ -152,14 +152,14 @@ class FlightRecordFactory(RecordFactory):
         ec_point_formats.ec_point_formats = [EllipticCurvePointFormat.UNCOMPRESSED]
 
         server_hello.extensions = [
-            RegonitiationInfo(bytes()),
-            ExtendedMasterSecret(bytes()),
-            use_srtp,
+            # RegonitiationInfo(bytes()),
+            # ExtendedMasterSecret(bytes()),
+            # use_srtp,
             ec_point_formats,
         ]
 
         return RecordLayer(
-            RecordHeader(ContentType.HANDSHAKE, DTLSVersion.V1_0, 0, 0),
+            RecordHeader(ContentType.HANDSHAKE, DTLSVersion.V1_2, 0, 0),
             Handshake(
                 HandshakeHeader(
                     handshake_type=HandshakeMessageType.ServerHello,
@@ -170,7 +170,7 @@ class FlightRecordFactory(RecordFactory):
             ),
         )
 
-    def certificate(self, certificates: list[x509.Certificate]) -> RecordLayer:
+    def certificate(self, certificates: list[bytes]) -> RecordLayer:
         certificate = Certificate(bytes())
         certificate.certificates = certificates
         return RecordLayer(

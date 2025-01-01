@@ -631,7 +631,7 @@ class ServerHello(Message):
 class Certificate(Message):
     message_type = HandshakeMessageType.Certificate
 
-    certificates: list[x509.Certificate] | None = None
+    certificates: list[bytes] | None = None
 
     def marshal_certificates(self) -> bytes:
         if not self.certificates:
@@ -639,11 +639,11 @@ class Certificate(Message):
 
         result = bytes()
         for cert in self.certificates:
-            cert_der = cert.dump()
-            if not isinstance(cert_der, bytes):
-                raise ValueError("Unable transform certificate to DER bytes")
+            # cert_der = cert.dump()
+            # if not isinstance(cert_der, bytes):
+            #     raise ValueError("Unable transform certificate to DER bytes")
 
-            result += byteops.pack_unsigned_24(len(cert_der)) + cert_der
+            result += byteops.pack_unsigned_24(len(cert)) + cert
 
         return result
 
@@ -659,7 +659,7 @@ class Certificate(Message):
         if self.buf.length < self.buf.offset + certificates_length:
             raise ValueError("Insufficient data for certificates")
 
-        result = list[x509.Certificate]()
+        result = list[bytes]()
         remaining_length = certificates_length
         while remaining_length > 0:
             if remaining_length < 3:
@@ -675,8 +675,9 @@ class Certificate(Message):
             certificate = self.buf.read_bytes(cert_length)
             remaining_length -= cert_length
 
-            certificate = x509.Certificate.load(certificate)
             result.append(certificate)
+            # certificate = x509.Certificate.load(certificate)
+            # result.append(certificate)
 
         self.certificates = result
 

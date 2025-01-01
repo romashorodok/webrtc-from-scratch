@@ -2,6 +2,7 @@ import asyncio
 from enum import IntEnum
 from typing import Protocol
 
+from webrtc.dtls.certificate import Certificate
 from webrtc.dtls.flight0 import Flight0
 from webrtc.dtls.flight1 import Flight1
 from webrtc.dtls.flight2 import Flight2
@@ -42,9 +43,9 @@ FLIGHT_TRANSITIONS: dict[Flight, FlightTransition] = {
     Flight.FLIGHT4: Flight4(),
     Flight.FLIGHT6: Flight6(),
     # Client side
-    Flight.FLIGHT1: Flight1(),
-    Flight.FLIGHT3: Flight3(),
-    Flight.FLIGHT5: Flight5(),
+    # Flight.FLIGHT1: Flight1(),
+    # Flight.FLIGHT3: Flight3(),
+    # Flight.FLIGHT5: Flight5(),
 }
 
 
@@ -52,6 +53,7 @@ class FSM:
     def __init__(
         self,
         remote: DTLSRemote,
+        certificate: Certificate,
         handshake_messages_chan: asyncio.Queue[Message],
         flight: Flight = Flight.FLIGHT0,
     ) -> None:
@@ -65,7 +67,7 @@ class FSM:
         self.remote = remote
         self.handshake_message_chan = handshake_messages_chan
 
-        self.state = State()
+        self.state = State(certificate)
 
         self.handshake_state_transition = asyncio.Queue[FSMState]()
         self.handshake_state_transition_lock = asyncio.Lock()
@@ -93,17 +95,29 @@ class FSM:
             raise e
 
         try:
-            # epoch = 0
-            # next_epoch = epoch
+            message_sequence = 1
+
             if self.pending_record_layers:
                 for record in self.pending_record_layers:
-                    # if self.is_server:
-                    #     record.header.epoch += epoch
+                    if self.is_server:
+                        record.header.sequence_number += (
+                            self.state.handshake_sequence_number
+                        )
+                        self.state.handshake_sequence_number += 1
+
+                    # epoch += 1
                     #
                     #     if record.header.epoch > next_epoch:
                     #         next_epoch = record.header.epoch
 
                     if record.header.content_type == ContentType.HANDSHAKE:
+                        if not isinstance(record.content, Handshake):
+                            continue
+
+                        if not len(self.pending_record_layers) == 1:
+                            record.content.header.message_sequence = message_sequence
+                            message_sequence += 1
+
                         # record.header.sequence_number = (
                         #     self.state.handshake_sequence_number
                         # )
@@ -126,6 +140,8 @@ class FSM:
         if not self.pending_record_layers:
             return FSMState.Waiting
 
+        send_batch = bytes()
+
         # TODO: message batch
         for layer in self.pending_record_layers:
             try:
@@ -143,17 +159,20 @@ class FSM:
                     if not data:
                         raise ValueError("None data after encrypt,")
 
-                if len(data) > MAX_MTU:
+                if len(data) > MAX_MTU and len(send_batch) > MAX_MTU:
                     raise ValueError(
                         "layer data has too much bytes. Message must be fragmented"
                     )
 
-                await self.remote.sendto(data)
+                send_batch += data
+
             except Exception as e:
                 # TODO: backoff
                 print("Unable send packet. Err:", e, "layer", layer)
                 await asyncio.sleep(10)
                 return FSMState.Sending
+
+        await self.remote.sendto(send_batch)
 
         return FSMState.Waiting
 
@@ -217,13 +236,14 @@ class DTLSConn:
     def __init__(
         self,
         remote: DTLSRemote,
+        certificate: Certificate,
         layer_chan: asyncio.Queue[RecordLayer],
         flight: Flight = Flight.FLIGHT0,
     ) -> None:
         self.record_layer_chan = layer_chan
 
         self.handshake_message_chan = asyncio.Queue[Message]()
-        self.fsm = FSM(remote, self.handshake_message_chan, flight)
+        self.fsm = FSM(remote, certificate, self.handshake_message_chan, flight)
         self.recv_lock = asyncio.Lock()
 
     def __handle_encrypted_message(

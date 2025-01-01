@@ -7,6 +7,7 @@ from typing import TypeVar
 
 from asn1crypto import x509
 
+from webrtc.dtls.certificate import Certificate
 from webrtc.dtls.dtls_cipher_suite import (
     CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
     Keypair,
@@ -158,16 +159,20 @@ class HandshakeCache:
 
 
 class State:
-    def __init__(self) -> None:
+    def __init__(self, certificate: Certificate) -> None:
         self.local_random = Random()
         self.local_random.populate()
 
         self.remote_random: bytes | None = None
 
         self.local_keypair: Keypair = Keypair.generate_P256()
-        self.local_certificate: x509.Certificate = create_self_signed_cert_with_ecdsa(
-            self.local_keypair
-        )
+        # self.local_keypair: Keypair = certificate.keypair
+        self.local_certificate: Certificate = certificate
+
+        # self.local_keypair: Keypair = Keypair.generate_P256()
+        # self.local_certificate: x509.Certificate = create_self_signed_cert_with_ecdsa(
+        #     self.local_keypair
+        # )
 
         __cooike_random = Random(20, 20)
         __cooike_random.populate()

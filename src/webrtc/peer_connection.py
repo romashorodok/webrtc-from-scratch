@@ -281,6 +281,7 @@ class PeerConnection(AsyncEventEmitter):
         self.gatherer = ICEGatherer()
 
         self.__certificate = dtls.Certificate.generate_certificate()
+
         self._certificates = [self.__certificate]
         self.__media_fingerprints = list[dtls.Fingerprint]()
 

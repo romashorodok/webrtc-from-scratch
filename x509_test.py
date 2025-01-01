@@ -86,6 +86,9 @@ def create_self_signed_cert_with_ecdsa():
         }
     )
 
+    fingerprint = certificate.sha256_fingerprint
+    print("Certificate fingerprint", fingerprint)
+
     cert_pem = pem.armor("CERTIFICATE", certificate.dump())
 
     return cert_pem
@@ -93,6 +96,7 @@ def create_self_signed_cert_with_ecdsa():
 
 cert_pem = create_self_signed_cert_with_ecdsa()
 print("Certificate:\n", cert_pem)
+
 
 with open("test.pem", "wb") as f:
     f.write(cert_pem)

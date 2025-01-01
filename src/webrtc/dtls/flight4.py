@@ -8,6 +8,7 @@ from ecdsa import VerifyingKey
 from webrtc.dtls.dtls_cipher_suite import (
     Keypair,
     ecdh_value_key_message,
+    generate_server_signature,
     prf_master_secret,
     verify_certificate_signature,
 )
@@ -24,6 +25,9 @@ from webrtc.dtls.dtls_record import (
 from webrtc.dtls.dtls_record_factory import DEFAULT_FACTORY
 from webrtc.dtls.flight_state import Flight, FlightTransition, HandshakeCacheKey, State
 
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import hashes
+
 
 class Flight4(FlightTransition):
     __msg = DEFAULT_FACTORY
@@ -35,21 +39,48 @@ class Flight4(FlightTransition):
         if not state.remote_random:
             raise ValueError("Not found remote random")
 
-        signature = state.local_keypair.generate_server_signature(
+        # keypair = Keypair.generate_X25519()
+        keypair = state.local_keypair
+
+        signature = generate_server_signature(
             state.remote_random,
             state.local_random.marshal_fixed(),
+            state.local_certificate.pubkey_der,
+            # keypair.publicKey.to_der(),
+            # keypair.publicKey,
+            keypair.curve,
+            # state.local_keypair.privateKey,
         )
+
+
+
+        # signature = hashlib.sha256(signature).digest()
+        signature = state.local_certificate._signkey.sign(
+            signature, ec.ECDSA(hashes.SHA256())
+        )
+
+        # signature = state.local_keypair.generate_server_signature(
+        #     state.remote_random,
+        #     state.local_random.marshal_fixed(),
+        #     state.local_keypair.privateKey,
+        # )
+
+        # signature = state.local_keypair.generate_server_signature(
+        #     state.remote_random,
+        #     state.local_random.marshal_fixed(),
+        # )
 
         return [
             self.__msg.server_hello(
                 state.local_random.marshal_fixed(), state.pending_cipher_suite
             ),
-            self.__msg.certificate([state.local_certificate]),
+            self.__msg.certificate([state.local_certificate.der]),
             self.__msg.key_server_exchange(
                 signature,
-                state.local_keypair.curve,
+                keypair.curve,
                 state.local_keypair.signature_hash_algorithm,
-                state.local_keypair.publicKey.to_der(),
+                state.local_certificate.pubkey_der,
+                # keypair.publicKey.to_der(),
             ),
             self.__msg.certificate_request(
                 [CertificateType.ECDSA], [state.local_keypair.signature_hash_algorithm]

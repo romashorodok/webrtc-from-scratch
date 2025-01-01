@@ -9,8 +9,14 @@ from datetime import datetime, UTC, timedelta
 from ecdsa import Ed25519, SigningKey, VerifyingKey, NIST256p
 from ecdsa.ecdh import ECDH
 from asn1crypto import x509, keys, algos
+from ecdsa.util import sha256
 
-from webrtc.dtls.dtls_record import RecordHeader, RecordLayer, SignatureHashAlgorithm
+from webrtc.dtls.dtls_record import (
+    EllipticCurvePointFormat,
+    RecordHeader,
+    RecordLayer,
+    SignatureHashAlgorithm,
+)
 from webrtc.dtls.dtls_typing import NAMED_CURVE_TYPE, CipherSuiteID, EllipticCurveGroup
 from webrtc.dtls.gcm import GCMCipherRecordLayer, p_hash, prf_generate_encryption_keys
 
@@ -50,28 +56,33 @@ class Keypair:
             EllipticCurveGroup.SECP256R1,
         )
 
-    def __ecdh_params(self) -> bytes:
-        server_ecdh_params = bytearray(4)
-        server_ecdh_params[0] = NAMED_CURVE_TYPE
-        server_ecdh_params[1:3] = byteops.pack_unsigned_short(self.curve)
-        server_ecdh_params[3:4] = byteops.pack_byte_int(len(self.publicKey.to_der()))
-        return bytes(server_ecdh_params)
+    # def __ecdh_params(self) -> bytes:
+    #     # server_ecdh_params = bytearray(4)
+    #     # server_ecdh_params[0] = NAMED_CURVE_TYPE
+    #     # server_ecdh_params[1:3] = byteops.pack_unsigned_short(self.curve)
+    #     # server_ecdh_params[3:4] = byteops.pack_byte_int(len(self.publicKey.to_der()))
+    #     server_ecdh_params = byteops.pack_byte_int(NAMED_CURVE_TYPE)
+    #     server_ecdh_params += byteops.pack_unsigned_short(self.curve)
+    #     server_ecdh_params += byteops.pack_byte_int(len(self.publicKey.to_der()))
+    #     return server_ecdh_params
 
-    def generate_server_signature(
-        self, remote_random: bytes, local_random: bytes
-    ) -> bytes:
-        ecdh_params = self.__ecdh_params()
-        msg = bytes(
-            remote_random + local_random + ecdh_params + self.publicKey.to_der()
-        )
-        # print("Expected server expected_ecdh_secret_message", binascii.hexlify(msg))
-        # print(
-        #     "Expected server expected_ecdh_secret_message digest",
-        #     binascii.hexlify(hashlib.sha256(msg).digest()),
-        # )
-
-        result = self.privateKey.sign(msg, hashfunc=hashlib.sha256)
-        return result
+    # def generate_server_signature(
+    #     self, remote_random: bytes, local_random: bytes, private_key: SigningKey
+    # ) -> bytes:
+    #     ecdh_params = self.__ecdh_params()
+    #     msg = bytes(
+    #         remote_random + local_random + ecdh_params + self.publicKey.to_der()
+    #     )
+    #     # print("Expected server expected_ecdh_secret_message", binascii.hexlify(msg))
+    #     # print(
+    #     #     "Expected server expected_ecdh_secret_message digest",
+    #     #     binascii.hexlify(hashlib.sha256(msg).digest()),
+    #     # )
+    #
+    #     # msg = hashlib.sha256(msg).digest()
+    #
+    #     result = private_key.sign(msg, hashfunc=hashlib.sha256)
+    #     return result
 
     # NOTE: Must be a len(bytes(...)) == 32
     def generate_shared_key(self) -> bytes:
@@ -102,17 +113,39 @@ class Keypair:
         return ecdh.generate_sharedsecret_bytes()
 
 
+def __ecdh_params(curve: EllipticCurveGroup, pubkey: bytes) -> bytes:
+    server_ecdh_params = byteops.pack_byte_int(NAMED_CURVE_TYPE)
+    server_ecdh_params += byteops.pack_unsigned_short(curve)
+    server_ecdh_params += byteops.pack_byte_int(len(pubkey))
+    return server_ecdh_params
+
+
+def generate_server_signature(
+    client_random: bytes,
+    server_random: bytes,
+    public_key: bytes,
+    named_curve: EllipticCurveGroup,
+    # private_key: SigningKey,
+) -> bytes:
+    ecdh_params = __ecdh_params(named_curve, public_key)
+    msg = bytes(client_random + server_random + ecdh_params + public_key)
+    return msg
+    # msg = hashlib.sha256(msg).digest()
+    # return private_key.sign_digest(msg)
+    # return private_key.sign(msg, hashfunc=hashlib.sha256)
+
+
 def create_self_signed_cert_with_ecdsa(keypair: Keypair):
     sk = keypair.privateKey
 
-    public_key_der = b"\x04" + keypair.publicKey.to_string()
+    public_key_der = keypair.publicKey.to_der()
 
     ecdomain_params = keys.ECDomainParameters(("named", "secp256r1"))
 
     ec_point_bit_string = keys.ECPointBitString(public_key_der)
 
-    if public_key_der[0] != 0x04:
-        raise ValueError("Public key is not in uncompressed format")
+    # if public_key_der[0] != 0x04:
+    #     raise ValueError("Public key is not in uncompressed format")
 
     public_key_info = keys.PublicKeyInfo(
         {
@@ -126,16 +159,17 @@ def create_self_signed_cert_with_ecdsa(keypair: Keypair):
 
     subject = x509.Name.build(
         {
-            "common_name": "My Self-Signed ECDSA Cert",
-            "country_name": "US",
-            "organization_name": "Example Org",
-        }
+            "common_name": "WebRTC",
+            # "country_name": "US",
+            # "organization_name": "Example Org",
+        },
+        True,
     )
 
     issuer = subject
 
     not_before = x509.Time({"utc_time": datetime.now(UTC)})
-    not_after = x509.Time({"utc_time": datetime.now(UTC) + timedelta(days=365)})
+    not_after = x509.Time({"utc_time": datetime.now(UTC) + timedelta(days=30)})
 
     tbs_certificate = x509.TbsCertificate(
         {
@@ -151,7 +185,9 @@ def create_self_signed_cert_with_ecdsa(keypair: Keypair):
         }
     )
 
-    signature = sk.sign(tbs_certificate.dump())
+    # signature = sk.sign(tbs_certificate.dump(), hashfunc=hashlib.sha256)
+    signature = sk.sign_digest(hashlib.sha256(tbs_certificate.dump()).digest())
+    # signature = sk.sign(tbs_certificate.dump(), hashfunc=hashlib.sha256)
 
     certificate = x509.Certificate(
         {

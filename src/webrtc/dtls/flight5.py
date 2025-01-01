@@ -219,7 +219,7 @@ class Flight5(FlightTransition):
         # )
         # certificate.certificates = [state.local_certificate]
 
-        layer_certificate = self.__msg.certificate([state.local_certificate])
+        layer_certificate = self.__msg.certificate([state.local_certificate.x509])
         # if isinstance(layer_certificate.content, Handshake):
         #     layer_certificate.content.header.message_sequence = seq_pred
 

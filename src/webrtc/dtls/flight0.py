@@ -9,7 +9,6 @@ class Flight0(FlightTransition):
         self,
         state: State,
     ) -> list[RecordLayer] | None:
-        state.remote_random = None
         return
 
     async def parse(

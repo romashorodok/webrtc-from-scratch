@@ -78,7 +78,8 @@
   const pc = new RTCPeerConnection();
 
   onMount(async () => {
-    const streams = await navigator.mediaDevices.getDisplayMedia({
+    // const streams = await navigator.mediaDevices.getDisplayMedia({
+    const streams = await navigator.mediaDevices.getUserMedia({
       video: true,
     });
     const [track] = streams.getVideoTracks();
