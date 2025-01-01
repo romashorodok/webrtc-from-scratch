@@ -26,11 +26,11 @@ class Flight1(FlightTransition):
     async def parse(
         self, state: State, handshake_message_ch: asyncio.Queue[Message]
     ) -> Flight:
-        handshake_messages = list[Message]()
+        # handshake_messages = list[Message]()
         while True:
             # TODO: timeout and make a fallback to flight 1
             message = await handshake_message_ch.get()
-            handshake_messages.append(message)
+            # handshake_messages.append(message)
 
             match message.message_type:
                 case HandshakeMessageType.HelloVerifyRequest:
@@ -47,7 +47,8 @@ class Flight1(FlightTransition):
 
                     state.cookie = message.cookie
 
-                    state.pending_remote_handshake_messages = handshake_messages
+                    # state.pending_remote_handshake_messages = handshake_messages
+
                     return Flight.FLIGHT5
                 case _:
                     pass

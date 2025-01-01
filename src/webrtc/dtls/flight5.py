@@ -21,7 +21,7 @@ from webrtc.dtls.dtls_record import (
     SignatureHashAlgorithm,
 )
 from webrtc.dtls.dtls_record_factory import DEFAULT_FACTORY
-from webrtc.dtls.flight_state import Flight, FlightTransition, State
+from webrtc.dtls.flight_state import Flight, FlightTransition, HandshakeCacheKey, State
 
 
 class Flight5(FlightTransition):
@@ -107,56 +107,107 @@ class Flight5(FlightTransition):
             False,
         )
 
+        print("Flight 5 cipher suite", verified)
+
     def generate(
         self,
         state: State,
     ) -> list[RecordLayer] | None:
-        if not state.pending_remote_handshake_messages:
-            raise ValueError("Flight5 not found pending messages")
+        # if not state.pending_remote_handshake_messages:
+        #     raise ValueError("Flight5 not found pending messages")
 
         if not state.remote_random:
             raise ValueError("Flight5 not found remote random")
 
         # print("flight 5 messages", state.pending_remote_handshake_messages)
 
-        merged = bytes()
+        cache_fingerprint = bytes()
         seq_pred = state.handshake_sequence_number
 
         # print("pending messages", state.pending_remote_handshake_messages)
 
-        key_server_exchange: KeyServerExchange | None = None
+        key_server_exchange = state.cache.pull(
+            KeyServerExchange,
+            HandshakeCacheKey(
+                message_type=HandshakeMessageType.KeyServerExchange,
+                epoch=0,
+                is_client=False,
+            ),
+        )
+
         result = list[RecordLayer]()
-        for message in state.pending_remote_handshake_messages:
-            match message.message_type:
-                case HandshakeMessageType.KeyServerExchange:
-                    if not isinstance(message, KeyServerExchange):
-                        raise ValueError("Require KeyServerExchange to be present")
-                    key_server_exchange = message
-                case _:
-                    pass
 
-            try:
-                reconstructed = Handshake(
-                    header=HandshakeHeader(
-                        message_sequence=seq_pred,
-                        handshake_type=message.message_type,
-                        fragment_offset=0,
-                    ),
-                    message=message,
-                )
+        cache_fingerprint = state.cache.pull_and_merge(
+            [
+                HandshakeCacheKey(
+                    message_type=HandshakeMessageType.ClientHello,
+                    epoch=0,
+                    is_client=True,
+                ),
+                HandshakeCacheKey(
+                    message_type=HandshakeMessageType.ServerHello,
+                    epoch=0,
+                    is_client=False,
+                ),
+                HandshakeCacheKey(
+                    message_type=HandshakeMessageType.Certificate,
+                    epoch=0,
+                    is_client=False,
+                ),
+                HandshakeCacheKey(
+                    message_type=HandshakeMessageType.KeyServerExchange,
+                    epoch=0,
+                    is_client=False,
+                ),
+                HandshakeCacheKey(
+                    message_type=HandshakeMessageType.CertificateRequest,
+                    epoch=0,
+                    is_client=False,
+                ),
+                HandshakeCacheKey(
+                    message_type=HandshakeMessageType.ServerHelloDone,
+                    epoch=0,
+                    is_client=False,
+                ),
+            ]
+        )
 
-                seq_pred += 1
-                merged += reconstructed.marshal()
-            except Exception as e:
-                print("Flight 5 error", e)
+        seq_pred += 6
 
-        if not key_server_exchange:
-            raise ValueError(
-                "Require KeyServerExchange to be present for cipher suite init"
-            )
+        # for message in state.pending_remote_handshake_messages:
+        #     print("client layer", HandshakeMessageType(message.message_type))
+        #     match message.message_type:
+        #         case HandshakeMessageType.KeyServerExchange:
+        #             if not isinstance(message, KeyServerExchange):
+        #                 raise ValueError("Require KeyServerExchange to be present")
+        #             key_server_exchange = message
+        #         case _:
+        #             pass
+        #
+        #     try:
+        #         reconstructed = Handshake(
+        #             header=HandshakeHeader(
+        #                 message_sequence=seq_pred,
+        #                 handshake_type=message.message_type,
+        #                 fragment_offset=0,
+        #             ),
+        #             message=message,
+        #         )
+        #
+        #         seq_pred += 1
+        #         merged += reconstructed.marshal()
+        #     except Exception as e:
+        #         print("Flight 5 error", e)
+
+        # if not key_server_exchange:
+        #     raise ValueError(
+        #         "Require KeyServerExchange to be present for cipher suite init"
+        #     )
 
         try:
-            self.__initialize_cipher_suite(state, key_server_exchange, merged)
+            self.__initialize_cipher_suite(
+                state, key_server_exchange, cache_fingerprint
+            )
         except Exception as e:
             print("Flight5 Unable init cipher suite", e)
             raise e
@@ -173,7 +224,7 @@ class Flight5(FlightTransition):
 
         result.append(layer_certificate)
         seq_pred += 1
-        merged += layer_certificate.content.marshal()
+        cache_fingerprint += layer_certificate.content.marshal()
 
         # print("merged data", merged)
         # print("remote state", binascii.hexlify(state.remote_random))
@@ -186,7 +237,7 @@ class Flight5(FlightTransition):
 
         result.append(layer_client_key_exchange)
         seq_pred += 1
-        merged += layer_client_key_exchange.content.marshal()
+        cache_fingerprint += layer_client_key_exchange.content.marshal()
 
         # TODO: Why client side separate a pubkey and signature of the cert ?
         # KeyServerExchange sends pubkey and signature in one layer
@@ -210,7 +261,7 @@ class Flight5(FlightTransition):
 
         # certificate_verify.signature = state.local_keypair.sign(merged)
         layer_certificate_verify_signature = self.__msg.certificate_verify(
-            state.local_keypair.sign(merged),
+            state.local_keypair.sign(cache_fingerprint),
             state.local_keypair.signature_hash_algorithm,
         )
         if isinstance(layer_certificate_verify_signature.content, Handshake):
@@ -237,7 +288,7 @@ class Flight5(FlightTransition):
 
         result.append(layer_certificate_verify_signature)
         seq_pred += 1
-        merged += layer_certificate_verify_signature.content.marshal()
+        cache_fingerprint += layer_certificate_verify_signature.content.marshal()
 
         # TODO: This not a handshake
         layer_change_cipher_spec = self.__msg.change_cipher_spec()
@@ -284,16 +335,21 @@ class Flight5(FlightTransition):
         # layer_finished.encrypt = True
 
         result.append(layer_finished)
-        # return result
-        return [
-            layer_client_key_exchange,
-            layer_change_cipher_spec,
-            layer_finished,
-        ]
-        return
+        print("result done")
+        return result
+
+        # return [
+        #     layer_client_key_exchange,
+        #     layer_change_cipher_spec,
+        #     layer_finished,
+        # ]
 
     async def parse(
         self, state: State, handshake_message_ch: asyncio.Queue[Message]
     ) -> Flight:
-        await asyncio.sleep(2)
-        return Flight.FLIGHT5
+        # TODO: time out if not recv send flight 5 again
+        finished = await handshake_message_ch.get()
+        print("Flight 5 finished recv", finished)
+
+        # await asyncio.sleep(2)
+        return

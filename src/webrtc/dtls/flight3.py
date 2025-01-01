@@ -106,7 +106,7 @@ class Flight3(FlightTransition):
                     # state.pending_cipher_suite = cipher_suite_cls()
 
                 case HandshakeMessageType.ServerHelloDone:
-                    state.pending_remote_handshake_messages = handshake_messages
+                    # state.pending_remote_handshake_messages = handshake_messages
                     print("Flight 3 done")
                     return Flight.FLIGHT5
                 case _:

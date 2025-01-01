@@ -1,7 +1,9 @@
 import abc
 import asyncio
 
+from dataclasses import dataclass
 from enum import IntEnum
+from typing import TypeVar
 
 from asn1crypto import x509
 
@@ -11,7 +13,12 @@ from webrtc.dtls.dtls_cipher_suite import (
     CipherSuite,
     create_self_signed_cert_with_ecdsa,
 )
-from webrtc.dtls.dtls_record import Message, RecordLayer
+from webrtc.dtls.dtls_record import (
+    Handshake,
+    HandshakeMessageType,
+    Message,
+    RecordLayer,
+)
 from webrtc.dtls.dtls_typing import EllipticCurveGroup, Random
 
 #                     [RFC6347 Section-4.2.4]
@@ -65,6 +72,91 @@ class Flight(IntEnum):
 _DEFAULT_CURVE = EllipticCurveGroup.SECP256R1
 
 
+_HANDSHAKE_CACHE_MESSAGE_T = TypeVar(
+    name="_HANDSHAKE_CACHE_MESSAGE_T", bound=Message, infer_variance=True
+)
+
+
+@dataclass(frozen=True)
+class HandshakeCacheKey:
+    message_type: HandshakeMessageType
+    epoch: int
+    is_client: bool
+
+
+class HandshakeCache:
+    def __init__(self) -> None:
+        self.__dict = dict[HandshakeCacheKey, RecordLayer]()
+
+        self.__subscribers = list[tuple[list[HandshakeCacheKey], asyncio.Event]]()
+
+    def __emit_ready_at_once(self):
+        to_remove = []
+        for cache_keys, event in self.__subscribers:
+            if all(key in self.__dict for key in cache_keys):
+                event.set()
+                to_remove.append((cache_keys, event))
+
+        for item in to_remove:
+            self.__subscribers.remove(item)
+
+    async def once(self, cache_keys: list[HandshakeCacheKey]):
+        event = asyncio.Event()
+        self.__subscribers.append((cache_keys, event))
+        self.__emit_ready_at_once()
+        await event.wait()
+
+    def put_and_notify_once(self, is_client: bool, record: RecordLayer):
+        self.put(is_client, record)
+        self.__emit_ready_at_once()
+
+    def put(self, is_client: bool, layer: RecordLayer):
+        if not isinstance(layer.content, Handshake):
+            raise ValueError("put handshake require a record layer")
+
+        self.__dict[
+            HandshakeCacheKey(
+                message_type=layer.content.message.message_type,
+                epoch=layer.header.epoch,
+                is_client=is_client,
+            )
+        ] = layer
+
+    def pull_and_merge(self, cache_keys: list[HandshakeCacheKey]) -> bytes:
+        merged = bytes()
+
+        for key in cache_keys:
+            layer = self.__dict.get(key)
+            if not layer:
+                raise ValueError(
+                    "unable pull_and_merge required handshake cache record"
+                )
+            merged += layer.content.marshal()
+
+        return merged
+
+    def pull(
+        self,
+        typ: type[_HANDSHAKE_CACHE_MESSAGE_T],
+        cache_key: HandshakeCacheKey,
+    ) -> _HANDSHAKE_CACHE_MESSAGE_T:
+        layer = self.__dict.get(cache_key)
+        print(self.__dict)
+
+        if not layer:
+            raise ValueError(f"unable pull required cache_key {typ}")
+
+        if not isinstance(layer.content, Handshake):
+            raise ValueError("unable pull required cache key must be a handshake")
+
+        if not isinstance(layer.content.message, typ):
+            raise ValueError(
+                f"unable pull type mismatch: expected {typ}, got {type(layer.content.message)}."
+            )
+
+        return layer.content.message
+
+
 class State:
     def __init__(self) -> None:
         self.local_random = Random()
@@ -93,9 +185,12 @@ class State:
         self.pre_master_secret: bytes | None = None
         self.master_secret: bytes | None = None
 
-        self.pending_remote_handshake_messages: list[Message] | None = None
+        # self.pending_local_handshake_layers: list[RecordLayer] | None = None
+        # self.pending_remote_handshake_messages: list[Message] | None = None
 
         self.handshake_sequence_number = 0
+
+        self.cache = HandshakeCache()
 
 
 # DTLS messages are grouped into a series of message flights, according

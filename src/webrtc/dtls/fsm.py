@@ -55,6 +55,13 @@ class FSM:
         handshake_messages_chan: asyncio.Queue[Message],
         flight: Flight = Flight.FLIGHT0,
     ) -> None:
+        if flight == Flight.FLIGHT0:
+            self.is_server = True
+        elif flight == Flight.FLIGHT1:
+            self.is_server = False
+        else:
+            raise ValueError("FSM must be started as server or client")
+
         self.remote = remote
         self.handshake_message_chan = handshake_messages_chan
 
@@ -85,18 +92,27 @@ class FSM:
             print("FSM catch:", e)
             raise e
 
-        epoch = 0
-        next_epoch = epoch
-        if self.pending_record_layers:
-            for record in self.pending_record_layers:
-                record.header.epoch += epoch
+        try:
+            epoch = 0
+            next_epoch = epoch
+            if self.pending_record_layers:
+                for record in self.pending_record_layers:
+                    record.header.epoch += epoch
 
-                if record.header.epoch > next_epoch:
-                    next_epoch = record.header.epoch
+                    if record.header.epoch > next_epoch:
+                        next_epoch = record.header.epoch
 
-                if record.header.content_type == ContentType.HANDSHAKE:
-                    record.header.sequence_number = self.state.handshake_sequence_number
-                    self.state.handshake_sequence_number += 1
+                    if record.header.content_type == ContentType.HANDSHAKE:
+                        record.header.sequence_number = (
+                            self.state.handshake_sequence_number
+                        )
+                        self.state.handshake_sequence_number += 1
+
+                        self.state.cache.put_and_notify_once(not self.is_server, record)
+
+        except Exception as e:
+            print("FSM prepere err", e)
+            raise e
 
         # if epoch != next_epoch:
         #     self.state.local_epoch = next_epoch
@@ -231,7 +247,7 @@ class DTLSConn:
 
                 if isinstance(content, Handshake):
                     print("Recv record", content.message)
-                    # self.handshake_message_chan.put_nowait(content.message)
+                    self.handshake_message_chan.put_nowait(content.message)
 
                 return
         except Exception as e:
@@ -273,6 +289,10 @@ class DTLSConn:
                                 continue
 
                         if isinstance(record_layer.content, Handshake):
+                            self.fsm.state.cache.put_and_notify_once(
+                                self.fsm.is_server, record_layer
+                            )
+
                             await self.handshake_message_chan.put(
                                 record_layer.content.message,
                             )
