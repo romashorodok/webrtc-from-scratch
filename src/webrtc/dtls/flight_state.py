@@ -139,7 +139,7 @@ class HandshakeCache:
                 raise ValueError(
                     f"unable pull_and_merge required handshake cache record {key}"
                 )
-            merged += layer.marshal()
+            merged += layer.content.marshal()
 
         return merged
 
