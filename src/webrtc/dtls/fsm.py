@@ -3,6 +3,7 @@ from enum import IntEnum
 from typing import Protocol
 
 from webrtc.dtls.certificate import Certificate
+from webrtc.dtls.dtls_cipher_suite import Keypair
 from webrtc.dtls.flight0 import Flight0
 from webrtc.dtls.flight1 import Flight1
 from webrtc.dtls.flight2 import Flight2
@@ -54,6 +55,7 @@ class FSM:
         self,
         remote: DTLSRemote,
         certificate: Certificate,
+        keypair: Keypair,
         handshake_messages_chan: asyncio.Queue[Message],
         flight: Flight = Flight.FLIGHT0,
     ) -> None:
@@ -67,7 +69,7 @@ class FSM:
         self.remote = remote
         self.handshake_message_chan = handshake_messages_chan
 
-        self.state = State(certificate)
+        self.state = State(certificate, keypair)
 
         self.handshake_state_transition = asyncio.Queue[FSMState]()
         self.handshake_state_transition_lock = asyncio.Lock()
@@ -190,6 +192,7 @@ class FSM:
             self.flight = await flight.parse(self.state, self.handshake_message_chan)
         except Exception as e:
             print(f"transition Flight{flight} error", e)
+            return FSMState.Errored
 
         return FSMState.Preparing
 
@@ -225,6 +228,13 @@ class FSM:
                             await self.handshake_state_transition.put(
                                 await self.wait(),
                             )
+                        case FSMState.Errored:
+                            print("FSM Error occured")
+                            await asyncio.sleep(4)
+                            await self.handshake_state_transition.put(
+                                FSMState.Preparing
+                            )
+
                         case _:
                             break
 
@@ -237,13 +247,16 @@ class DTLSConn:
         self,
         remote: DTLSRemote,
         certificate: Certificate,
+        keypair: Keypair,
         layer_chan: asyncio.Queue[RecordLayer],
         flight: Flight = Flight.FLIGHT0,
     ) -> None:
         self.record_layer_chan = layer_chan
 
         self.handshake_message_chan = asyncio.Queue[Message]()
-        self.fsm = FSM(remote, certificate, self.handshake_message_chan, flight)
+        self.fsm = FSM(
+            remote, certificate, keypair, self.handshake_message_chan, flight
+        )
         self.recv_lock = asyncio.Lock()
 
     def __handle_encrypted_message(
@@ -258,7 +271,7 @@ class DTLSConn:
             cipher_suite = self.fsm.state.pending_cipher_suite
 
         try:
-            if result := cipher_suite.decrypt(layer.header, message.encrypted_payload):
+            if result := cipher_suite.decrypt(layer):
                 # print("Got decrypted message result", result)
 
                 content_type_cls = CONTENT_TYPE_CLASSES.get(layer.header.content_type)
@@ -268,6 +281,10 @@ class DTLSConn:
 
                 if isinstance(content, Handshake):
                     print("Recv record", content.message)
+                    layer.content = content
+                    layer.header.length = len(result)
+
+                    self.fsm.state.cache.put_and_notify_once(True, layer)
                     self.handshake_message_chan.put_nowait(content.message)
 
                 return

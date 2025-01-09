@@ -34,6 +34,7 @@ from webrtc.dtls.dtls_record import (
     UseSRTP,
 )
 from webrtc.dtls.dtls_cipher_suite import CipherSuite
+from webrtc.dtls.certificate import Certificate as CertificateDTLS
 from webrtc.dtls.dtls_typing import CipherSuiteID, EllipticCurveGroup
 
 
@@ -48,7 +49,7 @@ class RecordFactory(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def certificate(self, certificates: list[bytes]) -> RecordLayer:
+    def certificate(self, certificates: list[CertificateDTLS]) -> RecordLayer:
         raise NotImplementedError()
 
     @abc.abstractmethod
@@ -106,7 +107,7 @@ class RecordFactory(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def finished(self) -> RecordLayer:
+    def finished(self, verifying_data: bytes) -> RecordLayer:
         raise NotImplementedError()
 
     # --- Client side DTLS Records End ---
@@ -170,7 +171,7 @@ class FlightRecordFactory(RecordFactory):
             ),
         )
 
-    def certificate(self, certificates: list[bytes]) -> RecordLayer:
+    def certificate(self, certificates: list[CertificateDTLS]) -> RecordLayer:
         certificate = Certificate(bytes())
         certificate.certificates = certificates
         return RecordLayer(
@@ -336,12 +337,12 @@ class FlightRecordFactory(RecordFactory):
             content=ChangeCipherSpec(),
         )
 
-    def finished(self) -> RecordLayer:
+    def finished(self, verifying_data: bytes) -> RecordLayer:
         layer = RecordLayer(
             header=RecordHeader(ContentType.HANDSHAKE, DTLSVersion.V1_2, 1, 0),
             content=Handshake(
                 header=HandshakeHeader(HandshakeMessageType.Finished, 0, 0),
-                message=Finished(bytes()),
+                message=Finished(verifying_data),
             ),
         )
         layer.encrypt = True

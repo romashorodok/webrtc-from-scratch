@@ -298,10 +298,10 @@ class CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:
 
         return self.gcm.encrypt(pkt)
 
-    def decrypt(self, header: RecordHeader, payload: bytes) -> bytes:
+    def decrypt(self, pkt: RecordLayer) -> bytes:
         if not self.gcm:
             raise ValueError("Unable decrypt start gcm first")
-        return self.gcm.decrypt(header, payload)
+        return self.gcm.decrypt(pkt)
 
     def cipher_suite_id(self) -> CipherSuiteID:
         return CipherSuiteID.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
@@ -318,7 +318,7 @@ class CipherSuite(Protocol):
 
     def encrypt(self, pkt: RecordLayer) -> bytes: ...
 
-    def decrypt(self, header: RecordHeader, payload: bytes) -> bytes: ...
+    def decrypt(self, pkt: RecordLayer) -> bytes: ...
 
     def cipher_suite_id(self) -> CipherSuiteID: ...
 

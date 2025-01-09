@@ -4,7 +4,7 @@ import binascii
 import hashlib
 import os
 
-from typing import Type, TypeVar
+from typing import Protocol, Self, Type, TypeVar
 
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -102,12 +102,14 @@ for srtp_profile in [
         SRTP_PROFILES.append(srtp_profile)
 
 
+class CertificateSigningRequest(Protocol):
+    def sign(self, data: bytes) -> bytes: ...
+
+
 class Certificate:
-    def __init__(
-        self, signkey: ec.EllipticCurvePrivateKey, key: crypto.PKey, cert: crypto.X509
-    ) -> None:
-        self._signkey = signkey
-        self._key = key
+    signkey: ec.EllipticCurvePrivateKey
+
+    def __init__(self, cert: crypto.X509) -> None:
         self._cert = cert
 
     @property
@@ -125,7 +127,7 @@ class Certificate:
 
     @property
     def pubkey_der(self) -> bytes:
-        return self._signkey.public_key().public_bytes(
+        return self.signkey.public_key().public_bytes(
             serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
         )
 
@@ -138,37 +140,44 @@ class Certificate:
         ]
 
     @classmethod
-    def generate_certificate(cls: Type[CERTIFICATE_T]) -> CERTIFICATE_T:
+    def from_bytes(cls, data: bytes) -> Self:
+        certificate = crypto.load_certificate(crypto.FILETYPE_ASN1, data)
+        return cls(certificate)
+
+    @classmethod
+    def generate_certificate(cls, csr: CertificateSigningRequest) -> Self:
         key = ec.generate_private_key(ec.SECP256R1(), default_backend())
 
-        private_key_bytes = key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-        pkey = crypto.load_privatekey(crypto.FILETYPE_PEM, private_key_bytes)
+        # private_key_bytes = key.private_bytes(
+        #     encoding=serialization.Encoding.PEM,
+        #     format=serialization.PrivateFormat.TraditionalOpenSSL,
+        #     encryption_algorithm=serialization.NoEncryption(),
+        # )
+        # pkey = crypto.load_privatekey(crypto.FILETYPE_PEM, private_key_bytes)
 
         cert = generate_certificate(key)
 
-        return cls(
-            signkey=key,
-            key=pkey,
+        i = cls(
+            # signkey=key,
+            # key=pkey,
             cert=crypto.X509.from_cryptography(cert),
         )
+        i.signkey = key
+        return i
 
-    def create_ssl_context(
-        self,
-        srtp_profiles: list[SRTPProtectionProfile],
-    ) -> SSL.Context:
-        ctx = SSL.Context(SSL.DTLS_METHOD)
-        ctx.set_verify(
-            SSL.VERIFY_PEER | SSL.VERIFY_FAIL_IF_NO_PEER_CERT, lambda *args: True
-        )
-        ctx.use_certificate(self._cert)
-        ctx.use_privatekey(self._key)
-        ctx.set_cipher_list(
-            b"ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA"
-        )
-        ctx.set_tlsext_use_srtp(b":".join(x.openssl_profile for x in srtp_profiles))
-
-        return ctx
+    # def create_ssl_context(
+    #     self,
+    #     srtp_profiles: list[SRTPProtectionProfile],
+    # ) -> SSL.Context:
+    #     ctx = SSL.Context(SSL.DTLS_METHOD)
+    #     ctx.set_verify(
+    #         SSL.VERIFY_PEER | SSL.VERIFY_FAIL_IF_NO_PEER_CERT, lambda *args: True
+    #     )
+    #     ctx.use_certificate(self._cert)
+    #     ctx.use_privatekey(self._key)
+    #     ctx.set_cipher_list(
+    #         b"ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA"
+    #     )
+    #     ctx.set_tlsext_use_srtp(b":".join(x.openssl_profile for x in srtp_profiles))
+    #
+    #     return ctx

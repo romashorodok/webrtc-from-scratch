@@ -94,6 +94,13 @@ class HandshakeCache:
     def __emit_ready_at_once(self):
         to_remove = []
         for cache_keys, event in self.__subscribers:
+            # needed_keys = set(cache_keys)  # Convert to a set for faster lookup
+            # present_keys = set(self._cache.keys())
+
+            # all_needed_keys_present = needed_keys.issubset(present_keys)
+            # print("all keys in???", self._cache)
+            # print("present keys", present_keys)
+
             if all(key in self._cache for key in cache_keys):
                 event.set()
                 to_remove.append((cache_keys, event))
@@ -111,17 +118,17 @@ class HandshakeCache:
         if not isinstance(layer.content, Handshake):
             raise ValueError("put handshake require a record layer")
 
-        self._cache[
-            HandshakeCacheKey(
-                message_type=layer.content.message.message_type,
-                epoch=layer.header.epoch,
-                is_remote=is_remote,
-            )
-        ] = layer
+        key = HandshakeCacheKey(
+            message_type=layer.content.message.message_type,
+            epoch=layer.header.epoch,
+            is_remote=is_remote,
+        )
+        self._cache[key] = layer
 
     def put_and_notify_once(self, is_client: bool, record: RecordLayer):
         self.__put(is_client, record)
         self.__emit_ready_at_once()
+        # print("Put flight state", self.__subscribers)
 
     def pull_and_merge(self, cache_keys: list[HandshakeCacheKey]) -> bytes:
         merged = bytes()
@@ -136,13 +143,26 @@ class HandshakeCache:
 
         return merged
 
+    def pull_record(
+        self,
+        typ: type[_HANDSHAKE_CACHE_MESSAGE_T],
+        cache_key: HandshakeCacheKey,
+    ) -> RecordLayer:
+        layer = self._cache.get(cache_key)
+        # print(self._cache)
+
+        if not layer:
+            raise ValueError(f"unable pull required cache_key {typ}")
+
+        return layer
+
     def pull(
         self,
         typ: type[_HANDSHAKE_CACHE_MESSAGE_T],
         cache_key: HandshakeCacheKey,
     ) -> _HANDSHAKE_CACHE_MESSAGE_T:
         layer = self._cache.get(cache_key)
-        print(self._cache)
+        # print(self._cache)
 
         if not layer:
             raise ValueError(f"unable pull required cache_key {typ}")
@@ -159,15 +179,16 @@ class HandshakeCache:
 
 
 class State:
-    def __init__(self, certificate: Certificate) -> None:
+    def __init__(self, certificate: Certificate, keypair: Keypair) -> None:
         self.local_random = Random()
         self.local_random.populate()
 
         self.remote_random: bytes | None = None
 
-        self.local_keypair: Keypair = Keypair.generate_P256()
+        # self.local_keypair: Keypair = Keypair.generate_P256()
         # self.local_keypair: Keypair = certificate.keypair
         self.local_certificate: Certificate = certificate
+        self.local_keypair: Keypair = keypair
 
         # self.local_keypair: Keypair = Keypair.generate_P256()
         # self.local_certificate: x509.Certificate = create_self_signed_cert_with_ecdsa(

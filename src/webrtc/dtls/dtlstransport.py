@@ -6,7 +6,8 @@ from OpenSSL import SSL
 from pylibsrtp import Policy, Session
 
 from webrtc import ice
-from webrtc.dtls.dtls_record import RecordLayer, is_dtls_record_layer
+from webrtc.dtls.dtls_cipher_suite import Keypair
+from webrtc.dtls.dtls_record import RecordLayer, RecordLayerBatch, is_dtls_record_layer
 from webrtc.dtls.flight_state import Flight
 from webrtc.dtls.fsm import DTLSConn
 from webrtc.ice import net
@@ -46,11 +47,17 @@ class DTLSLocal:
 
 
 class DTLSTransport:
-    def __init__(self, transport: ICETransportDTLS, certificate: Certificate) -> None:
+    def __init__(
+        self,
+        transport: ICETransportDTLS,
+        certificate: Certificate,
+        keypair: Keypair,
+    ) -> None:
         self.__transport = transport
 
         self.__dtls_role: DTLSRole = DTLSRole.Auto
         self.__certificate = certificate
+        self.__keypair = keypair
         # self.__media_fingerprints = list[dtls.Fingerprint]()
 
         self.__rx_srtp: Session | None = None
@@ -76,7 +83,11 @@ class DTLSTransport:
             flight = Flight.FLIGHT1
 
         dtls_conn = DTLSConn(
-            DTLSLocal(transport), self.__certificate, self.record_layer_chan, flight
+            DTLSLocal(transport),
+            self.__certificate,
+            self.__keypair,
+            self.record_layer_chan,
+            flight,
         )
         asyncio.create_task(dtls_conn.handle_inbound_record_layers())
         asyncio.create_task(dtls_conn.fsm.dispatch())
@@ -85,12 +96,13 @@ class DTLSTransport:
         while not __encrypted:
             print("current dtls role", self.__dtls_role)
 
-            dtls = await transport.recv_dtls()
-            if is_dtls_record_layer(dtls.data):
+            dtls_record_layer_batch = await transport.recv_dtls()
+            if is_dtls_record_layer(dtls_record_layer_batch.data):
                 try:
-                    record = RecordLayer.unmarshal(dtls.data)
+                    for record_layer in RecordLayerBatch(dtls_record_layer_batch.data):
+                        print("Recv", record_layer.content)
+                        await self.record_layer_chan.put(record_layer)
 
-                    await self.record_layer_chan.put(record)
                 except Exception as e:
                     print("DTLS transport error", e)
 

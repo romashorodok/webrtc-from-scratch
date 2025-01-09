@@ -3,7 +3,8 @@ import binascii
 import hashlib
 from typing import Callable
 
-from ecdsa import VerifyingKey
+from OpenSSL import crypto
+from ecdsa import NIST256p, SigningKey, VerifyingKey
 
 from webrtc.dtls.dtls_cipher_suite import (
     Keypair,
@@ -27,6 +28,8 @@ from webrtc.dtls.flight_state import Flight, FlightTransition, HandshakeCacheKey
 
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
 
 
 class Flight4(FlightTransition):
@@ -52,10 +55,8 @@ class Flight4(FlightTransition):
             # state.local_keypair.privateKey,
         )
 
-
-
         # signature = hashlib.sha256(signature).digest()
-        signature = state.local_certificate._signkey.sign(
+        signature = state.local_certificate.signkey.sign(
             signature, ec.ECDSA(hashes.SHA256())
         )
 
@@ -74,7 +75,7 @@ class Flight4(FlightTransition):
             self.__msg.server_hello(
                 state.local_random.marshal_fixed(), state.pending_cipher_suite
             ),
-            self.__msg.certificate([state.local_certificate.der]),
+            self.__msg.certificate([state.local_certificate]),
             self.__msg.key_server_exchange(
                 signature,
                 keypair.curve,
@@ -91,18 +92,42 @@ class Flight4(FlightTransition):
     def __setup_cipher_suite(
         self, state: State, client_key_exchange: ClientKeyExchange
     ):
-        pre_master_secret = Keypair.pre_master_secret_from_pub_and_priv_key(
-            VerifyingKey.from_der(client_key_exchange.pubkey),
-            state.local_keypair.privateKey,
+        # state.local_certificate.signkey
+
+        print("Flight 4 sign key", state.local_certificate.signkey)
+
+        if not client_key_exchange.pubkey:
+            raise ValueError("Not found pubkey")
+
+        pubkey = ec.EllipticCurvePublicKey.from_encoded_point(
+            ec.SECP256R1(), client_key_exchange.pubkey
         )
-        print(
-            "Flight 4 pre master secret",
-            binascii.hexlify(pre_master_secret),
-        )
+
+        # pubkey = VerifyingKey.from_string(client_key_exchange.pubkey, curve=NIST256p)
+
+        private_key = state.local_certificate.signkey
+        # private_key_bytes = private_key.private_bytes(
+        #     encoding=serialization.Encoding.PEM,
+        #     format=serialization.PrivateFormat.TraditionalOpenSSL,
+        #     encryption_algorithm=serialization.NoEncryption(),
+        # )
+
+        # private_key = SigningKey.from_pem(private_key_bytes)
+
+        pre_master_secret = private_key.exchange(ec.ECDH(), pubkey)
+
+        # server_shared_secret = server_private_key.exchange(ec.ECDH(), client_public_key)
+
+        # pre_master_secret = Keypair.pre_master_secret_from_pub_and_priv_key(
+        #     pubkey,
+        #     private_key,
+        # )
+
+        print("Flight 4 pre master secret", binascii.hexlify(pre_master_secret))
 
         if not state.remote_random:
             raise ValueError("Flight 4 not found remote random")
-
+        #
         state.master_secret = prf_master_secret(
             pre_master_secret,
             state.remote_random,
@@ -111,17 +136,18 @@ class Flight4(FlightTransition):
         )
 
         print("Flight 4 master secret", binascii.hexlify(state.master_secret))
-
-        if not state.pending_cipher_suite:
-            raise ValueError("Flight 4 require a pending cipher suite")
-
+        #
+        # if not state.pending_cipher_suite:
+        #     raise ValueError("Flight 4 require a pending cipher suite")
+        #
         # print("Flight 4", binascii.hexlify(state.remote_random), binascii.hexlify(state.local_random.marshal_fixed()) )
+        #
 
         state.pending_cipher_suite.start(
             state.master_secret,
             state.remote_random,
             state.local_random.marshal_fixed(),
-            True,
+            False,
         )
 
         print("Flight 4 Success cipher suite")
@@ -199,13 +225,13 @@ class Flight4(FlightTransition):
         try:
             print("Flight 4 fingerprint", binascii.hexlify(client_certificate_sign))
             # client_certificate_sign = bytes(0x01)
-            verified = verify_certificate_signature(
-                client_certificate_sign,
-                certificate_verify.signature,
-                hashlib.sha256,
-                certificate.certificates,
-            )
-            print("Is client cert verified??", verified)
+            # verified = verify_certificate_signature(
+            #     client_certificate_sign,
+            #     certificate_verify.signature,
+            #     hashlib.sha256,
+            #     certificate.certificates,
+            # )
+            # print("Is client cert verified??", verified)
         except Exception as e:
             print("Client cert invalid with err", e)
 
@@ -233,31 +259,31 @@ class Flight4(FlightTransition):
                 # HandshakeCacheKey(
                 #     message_type=HandshakeMessageType.Finished,
                 #     epoch=1,
-                #     is_client=True,
+                #     is_remote=True,
                 # ),
             ]
         )
-        print("Recv all needed parts")
+        print("Flight 4 block?? Recv all needed parts")
 
-        self.__validate_client_certificate(
-            state,
-            state.cache.pull(
-                Certificate,
-                HandshakeCacheKey(
-                    message_type=HandshakeMessageType.Certificate,
-                    epoch=0,
-                    is_remote=True,
-                ),
-            ),
-            state.cache.pull(
-                CertificateVerify,
-                HandshakeCacheKey(
-                    message_type=HandshakeMessageType.CertificateVerify,
-                    epoch=0,
-                    is_remote=True,
-                ),
-            ),
-        )
+        # self.__validate_client_certificate(
+        #     state,
+        #     state.cache.pull(
+        #         Certificate,
+        #         HandshakeCacheKey(
+        #             message_type=HandshakeMessageType.Certificate,
+        #             epoch=0,
+        #             is_remote=True,
+        #         ),
+        #     ),
+        #     state.cache.pull(
+        #         CertificateVerify,
+        #         HandshakeCacheKey(
+        #             message_type=HandshakeMessageType.CertificateVerify,
+        #             epoch=0,
+        #             is_remote=True,
+        #         ),
+        #     ),
+        # )
 
         self.__setup_cipher_suite(
             state,
@@ -271,10 +297,19 @@ class Flight4(FlightTransition):
             ),
         )
 
+        await state.cache.once(
+            [
+                HandshakeCacheKey(
+                    message_type=HandshakeMessageType.Finished,
+                    epoch=1,
+                    is_remote=True,
+                ),
+            ]
+        )
+
         print("All done transition to flight 6")
 
         return Flight.FLIGHT6
-        ...
 
         # while True:
         #     # print("Flight 4 wait")

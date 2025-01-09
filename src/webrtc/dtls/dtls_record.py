@@ -1,3 +1,4 @@
+import binascii
 from dataclasses import dataclass
 from enum import IntEnum
 
@@ -14,6 +15,7 @@ from webrtc.dtls.dtls_typing import (
 )
 
 from webrtc.ice.stun import utils as byteops
+from webrtc.dtls.certificate import Certificate as CertificateDTLS
 
 
 class ContentType(IntEnum):
@@ -631,7 +633,7 @@ class ServerHello(Message):
 class Certificate(Message):
     message_type = HandshakeMessageType.Certificate
 
-    certificates: list[bytes] | None = None
+    certificates: list[CertificateDTLS] | None = None
 
     def marshal_certificates(self) -> bytes:
         if not self.certificates:
@@ -639,11 +641,11 @@ class Certificate(Message):
 
         result = bytes()
         for cert in self.certificates:
-            # cert_der = cert.dump()
-            # if not isinstance(cert_der, bytes):
-            #     raise ValueError("Unable transform certificate to DER bytes")
+            cert_der = cert.der
+            if not isinstance(cert_der, bytes):
+                raise ValueError("Unable transform certificate to DER bytes")
 
-            result += byteops.pack_unsigned_24(len(cert)) + cert
+            result += byteops.pack_unsigned_24(len(cert_der)) + cert_der
 
         return result
 
@@ -659,7 +661,7 @@ class Certificate(Message):
         if self.buf.length < self.buf.offset + certificates_length:
             raise ValueError("Insufficient data for certificates")
 
-        result = list[bytes]()
+        result = list[CertificateDTLS]()
         remaining_length = certificates_length
         while remaining_length > 0:
             if remaining_length < 3:
@@ -675,9 +677,7 @@ class Certificate(Message):
             certificate = self.buf.read_bytes(cert_length)
             remaining_length -= cert_length
 
-            result.append(certificate)
-            # certificate = x509.Certificate.load(certificate)
-            # result.append(certificate)
+            result.append(CertificateDTLS.from_bytes(certificate))
 
         self.certificates = result
 
@@ -1055,7 +1055,7 @@ class RecordLayer:
         payload = self.content.marshal()
         # print("handshake", len(payload))
         return bytes(
-            byteops.pack_byte_int(self.content.content_type)
+            byteops.pack_byte_int(self.header.content_type or self.content.content_type)
             + byteops.pack_unsigned_short(self.header.version)
             + byteops.pack_unsigned_short(self.header.epoch)
             + self.header.sequence_number.to_bytes(6, byteorder="big")
@@ -1099,3 +1099,32 @@ class RecordLayer:
             raise e
 
         return cls(header, content)
+
+    @classmethod
+    def unmarshal_and_rest(cls, data: bytes) -> tuple[bytes, Self]:
+        if len(data) < cls.FIXED_HEADER_SIZE:
+            raise ValueError("DTLS record is too small")
+
+        length = byteops.unpack_unsigned_short(data[11:13])
+
+        layer = cls.unmarshal(data)
+
+        rest = data[cls.FIXED_HEADER_SIZE + length :]
+
+        return (rest, layer)
+
+
+class RecordLayerBatch:
+    def __init__(self, data: bytes) -> None:
+        self.__data = data
+
+    def __iter__(self) -> Self:
+        return self
+
+    def __next__(self) -> RecordLayer:
+        if not self.__data:
+            raise StopIteration()
+
+        data, layer = RecordLayer.unmarshal_and_rest(self.__data)
+        self.__data = data
+        return layer
