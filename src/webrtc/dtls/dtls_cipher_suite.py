@@ -6,6 +6,11 @@ from dataclasses import dataclass
 from typing import Callable, Protocol, Self
 from datetime import datetime, UTC, timedelta
 
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.backends import default_backend
+
+
 from ecdsa import Ed25519, SigningKey, VerifyingKey, NIST256p
 from ecdsa.ecdh import ECDH
 from asn1crypto import x509, keys, algos
@@ -358,6 +363,17 @@ def verify_data_server(master_secret: bytes, handshake_bodies: bytes):
 MASTER_SECRET_LABEL = b"master secret"
 
 
+def prf(key: bytes, info: bytes) -> bytes:
+    hkdf = HKDF(
+        algorithm=SHA256(),
+        length=48,
+        salt=None,
+        info=info,
+        backend=default_backend(),
+    )
+    return hkdf.derive(key)
+
+
 def prf_master_secret(
     pre_master_secret: bytes,
     client_random: bytes,
@@ -366,3 +382,4 @@ def prf_master_secret(
 ) -> bytes:
     seed = MASTER_SECRET_LABEL + client_random + server_random
     return p_hash(pre_master_secret, seed, 48, hash_func)
+    # return prf(pre_master_secret, seed)

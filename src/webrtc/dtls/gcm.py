@@ -12,6 +12,9 @@ from webrtc.dtls.dtls_record import Finished, RecordHeader, RecordLayer
 from webrtc.ice.stun import utils as byteops
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.backends import default_backend
 
 
 def generate_aead_additional_data(header: RecordHeader, payload_len: int) -> bytes:
@@ -114,12 +117,22 @@ def prf_generate_encryption_keys(
     key_expansion_label = b"key expansion"
     seed = key_expansion_label + server_random + client_random
 
-    key_material = p_hash(
-        master_secret,
-        seed,
-        (2 * mac_len) + (2 * key_len) + (2 * iv_len),
-        hashlib.sha256,
+    total_key_material_len = (2 * mac_len) + (2 * key_len) + (2 * iv_len)
+    hkdf = HKDF(
+        algorithm=SHA256(),
+        length=total_key_material_len,
+        salt=None,
+        info=seed,
+        backend=default_backend(),
     )
+    key_material = hkdf.derive(master_secret)
+
+    # key_material = p_hash(
+    #     master_secret,
+    #     seed,
+    #     (2 * mac_len) + (2 * key_len) + (2 * iv_len),
+    #     hashlib.sha256,
+    # )
     # print("key meterial", binascii.hexlify(key_material))
 
     client_mac_key = key_material[:mac_len]
@@ -179,25 +192,27 @@ def encrypt_with_aes_gcm(
 def decrypt_with_aes_gcm(
     key: bytes, nonce: bytes, ciphertext: bytes, additional_data: bytes
 ) -> bytes:
-    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce, mac_len=16)
-    # additional_data = bytes(0x01)
-    cipher.update(additional_data)
-
-    print("decrypted aead", binascii.hexlify(additional_data))
-    # print("decrypted tag", binascii.hexlify(tag))
-    print("decrypted payload", binascii.hexlify(ciphertext))
-    # result = cipher.decrypt_and_verify(ciphertext, tag)
-
-    result = cipher.decrypt(ciphertext)
-    # tag = result[-16:]
-
-    # cipher.verify(tag)
-    # result = cipher.decrypt_and_verify(ciphertext, tag)
-    # result = result[-16:]
-
-    print("dec", binascii.hexlify(result), "tag")
-
-    return result
+    aesgcm = AESGCM(key)
+    return aesgcm.decrypt(nonce, ciphertext, additional_data)
+    # cipher = AES.new(key, AES.MODE_GCM, nonce=nonce, mac_len=16)
+    # # additional_data = bytes(0x01)
+    # cipher.update(additional_data)
+    #
+    # print("decrypted aead", binascii.hexlify(additional_data))
+    # # print("decrypted tag", binascii.hexlify(tag))
+    # print("decrypted payload", binascii.hexlify(ciphertext))
+    # # result = cipher.decrypt_and_verify(ciphertext, tag)
+    #
+    # result = cipher.decrypt(ciphertext)
+    # # tag = result[-16:]
+    #
+    # # cipher.verify(tag)
+    # # result = cipher.decrypt_and_verify(ciphertext, tag)
+    # # result = result[-16:]
+    #
+    # print("dec", binascii.hexlify(result), "tag")
+    #
+    # return result
 
 
 GCM_NONCE_LENGTH = 12
@@ -327,12 +342,9 @@ class GCMCipherRecordLayer:
         pkt_header_len = pkt.header_size()
         payload = pkt_bytes[pkt_header_len:]
 
-        nonce = bytearray(GCM_NONCE_LENGTH)
-        nonce[0:4] = self.__gcm_bytes.remote_write_iv[:4]
-        nonce[4:GCM_NONCE_LENGTH] = payload[0:8]
-        nonce = bytes(nonce)
+        nonce = self.__gcm_bytes.remote_write_iv[:4] + payload[4 : GCM_NONCE_LENGTH]
 
-        payload = payload[8:]
+        payload = payload[:GCM_NONCE_LENGTH]
 
         print(pkt)
         print("header content typ", pkt.header.content_type)

@@ -3,7 +3,7 @@ import asyncio
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import TypeVar
+from typing import Protocol, TypeVar
 
 from asn1crypto import x509
 
@@ -178,8 +178,16 @@ class HandshakeCache:
         return layer.content.message
 
 
+class DTLSRemote(Protocol):
+    async def sendto(self, data: bytes): ...
+
+
 class State:
-    def __init__(self, certificate: Certificate, keypair: Keypair) -> None:
+    def __init__(
+        self, remote: DTLSRemote, certificate: Certificate, keypair: Keypair
+    ) -> None:
+        self.remote = remote
+
         self.local_random = Random()
         self.local_random.populate()
 

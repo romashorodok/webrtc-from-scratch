@@ -16,6 +16,7 @@ from webrtc.dtls.flight_state import FlightTransition, State, Flight
 from webrtc.dtls.dtls_record import (
     CONTENT_TYPE_CLASSES,
     ContentType,
+    Finished,
     Handshake,
     Message,
     EncryptedHandshakeMessage,
@@ -69,7 +70,7 @@ class FSM:
         self.remote = remote
         self.handshake_message_chan = handshake_messages_chan
 
-        self.state = State(certificate, keypair)
+        self.state = State(remote, certificate, keypair)
 
         self.handshake_state_transition = asyncio.Queue[FSMState]()
         self.handshake_state_transition_lock = asyncio.Lock()
@@ -101,7 +102,7 @@ class FSM:
 
             if self.pending_record_layers:
                 for record in self.pending_record_layers:
-                    if self.is_server:
+                    if self.is_server or not record.header.sequence_number:
                         record.header.sequence_number += (
                             self.state.handshake_sequence_number
                         )
@@ -146,14 +147,17 @@ class FSM:
 
         # TODO: message batch
         for layer in self.pending_record_layers:
-            try:
-                data = layer.marshal()
+            data = layer.marshal()
 
+            try:
                 if layer.encrypt:
                     if not self.state.pending_cipher_suite:
                         raise ValueError(
                             "layer data must be encrypted but cipher suite undefined"
                         )
+
+                    layer.header.sequence_number = 0
+                    data = layer.marshal()
 
                     print("Send seq number", layer.header.sequence_number)
 
@@ -278,11 +282,15 @@ class DTLSConn:
                 if not content_type_cls:
                     raise ValueError("Unable find a content type for decrypted message")
                 content = content_type_cls.unmarshal(result)
+                print("Decrypted", content)
 
                 if isinstance(content, Handshake):
                     print("Recv record", content.message)
                     layer.content = content
                     layer.header.length = len(result)
+
+                    # if isinstance(content, Finished):
+                    #     content.encrypted_payload =
 
                     self.fsm.state.cache.put_and_notify_once(True, layer)
                     self.handshake_message_chan.put_nowait(content.message)

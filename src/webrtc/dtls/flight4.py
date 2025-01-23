@@ -102,8 +102,10 @@ class Flight4(FlightTransition):
         pubkey = ec.EllipticCurvePublicKey.from_encoded_point(
             ec.SECP256R1(), client_key_exchange.pubkey
         )
-
-        # pubkey = VerifyingKey.from_string(client_key_exchange.pubkey, curve=NIST256p)
+        # pubkey = pubkey.public_bytes(
+        #     serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
+        # )
+        # pubkey = VerifyingKey.from_public_point(pubkey, curve=NIST256p)
 
         private_key = state.local_certificate.signkey
         # private_key_bytes = private_key.private_bytes(
@@ -128,6 +130,7 @@ class Flight4(FlightTransition):
         if not state.remote_random:
             raise ValueError("Flight 4 not found remote random")
         #
+
         state.master_secret = prf_master_secret(
             pre_master_secret,
             state.remote_random,
