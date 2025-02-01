@@ -1,11 +1,12 @@
 import asyncio
+import binascii
 from enum import Enum
 from typing import Protocol
 
 from OpenSSL import SSL
 from pylibsrtp import Policy, Session
 
-from webrtc import ice
+from webrtc import dtls, ice
 from webrtc.dtls.dtls_cipher_suite import Keypair
 from webrtc.dtls.dtls_record import RecordLayer, RecordLayerBatch, is_dtls_record_layer
 from webrtc.dtls.flight_state import Flight
@@ -98,6 +99,7 @@ class DTLSTransport:
 
             dtls_record_layer_batch = await transport.recv_dtls()
             if is_dtls_record_layer(dtls_record_layer_batch.data):
+                print("Got record", binascii.hexlify(dtls_record_layer_batch.data))
                 try:
                     for record_layer in RecordLayerBatch(dtls_record_layer_batch.data):
                         print("Recv", record_layer.content)

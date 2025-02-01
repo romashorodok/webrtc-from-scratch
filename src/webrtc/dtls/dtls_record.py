@@ -976,6 +976,51 @@ class Handshake(RecordContentType):
         return f"<{full_name} object at {hex(id(self))} message={self.message}>"
 
 
+class HandshakeMultipleMessages(RecordContentType):
+    content_type = ContentType.HANDSHAKE
+
+    def __init__(self, handshake_messages: list[Handshake]) -> None:
+        self.handshake_messages = handshake_messages
+
+    def marshal(self) -> bytes:
+        handshake_payload = bytes()
+
+        for message in self.handshake_messages:
+            handshake_payload += message.marshal()
+
+        return handshake_payload
+
+    @classmethod
+    def unmarshal(cls, data: bytes) -> Self:
+        handshake_messages = list[Handshake]()
+
+        while data:
+            header = HandshakeHeader(
+                handshake_type=HandshakeMessageType(data[0]),
+                length=byteops.unpack_unsigned_24(data[1:4]),
+                message_sequence=byteops.unpack_unsigned_short(data[4:6]),
+                fragment_offset=byteops.unpack_unsigned_24(data[6:9]),
+                fragment_length=byteops.unpack_unsigned_24(data[9:12]),
+            )
+            data = data[12:]
+
+            message_cls = MESSAGE_CLASSES.get(header.handshake_type)
+            if not message_cls:
+                raise ValueError("Not found message class")
+
+            message = message_cls.unmarshal(data)
+
+            data = data[header.length :]
+
+            handshake_messages.append(Handshake(header, message))
+
+        return cls(handshake_messages)
+
+    def __repr__(self) -> str:
+        full_name = f"{self.__class__.__module__}.{self.__class__.__qualname__}"
+        return f"<{full_name} object at {hex(id(self))} handshake_messages={self.handshake_messages}>"
+
+
 class EncryptedHandshakeMessage(RecordContentType):
     content_type = ContentType.UNSPECIFIED
 
@@ -1101,13 +1146,73 @@ class RecordLayer:
         return cls(header, content)
 
     @classmethod
+    def unmarshal_multiple(cls, data: bytes) -> Self:
+        if len(data) < cls.FIXED_HEADER_SIZE:
+            raise ValueError("DTLS record is too small")
+
+        header = data[: cls.FIXED_HEADER_SIZE]
+        # print("content type", header[0])
+        content_type = ContentType(header[0])
+
+        if content_type == ContentType.CONNECTION_ID:
+            raise ValueError("Unsupported connection id")
+
+        version = unpack_version(data[1:3])
+
+        epoch = byteops.unpack_unsigned_short(header[3:5])
+
+        sequence_number = byteops.unpack_unsigned_64(data[5:11])
+
+        length = byteops.unpack_unsigned_short(data[11:13])
+
+        data = data[13:]
+
+        header = RecordHeader(content_type, version, epoch, sequence_number, length)
+
+        try:
+            content = HandshakeMultipleMessages.unmarshal(data)
+        except Exception as e:
+            raise e
+
+        return cls(header, content)
+
+    @classmethod
     def unmarshal_and_rest(cls, data: bytes) -> tuple[bytes, Self]:
         if len(data) < cls.FIXED_HEADER_SIZE:
             raise ValueError("DTLS record is too small")
 
+        content_type = ContentType(data[0])
+        epoch = byteops.unpack_unsigned_short(data[3:5])
         length = byteops.unpack_unsigned_short(data[11:13])
+        layer: RecordLayer
 
-        layer = cls.unmarshal(data)
+        match content_type:
+            case ContentType.CHANGE_CIPHER_SPEC:
+                layer = cls.unmarshal(data)
+            # TODO: ref it
+            case ContentType.HANDSHAKE if epoch > 0:  # it's encrypted message
+                layer = cls.unmarshal(data)
+            case ContentType.HANDSHAKE if epoch == 0:  # Record with Single | Multiple messages
+                print("pkt length", length)
+
+                message_length = byteops.unpack_unsigned_24(data[14:17]) - 1
+                print(
+                    "message length",
+                    message_length,
+                    "record langth - header",
+                    length - cls.FIXED_HEADER_SIZE,
+                    "record len",
+                    len(data[26:]),
+                )
+
+                if message_length == length - cls.FIXED_HEADER_SIZE:
+                    layer = cls.unmarshal(data)
+                else:
+                    layer = cls.unmarshal_multiple(
+                        data[: cls.FIXED_HEADER_SIZE + length]
+                    )
+            case _:
+                raise ValueError(f"Unsupported content type of {content_type}")
 
         rest = data[cls.FIXED_HEADER_SIZE + length :]
 
@@ -1127,4 +1232,5 @@ class RecordLayerBatch:
 
         data, layer = RecordLayer.unmarshal_and_rest(self.__data)
         self.__data = data
+        print("Rest record layer batch", binascii.hexlify(data))
         return layer
