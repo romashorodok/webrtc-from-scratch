@@ -10,7 +10,7 @@ def main(module: str, app: str):
     mod = importlib.import_module(module)
     application = getattr(mod, app)
 
-    uvicorn.run(application, port=8080)
+    uvicorn.run(application, port=9000)
 
 
 if __name__ == "__main__":

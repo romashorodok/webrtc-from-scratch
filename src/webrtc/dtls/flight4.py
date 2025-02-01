@@ -31,6 +31,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 
+import native
 
 class Flight4(FlightTransition):
     __msg = DEFAULT_FACTORY
@@ -131,12 +132,19 @@ class Flight4(FlightTransition):
             raise ValueError("Flight 4 not found remote random")
         #
 
-        state.master_secret = prf_master_secret(
+
+        state.master_secret = native.prf_master_secret(
             pre_master_secret,
             state.remote_random,
             state.local_random.marshal_fixed(),
-            hashlib.sha256,
         )
+
+        # state.master_secret = prf_master_secret(
+        #     pre_master_secret,
+        #     state.remote_random,
+        #     state.local_random.marshal_fixed(),
+        #     hashlib.sha256,
+        # )
 
         print("Flight 4 master secret", binascii.hexlify(state.master_secret))
         #

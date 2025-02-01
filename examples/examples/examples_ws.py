@@ -9,14 +9,11 @@ from webrtc.peer_connection import (
 from webrtc import media
 from webrtc.session_description import SessionDescription, SessionDescriptionType
 from webrtc.transceiver import RTPCodecKind, RTPTransceiverDirection
-import native
 
 import fractions
 import threading
 
 app = FastAPI()
-
-print(native.sum_as_string(10, 20))
 
 
 async def on_recv(ws: WebSocket, on_close: Callable | None = None):
