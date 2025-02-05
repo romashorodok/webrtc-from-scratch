@@ -18,6 +18,7 @@ from webrtc.dtls.dtls_record import (
     ContentType,
     Finished,
     Handshake,
+    HandshakeMultipleMessages,
     Message,
     EncryptedHandshakeMessage,
     RecordLayer,
@@ -56,7 +57,6 @@ class FSM:
         self,
         remote: DTLSRemote,
         certificate: Certificate,
-        keypair: Keypair,
         handshake_messages_chan: asyncio.Queue[Message],
         flight: Flight = Flight.FLIGHT0,
     ) -> None:
@@ -70,7 +70,7 @@ class FSM:
         self.remote = remote
         self.handshake_message_chan = handshake_messages_chan
 
-        self.state = State(remote, certificate, keypair)
+        self.state = State(remote, certificate, Keypair.generate_P256())
 
         self.handshake_state_transition = asyncio.Queue[FSMState]()
         self.handshake_state_transition_lock = asyncio.Lock()
@@ -126,7 +126,12 @@ class FSM:
                         # )
                         # self.state.handshake_sequence_number += 1
 
-                        self.state.cache.put_and_notify_once(False, record)
+                        self.state.cache.put_and_notify_once(
+                            False,
+                            record.header.epoch,
+                            record.content.message.message_type,
+                            record.content.message,
+                        )
 
         except Exception as e:
             print("FSM prepere err", e)
@@ -251,20 +256,17 @@ class DTLSConn:
         self,
         remote: DTLSRemote,
         certificate: Certificate,
-        keypair: Keypair,
-        layer_chan: asyncio.Queue[RecordLayer],
+        layer_chan: asyncio.Queue[tuple[RecordLayer, bytes]],
         flight: Flight = Flight.FLIGHT0,
     ) -> None:
         self.record_layer_chan = layer_chan
 
         self.handshake_message_chan = asyncio.Queue[Message]()
-        self.fsm = FSM(
-            remote, certificate, keypair, self.handshake_message_chan, flight
-        )
+        self.fsm = FSM(remote, certificate, self.handshake_message_chan, flight)
         self.recv_lock = asyncio.Lock()
 
     def __handle_encrypted_message(
-        self, layer: RecordLayer, message: EncryptedHandshakeMessage
+        self, layer: RecordLayer, raw: bytes, message: EncryptedHandshakeMessage
     ):
         if not self.fsm.state.cipher_suite:
             return
@@ -275,25 +277,33 @@ class DTLSConn:
             cipher_suite = self.fsm.state.pending_cipher_suite
 
         try:
-            if result := cipher_suite.decrypt(layer):
+            if result := cipher_suite.decrypt(layer, raw):
                 # print("Got decrypted message result", result)
 
-                content_type_cls = CONTENT_TYPE_CLASSES.get(layer.header.content_type)
-                if not content_type_cls:
-                    raise ValueError("Unable find a content type for decrypted message")
-                content = content_type_cls.unmarshal(result)
-                print("Decrypted", content)
+                record = RecordLayer.unmarshal(result, decrypted=True)
+                print("Dec result??", record, record.content)
 
-                if isinstance(content, Handshake):
-                    print("Recv record", content.message)
-                    layer.content = content
-                    layer.header.length = len(result)
+                # content_type_cls = CONTENT_TYPE_CLASSES.get(layer.header.content_type)
+                # if not content_type_cls:
+                #     raise ValueError("Unable find a content type for decrypted message")
+                # content = content_type_cls.unmarshal(result)
+                # print("Decrypted", content)
+
+                if isinstance(record.content, Handshake):
+                    print("Recv dec record success dec", record.content.message)
+                    # layer.content = content
+                    # layer.header.length = len(result)
 
                     # if isinstance(content, Finished):
                     #     content.encrypted_payload =
 
-                    self.fsm.state.cache.put_and_notify_once(True, layer)
-                    self.handshake_message_chan.put_nowait(content.message)
+                    self.fsm.state.cache.put_and_notify_once(
+                        True,
+                        record.header.epoch,
+                        record.content.message.message_type,
+                        record.content.message,
+                    )
+                    self.handshake_message_chan.put_nowait(record.content.message)
 
                 return
         except Exception as e:
@@ -308,7 +318,7 @@ class DTLSConn:
 
         try:
             while True:
-                record_layer = await self.record_layer_chan.get()
+                record_layer, raw = await self.record_layer_chan.get()
                 print("recv record seq", record_layer.header.sequence_number)
 
                 match record_layer.header.content_type:
@@ -330,12 +340,30 @@ class DTLSConn:
                                 record_layer.content, EncryptedHandshakeMessage
                             ):
                                 self.__handle_encrypted_message(
-                                    record_layer, record_layer.content
+                                    record_layer, raw, record_layer.content
                                 )
                                 continue
 
+                        if isinstance(record_layer.content, HandshakeMultipleMessages):
+                            for (
+                                handshake,
+                                raw,
+                            ) in record_layer.content.handshake_messages:
+                                self.fsm.state.cache.put_and_notify_once(
+                                    True,
+                                    record_layer.header.epoch,
+                                    handshake.message.message_type,
+                                    handshake.message,
+                                )
+                                await self.handshake_message_chan.put(handshake.message)
+
                         if isinstance(record_layer.content, Handshake):
-                            self.fsm.state.cache.put_and_notify_once(True, record_layer)
+                            self.fsm.state.cache.put_and_notify_once(
+                                True,
+                                record_layer.header.epoch,
+                                record_layer.content.message.message_type,
+                                record_layer.content.message,
+                            )
 
                             await self.handshake_message_chan.put(
                                 record_layer.content.message,

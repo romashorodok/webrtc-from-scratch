@@ -106,6 +106,6 @@ pub trait CipherSuite {
         is_client: bool,
     ) -> Result<()>;
 
-    fn encrypt(&self, record_layer_header_aead: &[u8], raw: &[u8]) -> Result<Vec<u8>>;
-    fn decrypt(&self, record_layer_header_aead: &[u8], input: &[u8]) -> Result<Vec<u8>>;
+    fn encrypt(&self, raw: &[u8]) -> Result<Vec<u8>>;
+    fn decrypt(&self, input: &[u8]) -> Result<Vec<u8>>;
 }

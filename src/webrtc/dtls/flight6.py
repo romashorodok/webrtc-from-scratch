@@ -3,6 +3,7 @@ import time
 
 from ecdsa.util import binascii
 
+import native
 from webrtc.dtls.dtls_cipher_suite import (
     prf_verify_data,
     verify_data_client,
@@ -12,6 +13,7 @@ from webrtc.dtls.dtls_record import (
     Certificate,
     ChangeCipherSpec,
     ContentType,
+    Finished,
     Handshake,
     HandshakeMessageType,
     Message,
@@ -89,7 +91,7 @@ class Flight6(FlightTransition):
         try:
             verify = state.cache.pull_and_merge(server_verifying_data)
 
-            certificate = state.cache.pull_record(
+            certificate = state.cache.pull(
                 Certificate,
                 HandshakeCacheKey(
                     message_type=HandshakeMessageType.Certificate,
@@ -97,10 +99,10 @@ class Flight6(FlightTransition):
                     is_remote=True,
                 ),
             )
-            print(certificate.header)
 
             print("Flight 6 verify data", binascii.hexlify(verify))
-            verifying_data = verify_data_server(state.master_secret, verify)
+            verifying_data = native.prf_verify_data_server(state.master_secret, verify)
+            # verifying_data = verify_data_server(state.master_secret, verify)
             print("Flight 6 verifying data", binascii.hexlify(verifying_data))
         except Exception as e:
             print("FLight 6 error", e)
@@ -113,15 +115,26 @@ class Flight6(FlightTransition):
     async def parse(
         self, state: State, handshake_message_ch: asyncio.Queue[Message]
     ) -> Flight:
+        ...
+        # cache_result = state.cache.pull(
+        #     Finished,
+        #     HandshakeCacheKey(
+        #         message_type=HandshakeMessageType.Finished,
+        #         epoch=1,
+        #         is_remote=True,
+        #     ),
+        # )
+        # print("Finish has data??", cache_result.encrypted_payload)
+        #
         # await asyncio.sleep(5)
-
+        #
         # if not state.master_secret:
         #     raise ValueError("Master secret required")
         #
         # try:
         #     verify = state.cache.pull_and_merge(server_verifying_data)
         #
-        #     certificate = state.cache.pull_record(
+        #     certificate = state.cache.pull(
         #         Certificate,
         #         HandshakeCacheKey(
         #             message_type=HandshakeMessageType.Certificate,
@@ -129,23 +142,17 @@ class Flight6(FlightTransition):
         #             is_remote=True,
         #         ),
         #     )
-        #     print(certificate.header)
+        #     # print(certificate.header)
         #
         #     print("Flight 6 verify data", binascii.hexlify(verify))
-        #     verifying_data = verify_data_server(state.master_secret, verify)
+        #     # verifying_data = native.prf_verify_data_server(state.master_secret, verify)
+        #     verifying_data = native.prf_verify_data_server(state.master_secret, verify)
         #     print("Flight 6 verifying data", binascii.hexlify(verifying_data))
         # except Exception as e:
         #     print("FLight 6 error", e)
         #     return Flight.FLIGHT6
         #
         # finished = self.__msg.finished(verifying_data)
-        #
-        # # print(
-        # #     Handshake(
-        # #         header=Handshake(HandshakeMessageType.Finished, 0, 0),
-        # #         message=Finished(verifying_data),
-        # #     ),
-        # # )
         #
         # pending_record_layers = [self.__msg.change_cipher_spec(), finished]
         #
@@ -197,6 +204,6 @@ class Flight6(FlightTransition):
         #         await asyncio.sleep(10)
         #
         # await state.remote.sendto(send_batch)
-
-        await asyncio.sleep(2)
-        return Flight.FLIGHT6
+        #
+        # await asyncio.sleep(2)
+        # return Flight.FLIGHT6

@@ -16,6 +16,7 @@ from ecdsa.ecdh import ECDH
 from asn1crypto import x509, keys, algos
 from ecdsa.util import sha256
 
+import native
 from webrtc.dtls.dtls_record import (
     EllipticCurvePointFormat,
     RecordHeader,
@@ -23,7 +24,12 @@ from webrtc.dtls.dtls_record import (
     SignatureHashAlgorithm,
 )
 from webrtc.dtls.dtls_typing import NAMED_CURVE_TYPE, CipherSuiteID, EllipticCurveGroup
-from webrtc.dtls.gcm import GCMCipherRecordLayer, p_hash, prf_generate_encryption_keys
+from webrtc.dtls.gcm import (
+    GCMCipherRecordLayer,
+    generate_aead_additional_data,
+    p_hash,
+    prf_generate_encryption_keys,
+)
 
 from webrtc.ice.stun import utils as byteops
 
@@ -303,10 +309,39 @@ class CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:
 
         return self.gcm.encrypt(pkt)
 
-    def decrypt(self, pkt: RecordLayer) -> bytes:
+    def decrypt(self, pkt: RecordLayer, raw: bytes) -> bytes:
         if not self.gcm:
             raise ValueError("Unable decrypt start gcm first")
         return self.gcm.decrypt(pkt)
+
+    def cipher_suite_id(self) -> CipherSuiteID:
+        return CipherSuiteID.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+
+
+class CipherSuiteNative:
+    def __init__(self) -> None:
+        self.suite = native.CipherSuiteAes128GcmSha256()
+
+    def start(
+        self,
+        master_secret: bytes,
+        client_random: bytes,
+        server_random: bytes,
+        client: bool,
+    ):
+        self.suite.init(master_secret, client_random, server_random, client)
+
+    def encrypt(self, pkt: RecordLayer) -> bytes:
+        raw = pkt.marshal()
+        return self.suite.encrypt(raw)
+
+    def decrypt(self, pkt: RecordLayer, raw: bytes) -> bytes:
+        """
+        AEAD for cipher suite must be taken from record header - len of TAG: [...16]
+
+        :param pkt - Record looks like that | Header | Nonce | Encoded Payload | Tag |
+        """
+        return self.suite.decrypt(ciphertext=raw)
 
     def cipher_suite_id(self) -> CipherSuiteID:
         return CipherSuiteID.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
@@ -323,7 +358,7 @@ class CipherSuite(Protocol):
 
     def encrypt(self, pkt: RecordLayer) -> bytes: ...
 
-    def decrypt(self, pkt: RecordLayer) -> bytes: ...
+    def decrypt(self, pkt: RecordLayer, raw: bytes) -> bytes: ...
 
     def cipher_suite_id(self) -> CipherSuiteID: ...
 

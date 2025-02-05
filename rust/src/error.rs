@@ -148,6 +148,9 @@ pub enum Error {
     ErrFragmentBufferOverflow { new_size: usize, max_size: usize },
 
     #[error("{0}")]
+    Io(#[source] IoError),
+
+    #[error("{0}")]
     P256(#[source] P256Error),
 
     #[error("{0}")]
@@ -170,6 +173,12 @@ pub struct IoError(#[from] pub io::Error);
 impl PartialEq for IoError {
     fn eq(&self, other: &Self) -> bool {
         self.0.kind() == other.0.kind()
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Self {
+        Error::Io(IoError(e))
     }
 }
 

@@ -60,9 +60,9 @@ impl CipherSuite for CipherSuiteAes128GcmSha256 {
         Ok(())
     }
 
-    fn encrypt(&self, record_layer_header_aead: &[u8], raw: &[u8]) -> Result<Vec<u8>> {
+    fn encrypt(&self, raw: &[u8]) -> Result<Vec<u8>> {
         if let Some(cg) = &self.gcm {
-            cg.encrypt(record_layer_header_aead, raw)
+            cg.encrypt(raw)
         } else {
             Err(Error::Other(
                 "CipherSuite has not been initialized, unable to encrypt".to_owned(),
@@ -70,9 +70,9 @@ impl CipherSuite for CipherSuiteAes128GcmSha256 {
         }
     }
 
-    fn decrypt(&self, record_layer_header_aead: &[u8], input: &[u8]) -> Result<Vec<u8>> {
+    fn decrypt(&self, input: &[u8]) -> Result<Vec<u8>> {
         if let Some(cg) = &self.gcm {
-            cg.decrypt(record_layer_header_aead, input)
+            cg.decrypt(input)
         } else {
             Err(Error::Other(
                 "CipherSuite has not been initialized, unable to decrypt".to_owned(),

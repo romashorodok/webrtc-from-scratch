@@ -52,19 +52,17 @@ class DTLSTransport:
         self,
         transport: ICETransportDTLS,
         certificate: Certificate,
-        keypair: Keypair,
     ) -> None:
         self.__transport = transport
 
         self.__dtls_role: DTLSRole = DTLSRole.Auto
         self.__certificate = certificate
-        self.__keypair = keypair
         # self.__media_fingerprints = list[dtls.Fingerprint]()
 
         self.__rx_srtp: Session | None = None
         self.__tx_srtp: Session | None = None
 
-        self.record_layer_chan = asyncio.Queue[RecordLayer]()
+        self.record_layer_chan = asyncio.Queue[tuple[RecordLayer, bytes]]()
 
     async def bind(self, transport: ice.CandidatePairTransport):
         await self.__transport.bind(transport)
@@ -86,7 +84,6 @@ class DTLSTransport:
         dtls_conn = DTLSConn(
             DTLSLocal(transport),
             self.__certificate,
-            self.__keypair,
             self.record_layer_chan,
             flight,
         )
@@ -99,11 +96,12 @@ class DTLSTransport:
 
             dtls_record_layer_batch = await transport.recv_dtls()
             if is_dtls_record_layer(dtls_record_layer_batch.data):
-                print("Got record", binascii.hexlify(dtls_record_layer_batch.data))
+                # print("Got record", binascii.hexlify(dtls_record_layer_batch.data))
                 try:
-                    for record_layer in RecordLayerBatch(dtls_record_layer_batch.data):
-                        print("Recv", record_layer.content)
-                        await self.record_layer_chan.put(record_layer)
+                    for record_layer, raw in RecordLayerBatch(
+                        dtls_record_layer_batch.data
+                    ):
+                        await self.record_layer_chan.put((record_layer, raw))
 
                 except Exception as e:
                     print("DTLS transport error", e)

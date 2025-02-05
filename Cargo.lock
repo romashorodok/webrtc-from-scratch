@@ -470,6 +470,7 @@ name = "native"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "byteorder",
  "hmac",
  "p256",
  "pyo3",

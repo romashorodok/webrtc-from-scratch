@@ -24,6 +24,7 @@ from webrtc.dtls.dtls_record import (
     SignatureHashAlgorithm,
 )
 from webrtc.dtls.dtls_record_factory import DEFAULT_FACTORY
+from webrtc.dtls.dtls_typing import EllipticCurveGroup
 from webrtc.dtls.flight_state import Flight, FlightTransition, HandshakeCacheKey, State
 
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -32,6 +33,7 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 
 import native
+
 
 class Flight4(FlightTransition):
     __msg = DEFAULT_FACTORY
@@ -44,22 +46,22 @@ class Flight4(FlightTransition):
             raise ValueError("Not found remote random")
 
         # keypair = Keypair.generate_X25519()
-        keypair = state.local_keypair
+        # keypair = state.local_keypair
 
-        signature = generate_server_signature(
-            state.remote_random,
-            state.local_random.marshal_fixed(),
-            state.local_certificate.pubkey_der,
-            # keypair.publicKey.to_der(),
-            # keypair.publicKey,
-            keypair.curve,
-            # state.local_keypair.privateKey,
-        )
+        # signature = generate_server_signature(
+        #     state.remote_random,
+        #     state.local_random.marshal_fixed(),
+        #     state.local_certificate.pubkey_der,
+        #     # keypair.publicKey.to_der(),
+        #     # keypair.publicKey,
+        #     keypair.curve,
+        #     # state.local_keypair.privateKey,
+        # )
 
         # signature = hashlib.sha256(signature).digest()
-        signature = state.local_certificate.signkey.sign(
-            signature, ec.ECDSA(hashes.SHA256())
-        )
+        # signature = state.local_certificate.signkey.sign(
+        #     signature, ec.ECDSA(hashes.SHA256())
+        # )
 
         # signature = state.local_keypair.generate_server_signature(
         #     state.remote_random,
@@ -72,6 +74,12 @@ class Flight4(FlightTransition):
         #     state.local_random.marshal_fixed(),
         # )
 
+        signature = state.local_certificate._keypair.generate_server_signature(
+            state.remote_random,
+            state.local_random.marshal_fixed(),
+        )
+        curve = EllipticCurveGroup(state.local_certificate._keypair.curve_id())
+
         return [
             self.__msg.server_hello(
                 state.local_random.marshal_fixed(), state.pending_cipher_suite
@@ -79,7 +87,7 @@ class Flight4(FlightTransition):
             self.__msg.certificate([state.local_certificate]),
             self.__msg.key_server_exchange(
                 signature,
-                keypair.curve,
+                curve,
                 state.local_keypair.signature_hash_algorithm,
                 state.local_certificate.pubkey_der,
                 # keypair.publicKey.to_der(),
@@ -95,20 +103,25 @@ class Flight4(FlightTransition):
     ):
         # state.local_certificate.signkey
 
-        print("Flight 4 sign key", state.local_certificate.signkey)
+        # print("Flight 4 sign key", state.local_certificate.signkey)
 
         if not client_key_exchange.pubkey:
             raise ValueError("Not found pubkey")
 
-        pubkey = ec.EllipticCurvePublicKey.from_encoded_point(
-            ec.SECP256R1(), client_key_exchange.pubkey
+        pre_master_secret = native.prf_pre_master_secret(
+            client_key_exchange.pubkey, state.local_certificate._keypair
         )
+
+        # pubkey = ec.EllipticCurvePublicKey.from_encoded_point(
+        #     ec.SECP256R1(), client_key_exchange.pubkey
+        # )
+
         # pubkey = pubkey.public_bytes(
         #     serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
         # )
         # pubkey = VerifyingKey.from_public_point(pubkey, curve=NIST256p)
 
-        private_key = state.local_certificate.signkey
+        # private_key = state.local_certificate.signkey
         # private_key_bytes = private_key.private_bytes(
         #     encoding=serialization.Encoding.PEM,
         #     format=serialization.PrivateFormat.TraditionalOpenSSL,
@@ -117,7 +130,7 @@ class Flight4(FlightTransition):
 
         # private_key = SigningKey.from_pem(private_key_bytes)
 
-        pre_master_secret = private_key.exchange(ec.ECDH(), pubkey)
+        # pre_master_secret = private_key.exchange(ec.ECDH(), pubkey)
 
         # server_shared_secret = server_private_key.exchange(ec.ECDH(), client_public_key)
 
@@ -131,7 +144,6 @@ class Flight4(FlightTransition):
         if not state.remote_random:
             raise ValueError("Flight 4 not found remote random")
         #
-
 
         state.master_secret = native.prf_master_secret(
             pre_master_secret,

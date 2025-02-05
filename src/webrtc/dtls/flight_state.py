@@ -10,6 +10,7 @@ from asn1crypto import x509
 from webrtc.dtls.certificate import Certificate
 from webrtc.dtls.dtls_cipher_suite import (
     CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+    CipherSuiteNative,
     Keypair,
     CipherSuite,
     create_self_signed_cert_with_ecdsa,
@@ -87,7 +88,7 @@ class HandshakeCacheKey:
 
 class HandshakeCache:
     def __init__(self) -> None:
-        self._cache = dict[HandshakeCacheKey, RecordLayer]()
+        self._cache = dict[HandshakeCacheKey, Message]()
 
         self.__subscribers = list[tuple[list[HandshakeCacheKey], asyncio.Event]]()
 
@@ -114,19 +115,19 @@ class HandshakeCache:
         self.__emit_ready_at_once()
         await event.wait()
 
-    def __put(self, is_remote: bool, layer: RecordLayer):
-        if not isinstance(layer.content, Handshake):
-            raise ValueError("put handshake require a record layer")
-
+    def put_and_notify_once(
+        self,
+        is_client: bool,
+        epoch: int,
+        message_type: HandshakeMessageType,
+        message: Message,
+    ):
         key = HandshakeCacheKey(
-            message_type=layer.content.message.message_type,
-            epoch=layer.header.epoch,
-            is_remote=is_remote,
+            message_type=message_type,
+            epoch=epoch,
+            is_remote=is_client,
         )
-        self._cache[key] = layer
-
-    def put_and_notify_once(self, is_client: bool, record: RecordLayer):
-        self.__put(is_client, record)
+        self._cache[key] = message
         self.__emit_ready_at_once()
         # print("Put flight state", self.__subscribers)
 
@@ -134,48 +135,31 @@ class HandshakeCache:
         merged = bytes()
 
         for key in cache_keys:
-            layer = self._cache.get(key)
-            if not layer:
+            message = self._cache.get(key)
+            if not message:
                 raise ValueError(
                     f"unable pull_and_merge required handshake cache record {key}"
                 )
-            merged += layer.content.marshal()
+            merged += message.marshal()
 
         return merged
-
-    def pull_record(
-        self,
-        typ: type[_HANDSHAKE_CACHE_MESSAGE_T],
-        cache_key: HandshakeCacheKey,
-    ) -> RecordLayer:
-        layer = self._cache.get(cache_key)
-        # print(self._cache)
-
-        if not layer:
-            raise ValueError(f"unable pull required cache_key {typ}")
-
-        return layer
 
     def pull(
         self,
         typ: type[_HANDSHAKE_CACHE_MESSAGE_T],
         cache_key: HandshakeCacheKey,
     ) -> _HANDSHAKE_CACHE_MESSAGE_T:
-        layer = self._cache.get(cache_key)
-        # print(self._cache)
+        message = self._cache.get(cache_key)
 
-        if not layer:
+        if not message:
             raise ValueError(f"unable pull required cache_key {typ}")
 
-        if not isinstance(layer.content, Handshake):
-            raise ValueError("unable pull required cache key must be a handshake")
-
-        if not isinstance(layer.content.message, typ):
+        if not isinstance(message, typ):
             raise ValueError(
-                f"unable pull type mismatch: expected {typ}, got {type(layer.content.message)}."
+                f"unable pull type mismatch: expected {typ}, got {type(message)}."
             )
 
-        return layer.content.message
+        return message
 
 
 class DTLSRemote(Protocol):
@@ -211,9 +195,11 @@ class State:
 
         self.remote_peer_certificates: list[x509.Certificate] | None = None
 
-        self.pending_cipher_suite: CipherSuite = (
-            CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256()
-        )
+        self.pending_cipher_suite: CipherSuite = CipherSuiteNative()
+        # self.pending_cipher_suite: CipherSuite = (
+        #     CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256()
+        # )
+
         self.cipher_suite: CipherSuite | None = None
 
         self.pre_master_secret: bytes | None = None

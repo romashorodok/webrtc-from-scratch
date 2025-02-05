@@ -16,6 +16,8 @@ from OpenSSL import SSL, crypto
 # TODO: remove this lib
 from pylibsrtp import Policy, Error
 
+import native
+
 
 def certificate_digest(x509: crypto.X509) -> str:
     return x509.digest("SHA256").decode("ascii")
@@ -106,20 +108,38 @@ class CertificateSigningRequest(Protocol):
     def sign(self, data: bytes) -> bytes: ...
 
 
-class Certificate:
-    signkey: ec.EllipticCurvePrivateKey
-
+class RemoteCertificate:
     def __init__(self, cert: crypto.X509) -> None:
         self._cert = cert
 
     @property
+    def der(self) -> bytes:
+        return crypto.dump_certificate(crypto.FILETYPE_ASN1, self._cert)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> Self:
+        return cls(crypto.load_certificate(crypto.FILETYPE_ASN1, data))
+
+
+class Certificate:
+    # signkey: ec.EllipticCurvePrivateKey
+
+    # def __init__(self, cert: crypto.X509) -> None:
+    #     self._cert = cert
+
+    def __init__(self, keypair: native.Keypair) -> None:
+        self._keypair = keypair
+
+    @property
     def expires(self) -> datetime.datetime:
-        return self._cert.to_cryptography().not_valid_after_utc
+        return datetime.timedelta(days=1) + datetime.datetime.now()
+        # return self._cert.to_cryptography().not_valid_after_utc
 
     @property
     def der(self) -> bytes:
-        cert_der = crypto.dump_certificate(crypto.FILETYPE_ASN1, self._cert)
-        return cert_der
+        return self._keypair.certificate_der()
+        # cert_der = crypto.dump_certificate(crypto.FILETYPE_ASN1, self._cert)
+        # return cert_der
 
     # def sign(self, msg: bytes) -> bytes:
     #     key = self._key.to_cryptography_key()
@@ -127,26 +147,37 @@ class Certificate:
 
     @property
     def pubkey_der(self) -> bytes:
-        return self.signkey.public_key().public_bytes(
-            serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
-        )
+        # return self.signkey.public_key().public_bytes(
+        #     serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
+        # )
+
+        return self._keypair.pubkey_der()
 
     def get_fingerprints(self) -> list[Fingerprint]:
         return [
             Fingerprint(
                 algorithm="sha-256",
-                value=certificate_digest(self._cert),
+                value=self._keypair.certificate_fingerprint(),
             )
         ]
 
-    @classmethod
-    def from_bytes(cls, data: bytes) -> Self:
-        certificate = crypto.load_certificate(crypto.FILETYPE_ASN1, data)
-        return cls(certificate)
+        # return [
+        #     Fingerprint(
+        #         algorithm="sha-256",
+        #         value=certificate_digest(self._cert),
+        #     )
+        # ]
+
+    # @classmethod
+    # def from_bytes(cls, data: bytes) -> Self:
+    #     certificate = crypto.load_certificate(crypto.FILETYPE_ASN1, data)
+    #     return cls(native.Keypair(23))
 
     @classmethod
-    def generate_certificate(cls, csr: CertificateSigningRequest) -> Self:
-        key = ec.generate_private_key(ec.SECP256R1(), default_backend())
+    def generate_certificate(cls) -> Self:
+        keypair = native.Keypair(23)  # 23 - secp256r1 / nist256 / prime256r1
+
+        # key = ec.generate_private_key(ec.SECP256R1(), default_backend())
 
         # private_key_bytes = key.private_bytes(
         #     encoding=serialization.Encoding.PEM,
@@ -155,15 +186,16 @@ class Certificate:
         # )
         # pkey = crypto.load_privatekey(crypto.FILETYPE_PEM, private_key_bytes)
 
-        cert = generate_certificate(key)
+        # cert = generate_certificate(key)
 
-        i = cls(
-            # signkey=key,
-            # key=pkey,
-            cert=crypto.X509.from_cryptography(cert),
-        )
-        i.signkey = key
-        return i
+        # i = cls(
+        #     # signkey=key,
+        #     # key=pkey,
+        #     cert=crypto.X509.from_cryptography(cert),
+        # )
+
+        # i.signkey = key
+        return cls(keypair)
 
     # def create_ssl_context(
     #     self,

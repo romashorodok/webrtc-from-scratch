@@ -4,6 +4,7 @@ use std::fmt;
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use sha2::*;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -195,4 +196,47 @@ pub(crate) fn prf_encryption_keys(
         client_write_iv,
         server_write_iv,
     })
+}
+pub(crate) fn prf_verify_data(
+    master_secret: &[u8],
+    handshake_bodies: &[u8],
+    label: &str,
+    h: CipherSuiteHash,
+) -> Result<Vec<u8>> {
+    let mut hasher = match h {
+        CipherSuiteHash::Sha256 => sha2::Sha256::new(),
+    };
+
+    hasher.update(handshake_bodies);
+    let result = hasher.finalize();
+    let mut seed = label.as_bytes().to_vec();
+    seed.extend_from_slice(&result);
+
+    prf_p_hash(master_secret, &seed, 12, h)
+}
+
+pub(crate) fn prf_verify_data_client(
+    master_secret: &[u8],
+    handshake_bodies: &[u8],
+    h: CipherSuiteHash,
+) -> Result<Vec<u8>> {
+    prf_verify_data(
+        master_secret,
+        handshake_bodies,
+        PRF_VERIFY_DATA_CLIENT_LABEL,
+        h,
+    )
+}
+
+pub(crate) fn prf_verify_data_server(
+    master_secret: &[u8],
+    handshake_bodies: &[u8],
+    h: CipherSuiteHash,
+) -> Result<Vec<u8>> {
+    prf_verify_data(
+        master_secret,
+        handshake_bodies,
+        PRF_VERIFY_DATA_SERVER_LABEL,
+        h,
+    )
 }

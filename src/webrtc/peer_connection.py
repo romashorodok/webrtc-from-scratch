@@ -280,8 +280,7 @@ class PeerConnection(AsyncEventEmitter):
         self.__loop = asyncio.get_running_loop()
         self.gatherer = ICEGatherer()
 
-        self.__keypair = dtls.Keypair.generate_P256()
-        self.__certificate = dtls.Certificate.generate_certificate(self.__keypair)
+        self.__certificate = dtls.Certificate.generate_certificate()
 
         self._certificates = [self.__certificate]
         self.__media_fingerprints = list[dtls.Fingerprint]()
@@ -316,9 +315,7 @@ class PeerConnection(AsyncEventEmitter):
         pair_ctrl.remove_all_listeners()
 
         ice_transport = ICETransport(self.gatherer)
-        dtls_transport = dtls.DTLSTransport(
-            ice_transport, self.__certificate, self.__keypair
-        )
+        dtls_transport = dtls.DTLSTransport(ice_transport, self.__certificate)
         await dtls_transport.bind(pair_ctrl.get_transport())
 
         @pair_ctrl.on(ice.CandidatePairControllerEvent.NOMINATE_TRANSPORT)

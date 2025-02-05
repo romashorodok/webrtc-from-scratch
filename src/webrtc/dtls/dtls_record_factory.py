@@ -34,7 +34,7 @@ from webrtc.dtls.dtls_record import (
     UseSRTP,
 )
 from webrtc.dtls.dtls_cipher_suite import CipherSuite
-from webrtc.dtls.certificate import Certificate as CertificateDTLS
+from webrtc.dtls.certificate import Certificate as CertificateDTLS, RemoteCertificate
 from webrtc.dtls.dtls_typing import CipherSuiteID, EllipticCurveGroup
 
 
@@ -173,7 +173,11 @@ class FlightRecordFactory(RecordFactory):
 
     def certificate(self, certificates: list[CertificateDTLS]) -> RecordLayer:
         certificate = Certificate(bytes())
-        certificate.certificates = certificates
+        remote_certs = list(
+            map(lambda i: RemoteCertificate.from_bytes(i.der), certificates)
+        )
+
+        certificate.certificates = remote_certs
         return RecordLayer(
             RecordHeader(ContentType.HANDSHAKE, DTLSVersion.V1_0, 0, 0),
             Handshake(

@@ -21,26 +21,11 @@ def generate_aead_additional_data(header: RecordHeader, payload_len: int) -> byt
     data = bytearray(13)
 
     sequence_number = header.sequence_number & 0xFFFFFFFFFFFF  # Mask to 48 bits
-    data[0] = (sequence_number >> 40) & 0xFF
-    data[1] = (sequence_number >> 32) & 0xFF
-    data[2] = (sequence_number >> 24) & 0xFF
-    data[3] = (sequence_number >> 16) & 0xFF
-    data[4] = (sequence_number >> 8) & 0xFF
-    data[5] = sequence_number & 0xFF
-
-    # Epoch: 16-bit integer
-    data[6] = (header.epoch >> 8) & 0xFF
-    data[7] = header.epoch & 0xFF
-
-    # ContentType: 1 byte
+    data[0:8] = byteops.pack_unsigned_64(sequence_number)
+    data[6:8] = byteops.pack_unsigned_short(header.epoch)
     data[8] = header.content_type
-
-    # Version (Major and Minor): 2 bytes
-    data[9:10] = byteops.pack_unsigned_short(header.version)
-
-    # Payload Length: 16-bit integer
-    data[11] = (payload_len >> 8) & 0xFF
-    data[12] = payload_len & 0xFF
+    data[9:11] = byteops.pack_unsigned_short(header.version)
+    data[11:13] = byteops.pack_unsigned_short(payload_len)
 
     return bytes(data)
 
@@ -342,7 +327,7 @@ class GCMCipherRecordLayer:
         pkt_header_len = pkt.header_size()
         payload = pkt_bytes[pkt_header_len:]
 
-        nonce = self.__gcm_bytes.remote_write_iv[:4] + payload[4 : GCM_NONCE_LENGTH]
+        nonce = self.__gcm_bytes.remote_write_iv[:4] + payload[4:GCM_NONCE_LENGTH]
 
         payload = payload[:GCM_NONCE_LENGTH]
 

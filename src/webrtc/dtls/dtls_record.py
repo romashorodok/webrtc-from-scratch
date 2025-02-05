@@ -15,7 +15,7 @@ from webrtc.dtls.dtls_typing import (
 )
 
 from webrtc.ice.stun import utils as byteops
-from webrtc.dtls.certificate import Certificate as CertificateDTLS
+from webrtc.dtls.certificate import RemoteCertificate as CertificateDTLS
 
 
 class ContentType(IntEnum):
@@ -979,20 +979,20 @@ class Handshake(RecordContentType):
 class HandshakeMultipleMessages(RecordContentType):
     content_type = ContentType.HANDSHAKE
 
-    def __init__(self, handshake_messages: list[Handshake]) -> None:
+    def __init__(self, handshake_messages: list[tuple[Handshake, bytes]]) -> None:
         self.handshake_messages = handshake_messages
 
     def marshal(self) -> bytes:
         handshake_payload = bytes()
 
-        for message in self.handshake_messages:
+        for message, _ in self.handshake_messages:
             handshake_payload += message.marshal()
 
         return handshake_payload
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self:
-        handshake_messages = list[Handshake]()
+        handshake_messages = list[tuple[Handshake, bytes]]()
 
         while data:
             header = HandshakeHeader(
@@ -1010,9 +1010,10 @@ class HandshakeMultipleMessages(RecordContentType):
 
             message = message_cls.unmarshal(data)
 
+            handshake_messages.append(
+                (Handshake(header, message), data[: header.length])
+            )
             data = data[header.length :]
-
-            handshake_messages.append(Handshake(header, message))
 
         return cls(handshake_messages)
 
@@ -1109,7 +1110,7 @@ class RecordLayer:
         )
 
     @classmethod
-    def unmarshal(cls, data: bytes) -> Self:
+    def unmarshal(cls, data: bytes, decrypted=False) -> Self:
         if len(data) < cls.FIXED_HEADER_SIZE:
             raise ValueError("DTLS record is too small")
 
@@ -1132,7 +1133,7 @@ class RecordLayer:
 
         header = RecordHeader(content_type, version, epoch, sequence_number, length)
 
-        if epoch > 0:
+        if epoch > 0 and not decrypted:
             return cls(header, EncryptedHandshakeMessage(data))
 
         try:
@@ -1177,7 +1178,7 @@ class RecordLayer:
         return cls(header, content)
 
     @classmethod
-    def unmarshal_and_rest(cls, data: bytes) -> tuple[bytes, Self]:
+    def unmarshal_and_rest(cls, data: bytes) -> tuple[bytes, bytes, Self]:
         if len(data) < cls.FIXED_HEADER_SIZE:
             raise ValueError("DTLS record is too small")
 
@@ -1193,17 +1194,17 @@ class RecordLayer:
             case ContentType.HANDSHAKE if epoch > 0:  # it's encrypted message
                 layer = cls.unmarshal(data)
             case ContentType.HANDSHAKE if epoch == 0:  # Record with Single | Multiple messages
-                print("pkt length", length)
+                # print("pkt length", length)
 
                 message_length = byteops.unpack_unsigned_24(data[14:17]) - 1
-                print(
-                    "message length",
-                    message_length,
-                    "record langth - header",
-                    length - cls.FIXED_HEADER_SIZE,
-                    "record len",
-                    len(data[26:]),
-                )
+                # print(
+                #     "message length",
+                #     message_length,
+                #     "record langth - header",
+                #     length - cls.FIXED_HEADER_SIZE,
+                #     "record len",
+                #     len(data[26:]),
+                # )
 
                 if message_length == length - cls.FIXED_HEADER_SIZE:
                     layer = cls.unmarshal(data)
@@ -1215,8 +1216,9 @@ class RecordLayer:
                 raise ValueError(f"Unsupported content type of {content_type}")
 
         rest = data[cls.FIXED_HEADER_SIZE + length :]
+        raw = data[: cls.FIXED_HEADER_SIZE + length]
 
-        return (rest, layer)
+        return (rest, raw, layer)
 
 
 class RecordLayerBatch:
@@ -1226,11 +1228,11 @@ class RecordLayerBatch:
     def __iter__(self) -> Self:
         return self
 
-    def __next__(self) -> RecordLayer:
+    def __next__(self) -> tuple[RecordLayer, bytes]:
         if not self.__data:
             raise StopIteration()
 
-        data, layer = RecordLayer.unmarshal_and_rest(self.__data)
+        data, raw, layer = RecordLayer.unmarshal_and_rest(self.__data)
         self.__data = data
-        print("Rest record layer batch", binascii.hexlify(data))
-        return layer
+        # print("Rest record layer batch", binascii.hexlify(data))
+        return layer, raw
