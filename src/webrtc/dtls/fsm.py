@@ -130,7 +130,7 @@ class FSM:
                             False,
                             record.header.epoch,
                             record.content.message.message_type,
-                            record.content.message,
+                            record.content.marshal(),
                         )
 
         except Exception as e:
@@ -301,7 +301,8 @@ class DTLSConn:
                         True,
                         record.header.epoch,
                         record.content.message.message_type,
-                        record.content.message,
+                        result[13:]
+                        # record.content.marshal(),
                     )
                     self.handshake_message_chan.put_nowait(record.content.message)
 
@@ -349,11 +350,14 @@ class DTLSConn:
                                 handshake,
                                 raw,
                             ) in record_layer.content.handshake_messages:
+                                if not raw == handshake.marshal():
+                                    raise ValueError("Different message")
+
                                 self.fsm.state.cache.put_and_notify_once(
                                     True,
                                     record_layer.header.epoch,
                                     handshake.message.message_type,
-                                    handshake.message,
+                                    raw,
                                 )
                                 await self.handshake_message_chan.put(handshake.message)
 
@@ -362,7 +366,8 @@ class DTLSConn:
                                 True,
                                 record_layer.header.epoch,
                                 record_layer.content.message.message_type,
-                                record_layer.content.message,
+                                raw[13:],
+                                # record_layer.content.marshal(),
                             )
 
                             await self.handshake_message_chan.put(

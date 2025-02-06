@@ -18,6 +18,7 @@ from webrtc.dtls.dtls_record import (
     CertificateType,
     CertificateVerify,
     ClientKeyExchange,
+    Handshake,
     HandshakeMessageType,
     Message,
     RecordLayer,
@@ -308,17 +309,19 @@ class Flight4(FlightTransition):
         #     ),
         # )
 
-        self.__setup_cipher_suite(
-            state,
-            state.cache.pull(
-                ClientKeyExchange,
-                HandshakeCacheKey(
-                    message_type=HandshakeMessageType.ClientKeyExchange,
-                    epoch=0,
-                    is_remote=True,
-                ),
+        client_key_exchange_bytes = state.cache.pull(
+            ClientKeyExchange,
+            HandshakeCacheKey(
+                message_type=HandshakeMessageType.ClientKeyExchange,
+                epoch=0,
+                is_remote=True,
             ),
         )
+        client_key_exchange = Handshake.unmarshal(client_key_exchange_bytes)
+        if not isinstance(client_key_exchange.message, ClientKeyExchange):
+            raise ValueError("Not a client key exchange")
+
+        self.__setup_cipher_suite(state, client_key_exchange.message)
 
         await state.cache.once(
             [

@@ -88,7 +88,7 @@ class HandshakeCacheKey:
 
 class HandshakeCache:
     def __init__(self) -> None:
-        self._cache = dict[HandshakeCacheKey, Message]()
+        self._cache = dict[HandshakeCacheKey, bytes]()
 
         self.__subscribers = list[tuple[list[HandshakeCacheKey], asyncio.Event]]()
 
@@ -120,7 +120,7 @@ class HandshakeCache:
         is_client: bool,
         epoch: int,
         message_type: HandshakeMessageType,
-        message: Message,
+        message: bytes,
     ):
         key = HandshakeCacheKey(
             message_type=message_type,
@@ -140,7 +140,7 @@ class HandshakeCache:
                 raise ValueError(
                     f"unable pull_and_merge required handshake cache record {key}"
                 )
-            merged += message.marshal()
+            merged += message
 
         return merged
 
@@ -148,16 +148,11 @@ class HandshakeCache:
         self,
         typ: type[_HANDSHAKE_CACHE_MESSAGE_T],
         cache_key: HandshakeCacheKey,
-    ) -> _HANDSHAKE_CACHE_MESSAGE_T:
+    ) -> bytes:
         message = self._cache.get(cache_key)
 
         if not message:
             raise ValueError(f"unable pull required cache_key {typ}")
-
-        if not isinstance(message, typ):
-            raise ValueError(
-                f"unable pull type mismatch: expected {typ}, got {type(message)}."
-            )
 
         return message
 

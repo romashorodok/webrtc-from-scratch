@@ -1002,18 +1002,18 @@ class HandshakeMultipleMessages(RecordContentType):
                 fragment_offset=byteops.unpack_unsigned_24(data[6:9]),
                 fragment_length=byteops.unpack_unsigned_24(data[9:12]),
             )
-            data = data[12:]
+            # data = data[12:]
 
             message_cls = MESSAGE_CLASSES.get(header.handshake_type)
             if not message_cls:
                 raise ValueError("Not found message class")
 
-            message = message_cls.unmarshal(data)
+            message = message_cls.unmarshal(data[12:])
 
             handshake_messages.append(
-                (Handshake(header, message), data[: header.length])
+                (Handshake(header, message), data[: 12 + header.length])
             )
-            data = data[header.length :]
+            data = data[12 + header.length :]
 
         return cls(handshake_messages)
 
