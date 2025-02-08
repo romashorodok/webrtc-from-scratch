@@ -62,14 +62,6 @@ impl Conn for Pipe {
         Err(Error::new(ErrorKind::Other, "Not applicable").into())
     }
 
-    fn local_addr(&self) -> Result<SocketAddr> {
-        Err(Error::new(ErrorKind::AddrNotAvailable, "Addr Not Available").into())
-    }
-
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        None
-    }
-
     async fn close(&self) -> Result<()> {
         Ok(())
     }

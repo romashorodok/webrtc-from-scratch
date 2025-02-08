@@ -74,7 +74,7 @@ async fn main() -> Result<(), Error> {
         Arc::new(DTLSConn::new(conn, config, true, None).await?);
 
     println!("Connected; type 'exit' to shutdown gracefully");
-    let _ = hub::utilities::chat(Arc::clone(&dtls_conn)).await;
+    // let _ = hub::utilities::chat(Arc::clone(&dtls_conn)).await;
 
     dtls_conn.close().await?;
 

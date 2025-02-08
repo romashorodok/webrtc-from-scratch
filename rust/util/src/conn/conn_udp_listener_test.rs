@@ -30,13 +30,6 @@ async fn pipe() -> Result<(
     let (l_conn, raddr) = listener.accept().await?;
     assert_eq!(daddr, raddr, "remote address should be match");
 
-    let raddr = l_conn.remote_addr();
-    if let Some(raddr) = raddr {
-        assert_eq!(daddr, raddr, "remote address should be match");
-    } else {
-        panic!("expected Some, but got None, for remote_addr()");
-    }
-
     let mut buf = vec![0u8; handshake.len()];
     let n = l_conn.recv(&mut buf).await?;
 

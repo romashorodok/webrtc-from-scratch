@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 #[cfg(test)]
 mod conn_test;
 
@@ -72,7 +73,7 @@ struct ConnReaderContext {
 
 // Conn represents a DTLS connection
 pub struct DTLSConn {
-    conn: Arc<dyn Conn + Send + Sync>,
+    // conn: Arc<dyn Conn + Send + Sync>,
     pub(crate) cache: HandshakeCache, // caching of handshake messages for verifyData generation
     decrypted_rx: Mutex<mpsc::Receiver<Result<Vec<u8>>>>, // Decrypted Application Data or error, pull by calling `Read`
     pub(crate) state: State,                              // Internal state
@@ -118,26 +119,21 @@ impl Conn for DTLSConn {
         self.read(buf, None).await.map_err(util::Error::from_std)
     }
     async fn recv_from(&self, buf: &mut [u8]) -> UtilResult<(usize, SocketAddr)> {
-        if let Some(raddr) = self.conn.remote_addr() {
-            let n = self.read(buf, None).await.map_err(util::Error::from_std)?;
-            Ok((n, raddr))
-        } else {
-            Err(util::Error::Other(
-                "No remote address is provided by underlying Conn".to_owned(),
-            ))
-        }
+        // if let Some(raddr) = self.conn.remote_addr() {
+        //     let n = self.read(buf, None).await.map_err(util::Error::from_std)?;
+        //     Ok((n, raddr))
+        // } else {
+        //     Err(util::Error::Other(
+        //         "No remote address is provided by underlying Conn".to_owned(),
+        //     ))
+        // }
+        Err(util::Error::Other("test".to_string()))
     }
     async fn send(&self, buf: &[u8]) -> UtilResult<usize> {
         self.write(buf, None).await.map_err(util::Error::from_std)
     }
     async fn send_to(&self, _buf: &[u8], _target: SocketAddr) -> UtilResult<usize> {
         Err(util::Error::Other("Not applicable".to_owned()))
-    }
-    fn local_addr(&self) -> UtilResult<SocketAddr> {
-        self.conn.local_addr()
-    }
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        self.conn.remote_addr()
     }
     async fn close(&self) -> UtilResult<()> {
         self.close().await.map_err(util::Error::from_std)
@@ -199,12 +195,13 @@ impl DTLSConn {
 
         // Use host from conn address when server_name is not provided
         if is_client && server_name.is_empty() {
-            if let Some(remote_addr) = conn.remote_addr() {
-                server_name = remote_addr.ip().to_string();
-            } else {
-                warn!("conn.remote_addr is empty, please set explicitly server_name in Config! Use default \"localhost\" as server_name now");
-                "localhost".clone_into(&mut server_name);
-            }
+            // if let Some(remote_addr) = conn.remote_addr() {
+            //     server_name = remote_addr.ip().to_string();
+            // } else {
+            //     warn!("conn.remote_addr is empty, please set explicitly server_name in Config! Use default \"localhost\" as server_name now");
+            //     "localhost".clone_into(&mut server_name);
+            // }
+            todo!()
         }
 
         let cfg = HandshakeConfig {
@@ -299,7 +296,7 @@ impl DTLSConn {
         let handshake_completed_successfully2 = Arc::clone(&handshake_completed_successfully);
 
         let mut c = DTLSConn {
-            conn: Arc::clone(&conn),
+            // conn: Arc::clone(&conn),
             cache,
             decrypted_rx: Mutex::new(decrypted_rx),
             state,
@@ -507,7 +504,7 @@ impl DTLSConn {
                 let mut reader_close_tx = self.reader_close_tx.lock().await;
                 reader_close_tx.take();
             }
-            self.conn.close().await?;
+            // self.conn.close().await?;
         }
 
         Ok(())

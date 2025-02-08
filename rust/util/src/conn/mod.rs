@@ -31,8 +31,6 @@ pub trait Conn {
     async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)>;
     async fn send(&self, buf: &[u8]) -> Result<usize>;
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> Result<usize>;
-    fn local_addr(&self) -> Result<SocketAddr>;
-    fn remote_addr(&self) -> Option<SocketAddr>;
     async fn close(&self) -> Result<()>;
     fn as_any(&self) -> &(dyn std::any::Any + Send + Sync);
 }

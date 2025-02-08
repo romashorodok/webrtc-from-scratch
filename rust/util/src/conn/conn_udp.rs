@@ -24,14 +24,6 @@ impl Conn for UdpSocket {
         Ok(self.send_to(buf, target).await?)
     }
 
-    fn local_addr(&self) -> Result<SocketAddr> {
-        Ok(self.local_addr()?)
-    }
-
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        None
-    }
-
     async fn close(&self) -> Result<()> {
         Ok(())
     }

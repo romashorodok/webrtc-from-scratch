@@ -70,7 +70,7 @@ impl Listener for ListenerImpl {
 
     /// Addr returns the listener's network address.
     async fn addr(&self) -> Result<SocketAddr> {
-        self.pconn.local_addr()
+        Err(Error::ErrNoRemAddr)
     }
 }
 
@@ -270,14 +270,6 @@ impl Conn for UdpConn {
 
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> Result<usize> {
         self.pconn.send_to(buf, target).await
-    }
-
-    fn local_addr(&self) -> Result<SocketAddr> {
-        self.pconn.local_addr()
-    }
-
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        Some(self.raddr)
     }
 
     async fn close(&self) -> Result<()> {
