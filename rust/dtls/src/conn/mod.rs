@@ -105,6 +105,10 @@ pub struct DTLSConn {
     pub(crate) handle_queue_tx: mpsc::Sender<mpsc::Sender<()>>,
     pub(crate) handshake_done_tx: Option<mpsc::Sender<()>>,
 
+    pub initial_fsm_state: HandshakeState,
+    pub inbound_tx: Arc<mpsc::Sender<Vec<u8>>>,
+    pub outbound_rx: mpsc::Receiver<Vec<u8>>,
+
     reader_close_tx: Mutex<Option<mpsc::Sender<()>>>,
 }
 
@@ -145,8 +149,8 @@ impl Conn for DTLSConn {
 }
 
 impl DTLSConn {
-    pub async fn new(
-        conn: Arc<dyn Conn + Send + Sync>,
+    pub fn new(
+        // conn: Arc<dyn Conn + Send + Sync>,
         mut config: Config,
         is_client: bool,
         initial_state: Option<State>,
@@ -287,8 +291,16 @@ impl DTLSConn {
 
         let packet_tx = Arc::new(packet_tx);
         let packet_tx2 = Arc::clone(&packet_tx);
-        let next_conn_rx = Arc::clone(&conn);
-        let next_conn_tx = Arc::clone(&conn);
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(1);
+
+        let inbound_tx = Arc::new(inbound_tx);
+        // let outbound_rx = Arc::new(outbound_rx);
+
+        // let next_conn_rx = Arc::clone(&conn);
+        // let next_conn_tx = Arc::clone(&conn);
+
         let cache = HandshakeCache::new();
         let mut cache1 = cache.clone();
         let cache2 = cache.clone();
@@ -312,6 +324,11 @@ impl DTLSConn {
             packet_tx,
             handle_queue_tx,
             handshake_done_tx: Some(handshake_done_tx),
+
+            inbound_tx,
+            outbound_rx,
+            initial_fsm_state,
+
             reader_close_tx: Mutex::new(Some(reader_close_tx)),
         };
 
@@ -325,7 +342,8 @@ impl DTLSConn {
                     let (pkt, result_tx) = r;
 
                     let result = DTLSConn::handle_outgoing_packets(
-                        &next_conn_tx,
+                        &outbound_tx,
+                        // &next_conn_tx,
                         pkt,
                         &mut cache1,
                         is_client,
@@ -378,7 +396,7 @@ impl DTLSConn {
                     }
                     result = DTLSConn::read_and_buffer(
                                             &mut ctx,
-                                            &next_conn_rx,
+                                            &mut inbound_rx,
                                             &mut handle_queue_rx,
                                             &mut buf,
                                             &local_epoch,
@@ -405,12 +423,18 @@ impl DTLSConn {
             }
         });
 
-        // Do handshake
-        c.handshake(initial_fsm_state).await?;
-
-        trace!("Handshake Completed");
-
         Ok(c)
+
+        // Do handshake
+        // c.handshake(initial_fsm_state).await?;
+
+        // trace!("Handshake Completed");
+
+        // Ok(c)
+    }
+
+    pub async fn do_handshake(&mut self) -> Result<()> {
+        Ok(self.handshake(self.initial_fsm_state).await?)
     }
 
     // Read reads data from the connection.
@@ -550,7 +574,7 @@ impl DTLSConn {
     }
 
     async fn handle_outgoing_packets(
-        next_conn: &Arc<dyn util::Conn + Send + Sync>,
+        next_conn_tx: &mpsc::Sender<Vec<u8>>,
         mut pkts: Vec<Packet>,
         cache: &mut HandshakeCache,
         is_client: bool,
@@ -610,7 +634,7 @@ impl DTLSConn {
                 compact_raw_packets(&raw_packets, maximum_transmission_unit);
 
             for compacted_raw_packets in &compacted_raw_packets {
-                next_conn.send(compacted_raw_packets).await?;
+                next_conn_tx.send(compacted_raw_packets.clone()).await?;
             }
         }
 
@@ -774,92 +798,99 @@ impl DTLSConn {
 
     async fn read_and_buffer(
         ctx: &mut ConnReaderContext,
-        next_conn: &Arc<dyn util::Conn + Send + Sync>,
+        inbound_rx: &mut mpsc::Receiver<Vec<u8>>,
+        // next_conn: &Arc<dyn util::Conn + Send + Sync>,
         handle_queue_rx: &mut mpsc::Receiver<mpsc::Sender<()>>,
         buf: &mut [u8],
         local_epoch: &Arc<AtomicU16>,
         handshake_completed_successfully: &Arc<AtomicBool>,
     ) -> Result<()> {
-        let n = next_conn.recv(buf).await?;
-        let pkts = unpack_datagram(&buf[..n])?;
-        let mut has_handshake = false;
-        for pkt in pkts {
-            let (hs, alert, mut err) = DTLSConn::handle_incoming_packet(ctx, pkt, true).await;
-            if let Some(alert) = alert {
-                let alert_err = ctx
-                    .packet_tx
-                    .send((
-                        vec![Packet {
-                            record: RecordLayer::new(
-                                PROTOCOL_VERSION1_2,
-                                local_epoch.load(Ordering::SeqCst),
-                                Content::Alert(Alert {
-                                    alert_level: alert.alert_level,
-                                    alert_description: alert.alert_description,
-                                }),
-                            ),
-                            should_encrypt: handshake_completed_successfully.load(Ordering::SeqCst),
-                            reset_local_sequence_number: false,
-                        }],
-                        None,
-                    ))
-                    .await;
+        // let n = next_conn.recv(buf).await?;
 
-                if let Err(alert_err) = alert_err {
-                    if err.is_none() {
-                        err = Some(Error::Other(alert_err.to_string()));
-                    }
-                }
+        tokio::select! {
+            buf = inbound_rx.recv() => {
+                let pkts = unpack_datagram(&buf.unwrap().to_owned())?;
 
-                if alert.alert_level == AlertLevel::Fatal
-                    || alert.alert_description == AlertDescription::CloseNotify
-                {
-                    return Err(Error::ErrAlertFatalOrClose);
-                }
-            }
+                let mut has_handshake = false;
+                for pkt in pkts {
+                    let (hs, alert, mut err) = DTLSConn::handle_incoming_packet(ctx, pkt, true).await;
+                    if let Some(alert) = alert {
+                        let alert_err = ctx
+                            .packet_tx
+                            .send((
+                                vec![Packet {
+                                    record: RecordLayer::new(
+                                        PROTOCOL_VERSION1_2,
+                                        local_epoch.load(Ordering::SeqCst),
+                                        Content::Alert(Alert {
+                                            alert_level: alert.alert_level,
+                                            alert_description: alert.alert_description,
+                                        }),
+                                    ),
+                                    should_encrypt: handshake_completed_successfully.load(Ordering::SeqCst),
+                                    reset_local_sequence_number: false,
+                                }],
+                                None,
+                            ))
+                            .await;
 
-            if let Some(err) = err {
-                return Err(err);
-            }
-
-            if hs {
-                has_handshake = true
-            }
-        }
-
-        if has_handshake {
-            let (done_tx, mut done_rx) = mpsc::channel(1);
-            let rendezvous_at_handshake = async {
-                let (rendezvous_tx, rendezvous_rx) = oneshot::channel();
-                _ = ctx.handshake_tx.send((rendezvous_tx, done_tx)).await;
-                rendezvous_rx.await
-            };
-            tokio::select! {
-                _ = rendezvous_at_handshake => {
-                    let mut wait_done_rx = true;
-                    while wait_done_rx{
-                        tokio::select!{
-                            _ = done_rx.recv() => {
-                                // If the other party may retransmit the flight,
-                                // we should respond even if it not a new message.
-                                wait_done_rx = false;
-                            }
-                            done = handle_queue_rx.recv() => {
-                                //trace!("recv handle_queue: {} ", srv_cli_str(ctx.is_client));
-
-                                let pkts = ctx.encrypted_packets.drain(..).collect();
-                                DTLSConn::handle_queued_packets(ctx, local_epoch, handshake_completed_successfully, pkts).await?;
-
-                                drop(done);
+                        if let Err(alert_err) = alert_err {
+                            if err.is_none() {
+                                err = Some(Error::Other(alert_err.to_string()));
                             }
                         }
+
+                        if alert.alert_level == AlertLevel::Fatal
+                            || alert.alert_description == AlertDescription::CloseNotify
+                        {
+                            return Err(Error::ErrAlertFatalOrClose);
+                        }
+                    }
+
+                    if let Some(err) = err {
+                        return Err(err);
+                    }
+
+                    if hs {
+                        has_handshake = true
                     }
                 }
-                _ = ctx.handshake_done_rx.recv() => {}
+
+                if has_handshake {
+                    let (done_tx, mut done_rx) = mpsc::channel(1);
+                    let rendezvous_at_handshake = async {
+                        let (rendezvous_tx, rendezvous_rx) = oneshot::channel();
+                        _ = ctx.handshake_tx.send((rendezvous_tx, done_tx)).await;
+                        rendezvous_rx.await
+                    };
+                    tokio::select! {
+                        _ = rendezvous_at_handshake => {
+                            let mut wait_done_rx = true;
+                            while wait_done_rx{
+                                tokio::select!{
+                                    _ = done_rx.recv() => {
+                                        // If the other party may retransmit the flight,
+                                        // we should respond even if it not a new message.
+                                        wait_done_rx = false;
+                                    }
+                                    done = handle_queue_rx.recv() => {
+                                        //trace!("recv handle_queue: {} ", srv_cli_str(ctx.is_client));
+
+                                        let pkts = ctx.encrypted_packets.drain(..).collect();
+                                        DTLSConn::handle_queued_packets(ctx, local_epoch, handshake_completed_successfully, pkts).await?;
+
+                                        drop(done);
+                                    }
+                                }
+                            }
+                        }
+                        _ = ctx.handshake_done_rx.recv() => {}
+                    }
+                }
+
+                Ok(())
             }
         }
-
-        Ok(())
     }
 
     async fn handle_queued_packets(

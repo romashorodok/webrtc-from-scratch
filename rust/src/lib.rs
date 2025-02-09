@@ -1,14 +1,12 @@
-// use pyo3::exceptions::PyValueError;
-use pyo3::prelude::*;
-// use pyo3::types::PyBytes;
+use std::sync::Arc;
+use std::vec;
 
-use webrtc_dtls::config::*;
+use pyo3::types::PyBytes;
+use pyo3::{prelude::*, types::PyString};
 
-// impl std::convert::From<error::Error> for PyErr {
-//     fn from(value: error::Error) -> Self {
-//         PyValueError::new_err(value.to_string())
-//     }
-// }
+use tokio::runtime::{Builder, Runtime};
+use tokio::sync::Mutex;
+use webrtc_dtls::conn;
 
 // #[pyclass]
 // struct CipherSuiteAes128GcmSha256 {
@@ -171,11 +169,109 @@ use webrtc_dtls::config::*;
 //     )?)
 // }
 //
+
+#[pyclass]
+struct DTLS {
+    runtime: Runtime,
+    dtls: Arc<Mutex<webrtc_dtls::conn::DTLSConn>>,
+}
+
+#[pymethods]
+impl DTLS {
+    #[new]
+    fn new(client: bool, threads: Option<usize>) -> PyResult<Self> {
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(threads.unwrap_or(4))
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Failed to create tokio runtime: {}",
+                    e
+                ))
+            })?;
+
+        // let cert =
+        //     webrtc_dtls::crypto::Certificate::generate_self_signed(vec!["webrtc".to_owned()])?;
+        //
+        // let config = webrtc_dtls::config::Config {
+        //     certificates: vec![cert],
+        //     insecure_skip_verify: true,
+        //     extended_master_secret: webrtc_dtls::config::ExtendedMasterSecretType::Disable,
+        //     ..webrtc_dtls::config::Config::default()
+        // };
+
+        let (dtls, error) = runtime.block_on(async {
+            let cert =
+                webrtc_dtls::crypto::Certificate::generate_self_signed(vec!["webrtc".to_owned()])
+                    .unwrap();
+
+            let config = webrtc_dtls::config::Config {
+                certificates: vec![cert],
+                insecure_skip_verify: true,
+                extended_master_secret: webrtc_dtls::config::ExtendedMasterSecretType::Disable,
+                ..webrtc_dtls::config::Config::default()
+            };
+
+            // Create DTLSConn
+            match webrtc_dtls::conn::DTLSConn::new(config, client, None) {
+                Ok(conn) => (Some(conn), None),
+                Err(e) => (None, Some(e)),
+            }
+        });
+
+        if let Some(error) = error {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Failed to initialize DTLS: {}",
+                error
+            )));
+        }
+
+        Ok(DTLS {
+            runtime,
+            dtls: Arc::new(Mutex::new(dtls.unwrap())),
+        })
+    }
+
+    fn do_handshake(&mut self) -> PyResult<()> {
+        let dtls = self.dtls.clone(); // Clone the Arc to move into the async block
+        self.runtime.spawn(async move {
+            println!("Handshake acquire lock");
+            let mut dtls = dtls.lock().await; // Acquire a mutable lock
+            dtls.do_handshake().await;
+            println!("Handshake Completed");
+        });
+        Ok(())
+    }
+
+    fn enqueue_record(&self, record: Vec<u8>) -> PyResult<()> {
+        println!("Received record: {:?}", record);
+
+        // Spawn an async task on the Tokio runtime
+        self.runtime.spawn(async move {
+            println!("Sending record asynchronously: {:?}", record);
+            // Simulate an async operation (e.g., networking)
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            println!("Finished sending record");
+        });
+
+        Ok(())
+    }
+
+    fn dequeue_record(&mut self) -> PyResult<Vec<u8>> {
+        // println!("Try get record from dtls");
+        // match self.dtls.outbound_rx.recv().await {
+        //     Some(record) => Ok(record),
+        //     None => Err(pyo3::exceptions::PyRuntimeError::new_err("Channel closed")),
+        // }
+        todo!()
+    }
+}
+
 #[pymodule]
 fn native(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // m.add_class::<Keypair>()?;
-    // m.add_class::<CipherSuiteAes128GcmSha256>()?;
-    //
+    m.add_class::<DTLS>()?;
+
     // m.add_function(wrap_pyfunction!(generate_aead_additional_data, m)?)?;
     // m.add_function(wrap_pyfunction!(prf_pre_master_secret, m)?)?;
     // m.add_function(wrap_pyfunction!(prf_master_secret, m)?)?;

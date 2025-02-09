@@ -127,8 +127,8 @@ class Certificate:
     # def __init__(self, cert: crypto.X509) -> None:
     #     self._cert = cert
 
-    def __init__(self, keypair: native.Keypair) -> None:
-        self._keypair = keypair
+    # def __init__(self, keypair: native.Keypair) -> None:
+    #     self._keypair = keypair
 
     @property
     def expires(self) -> datetime.datetime:
@@ -137,7 +137,8 @@ class Certificate:
 
     @property
     def der(self) -> bytes:
-        return self._keypair.certificate_der()
+        ...
+        # return self._keypair.certificate_der()
         # cert_der = crypto.dump_certificate(crypto.FILETYPE_ASN1, self._cert)
         # return cert_der
 
@@ -151,14 +152,15 @@ class Certificate:
         #     serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
         # )
 
-        return self._keypair.pubkey_der()
+        # return self._keypair.pubkey_der()
+        ...
 
     def get_fingerprints(self) -> list[Fingerprint]:
         return [
-            Fingerprint(
-                algorithm="sha-256",
-                value=self._keypair.certificate_fingerprint(),
-            )
+            # Fingerprint(
+            #     algorithm="sha-256",
+            #     value=self._keypair.certificate_fingerprint(),
+            # )
         ]
 
         # return [
@@ -175,7 +177,7 @@ class Certificate:
 
     @classmethod
     def generate_certificate(cls) -> Self:
-        keypair = native.Keypair(23)  # 23 - secp256r1 / nist256 / prime256r1
+        # keypair = native.Keypair(23)  # 23 - secp256r1 / nist256 / prime256r1
 
         # key = ec.generate_private_key(ec.SECP256R1(), default_backend())
 
@@ -195,7 +197,8 @@ class Certificate:
         # )
 
         # i.signkey = key
-        return cls(keypair)
+        # return cls(keypair)
+        ...
 
     # def create_ssl_context(
     #     self,

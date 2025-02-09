@@ -12,6 +12,7 @@ repository = "https://github.com/webrtc-rs/webrtc/tree/master/dtls"
 [dependencies]
 util = { version = "0.10.0", path = "../util", package = "webrtc-util", default-features = false, features = ["conn"] }
 
+pyo3 = { version = "0.23.3", features = ["experimental-async"]}
 byteorder = "1"
 rand_core = "0.6"
 hkdf = "0.12"

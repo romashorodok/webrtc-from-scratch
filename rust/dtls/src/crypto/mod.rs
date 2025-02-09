@@ -66,7 +66,7 @@ impl Certificate {
 
     /// Parses a certificate from the ASCII PEM format.
     #[cfg(feature = "pem")]
-    pub fn from_pem(pem_str: &str) -> Result<Self> {
+    pub fn from_pem(pem_str: &[u8]) -> Result<Self> {
         let mut pems = pem::parse_many(pem_str).map_err(|e| Error::InvalidPEM(e.to_string()))?;
         if pems.len() < 2 {
             return Err(Error::InvalidPEM(format!(

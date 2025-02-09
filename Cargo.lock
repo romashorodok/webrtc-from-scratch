@@ -1385,6 +1385,7 @@ name = "native"
 version = "0.1.0"
 dependencies = [
  "pyo3",
+ "tokio",
  "webrtc-dtls",
 ]
 
@@ -2479,6 +2480,7 @@ dependencies = [
  "p384",
  "pem",
  "portable-atomic",
+ "pyo3",
  "rand",
  "rand_core",
  "rcgen",
@@ -2500,6 +2502,9 @@ dependencies = [
 [[package]]
 name = "webrtc-from-scratch"
 version = "0.1.0"
+dependencies = [
+ "p256",
+]
 
 [[package]]
 name = "webrtc-util"

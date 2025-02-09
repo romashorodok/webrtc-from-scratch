@@ -1,6 +1,8 @@
 use std::io;
 use std::string::FromUtf8Error;
 
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
 use thiserror::Error;
 use tokio::sync::mpsc::error::SendError as MpscSendError;
 use util::KeyingMaterialExporterError;
@@ -174,6 +176,12 @@ pub enum Error {
     #[allow(non_camel_case_types)]
     #[error("{0}")]
     Other(String),
+}
+
+impl std::convert::From<Error> for PyErr {
+    fn from(value: Error) -> Self {
+        PyValueError::new_err(value.to_string())
+    }
 }
 
 #[derive(Debug, Error)]

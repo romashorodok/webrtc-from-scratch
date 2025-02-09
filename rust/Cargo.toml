@@ -9,5 +9,17 @@ name = "native"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = "0.23.3"
-webrtc_dtls = { version = "0.11.0", path = "./dtls", package = "webrtc-dtls" }
+pyo3 = { version = "0.23.3", features = ["experimental-async"]}
+webrtc_dtls = { version = "0.11.0", path = "./dtls", package = "webrtc-dtls", features = ["pem"] }
+tokio = { version = "1.32.0", features = [
+    "fs",
+    "io-util",
+    "io-std",
+    "macros",
+    "net",
+    "parking_lot",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
