@@ -5,7 +5,7 @@ use pyo3::types::PyBytes;
 use pyo3::{prelude::*, types::PyString};
 
 use tokio::runtime::{Builder, Runtime};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use webrtc_dtls::conn;
 
 // #[pyclass]
@@ -174,6 +174,9 @@ use webrtc_dtls::conn;
 struct DTLS {
     runtime: Runtime,
     dtls: Arc<Mutex<webrtc_dtls::conn::DTLSConn>>,
+
+    inbound_tx: mpsc::Sender<Vec<u8>>,
+    outbound_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
 }
 
 #[pymethods]
@@ -200,8 +203,15 @@ impl DTLS {
         //     extended_master_secret: webrtc_dtls::config::ExtendedMasterSecretType::Disable,
         //     ..webrtc_dtls::config::Config::default()
         // };
+        //
 
-        let (dtls, error) = runtime.block_on(async {
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(1);
+
+        let mut inbound_rx = Arc::new(Mutex::new(inbound_rx));
+        let outbound_tx = Arc::new(outbound_tx);
+
+        let (dtls, error) = runtime.block_on(async move {
             let cert =
                 webrtc_dtls::crypto::Certificate::generate_self_signed(vec!["webrtc".to_owned()])
                     .unwrap();
@@ -214,7 +224,7 @@ impl DTLS {
             };
 
             // Create DTLSConn
-            match webrtc_dtls::conn::DTLSConn::new(config, client, None) {
+            match webrtc_dtls::conn::DTLSConn::new(inbound_rx, outbound_tx, config, client, None) {
                 Ok(conn) => (Some(conn), None),
                 Err(e) => (None, Some(e)),
             }
@@ -229,6 +239,8 @@ impl DTLS {
 
         Ok(DTLS {
             runtime,
+            inbound_tx,
+            outbound_rx: Arc::new(Mutex::new(outbound_rx)),
             dtls: Arc::new(Mutex::new(dtls.unwrap())),
         })
     }
@@ -237,25 +249,10 @@ impl DTLS {
         let dtls = self.dtls.clone(); // Clone the Arc to move into the async block
         self.runtime.spawn(async move {
             println!("Handshake acquire lock");
-            let mut dtls = dtls.await; // Acquire a mutable lock
-            // let mut dtls = dtls.lock_owned().await; // Acquire a mutable lock
+            let mut dtls = dtls.lock().await; // Acquire a mutable lock
             let _ = dtls.do_handshake().await;
             println!("Handshake Completed");
         });
-        Ok(())
-    }
-
-    fn enqueue_record(&self, record: Vec<u8>) -> PyResult<()> {
-        println!("Received record: {:?}", record);
-
-        // Spawn an async task on the Tokio runtime
-        self.runtime.spawn(async move {
-            println!("Sending record asynchronously: {:?}", record);
-            // Simulate an async operation (e.g., networking)
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            println!("Finished sending record");
-        });
-
         Ok(())
     }
 
@@ -266,14 +263,35 @@ impl DTLS {
     // }
     // todo!()
     fn dequeue_record<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
-        let dtls = self.dtls.clone();
+        let rx = self.outbound_rx.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut rx1 = rx.lock().await;
             println!("Dequeue start lock");
-            let mut dtls = dtls.await;
-            println!("Dequeue acquired lock");
+            Ok(rx1.recv().await)
+            // rx = rx.lock().await.recv();
+            // Ok(rx.await)
 
-            Ok(dtls.outbound_rx.recv().await)
+            // Ok(self.outbound_rx.lock().await.recv().await)
+            //     let mut dtls = dtls.lock_owned().await;
+            //     println!("Dequeue acquired lock");
+            //
+            //     Ok(dtls.outbound_rx.recv().await)
         })
+    }
+
+    fn enqueue_record(&self, record: Vec<u8>) -> PyResult<()> {
+        todo!()
+        // println!("Received record: {:?}", record);
+        //
+        // // Spawn an async task on the Tokio runtime
+        // self.runtime.spawn(async move {
+        //     println!("Sending record asynchronously: {:?}", record);
+        //     // Simulate an async operation (e.g., networking)
+        //     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        //     println!("Finished sending record");
+        // });
+        //
+        // Ok(())
     }
 }
 

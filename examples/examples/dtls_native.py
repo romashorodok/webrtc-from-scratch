@@ -42,11 +42,11 @@ async def async_udp_server():
             print("Start listen on ", SERVER_IP, SERVER_PORT)
             pkt, addr = await loop.sock_recvfrom(sock, MAX_MTU)
             print("SERVER | Receive from", addr, "n=", len(pkt), "enqueue record layers")
-            dtls.enqueue_record(pkt)
+            # dtls.enqueue_record(pkt)
 
             print("SERVER | Start dequeue tokio result with asyncio")
-            result = await dtls.dequeue_record()
-            print("SERVER | DTLS result done", result)
+            # result = await dtls.dequeue_record()
+            # print("SERVER | DTLS result done", result)
 
 
 async def async_udp_client():
