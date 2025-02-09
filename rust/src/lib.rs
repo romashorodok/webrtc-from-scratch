@@ -237,8 +237,9 @@ impl DTLS {
         let dtls = self.dtls.clone(); // Clone the Arc to move into the async block
         self.runtime.spawn(async move {
             println!("Handshake acquire lock");
-            let mut dtls = dtls.lock().await; // Acquire a mutable lock
-            dtls.do_handshake().await;
+            let mut dtls = dtls.await; // Acquire a mutable lock
+            // let mut dtls = dtls.lock_owned().await; // Acquire a mutable lock
+            let _ = dtls.do_handshake().await;
             println!("Handshake Completed");
         });
         Ok(())
@@ -258,13 +259,21 @@ impl DTLS {
         Ok(())
     }
 
-    fn dequeue_record(&mut self) -> PyResult<Vec<u8>> {
-        // println!("Try get record from dtls");
-        // match self.dtls.outbound_rx.recv().await {
-        //     Some(record) => Ok(record),
-        //     None => Err(pyo3::exceptions::PyRuntimeError::new_err("Channel closed")),
-        // }
-        todo!()
+    // println!("Try get record from dtls");
+    // match self.dtls.outbound_rx.recv().await {
+    //     Some(record) => Ok(record),
+    //     None => Err(pyo3::exceptions::PyRuntimeError::new_err("Channel closed")),
+    // }
+    // todo!()
+    fn dequeue_record<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let dtls = self.dtls.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            println!("Dequeue start lock");
+            let mut dtls = dtls.await;
+            println!("Dequeue acquired lock");
+
+            Ok(dtls.outbound_rx.recv().await)
+        })
     }
 }
 

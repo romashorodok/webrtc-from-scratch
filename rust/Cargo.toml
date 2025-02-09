@@ -23,3 +23,5 @@ tokio = { version = "1.32.0", features = [
     "sync",
     "time",
 ] }
+pyo3-async-runtimes = { version = "0.23", features = ["attributes", "tokio-runtime"] }
+

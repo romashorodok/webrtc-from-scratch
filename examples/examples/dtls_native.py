@@ -39,9 +39,14 @@ async def async_udp_server():
         dtls = native.DTLS(False)
         dtls.do_handshake()
         while True:
-            # dtls.enqueue_record(b"test")
-            print("Done the enqueue packet")
+            print("Start listen on ", SERVER_IP, SERVER_PORT)
             pkt, addr = await loop.sock_recvfrom(sock, MAX_MTU)
+            print("SERVER | Receive from", addr, "n=", len(pkt), "enqueue record layers")
+            dtls.enqueue_record(pkt)
+
+            print("SERVER | Start dequeue tokio result with asyncio")
+            result = await dtls.dequeue_record()
+            print("SERVER | DTLS result done", result)
 
 
 async def async_udp_client():
@@ -50,7 +55,15 @@ async def async_udp_client():
         sock.bind((SERVER_IP, CLIENT_PORT))
         sock.setblocking(False)
         print(f"Async UDP client bound to {SERVER_IP}:{CLIENT_PORT}")
+
+        dtls = native.DTLS(True)
+        dtls.do_handshake()
+
         while True:
+            print("CLIENT | Start next flight")
+            handshake = await dtls.dequeue_record()
+            print("CLIENT | Receive from dtls next flight", "n=", len(handshake))
+
             pkt, addr = await loop.sock_recvfrom(sock, MAX_MTU)
 
 
