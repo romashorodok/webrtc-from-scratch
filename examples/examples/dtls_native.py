@@ -3,31 +3,12 @@ import contextlib
 import threading
 import socket
 import native
-from webrtc.dtls.certificate import generate_certificate
-
-
-from cryptography import x509
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives import serialization
-from OpenSSL import SSL, crypto
 
 SERVER_IP = "127.0.0.1"
 SERVER_PORT = 12345
 CLIENT_PORT = 54321
 
 MAX_MTU = 1280
-
-# key = ec.generate_private_key(ec.SECP256R1(), default_backend())
-# pkey_pem = key.private_bytes(
-#     serialization.Encoding.PEM,
-#     serialization.PrivateFormat.PKCS8,
-#     serialization.NoEncryption(),
-# )
-# print(pkey_pem)
-# cert = generate_certificate(key)
-# cert_pem = pkey_pem + cert.public_bytes(serialization.Encoding.PEM)
 
 
 async def async_udp_server():
@@ -41,12 +22,14 @@ async def async_udp_server():
         while True:
             print("Start listen on ", SERVER_IP, SERVER_PORT)
             pkt, addr = await loop.sock_recvfrom(sock, MAX_MTU)
-            print("SERVER | Receive from", addr, "n=", len(pkt), "enqueue record layers")
-            # dtls.enqueue_record(pkt)
-
+            print(
+                "SERVER | Receive from", addr, "n=", len(pkt), "enqueue record layers"
+            )
+            await dtls.enqueue_record(pkt)
             print("SERVER | Start dequeue tokio result with asyncio")
-            # result = await dtls.dequeue_record()
-            # print("SERVER | DTLS result done", result)
+            handshake_flight = await dtls.dequeue_record()
+            print("SERVER | DTLS result done", handshake_flight)
+            await loop.sock_sendto(sock, handshake_flight, addr)
 
 
 async def async_udp_client():
@@ -58,13 +41,17 @@ async def async_udp_client():
 
         dtls = native.DTLS(True)
         dtls.do_handshake()
+        handshake_flight1 = await dtls.dequeue_record()
+        print("CLIENT | Start next flight")
+        await loop.sock_sendto(sock, handshake_flight1, (SERVER_IP, SERVER_PORT))
 
         while True:
-            print("CLIENT | Start next flight")
-            handshake = await dtls.dequeue_record()
-            print("CLIENT | Receive from dtls next flight", "n=", len(handshake))
-
             pkt, addr = await loop.sock_recvfrom(sock, MAX_MTU)
+            print("CLIENT | Receive flight from server", pkt)
+            await dtls.enqueue_record(pkt)
+            next_flight = await dtls.dequeue_record()
+            print("CLIENT | Next flight from server n=", len(next_flight))
+            await loop.sock_sendto(sock, next_flight, addr)
 
 
 def run_in_thread(coro):
