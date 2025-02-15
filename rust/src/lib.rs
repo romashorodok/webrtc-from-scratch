@@ -1,12 +1,10 @@
 use std::sync::Arc;
 use std::vec;
 
-use pyo3::types::PyBytes;
-use pyo3::{prelude::*, types::PyString};
+use pyo3::prelude::*;
 
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{mpsc, Mutex};
-use webrtc_dtls::conn;
 
 #[pyclass]
 struct DTLS {
@@ -19,6 +17,7 @@ struct DTLS {
 
 #[pymethods]
 impl DTLS {
+    #[pyo3(signature = (client, threads=None))]
     #[new]
     fn new(client: bool, threads: Option<usize>) -> PyResult<Self> {
         let runtime = Builder::new_multi_thread()
@@ -94,7 +93,7 @@ impl DTLS {
     fn enqueue_record<'a>(&self, py: Python<'a>, record: Vec<u8>) -> PyResult<Bound<'a, PyAny>> {
         let tx = self.inbound_tx.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            if let Err(result) = tx.lock().await.send(record).await {
+            if let Err(_) = tx.lock().await.send(record).await {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "Failed to enqueue dtls record",
                 )));

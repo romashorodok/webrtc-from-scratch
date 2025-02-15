@@ -10,7 +10,6 @@ use util::conn::conn_udp_listener::*;
 use util::conn::*;
 
 use crate::config::*;
-use crate::conn::DTLSConn;
 use crate::content::ContentType;
 use crate::error::Result;
 use crate::record_layer::record_layer_header::RecordLayerHeader;

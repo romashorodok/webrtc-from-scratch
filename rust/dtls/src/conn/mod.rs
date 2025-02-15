@@ -105,7 +105,7 @@ pub struct DTLSConn {
     pub(crate) handle_queue_tx: mpsc::Sender<mpsc::Sender<()>>,
     pub(crate) handshake_done_tx: Option<mpsc::Sender<()>>,
 
-    pub initial_fsm_state: HandshakeState,
+    initial_fsm_state: HandshakeState,
 
     reader_close_tx: Mutex<Option<mpsc::Sender<()>>>,
 }
@@ -120,7 +120,8 @@ impl Conn for DTLSConn {
     async fn recv(&self, buf: &mut [u8]) -> UtilResult<usize> {
         self.read(buf, None).await.map_err(util::Error::from_std)
     }
-    async fn recv_from(&self, buf: &mut [u8]) -> UtilResult<(usize, SocketAddr)> {
+    // TODO: remove
+    async fn recv_from(&self, _buf: &mut [u8]) -> UtilResult<(usize, SocketAddr)> {
         // if let Some(raddr) = self.conn.remote_addr() {
         //     let n = self.read(buf, None).await.map_err(util::Error::from_std)?;
         //     Ok((n, raddr))
@@ -311,8 +312,7 @@ impl DTLSConn {
         let handshake_completed_successfully = Arc::new(AtomicBool::new(false));
         let handshake_completed_successfully2 = Arc::clone(&handshake_completed_successfully);
 
-        let mut c = DTLSConn {
-            // conn: Arc::clone(&conn),
+        let c = DTLSConn {
             cache,
             decrypted_rx: Mutex::new(decrypted_rx),
             state,
@@ -806,7 +806,8 @@ impl DTLSConn {
         inbound_rx: &mut MutexGuard<'_, mpsc::Receiver<Vec<u8>>>,
         // next_conn: &Arc<dyn util::Conn + Send + Sync>,
         handle_queue_rx: &mut mpsc::Receiver<mpsc::Sender<()>>,
-        buf: &mut [u8],
+        // TODO: remove
+        _buf: &mut [u8],
         local_epoch: &Arc<AtomicU16>,
         handshake_completed_successfully: &Arc<AtomicBool>,
     ) -> Result<()> {
