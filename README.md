@@ -1,4 +1,6 @@
-Proof of concept that a WebRTC backend can be implemented without too much code, large dependencies and coding/decoding of media.
+Working code at `old` branch.
+
+Proof of concept that a WebRTC Media Server can (not) be implemented without too much code, large dependencies and coding/decoding of media.
 
 ### Features
 
