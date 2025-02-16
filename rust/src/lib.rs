@@ -5,6 +5,27 @@ use pyo3::prelude::*;
 
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{mpsc, Mutex};
+use webrtc_dtls::{crypto, extension};
+
+#[pyclass]
+struct Certificate {
+    cert: crypto::Certificate,
+}
+
+#[pymethods]
+impl Certificate {
+    #[new]
+    fn new() -> Self {
+        let cert =
+            webrtc_dtls::crypto::Certificate::generate_self_signed(vec!["webrtc".to_owned()])
+                .unwrap();
+        Self { cert }
+    }
+
+    fn certificate_fingerprint(&self) -> String {
+        self.cert.certificate_fingerprint()
+    }
+}
 
 #[pyclass]
 struct DTLS {
@@ -17,9 +38,13 @@ struct DTLS {
 
 #[pymethods]
 impl DTLS {
-    #[pyo3(signature = (client, threads=None))]
+    #[pyo3(signature = (client, certificate, threads=None))]
     #[new]
-    fn new(client: bool, threads: Option<usize>) -> PyResult<Self> {
+    fn new(
+        client: bool,
+        certificate: PyRef<Certificate>,
+        threads: Option<usize>,
+    ) -> PyResult<Self> {
         let runtime = Builder::new_multi_thread()
             .worker_threads(threads.unwrap_or(4))
             .enable_all()
@@ -38,14 +63,14 @@ impl DTLS {
         let outbound_tx = Arc::new(outbound_tx);
 
         let (dtls, error) = runtime.block_on(async move {
-            let cert =
-                webrtc_dtls::crypto::Certificate::generate_self_signed(vec!["webrtc".to_owned()])
-                    .unwrap();
+            let cert = certificate.cert.clone();
 
             let config = webrtc_dtls::config::Config {
                 certificates: vec![cert],
                 insecure_skip_verify: true,
                 extended_master_secret: webrtc_dtls::config::ExtendedMasterSecretType::Disable,
+                srtp_protection_profiles: vec![extension::extension_use_srtp::SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_80, extension::extension_use_srtp::SrtpProtectionProfile::Srtp_Aead_Aes_128_Gcm],
+                mtu: 1280,
                 ..webrtc_dtls::config::Config::default()
             };
 
@@ -61,12 +86,13 @@ impl DTLS {
                 error
             )));
         }
+        let dtls = dtls.unwrap();
 
         Ok(DTLS {
             runtime,
             inbound_tx: Arc::new(Mutex::new(inbound_tx)),
             outbound_rx: Arc::new(Mutex::new(outbound_rx)),
-            dtls: Arc::new(Mutex::new(dtls.unwrap())),
+            dtls: Arc::new(Mutex::new(dtls)),
         })
     }
 
@@ -105,6 +131,7 @@ impl DTLS {
 
 #[pymodule]
 fn native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<Certificate>()?;
     m.add_class::<DTLS>()?;
     Ok(())
 }

@@ -16,7 +16,6 @@ use tokio::time::Duration;
 use util::replay_detector::*;
 use util::Conn;
 
-use crate::alert::*;
 use crate::application_data::*;
 use crate::cipher_suite::*;
 use crate::config::*;
@@ -38,6 +37,7 @@ use crate::record_layer::record_layer_header::*;
 use crate::record_layer::*;
 use crate::signature_hash_algorithm::parse_signature_schemes;
 use crate::state::*;
+use crate::{alert::*, crypto};
 
 pub(crate) const INITIAL_TICKER_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const COOKIE_LENGTH: usize = 20;
@@ -104,6 +104,8 @@ pub struct DTLSConn {
     pub(crate) packet_tx: Arc<mpsc::Sender<PacketSendRequest>>,
     pub(crate) handle_queue_tx: mpsc::Sender<mpsc::Sender<()>>,
     pub(crate) handshake_done_tx: Option<mpsc::Sender<()>>,
+
+    pub cert: crypto::Certificate,
 
     initial_fsm_state: HandshakeState,
 
@@ -328,6 +330,7 @@ impl DTLSConn {
             packet_tx,
             handle_queue_tx,
             handshake_done_tx: Some(handshake_done_tx),
+            cert: config.certificates.first().unwrap().clone(),
 
             initial_fsm_state,
 

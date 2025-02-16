@@ -25,6 +25,8 @@ use crate::error::*;
 use crate::record_layer::record_layer_header::*;
 use crate::signature_hash_algorithm::{HashAlgorithm, SignatureAlgorithm, SignatureHashAlgorithm};
 
+use sha2::{Digest, Sha256};
+
 /// A X.509 certificate(s) used to authenticate a DTLS connection.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Certificate {
@@ -115,6 +117,15 @@ impl Certificate {
             ));
         }
         pem::encode_many(&data)
+    }
+
+    pub fn certificate_fingerprint(&self) -> String {
+        let certificate = self.certificate.iter().next().unwrap();
+        let mut hash = Sha256::new();
+        hash.update(certificate.as_ref());
+        let hashed = hash.finalize();
+        let values: Vec<String> = hashed.iter().map(|x| format! {"{x:02x}"}).collect();
+        values.join(":")
     }
 }
 

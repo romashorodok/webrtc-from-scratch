@@ -4,6 +4,8 @@ from enum import StrEnum
 import secrets
 import string
 
+import native
+
 from . import ice
 from .ice import net
 from . import dtls
@@ -272,6 +274,28 @@ class PeerConnectionEvent(StrEnum):
     SignalingStateChange = "signaling-state-change"
 
 
+async def dtls_ice_pair_queue_handshake_routine(
+    pair_transport: ice.CandidatePairTransport, dtls_transport: dtls.DTLSTransport
+):
+    while True:
+        try:
+            pkt = await pair_transport.recv_dtls()
+            await dtls_transport.enqueue_record(pkt.data)
+        except Exception as e:
+            print("dtls_ice_pair_queue_routine error:", e)
+
+
+async def dtls_ice_pair_dequeue_handshake_routine(
+    pair_transport: ice.CandidatePairTransport, dtls_transport: dtls.DTLSTransport
+):
+    while True:
+        try:
+            layer = await dtls_transport.dequeue_record()
+            pair_transport.sendto(layer)
+        except Exception as e:
+            print("dtls_ice_pair_queue_routine error:", e)
+
+
 # TODO: Watch into ORTC API
 class PeerConnection(AsyncEventEmitter):
     def __init__(self) -> None:
@@ -280,12 +304,12 @@ class PeerConnection(AsyncEventEmitter):
         self.__loop = asyncio.get_running_loop()
         self.gatherer = ICEGatherer()
 
-        self.__certificate = dtls.Certificate.generate_certificate()
-
-        self._certificates = [self.__certificate]
+        self.__certificate = native.Certificate()
+        self.__dtls_transport = dtls.DTLSTransport(self.__certificate)
         self.__media_fingerprints = list[dtls.Fingerprint]()
 
-        self.dtls_transports = list[dtls.DTLSTransport]()
+        # self._certificates = [self.__certificate]
+        # self.dtls_transports = list[dtls.DTLSTransport]()
 
         self._caps = MediaCaps()
         set_default_caps(self._caps)
@@ -315,24 +339,32 @@ class PeerConnection(AsyncEventEmitter):
         pair_ctrl.remove_all_listeners()
 
         ice_transport = ICETransport(self.gatherer)
-        dtls_transport = dtls.DTLSTransport(ice_transport, self.__certificate)
-        await dtls_transport.bind(pair_ctrl.get_transport())
+        if ice_transport.get_ice_role() == ice.AgentRole.Controlled:
+            dtls_role = dtls.DTLSRole.Client
+        else:
+            dtls_role = dtls.DTLSRole.Server
 
         @pair_ctrl.on(ice.CandidatePairControllerEvent.NOMINATE_TRANSPORT)
-        async def __bind_transport_on_nominated_to_transceivers(
+        async def _bind_transport_on_nominated_to_transceivers(
             transport: ice.CandidatePairTransport,
         ):
             print("on __bind_transport_on_nominated_to_transceivers")
 
-            for t in self.dtls_transports:
-                await t.bind(transport)
+            # TODO: Check if it started
+            self.__dtls_transport.start(dtls_role)
+            self.__loop.create_task(
+                dtls_ice_pair_queue_handshake_routine(transport, self.__dtls_transport)
+            )
+            self.__loop.create_task(
+                dtls_ice_pair_dequeue_handshake_routine(
+                    transport, self.__dtls_transport
+                )
+            )
 
-            for t in self._transceivers:
-                await t.bind(dtls_transport)
-
-        self.__loop.create_task(dtls_transport.start(self.__media_fingerprints))
         self.__loop.create_task(pair_ctrl.start())
-        self.dtls_transports.append(dtls_transport)
+
+        # self.__loop.create_task(dtls_transport.start(dtls_role))
+        # self.dtls_transports.append(dtls_transport)
 
     def start(self):
         self.gatherer.on(
@@ -412,9 +444,9 @@ class PeerConnection(AsyncEventEmitter):
             if not codecs:
                 raise ValueError(f"Not found codecs for {kind.value}")
 
-            transport = ICETransport(self.gatherer)
-            dtls_transport = dtls.DTLSTransport(transport, self.__certificate)
-            self.dtls_transports.append(dtls_transport)
+            # transport = ICETransport(self.gatherer)
+            # dtls_transport = dtls.DTLSTransport(transport, self.__certificate)
+            # self.dtls_transports.append(dtls_transport)
 
             receiver = RTPReceiver(self._caps, kind)
             receiver.receive(
@@ -626,7 +658,12 @@ class PeerConnection(AsyncEventEmitter):
             else:
                 print("Not found transceiver mid. Must be already defined")
 
-        fingerprints = self._certificates[0].get_fingerprints()
+        fingerprints = [
+            dtls.Fingerprint(
+                algorithm="sha-256",
+                value=self.__certificate.certificate_fingerprint(),
+            ),
+        ]
 
         print("media sections", media_sections)
 
@@ -729,7 +766,12 @@ class PeerConnection(AsyncEventEmitter):
                 continue
             media_sections.append(MediaSection(mid=t.mid.value, transceivers=[t]))
 
-        fingerprints = self._certificates[0].get_fingerprints()
+        fingerprints = [
+            dtls.Fingerprint(
+                algorithm="sha-256",
+                value=self.__certificate.certificate_fingerprint(),
+            ),
+        ]
 
         return populate_session_descriptor(
             desc=SessionDescription(),
