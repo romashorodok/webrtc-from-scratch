@@ -1,0 +1,27 @@
+[package]
+name = "native"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23.3", features = ["experimental-async"]}
+webrtc_dtls = { version = "0.11.0", path = "./dtls", package = "webrtc-dtls", features = ["pem"] }
+tokio = { version = "1.32.0", features = [
+    "fs",
+    "io-util",
+    "io-std",
+    "macros",
+    "net",
+    "parking_lot",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+pyo3-async-runtimes = { version = "0.23", features = ["attributes", "tokio-runtime"] }
+

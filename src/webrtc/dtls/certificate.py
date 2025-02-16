@@ -1,9 +1,10 @@
 from dataclasses import dataclass
 import datetime
 import binascii
+import hashlib
 import os
 
-from typing import Type, TypeVar
+from typing import Protocol, Self, Type, TypeVar
 
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -15,6 +16,8 @@ from OpenSSL import SSL, crypto
 # TODO: remove this lib
 from pylibsrtp import Policy, Error
 
+import native
+
 
 def certificate_digest(x509: crypto.X509) -> str:
     return x509.digest("SHA256").decode("ascii")
@@ -25,7 +28,8 @@ def generate_certificate(key: ec.EllipticCurvePrivateKey) -> x509.Certificate:
         [
             x509.NameAttribute(
                 x509.NameOID.COMMON_NAME,
-                binascii.hexlify(os.urandom(16)).decode("ascii"),
+                "WebRTC",
+                # binascii.hexlify(os.urandom(16)).decode("ascii"),
             )
         ]
     )
@@ -100,54 +104,115 @@ for srtp_profile in [
         SRTP_PROFILES.append(srtp_profile)
 
 
-class Certificate:
-    def __init__(self, key: crypto.PKey, cert: crypto.X509) -> None:
-        self._key = key
+class CertificateSigningRequest(Protocol):
+    def sign(self, data: bytes) -> bytes: ...
+
+
+class RemoteCertificate:
+    def __init__(self, cert: crypto.X509) -> None:
         self._cert = cert
 
     @property
+    def der(self) -> bytes:
+        return crypto.dump_certificate(crypto.FILETYPE_ASN1, self._cert)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> Self:
+        return cls(crypto.load_certificate(crypto.FILETYPE_ASN1, data))
+
+
+class Certificate:
+    # signkey: ec.EllipticCurvePrivateKey
+
+    # def __init__(self, cert: crypto.X509) -> None:
+    #     self._cert = cert
+
+    # def __init__(self, keypair: native.Keypair) -> None:
+    #     self._keypair = keypair
+
+    @property
     def expires(self) -> datetime.datetime:
-        return self._cert.to_cryptography().not_valid_after_utc
+        return datetime.timedelta(days=1) + datetime.datetime.now()
+        # return self._cert.to_cryptography().not_valid_after_utc
+
+    @property
+    def der(self) -> bytes:
+        ...
+        # return self._keypair.certificate_der()
+        # cert_der = crypto.dump_certificate(crypto.FILETYPE_ASN1, self._cert)
+        # return cert_der
+
+    # def sign(self, msg: bytes) -> bytes:
+    #     key = self._key.to_cryptography_key()
+    #     return key.sign(msg, signature_algorithm=hashes.SHA256)
+
+    @property
+    def pubkey_der(self) -> bytes:
+        # return self.signkey.public_key().public_bytes(
+        #     serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
+        # )
+
+        # return self._keypair.pubkey_der()
+        ...
 
     def get_fingerprints(self) -> list[Fingerprint]:
         return [
-            Fingerprint(
-                algorithm="sha-256",
-                value=certificate_digest(self._cert),
-            )
+            # Fingerprint(
+            #     algorithm="sha-256",
+            #     value=self._keypair.certificate_fingerprint(),
+            # )
         ]
 
+        # return [
+        #     Fingerprint(
+        #         algorithm="sha-256",
+        #         value=certificate_digest(self._cert),
+        #     )
+        # ]
+
+    # @classmethod
+    # def from_bytes(cls, data: bytes) -> Self:
+    #     certificate = crypto.load_certificate(crypto.FILETYPE_ASN1, data)
+    #     return cls(native.Keypair(23))
+
     @classmethod
-    def generate_certificate(cls: Type[CERTIFICATE_T]) -> CERTIFICATE_T:
-        key = ec.generate_private_key(ec.SECP256R1(), default_backend())
+    def generate_certificate(cls) -> Self:
+        # keypair = native.Keypair(23)  # 23 - secp256r1 / nist256 / prime256r1
 
-        private_key_bytes = key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-        pkey = crypto.load_privatekey(crypto.FILETYPE_PEM, private_key_bytes)
+        # key = ec.generate_private_key(ec.SECP256R1(), default_backend())
 
-        cert = generate_certificate(key)
+        # private_key_bytes = key.private_bytes(
+        #     encoding=serialization.Encoding.PEM,
+        #     format=serialization.PrivateFormat.TraditionalOpenSSL,
+        #     encryption_algorithm=serialization.NoEncryption(),
+        # )
+        # pkey = crypto.load_privatekey(crypto.FILETYPE_PEM, private_key_bytes)
 
-        return cls(
-            key=pkey,
-            cert=crypto.X509.from_cryptography(cert),
-        )
+        # cert = generate_certificate(key)
 
-    def create_ssl_context(
-        self,
-        srtp_profiles: list[SRTPProtectionProfile],
-    ) -> SSL.Context:
-        ctx = SSL.Context(SSL.DTLS_METHOD)
-        ctx.set_verify(
-            SSL.VERIFY_PEER | SSL.VERIFY_FAIL_IF_NO_PEER_CERT, lambda *args: True
-        )
-        ctx.use_certificate(self._cert)
-        ctx.use_privatekey(self._key)
-        ctx.set_cipher_list(
-            b"ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA"
-        )
-        ctx.set_tlsext_use_srtp(b":".join(x.openssl_profile for x in srtp_profiles))
+        # i = cls(
+        #     # signkey=key,
+        #     # key=pkey,
+        #     cert=crypto.X509.from_cryptography(cert),
+        # )
 
-        return ctx
+        # i.signkey = key
+        # return cls(keypair)
+        ...
+
+    # def create_ssl_context(
+    #     self,
+    #     srtp_profiles: list[SRTPProtectionProfile],
+    # ) -> SSL.Context:
+    #     ctx = SSL.Context(SSL.DTLS_METHOD)
+    #     ctx.set_verify(
+    #         SSL.VERIFY_PEER | SSL.VERIFY_FAIL_IF_NO_PEER_CERT, lambda *args: True
+    #     )
+    #     ctx.use_certificate(self._cert)
+    #     ctx.use_privatekey(self._key)
+    #     ctx.set_cipher_list(
+    #         b"ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA"
+    #     )
+    #     ctx.set_tlsext_use_srtp(b":".join(x.openssl_profile for x in srtp_profiles))
+    #
+    #     return ctx

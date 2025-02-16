@@ -1,0 +1,10 @@
+[package]
+name = "webrtc-from-scratch"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = ["builder", "rust"]
+
+[dependencies]
+p256 = "0.13.2"

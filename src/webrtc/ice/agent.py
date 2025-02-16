@@ -516,7 +516,7 @@ class CandidatePairTransport:
     def recv_rtcp_sync(self) -> Packet:
         return self._rtcp.get()
 
-    def sendto(self, data: bytes | bytearray | bytes):
+    def sendto(self, data: bytes):
         self._conn.sendto(data)
 
 
