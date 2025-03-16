@@ -8,6 +8,22 @@ Proof of concept that a WebRTC Media Server can (not) be implemented without too
 - Sending/Receiving media in the Chrome browser
 - Reading IVF container format with VP8 codec
 
+### Build
+
+```bash
+rustup default nightly
+```
+
+Start rust module in watch mode:
+```bash
+make
+```
+
+In other term session (Also in watch mode for rust and python proj)
+```bash
+cd examples && make
+```
+
 ### Install
 ```bash
 docker compose up
