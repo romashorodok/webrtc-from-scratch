@@ -430,7 +430,9 @@ class PeerConnection(AsyncEventEmitter):
                     )
                 )
 
-        transceiver = RTPTransceiver(caps=self._caps, kind=kind, direction=direction)
+        transceiver = RTPTransceiver(
+            self.__dtls_transport, caps=self._caps, kind=kind, direction=direction
+        )
         transceiver.set_prefered_codec(codec)
 
         if sender:
@@ -495,7 +497,7 @@ class PeerConnection(AsyncEventEmitter):
             )
 
             transceiver = RTPTransceiver(
-                caps=self._caps, kind=kind, direction=direction
+                self.__dtls_transport, caps=self._caps, kind=kind, direction=direction
             )
             transceiver.set_receiver(receiver)
             transceiver.set_prefered_codec(codecs[0])
@@ -660,7 +662,7 @@ class PeerConnection(AsyncEventEmitter):
         self.__media_fingerprints.extend(desc.get_media_fingerprints())
 
         for transceiver in self._transceivers:
-            await transceiver.start_srtp_streams()
+            self.__loop.create_task(transceiver.start_srtp_streams())
 
     def __get_sdp_role(self) -> ConnectionRole:
         role = self.gatherer.get_role()

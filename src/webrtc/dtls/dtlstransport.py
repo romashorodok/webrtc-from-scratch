@@ -57,6 +57,8 @@ class DTLSTransport:
     ) -> None:
         self.__cert = certificate
         self.__dtls: native.DTLS | None = None
+
+        self.__srtp_rtp_lock = asyncio.Event()
         self.__srtp_rtp: native.SRTP | None = None
         self.__srtp_rtcp: native.SRTP | None = None
 
@@ -244,6 +246,7 @@ class DTLSTransport:
                 client=is_client,
                 dtls=_dtls,
             )
+            self.__srtp_rtp_lock.set()
 
         self.__loop.create_task(on_handshake_success())
 
@@ -304,10 +307,12 @@ class DTLSTransport:
         # transport.sendto(data)
         #
         # return len(data)
-        pass
 
-    async def srtp_stream(self, ssrc: int):
-        pass
+    async def srtp_rtp_stream(self, ssrc: int) -> native.Stream:
+        await self.__srtp_rtp_lock.wait()
+        if not self.__srtp_rtp:
+            raise ValueError("SRTP must be started to get the stream")
+        return await self.__srtp_rtp.ssrc_stream(ssrc)
 
     async def read_rtp_bytes(self) -> tuple[bytes, int]:
         if srtp := self.__srtp_rtp:

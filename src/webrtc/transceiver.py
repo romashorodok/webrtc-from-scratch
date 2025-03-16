@@ -7,6 +7,8 @@ from enum import Enum
 import threading
 from typing import Any, Callable, Coroutine, Protocol
 
+import native
+
 from . import media
 from .utils import impl_protocol
 from .media.packetizer import Packetizer, get_payloader_by_payload_type
@@ -432,13 +434,29 @@ class TrackRemote:
         self.rtx_ssrc = rtx_ssrc
         self.rid = rid
 
-        self._rtp_packet_queue = queue.Queue[media.RtpPacket]()
+        self.__stream: native.Stream | None = None
 
-    def write_rtp_bytes_sync(self, data: bytes):
-        self._rtp_packet_queue.put(media.RtpPacket.parse(data))
+    async def recv(self) -> bytes:
+        return await self.stream.recv()
 
-    def recv_rtp_pkt_sync(self) -> media.RtpPacket:
-        return self._rtp_packet_queue.get()
+    @property
+    def stream(self) -> native.Stream:
+        if not self.__stream:
+            raise ValueError("Unable get stream")
+
+        return self.__stream
+
+    @stream.setter
+    def stream(self, value: native.Stream):
+        self.__stream = value
+
+        # self._rtp_packet_queue = queue.Queue[media.RtpPacket]()
+
+    # def write_rtp_bytes_sync(self, data: bytes):
+    #     self._rtp_packet_queue.put(media.RtpPacket.parse(data))
+    #
+    # def recv_rtp_pkt_sync(self) -> media.RtpPacket:
+    #     return self._rtp_packet_queue.get()
 
 
 def _receive_worker(
@@ -597,6 +615,7 @@ def codecs_params_fuzzy_search(
 class RTPTransceiver:
     def __init__(
         self,
+        dtls: dtls.DTLSTransport,
         caps: MediaCaps,
         kind: RTPCodecKind,
         direction: RTPTransceiverDirection,
@@ -608,7 +627,7 @@ class RTPTransceiver:
         self._kind: RTPCodecKind = kind
         self._prefered_codecs = list[RTPCodecParameters]()
         self._direction = direction
-        self.__dtls: dtls.DTLSTransport | None = None
+        self.__dtls = dtls
 
     async def start_srtp_streams(self):
         if self._sender:
@@ -616,7 +635,11 @@ class RTPTransceiver:
             print("TODO: startp srtp stream for SSRC:", encoding.ssrc)
 
         if self._receiver and self._receiver.track:
-            print("TODO: start srtp stream for remote SSRC:", self._receiver.track.ssrc)
+            print("Start srtp stream for remote SSRC:", self._receiver.track.ssrc)
+            stream = await self.__dtls.srtp_rtp_stream(self._receiver.track.ssrc)
+            self._receiver.track.stream = stream
+            print("Done start srtp stream for remote SSRC:", self._receiver.track.ssrc)
+            print("Is there a stram??", stream)
 
     async def bind(self, transport: dtls.DTLSTransport):
         if self._sender:

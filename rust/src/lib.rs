@@ -1,12 +1,16 @@
 use std::sync::Arc;
 use std::vec;
 
+use bytes::BytesMut;
 use pyo3::prelude::*;
 
 use tokio::runtime::{Builder, Runtime};
 use tokio::select;
 use tokio::sync::{mpsc, Mutex};
 use webrtc_dtls::{crypto, extension};
+use webrtc_srtp::stream::SRTP_BUFFER_SIZE;
+use webrtc_util::marshal::Marshal;
+
 
 #[pyclass]
 struct Certificate {
@@ -150,9 +154,29 @@ impl DTLS {
 const DEFAULT_SESSION_SRTP_REPLAY_PROTECTION_WINDOW: usize = 64;
 const DEFAULT_SESSION_SRTCP_REPLAY_PROTECTION_WINDOW: usize = 64;
 
+
+#[pyclass]
+struct Stream {
+    stream: Arc<Mutex<Arc<webrtc_srtp::stream::Stream>>>,
+}
+
+#[pymethods]
+impl Stream {
+    fn recv<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let stream = self.stream.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let stream = stream.lock().await.clone();
+            let mut buf = vec![0u8; 1300];
+            let pkt = stream.read_rtp(&mut buf).await.unwrap();
+            let data = pkt.marshal().unwrap().to_vec();
+            Ok(data)
+        })
+    }
+}
+
 #[pyclass]
 struct SRTP {
-    session: webrtc_srtp::session::Session,
+    session: Arc<Mutex<webrtc_srtp::session::Session>>,
 
     tx: Arc<Mutex<mpsc::Sender<Vec<u8>>>>,
     rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>
@@ -222,7 +246,7 @@ impl SRTP {
             let session = session.unwrap();
 
             Ok(SRTP{
-                session,
+                session: Arc::new(Mutex::new(session)),
                 tx: Arc::new(Mutex::new(inbound_tx)),
                 rx: Arc::new(Mutex::new(outbound_rx))
             })
@@ -258,6 +282,17 @@ impl SRTP {
             Ok(rx.recv().await)
         })
     }
+
+    fn ssrc_stream<'a>(&self, py: Python<'a>, ssrc: u32) -> PyResult<Bound<'a, PyAny>> {
+        let session = self.session.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let session = session.lock().await;
+            let stream = session.open(ssrc).await;
+            Ok(Stream {
+                stream: Arc::new(Mutex::new(stream)),
+            })
+        })
+    }
 }
 
 #[pymodule]
@@ -265,5 +300,6 @@ fn native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Certificate>()?;
     m.add_class::<DTLS>()?;
     m.add_class::<SRTP>()?;
+    m.add_class::<Stream>()?;
     Ok(())
 }

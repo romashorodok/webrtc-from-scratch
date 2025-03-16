@@ -136,13 +136,13 @@ impl Conn for UdpConn {
         Ok(buf.len())
     }
 
-    fn local_addr(&self) -> Result<SocketAddr> {
-        Ok(self.loc_addr)
-    }
-
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        *self.rem_addr.read()
-    }
+    // fn local_addr(&self) -> Result<SocketAddr> {
+    //     Ok(self.loc_addr)
+    // }
+    //
+    // fn remote_addr(&self) -> Option<SocketAddr> {
+    //     *self.rem_addr.read()
+    // }
 
     async fn close(&self) -> Result<()> {
         let obs = self.obs.upgrade().ok_or_else(|| Error::ErrVnetDisabled)?;

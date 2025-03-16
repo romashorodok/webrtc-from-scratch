@@ -1,4 +1,5 @@
 import asyncio
+import time
 import json
 from typing import Any, Callable
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -99,9 +100,9 @@ def start_reader_loop(pc: PeerConnection):
     if not track:
         raise ValueError("Not found expected track")
 
-    while True:
-        pkt = track.recv_rtp_pkt_sync()
-        print("Recv pkt from reader loop", pkt)
+    # while True:
+    #     pkt = track.recv_rtp_pkt_sync()
+    #     print("Recv pkt from reader loop", pkt)
 
 
 def start_read_write_loop(pc: PeerConnection):
@@ -119,9 +120,16 @@ def start_read_write_loop(pc: PeerConnection):
         return
 
     while True:
-        pkt = remote_track.recv_rtp_pkt_sync()
-        result = rw_loop.run_until_complete(local_track.write_rtp_packet(pkt))
-        print("Write result", result)
+        try:
+            result = rw_loop.run_until_complete(remote_track.recv())
+            print("examples_ws | recv remote", result)
+        except Exception as e:
+            print("examples_ws | recv err", e)
+            time.sleep(1)
+    # while True:
+    #     pkt = remote_track.recv_rtp_pkt_sync()
+    #     result = rw_loop.run_until_complete(local_track.write_rtp_packet(pkt))
+    #     print("Write result", result)
 
 
 @app.websocket("/ws")

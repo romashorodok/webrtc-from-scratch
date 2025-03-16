@@ -164,7 +164,7 @@ impl Session {
                             Session::get_or_create_stream(streams_map, close_stream_tx.clone(), is_rtp, ssrc)
                                 .await;
 
-                        println!("SRPT stream {:?} write decrypted", ssrc);
+                        // println!("SRPT stream {:?} write decrypted", ssrc);
 
                         if is_new {
                             log::trace!(

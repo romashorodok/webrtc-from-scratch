@@ -1411,11 +1411,14 @@ dependencies = [
 name = "native"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "pyo3",
  "pyo3-async-runtimes",
+ "rtp",
  "tokio",
  "webrtc-dtls",
  "webrtc-srtp",
+ "webrtc-util",
 ]
 
 [[package]]
