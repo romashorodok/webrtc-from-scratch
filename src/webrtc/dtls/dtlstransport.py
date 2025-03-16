@@ -57,6 +57,9 @@ class DTLSTransport:
     ) -> None:
         self.__cert = certificate
         self.__dtls: native.DTLS | None = None
+        self.__srtp_rtp: native.SRTP | None = None
+        self.__srtp_rtcp: native.SRTP | None = None
+
         self.__loop = asyncio.get_running_loop()
 
         # self.__dtls = native.DTLS(
@@ -221,9 +224,11 @@ class DTLSTransport:
         return await self.__dtls.dequeue_record()
 
     def start(self, role: DTLSRole):
+        is_client = True if role == DTLSRole.Client else False
+
         if not self.__dtls:
             self.__dtls = native.DTLS(
-                True if role == DTLSRole.Client else False,
+                is_client,
                 self.__cert,
                 4,
             )
@@ -234,6 +239,11 @@ class DTLSTransport:
         async def on_handshake_success():
             await _dtls.handshake_success()
             print("Handshake done success")
+            self.__srtp_rtp = native.SRTP(
+                is_rtp=True,
+                client=is_client,
+                dtls=_dtls,
+            )
 
         self.__loop.create_task(on_handshake_success())
 
@@ -277,8 +287,12 @@ class DTLSTransport:
         print("TODO: Handle rtcp")
         return 0
 
-    async def write_rtp_bytes(self, transport: ICETransportDTLS, data: bytes) -> int:
-        print("TODO: recv rtp")
+    async def write_rtp_bytes(self, data: bytes) -> int:
+        if srtp := self.__srtp_rtp:
+            await srtp.write_pkt(data)
+
+        return 0
+
         # if not self.__tx_srtp:
         #     return 0
         #
@@ -292,8 +306,16 @@ class DTLSTransport:
         # return len(data)
         pass
 
+    async def srtp_stream(self, ssrc: int):
+        pass
+
     async def read_rtp_bytes(self) -> tuple[bytes, int]:
-        print("TODO: send rtp")
+        if srtp := self.__srtp_rtp:
+            data = await srtp.read_pkt()
+            print("read result???", data)
+            return data, len(data)
+
+        return bytes(), 0
         # if not self.__rx_srtp:
         #     return bytes(), 0
         #
@@ -305,4 +327,4 @@ class DTLSTransport:
         # data = self.__rx_srtp.unprotect(pkt.data)
         #
         # return data, len(data)
-        pass
+        ...

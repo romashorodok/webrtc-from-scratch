@@ -461,11 +461,11 @@ def _receive_worker(
 
             data, n = loop.run_until_complete(future)
             if n == 0:
-                print("__rtp_reader EOF")
+                # print("__rtp_reader EOF")
                 loop.run_until_complete(asyncio.sleep(1))
                 continue
 
-            print("Recv rtp??", data)
+            # print("Recv rtp??", data)
             track.write_rtp_bytes_sync(data)
 
         except ValueError:
@@ -609,6 +609,14 @@ class RTPTransceiver:
         self._prefered_codecs = list[RTPCodecParameters]()
         self._direction = direction
         self.__dtls: dtls.DTLSTransport | None = None
+
+    async def start_srtp_streams(self):
+        if self._sender:
+            encoding = self._sender._track_encodings[0]
+            print("TODO: startp srtp stream for SSRC:", encoding.ssrc)
+
+        if self._receiver and self._receiver.track:
+            print("TODO: start srtp stream for remote SSRC:", self._receiver.track.ssrc)
 
     async def bind(self, transport: dtls.DTLSTransport):
         if self._sender:

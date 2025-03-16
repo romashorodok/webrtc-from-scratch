@@ -233,6 +233,7 @@ impl SRTP {
         }
 
         let srtp = srtp.unwrap();
+        println!("Sesssion SRTP successfully created");
 
         Ok(srtp)
     }
@@ -252,7 +253,9 @@ impl SRTP {
     fn read_pkt<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let rx = self.rx.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Ok(rx.lock().await.recv().await)
+            let mut rx = rx.lock().await;
+            println!("SRTP read done");
+            Ok(rx.recv().await)
         })
     }
 }

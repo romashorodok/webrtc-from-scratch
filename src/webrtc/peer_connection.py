@@ -361,6 +361,23 @@ class PeerConnection(AsyncEventEmitter):
                 )
             )
 
+            async def run_rtp_recv_loop():
+                while True:
+                    pkt = await transport.recv_rtp()
+                    await self.__dtls_transport.write_rtp_bytes(pkt.data)
+
+            async def run_rtp_send_loop():
+                while True:
+                    if result := await self.__dtls_transport.read_rtp_bytes():
+                        pkt, _ = result
+                        print("send ?", pkt)
+                        transport.sendto(pkt)
+
+                    await asyncio.sleep(1)
+
+            self.__loop.create_task(run_rtp_recv_loop())
+            self.__loop.create_task(run_rtp_send_loop())
+
         self.__loop.create_task(pair_ctrl.start())
 
         # self.__loop.create_task(dtls_transport.start(dtls_role))
@@ -419,7 +436,26 @@ class PeerConnection(AsyncEventEmitter):
         if sender:
             await sender.add_encoding(track)
             await transceiver.set_sender(sender)
+
+            encoding = sender._track_encodings[0]
+            print(
+                "add_transceiver_from_track | Local Sender open stream for SSRC:",
+                encoding.ssrc,
+                "STREAM_ID",
+                track.stream_id,
+            )
         if receiver:
+            if not receiver._track:
+                raise ValueError("Receiver stream must bedefined")
+
+            # NOTE: It may have different SSRC after negotiation
+            print(
+                "add_transceiver_from_track | Remote receiver open stream for SSRC:",
+                receiver._track.ssrc,
+                "STREAM_ID",
+                track.stream_id,
+            )
+
             transceiver.set_receiver(receiver)
 
         self._transceivers.append(transceiver)
@@ -605,6 +641,16 @@ class PeerConnection(AsyncEventEmitter):
                     else:
                         print("Create transciver from kind", kind, media.direction)
                         await self.add_transceiver_from_kind(kind, media.direction)
+                elif transceiver:
+                    # TODO: It may change direction too
+
+                    if ssrc := media.get_attribute_value(
+                        SessionDescriptionAttrKey.SSRC.value
+                    ):
+                        # TODO: Work around msid-semantic:WMS*
+                        if recv := transceiver.receiver:
+                            if track := recv.track:
+                                track.ssrc = int(ssrc.split(" ")[0])
 
         print("New state", self._transceivers)
         # NOTE: Here may be also restart and updating candidates
@@ -612,6 +658,9 @@ class PeerConnection(AsyncEventEmitter):
         # TODO: This also may remote all unmatched transceivers
 
         self.__media_fingerprints.extend(desc.get_media_fingerprints())
+
+        for transceiver in self._transceivers:
+            await transceiver.start_srtp_streams()
 
     def __get_sdp_role(self) -> ConnectionRole:
         role = self.gatherer.get_role()

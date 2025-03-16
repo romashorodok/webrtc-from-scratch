@@ -164,6 +164,8 @@ impl Session {
                             Session::get_or_create_stream(streams_map, close_stream_tx.clone(), is_rtp, ssrc)
                                 .await;
 
+                        println!("SRPT stream {:?} write decrypted", ssrc);
+
                         if is_new {
                             log::trace!(
                                 "srtp session got new {} stream {}",
@@ -176,7 +178,7 @@ impl Session {
                         }
 
                         match stream.buffer.write(&decrypted).await {
-                            Ok(_) => {}
+                            Ok(_) => { }
                             Err(err) => {
                                 // Silently drop data when the buffer is full.
                                 if util::Error::ErrBufferFull != err {
@@ -265,10 +267,7 @@ impl Session {
         Ok(())
     }
 
-    pub async fn write_rtcp(
-        &self,
-        pkt: &(dyn rtcp::packet::Packet + Send + Sync),
-    ) -> Result<()> {
+    pub async fn write_rtcp(&self, pkt: &(dyn rtcp::packet::Packet + Send + Sync)) -> Result<()> {
         let raw = pkt.marshal()?;
         self.write(&raw, false).await;
         Ok(())
