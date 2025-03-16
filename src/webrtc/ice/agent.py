@@ -494,8 +494,10 @@ class CandidatePairTransport:
     def __init__(self, conn: MuxConnProtocol) -> None:
         self._conn: MuxConnProtocol = conn
 
-        self._rtp = queue.Queue[Packet]()
-        self._rtcp = queue.Queue[Packet]()
+        # self._rtp = queue.Queue[Packet]()
+        # self._rtcp = queue.Queue[Packet]()
+        self._rtp = Interceptor()
+        self._rtcp = Interceptor()
         self._dtls = Interceptor()
 
     def pipe(self, pkt: Packet):
@@ -510,11 +512,11 @@ class CandidatePairTransport:
     async def recv_dtls(self) -> Packet:
         return await self._dtls.get()
 
-    def recv_rtp_sync(self) -> Packet:
-        return self._rtp.get()
+    async def recv_rtp(self) -> Packet:
+        return await self._rtp.get()
 
-    def recv_rtcp_sync(self) -> Packet:
-        return self._rtcp.get()
+    async def recv_rtcp(self) -> Packet:
+        return await self._rtcp.get()
 
     def sendto(self, data: bytes):
         self._conn.sendto(data)

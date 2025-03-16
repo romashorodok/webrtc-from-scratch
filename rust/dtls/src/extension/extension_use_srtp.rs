@@ -31,6 +31,18 @@ impl From<u16> for SrtpProtectionProfile {
     }
 }
 
+impl From<SrtpProtectionProfile> for u16 {
+    fn from(profile: SrtpProtectionProfile) -> Self {
+        match profile {
+            SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_80 => 0x0001,
+            SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_32 => 0x0002,
+            SrtpProtectionProfile::Srtp_Aead_Aes_128_Gcm => 0x0007,
+            SrtpProtectionProfile::Srtp_Aead_Aes_256_Gcm => 0x0008,
+            SrtpProtectionProfile::Unsupported => 0xFFFF, // Use a special value for Unsupported
+        }
+    }
+}
+
 const EXTENSION_USE_SRTPHEADER_SIZE: usize = 6;
 
 /// ## Specifications
