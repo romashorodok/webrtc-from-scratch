@@ -57,6 +57,7 @@ class DTLSTransport:
     ) -> None:
         self.__cert = certificate
         self.__dtls: native.DTLS | None = None
+        self.__loop = asyncio.get_running_loop()
 
         # self.__dtls = native.DTLS(
         #     True if role == DTLSRole.Client else False,
@@ -227,7 +228,14 @@ class DTLSTransport:
                 4,
             )
 
-        self.__dtls.do_handshake()
+        _dtls = self.__dtls
+        _dtls.do_handshake()
+
+        async def on_handshake_success():
+            await _dtls.handshake_success()
+            print("Handshake done success")
+
+        self.__loop.create_task(on_handshake_success())
 
         # assert len(remote_fingerprints)
         # print("Handshake start")
@@ -270,6 +278,7 @@ class DTLSTransport:
         return 0
 
     async def write_rtp_bytes(self, transport: ICETransportDTLS, data: bytes) -> int:
+        print("TODO: recv rtp")
         # if not self.__tx_srtp:
         #     return 0
         #
@@ -283,7 +292,8 @@ class DTLSTransport:
         # return len(data)
         pass
 
-    async def read_rtp_bytes(self, transport: ICETransportDTLS) -> tuple[bytes, int]:
+    async def read_rtp_bytes(self) -> tuple[bytes, int]:
+        print("TODO: send rtp")
         # if not self.__rx_srtp:
         #     return bytes(), 0
         #

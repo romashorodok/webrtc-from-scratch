@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use log::*;
 use portable_atomic::{AtomicBool, AtomicU16};
-use tokio::sync::{mpsc, oneshot, Mutex, MutexGuard};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, MutexGuard};
 use tokio::time::Duration;
 use util::replay_detector::*;
 use util::Conn;
@@ -77,6 +77,9 @@ pub struct DTLSConn {
     pub(crate) cache: HandshakeCache, // caching of handshake messages for verifyData generation
     decrypted_rx: Mutex<mpsc::Receiver<Result<Vec<u8>>>>, // Decrypted Application Data or error, pull by calling `Read`
     pub(crate) state: State,                              // Internal state
+
+    pub handshake_completed_successfully_watch_rx: watch::Receiver<bool>,
+    handshake_completed_successfully_watch_tx: watch::Sender<bool>,
 
     handshake_completed_successfully: Arc<AtomicBool>,
     connection_closed_by_user: bool,
@@ -314,10 +317,17 @@ impl DTLSConn {
         let handshake_completed_successfully = Arc::new(AtomicBool::new(false));
         let handshake_completed_successfully2 = Arc::clone(&handshake_completed_successfully);
 
+        let (handshake_completed_successfully_watch_tx, handshake_completed_successfully_watch_rx) =
+            watch::channel(false);
+
         let c = DTLSConn {
             cache,
             decrypted_rx: Mutex::new(decrypted_rx),
             state,
+
+            handshake_completed_successfully_watch_rx,
+            handshake_completed_successfully_watch_tx,
+
             handshake_completed_successfully,
             connection_closed_by_user: false,
             closed: AtomicBool::new(false),
@@ -798,6 +808,7 @@ impl DTLSConn {
     pub(crate) fn set_handshake_completed_successfully(&mut self) {
         self.handshake_completed_successfully
             .store(true, Ordering::SeqCst);
+        let _ = self.handshake_completed_successfully_watch_tx.send(true);
     }
 
     pub(crate) fn is_handshake_completed_successfully(&self) -> bool {
