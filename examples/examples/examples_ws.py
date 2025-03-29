@@ -1,9 +1,11 @@
 import asyncio
+from struct import pack
 import time
 import json
 from typing import Any, Callable
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
+from webrtc.media.packetizer import Sequencer, SimplePacketizer
 from webrtc.peer_connection import (
     PeerConnection,
 )
@@ -107,7 +109,6 @@ def start_reader_loop(pc: PeerConnection):
 
 def start_read_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
     rw_loop = asyncio.new_event_loop()
-    w = asyncio.new_event_loop()
 
     sender = pc._transceivers[0].sender
     receiver = pc._transceivers[0].receiver
@@ -121,6 +122,46 @@ def start_read_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
     if not remote_track or not local_track:
         return
 
+    frames = rw_loop.run_until_complete(pre_read_frames("output.ivf"))
+
+    srtp = pc._dtls_transport._srtp_rtp
+
+    async def enc():
+        frame_index = 0
+        ptime = encoding.codec.refresh_rate
+        ms = 1000
+
+        async for _ in media.ticker(ptime / ms):
+            if frame_index >= len(frames):
+                print("All frames sent. Replay from beginning.")
+                frame_index = 0
+
+            frame, _ = frames[frame_index]
+            frame_index += 1
+
+            try:
+                pts, time_base = await encoding._packetizer.next_timestamp()
+
+                pkts = encoding._packetizer.packetize(
+                    frame, encoding.convert_timebase(pts, time_base, time_base)
+                )
+
+                srtp = pc._dtls_transport._srtp_rtp
+
+                if not srtp:
+                    await asyncio.sleep(1)
+                    continue
+
+                assert pc._transport
+                for pkt in pkts:
+                    enc = await srtp.encrypt_nonblock(pkt.serialize())
+                    pc._transport.sendto(enc)
+
+            except RuntimeError:
+                pass
+
+    asyncio.ensure_future(enc(), loop=loop)
+
     while True:
         try:
             result = rw_loop.run_until_complete(remote_track.recv())
@@ -132,13 +173,6 @@ def start_read_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
                 continue
 
             srtp = pc._dtls_transport._srtp_rtp
-
-            async def enc():
-                enc = await srtp.encrypt_nonblock(pkt.serialize())
-                pc._transport.sendto(enc)
-                # pc.gatherer
-
-            asyncio.ensure_future(enc(), loop=loop)
 
             # async def enc():
             # remote_track
