@@ -290,7 +290,12 @@ class DTLSTransport:
         print("TODO: Handle rtcp")
         return 0
 
+    async def encrypt_rtp_bytes(self, data: bytes):
+        if srtp := self.__srtp_rtp:
+            await srtp.encrypt(data)
+
     async def write_rtp_bytes(self, data: bytes) -> int:
+        """Enqueue the encrypted packet into srtp session and then deliver decoded packet into own SSRC stream."""
         if srtp := self.__srtp_rtp:
             await srtp.write_pkt(data)
 
@@ -317,7 +322,6 @@ class DTLSTransport:
     async def read_rtp_bytes(self) -> tuple[bytes, int]:
         if srtp := self.__srtp_rtp:
             data = await srtp.read_pkt()
-            print("read result???", data)
             return data, len(data)
 
         return bytes(), 0

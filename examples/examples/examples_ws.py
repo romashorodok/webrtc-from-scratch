@@ -115,6 +115,7 @@ def start_read_write_loop(pc: PeerConnection):
 
     remote_track = receiver.track
     local_track = sender.track
+    encoding = sender._track_encodings[0]
 
     if not remote_track or not local_track:
         return
@@ -122,10 +123,15 @@ def start_read_write_loop(pc: PeerConnection):
     while True:
         try:
             result = rw_loop.run_until_complete(remote_track.recv())
-            print("examples_ws | recv remote", result)
+
+            n = rw_loop.run_until_complete(
+                encoding.write_rtp_raw_bytes(result),
+            )
+
         except Exception as e:
             print("examples_ws | recv err", e)
             time.sleep(1)
+
     # while True:
     #     pkt = remote_track.recv_rtp_pkt_sync()
     #     result = rw_loop.run_until_complete(local_track.write_rtp_packet(pkt))

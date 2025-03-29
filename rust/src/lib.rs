@@ -117,7 +117,7 @@ impl DTLS {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut dtls = dtls.lock().await;
 
-            loop {
+            'l: loop {
                 select! {
                     _ = dtls.handshake_completed_successfully_watch_rx.changed() => {
                         break;
@@ -172,11 +172,12 @@ impl Stream {
             Ok(data)
         })
     }
-}
+ }
 
 #[pyclass]
 struct SRTP {
     session: Arc<Mutex<webrtc_srtp::session::Session>>,
+    is_rtp: bool,
 
     tx: Arc<Mutex<mpsc::Sender<Vec<u8>>>>,
     rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>
@@ -248,7 +249,8 @@ impl SRTP {
             Ok(SRTP{
                 session: Arc::new(Mutex::new(session)),
                 tx: Arc::new(Mutex::new(inbound_tx)),
-                rx: Arc::new(Mutex::new(outbound_rx))
+                rx: Arc::new(Mutex::new(outbound_rx)),
+                is_rtp
             })
         });
 
@@ -260,6 +262,17 @@ impl SRTP {
         println!("Sesssion SRTP successfully created");
 
         Ok(srtp)
+    }
+
+    fn encrypt<'a>(&self, py: Python<'a>, pkt: Vec<u8>) -> PyResult<Bound<'a, PyAny>> {
+        let session = self.session.clone();
+        let is_rtp = self.is_rtp;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let session = session.lock().await;
+            let data = BytesMut::from(pkt.as_slice());
+            let _ = session.write(&data.freeze(), is_rtp).await;
+            Ok(())
+        })
     }
 
     fn write_pkt<'a>(&self, py: Python<'a>, pkt: Vec<u8>) -> PyResult<Bound<'a, PyAny>> {
@@ -278,7 +291,6 @@ impl SRTP {
         let rx = self.rx.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut rx = rx.lock().await;
-            println!("SRTP read done");
             Ok(rx.recv().await)
         })
     }
