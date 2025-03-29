@@ -264,6 +264,17 @@ impl SRTP {
         Ok(srtp)
     }
 
+    fn encrypt_nonblock<'a>(&self, py: Python<'a>, pkt: Vec<u8>) -> PyResult<Bound<'a, PyAny>> {
+        let session = self.session.clone();
+        let is_rtp = self.is_rtp;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let session = session.lock().await;
+            let pkt = session.encrypt_write(pkt, is_rtp).await.unwrap();
+            Ok(pkt)
+
+        })
+    }
+
     fn encrypt<'a>(&self, py: Python<'a>, pkt: Vec<u8>) -> PyResult<Bound<'a, PyAny>> {
         let session = self.session.clone();
         let is_rtp = self.is_rtp;

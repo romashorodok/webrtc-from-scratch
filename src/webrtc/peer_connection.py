@@ -305,7 +305,7 @@ class PeerConnection(AsyncEventEmitter):
         self.gatherer = ICEGatherer()
 
         self.__certificate = native.Certificate()
-        self.__dtls_transport = dtls.DTLSTransport(self.__certificate)
+        self._dtls_transport = dtls.DTLSTransport(self.__certificate)
         self.__media_fingerprints = list[dtls.Fingerprint]()
 
         # self._certificates = [self.__certificate]
@@ -333,6 +333,7 @@ class PeerConnection(AsyncEventEmitter):
 
         self._closed: bool = False
         self._peer_connection_lock = asyncio.Lock()
+        self._transport: ice.CandidatePairTransport | None = None
 
     async def __on_ice_pair_controller(self, pair_ctrl: ice.CandidatePairController):
         # TODO: check if this already started
@@ -349,26 +350,25 @@ class PeerConnection(AsyncEventEmitter):
             transport: ice.CandidatePairTransport,
         ):
             print("on __bind_transport_on_nominated_to_transceivers")
+            self._transport = transport
 
             # TODO: Check if it started
-            self.__dtls_transport.start(dtls_role)
+            self._dtls_transport.start(dtls_role)
             self.__loop.create_task(
-                dtls_ice_pair_queue_handshake_routine(transport, self.__dtls_transport)
+                dtls_ice_pair_queue_handshake_routine(transport, self._dtls_transport)
             )
             self.__loop.create_task(
-                dtls_ice_pair_dequeue_handshake_routine(
-                    transport, self.__dtls_transport
-                )
+                dtls_ice_pair_dequeue_handshake_routine(transport, self._dtls_transport)
             )
 
             async def run_rtp_recv_loop():
                 while True:
                     pkt = await transport.recv_rtp()
-                    await self.__dtls_transport.write_rtp_bytes(pkt.data)
+                    await self._dtls_transport.write_rtp_bytes(pkt.data)
 
             async def run_rtp_send_loop():
                 while True:
-                    if result := await self.__dtls_transport.read_rtp_bytes():
+                    if result := await self._dtls_transport.read_rtp_bytes():
                         pkt, _ = result
                         print("send ?", pkt)
                         transport.sendto(pkt)
@@ -431,7 +431,7 @@ class PeerConnection(AsyncEventEmitter):
                 )
 
         transceiver = RTPTransceiver(
-            self.__dtls_transport, caps=self._caps, kind=kind, direction=direction
+            self._dtls_transport, caps=self._caps, kind=kind, direction=direction
         )
         transceiver.set_prefered_codec(codec)
 
@@ -497,7 +497,7 @@ class PeerConnection(AsyncEventEmitter):
             )
 
             transceiver = RTPTransceiver(
-                self.__dtls_transport, caps=self._caps, kind=kind, direction=direction
+                self._dtls_transport, caps=self._caps, kind=kind, direction=direction
             )
             transceiver.set_receiver(receiver)
             transceiver.set_prefered_codec(codecs[0])

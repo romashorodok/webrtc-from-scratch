@@ -242,6 +242,24 @@ impl Session {
         Ok(())
     }
 
+    pub async fn encrypt_write(&self, buf: Vec<u8>, is_rtp: bool) -> Result<Vec<u8>> {
+        if self.is_rtp != is_rtp {
+            return Err(Error::SessionRtpRtcpTypeMismatch);
+        }
+
+        let encrypted = {
+            let mut local_context = self.local_context.lock().await;
+
+            if is_rtp {
+                local_context.encrypt_rtp(&buf)?
+            } else {
+                local_context.encrypt_rtcp(&buf)?
+            }
+        };
+
+        Ok(encrypted.to_vec())
+    }
+
     pub async fn write(&self, buf: &Bytes, is_rtp: bool) -> Result<()> {
         if self.is_rtp != is_rtp {
             return Err(Error::SessionRtpRtcpTypeMismatch);

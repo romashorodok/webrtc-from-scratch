@@ -59,7 +59,7 @@ class DTLSTransport:
         self.__dtls: native.DTLS | None = None
 
         self.__srtp_rtp_lock = asyncio.Event()
-        self.__srtp_rtp: native.SRTP | None = None
+        self._srtp_rtp: native.SRTP | None = None
         self.__srtp_rtcp: native.SRTP | None = None
 
         self.__loop = asyncio.get_running_loop()
@@ -241,7 +241,7 @@ class DTLSTransport:
         async def on_handshake_success():
             await _dtls.handshake_success()
             print("Handshake done success")
-            self.__srtp_rtp = native.SRTP(
+            self._srtp_rtp = native.SRTP(
                 is_rtp=True,
                 client=is_client,
                 dtls=_dtls,
@@ -291,12 +291,12 @@ class DTLSTransport:
         return 0
 
     async def encrypt_rtp_bytes(self, data: bytes):
-        if srtp := self.__srtp_rtp:
+        if srtp := self._srtp_rtp:
             await srtp.encrypt(data)
 
     async def write_rtp_bytes(self, data: bytes) -> int:
         """Enqueue the encrypted packet into srtp session and then deliver decoded packet into own SSRC stream."""
-        if srtp := self.__srtp_rtp:
+        if srtp := self._srtp_rtp:
             await srtp.write_pkt(data)
 
         return 0
@@ -315,12 +315,12 @@ class DTLSTransport:
 
     async def srtp_rtp_stream(self, ssrc: int) -> native.Stream:
         await self.__srtp_rtp_lock.wait()
-        if not self.__srtp_rtp:
+        if not self._srtp_rtp:
             raise ValueError("SRTP must be started to get the stream")
-        return await self.__srtp_rtp.ssrc_stream(ssrc)
+        return await self._srtp_rtp.ssrc_stream(ssrc)
 
     async def read_rtp_bytes(self) -> tuple[bytes, int]:
-        if srtp := self.__srtp_rtp:
+        if srtp := self._srtp_rtp:
             data = await srtp.read_pkt()
             return data, len(data)
 

@@ -105,8 +105,9 @@ def start_reader_loop(pc: PeerConnection):
     #     print("Recv pkt from reader loop", pkt)
 
 
-def start_read_write_loop(pc: PeerConnection):
+def start_read_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
     rw_loop = asyncio.new_event_loop()
+    w = asyncio.new_event_loop()
 
     sender = pc._transceivers[0].sender
     receiver = pc._transceivers[0].receiver
@@ -124,10 +125,53 @@ def start_read_write_loop(pc: PeerConnection):
         try:
             result = rw_loop.run_until_complete(remote_track.recv())
 
-            n = rw_loop.run_until_complete(
-                encoding.write_rtp_raw_bytes(result),
-            )
+            pkt = media.RtpPacket.parse(result)
+            pkt.ssrc = encoding.ssrc
 
+            if not pc._dtls_transport._srtp_rtp:
+                continue
+
+            srtp = pc._dtls_transport._srtp_rtp
+
+            async def enc():
+                enc = await srtp.encrypt_nonblock(pkt.serialize())
+                pc._transport.sendto(enc)
+                # pc.gatherer
+
+            asyncio.ensure_future(enc(), loop=loop)
+
+            # async def enc():
+            # remote_track
+            # encoded = await pc._dtls_transport._srtp_rtp.encrypt_nonblock(
+            # pkt.serialize()
+            # )
+            # if not encoded:
+            # return
+
+            # print("encoded", encoded)
+            # await local_track.write_frame(encoded)
+
+            # async def send():
+            # data = await remote_track.recv_rtp_pkt_sync()
+            # _pkt = media.RtpPacket.parse(data)
+            # _pkt.ssrc = encoding.ssrc
+            # encoded = await pc._dtls_transport.encrypt_rtp_bytes(_pkt.serialize())
+            # await local_track.write_rtp_packet(_pkt)
+
+            # asyncio.ensure_future(enc(), loop=loop)
+            # )
+
+            # pkt = rw_loop.run_until_complete(
+            #     pc._dtls_transport.encrypt_rtp_bytes(pkt.serialize()),
+            # )
+
+            # print("run", pkt.serialize())
+
+            # n = rw_loop.run_until_complete(
+            #     encoding.write_rtp_raw_bytes(result),
+            # )
+        # enc_pkt = rw_loop.run_until_complete(
+        # pc._dtls_transport._srtp_rtp.encrypt_nonblock(pkt.serialize())
         except Exception as e:
             print("examples_ws | recv err", e)
             time.sleep(1)
@@ -165,7 +209,9 @@ async def ws_endpoint(ws: WebSocket):
     #     target=start_writer_loop, daemon=False, args=(pc, done)
     # )
     # reader_thread = threading.Thread(target=start_reader_loop, daemon=False, args=(pc,))
-    rw_thread = threading.Thread(target=start_read_write_loop, args=(pc,))
+    rw_thread = threading.Thread(
+        target=start_read_write_loop, args=(pc, asyncio.get_running_loop())
+    )
 
     def on_close():
         # done.set()

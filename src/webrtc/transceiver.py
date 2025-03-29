@@ -447,6 +447,7 @@ class TrackRemote:
         self.rid = rid
 
         self.__stream: native.Stream | None = None
+        self.__queue = asyncio.Queue[bytes]()
 
     async def recv(self) -> bytes:
         return await self.stream.recv()
@@ -464,11 +465,15 @@ class TrackRemote:
 
         # self._rtp_packet_queue = queue.Queue[media.RtpPacket]()
 
-    # def write_rtp_bytes_sync(self, data: bytes):
-    #     self._rtp_packet_queue.put(media.RtpPacket.parse(data))
+    async def write_rtp_bytes_sync(self, data: bytes):
+        await self.__queue.put(data)
+        # self._rtp_packet_queue.put(media.RtpPacket.parse(data))
+
     #
-    # def recv_rtp_pkt_sync(self) -> media.RtpPacket:
-    #     return self._rtp_packet_queue.get()
+    async def recv_rtp_pkt_sync(self):
+        return await self.__queue.get()
+
+        # return self._rtp_packet_queue.get()
 
 
 def _receive_worker(
@@ -495,6 +500,7 @@ def _receive_worker(
                 loop.run_until_complete(asyncio.sleep(1))
                 continue
 
+            loop.run_until_complete(track.write_rtp_bytes_sync(data))
             # print("Recv rtp??", data)
             # track.write_rtp_bytes_sync(data)
 
