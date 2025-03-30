@@ -27,6 +27,40 @@ def get_payloader_by_payload_type(pt: int) -> PayloaderProtocol | None:
             return
 
 
+class SimplePacketizer:
+    def __init__(self, clock_rate: int, refresh_rate: float) -> None:
+        self.clock_rate = clock_rate
+        self.refresh_rate = refresh_rate
+        self.sequencer = Sequencer()
+        self._timestamp = None
+
+    def convert_timebase(
+        self, pts: int, from_base: fractions.Fraction, to_base: fractions.Fraction
+    ) -> int:
+        if from_base != to_base:
+            pts = int(pts * from_base / to_base)
+        return pts
+
+    async def next_timestamp(self) -> tuple[int, fractions.Fraction]:
+        if self._timestamp is not None:
+            self._timestamp += int(self.refresh_rate * self.clock_rate)
+            wait = self._start + (self._timestamp / self.clock_rate) - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+        else:
+            self._start = time.time()
+            self._timestamp = 0
+
+        VIDEO_TIME_BASE = fractions.Fraction(1, self.clock_rate)
+        return self._timestamp, VIDEO_TIME_BASE
+
+    async def packetize(self, pkt: RtpPacket) -> bytes:
+        pts, time_base = await self.next_timestamp()
+        pkt.sequence_number = self.sequencer.next_sequence_number()
+        pkt.timestamp = self.convert_timebase(pts, time_base, time_base)
+        return pkt.serialize()
+
+
 class Packetizer:
     def __init__(
         self,

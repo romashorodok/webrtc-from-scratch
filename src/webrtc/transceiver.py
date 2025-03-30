@@ -142,6 +142,8 @@ class TrackEncoding:
         return pts
 
     async def write_rtp_bytes(self, rtp_packet: media.RtpPacket) -> int:
+        raise ValueError("Not implemented")
+
         if not self._dtls:
             print("write_rtp | Not found transport")
             return 0
@@ -149,6 +151,15 @@ class TrackEncoding:
         rtp_packet.ssrc = self.ssrc
 
         return await self._dtls.write_rtp_bytes(rtp_packet.serialize())
+
+    async def write_rtp_raw_bytes(self, rtp_packet_raw: bytes):
+        if not self._dtls:
+            print(f"write_rtp_bytes_raw {self.ssrc} | not found dtls")
+            return 0
+        pkt = media.RtpPacket.parse(rtp_packet_raw)
+        pkt.ssrc = self.ssrc
+
+        await self._dtls.encrypt_rtp_bytes(pkt.serialize())
 
     async def write_frame(self, frame: bytes) -> int:
         if not self._dtls:
@@ -164,6 +175,7 @@ class TrackEncoding:
         n = 0
         for pkt in pkts:
             n += await self._dtls.write_rtp_bytes(pkt.serialize())
+
         return n
 
 
@@ -435,6 +447,7 @@ class TrackRemote:
         self.rid = rid
 
         self.__stream: native.Stream | None = None
+        self.__queue = asyncio.Queue[bytes]()
 
     async def recv(self) -> bytes:
         return await self.stream.recv()
@@ -452,11 +465,15 @@ class TrackRemote:
 
         # self._rtp_packet_queue = queue.Queue[media.RtpPacket]()
 
-    # def write_rtp_bytes_sync(self, data: bytes):
-    #     self._rtp_packet_queue.put(media.RtpPacket.parse(data))
+    async def write_rtp_bytes_sync(self, data: bytes):
+        await self.__queue.put(data)
+        # self._rtp_packet_queue.put(media.RtpPacket.parse(data))
+
     #
-    # def recv_rtp_pkt_sync(self) -> media.RtpPacket:
-    #     return self._rtp_packet_queue.get()
+    async def recv_rtp_pkt_sync(self):
+        return await self.__queue.get()
+
+        # return self._rtp_packet_queue.get()
 
 
 def _receive_worker(
@@ -483,8 +500,9 @@ def _receive_worker(
                 loop.run_until_complete(asyncio.sleep(1))
                 continue
 
+            loop.run_until_complete(track.write_rtp_bytes_sync(data))
             # print("Recv rtp??", data)
-            track.write_rtp_bytes_sync(data)
+            # track.write_rtp_bytes_sync(data)
 
         except ValueError:
             pass
@@ -632,14 +650,18 @@ class RTPTransceiver:
     async def start_srtp_streams(self):
         if self._sender:
             encoding = self._sender._track_encodings[0]
-            print("TODO: startp srtp stream for SSRC:", encoding.ssrc)
+            print(f"SSRC {encoding.ssrc} Local Sender | Start srtp stream")
+            # TODO: actual rust impl of srtp don't have the write api, encryption the Session
+            stream = await self.__dtls.srtp_rtp_stream(encoding.ssrc)
+            print(f"SSRC {encoding.ssrc} Local Sender | Done stream", stream)
+            # encoding.stream = stream
 
         if self._receiver and self._receiver.track:
-            print("Start srtp stream for remote SSRC:", self._receiver.track.ssrc)
-            stream = await self.__dtls.srtp_rtp_stream(self._receiver.track.ssrc)
-            self._receiver.track.stream = stream
-            print("Done start srtp stream for remote SSRC:", self._receiver.track.ssrc)
-            print("Is there a stram??", stream)
+            track = self._receiver.track
+            print(f"SSRC {track.ssrc} Remote Receiver | Start srtp stream")
+            stream = await self.__dtls.srtp_rtp_stream(track.ssrc)
+            track.stream = stream
+            print(f"SSRC {track.ssrc} Remote Receiver | Done stream", stream)
 
     async def bind(self, transport: dtls.DTLSTransport):
         if self._sender:
