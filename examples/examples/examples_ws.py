@@ -183,6 +183,7 @@ def start_read_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
 
             # srtp = pc._dtls_transport._srtp_rtp
 
+            # The frame packetized and may be restored via identical timestamp so frame splited into many rtp packets with the same timestamp but each part of it has own sequence number
             # The jitter return the sample frame that able to decode by decoder in my case it libvpx for vp8
             is_pli, encoded_frame = jitter.add(pkt)
             if is_pli:
