@@ -21,9 +21,14 @@ Start rust module in watch mode:
 make
 ```
 
+poetry
+```bash
+poetry install && cd examples && poetry install && cd ..
+```
+
 In other term session (Also in watch mode for rust and python proj)
 ```bash
-cd examples && make
+cd examples &&  make serve
 ```
 
 ### Install
