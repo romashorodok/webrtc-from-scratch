@@ -1,4 +1,7 @@
 from struct import pack
+from typing import Self
+
+from struct import unpack_from
 
 from .types import PayloaderProtocol
 from webrtc.utils.types import impl_protocol
@@ -20,6 +23,77 @@ class VpxPayloadDescriptor:
         self.tl0picidx = tl0picidx
         self.tid = tid
         self.keyidx = keyidx
+
+    @classmethod
+    def parse(cls, data: bytes) -> tuple[Self, bytes]:
+        if len(data) < 1:
+            raise ValueError("VPX descriptor is too short")
+
+        # first byte
+        octet = data[0]
+        extended = octet >> 7
+        partition_start = (octet >> 4) & 1
+        partition_id = octet & 0xF
+        picture_id = None
+        tl0picidx = None
+        tid = None
+        keyidx = None
+        pos = 1
+
+        # extended control bits
+        if extended:
+            if len(data) < pos + 1:
+                raise ValueError("VPX descriptor has truncated extended bits")
+
+            octet = data[pos]
+            ext_I = (octet >> 7) & 1
+            ext_L = (octet >> 6) & 1
+            ext_T = (octet >> 5) & 1
+            ext_K = (octet >> 4) & 1
+            pos += 1
+
+            # picture id
+            if ext_I:
+                if len(data) < pos + 1:
+                    raise ValueError("VPX descriptor has truncated PictureID")
+
+                if data[pos] & 0x80:
+                    if len(data) < pos + 2:
+                        raise ValueError("VPX descriptor has truncated long PictureID")
+
+                    picture_id = unpack_from("!H", data, pos)[0] & 0x7FFF
+                    pos += 2
+                else:
+                    picture_id = data[pos]
+                    pos += 1
+
+            # unused
+            if ext_L:
+                if len(data) < pos + 1:
+                    raise ValueError("VPX descriptor has truncated TL0PICIDX")
+
+                tl0picidx = data[pos]
+                pos += 1
+            if ext_T or ext_K:
+                if len(data) < pos + 1:
+                    raise ValueError("VPX descriptor has truncated T/K")
+
+                t_k = data[pos]
+                if ext_T:
+                    tid = ((t_k >> 6) & 3, (t_k >> 5) & 1)
+                if ext_K:
+                    keyidx = t_k & 0x1F
+                pos += 1
+
+        obj = cls(
+            partition_start=partition_start,
+            partition_id=partition_id,
+            picture_id=picture_id,
+            tl0picidx=tl0picidx,
+            tid=tid,
+            keyidx=keyidx,
+        )
+        return obj, data[pos:]
 
     def __bytes__(self) -> bytes:
         octet = (self.partition_start << 4) | self.partition_id
@@ -60,6 +134,11 @@ class VpxPayloadDescriptor:
             f"VpxPayloadDescriptor(S={self.partition_start}, "
             f"PID={self.partition_id}, pic_id={self.picture_id})"
         )
+
+
+def vp8_depayload(payload: bytes) -> bytes:
+    descriptor, data = VpxPayloadDescriptor.parse(payload)
+    return data
 
 
 PACKET_MAX = 1300
@@ -108,7 +187,6 @@ class VP8Payloader:
 #
 #         first = True
 #         fragments = []
-#
 #         payload_data_remaining = payload_len
 #         payload_data_index = 0
 #

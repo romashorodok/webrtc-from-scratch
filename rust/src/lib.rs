@@ -271,7 +271,6 @@ impl SRTP {
             let session = session.lock().await;
             let pkt = session.encrypt_write(pkt, is_rtp).await.unwrap();
             Ok(pkt)
-
         })
     }
 

@@ -5,13 +5,16 @@ import json
 from typing import Any, Callable
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
+from webrtc.media.jitterbuffer import JitterBuffer, JitterFrame
 from webrtc.media.packetizer import Sequencer, SimplePacketizer
+from webrtc.media.vp8_payloader import vp8_depayload
 from webrtc.peer_connection import (
     PeerConnection,
 )
 from webrtc import media
 from webrtc.session_description import SessionDescription, SessionDescriptionType
 from webrtc.transceiver import RTPCodecKind, RTPTransceiverDirection
+from webrtc.media.jitterbuffer import JitterBuffer
 
 import fractions
 import threading
@@ -122,28 +125,26 @@ def start_read_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
     if not remote_track or not local_track:
         return
 
-    frames = rw_loop.run_until_complete(pre_read_frames("output.ivf"))
+    jitter = JitterBuffer(capacity=128, is_video=True)
 
-    srtp = pc._dtls_transport._srtp_rtp
+    frames_queue = asyncio.Queue[JitterFrame](100)
 
-    async def enc():
-        frame_index = 0
-        ptime = encoding.codec.refresh_rate
-        ms = 1000
+    ptime = encoding.codec.refresh_rate
+    ms = 1000
 
-        async for _ in media.ticker(ptime / ms):
-            if frame_index >= len(frames):
-                print("All frames sent. Replay from beginning.")
-                frame_index = 0
-
-            frame, _ = frames[frame_index]
-            frame_index += 1
+    async def encode():
+        while True:
+            # print("encode loop")
+            frame = await frames_queue.get()
+            # print("encoded frame recv", frame)
 
             try:
-                pts, time_base = await encoding._packetizer.next_timestamp()
+                # pts, time_base = await encoding._packetizer.next_timestamp()
 
                 pkts = encoding._packetizer.packetize(
-                    frame, encoding.convert_timebase(pts, time_base, time_base)
+                    frame.data,
+                    frame.timestamp,
+                    # encoding.convert_timebase(pts, time_base, time_base)
                 )
 
                 srtp = pc._dtls_transport._srtp_rtp
@@ -153,14 +154,20 @@ def start_read_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
                     continue
 
                 assert pc._transport
+
                 for pkt in pkts:
+                    # pkt.timestamp = frame.timestamp
                     enc = await srtp.encrypt_nonblock(pkt.serialize())
                     pc._transport.sendto(enc)
 
-            except RuntimeError:
+            except Exception as e:
+                print("encode loop error:", e)
                 pass
 
-    asyncio.ensure_future(enc(), loop=loop)
+    asyncio.ensure_future(encode(), loop=loop)
+
+    async def enqueue(frame: JitterFrame):
+        await frames_queue.put(frame)
 
     while True:
         try:
@@ -172,7 +179,26 @@ def start_read_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
             if not pc._dtls_transport._srtp_rtp:
                 continue
 
-            srtp = pc._dtls_transport._srtp_rtp
+            pkt._data = vp8_depayload(pkt.payload)
+
+            # srtp = pc._dtls_transport._srtp_rtp
+
+            # The jitter return the sample frame that able to decode by decoder in my case it libvpx for vp8
+            is_pli, encoded_frame = jitter.add(pkt)
+            if is_pli:
+                print("got pli")
+                continue
+
+            if encoded_frame:
+                asyncio.ensure_future(enqueue(encoded_frame), loop=loop)
+
+            # if not is_pli:
+            #     print("got pli")
+            #     continue
+
+            # if encoded_frame:
+            #     print("send frame")
+            #     asyncio.ensure_future(enqueue(encoded_frame), loop=loop)
 
             # async def enc():
             # remote_track

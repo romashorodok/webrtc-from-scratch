@@ -46,6 +46,7 @@ class RtpPacket:
         self.payload = payload
         self.padding_size = 0
         self.extensions = HeaderExtensions()
+        self._data: bytes | None = None
 
     def __repr__(self) -> str:
         return (
