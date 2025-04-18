@@ -120,7 +120,7 @@ impl DTLS {
             'l: loop {
                 select! {
                     _ = dtls.handshake_completed_successfully_watch_rx.changed() => {
-                        break;
+                        break 'l;
                     }
                 }
             }
