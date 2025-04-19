@@ -36,12 +36,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             workspace_path, src_path
         );
 
-        let mut maturin = Command::new("maturin");
-        maturin
+        let mut uv = Command::new("uv");
+
+        uv.arg("run")
+            .arg("maturin")
             .arg("develop")
             .arg("--skip-install")
+            .arg("--uv")
             .arg("--bindings=pyo3");
-        maturin.current_dir(workspace_path);
+        uv.current_dir(workspace_path);
 
         let (tx, rx) = std::sync::mpsc::channel();
         let mut debouncer = new_debouncer(Duration::from_secs(1), None, tx)?;
@@ -52,10 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for result in rx {
             match result {
                 Ok(_) => {
-                    let mut cmd = maturin
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()?;
+                    let mut cmd = uv.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
 
                     let stdout = cmd.stdout.take().expect("Failed to capture stdout");
                     let stderr = cmd.stderr.take().expect("Failed to capture stderr");
