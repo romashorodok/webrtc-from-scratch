@@ -24,11 +24,6 @@ eventloop = { workspace = true }
 
 [tool.uv]
 config-settings = { build-args = '--profile=dev' }
-# cache-keys = [
-#     {file = "pyproject.toml"},
-#     {file = "rust/Cargo.toml"},
-#     {file = "**/*.rs"},
-# ]
 
 [build-system]
 requires = ["setuptools>=61"]
