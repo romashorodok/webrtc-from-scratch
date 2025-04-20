@@ -4,7 +4,7 @@ from enum import StrEnum
 import secrets
 import string
 
-import native
+import webrtc_rs
 
 from . import ice
 from .ice import net
@@ -304,7 +304,7 @@ class PeerConnection(AsyncEventEmitter):
         self.__loop = asyncio.get_running_loop()
         self.gatherer = ICEGatherer()
 
-        self.__certificate = native.Certificate()
+        self.__certificate = webrtc_rs.Certificate()
         self._dtls_transport = dtls.DTLSTransport(self.__certificate)
         self.__media_fingerprints = list[dtls.Fingerprint]()
 

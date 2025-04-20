@@ -7,7 +7,7 @@ from enum import Enum
 import threading
 from typing import Any, Callable, Coroutine, Protocol
 
-import native
+import webrtc_rs
 
 from . import media
 from .utils import impl_protocol
@@ -446,21 +446,21 @@ class TrackRemote:
         self.rtx_ssrc = rtx_ssrc
         self.rid = rid
 
-        self.__stream: native.Stream | None = None
+        self.__stream: webrtc_rs.Stream | None = None
         self.__queue = asyncio.Queue[bytes]()
 
     async def recv(self) -> bytes:
         return await self.stream.recv()
 
     @property
-    def stream(self) -> native.Stream:
+    def stream(self) -> webrtc_rs.Stream:
         if not self.__stream:
             raise ValueError("Unable get stream")
 
         return self.__stream
 
     @stream.setter
-    def stream(self, value: native.Stream):
+    def stream(self, value: webrtc_rs.Stream):
         self.__stream = value
 
         # self._rtp_packet_queue = queue.Queue[media.RtpPacket]()

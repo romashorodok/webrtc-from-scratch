@@ -9,6 +9,9 @@ dependencies = [
     "webrtc_rs",
     "eventloop",
 ]
+authors = [
+    { name = "romashorodok", email = "108732029+romashorodok@users.noreply.github.com" }
+]
 
 [tool.uv.workspace]
 members = [
@@ -21,6 +24,11 @@ eventloop = { workspace = true }
 
 [tool.uv]
 config-settings = { build-args = '--profile=dev' }
+# cache-keys = [
+#     {file = "pyproject.toml"},
+#     {file = "rust/Cargo.toml"},
+#     {file = "**/*.rs"},
+# ]
 
 [build-system]
 requires = ["setuptools>=61"]
@@ -30,9 +38,6 @@ build-backend = "setuptools.build_meta"
 include = ["webrtc*", "packages*"]
 
 [tool.maturin]
-module-name = "native"
-manifest-path = "rust/Cargo.toml"
+module-name = "builder"
 bindings = "pyo3"
 features = ["pyo3/extension-module"]
-python-packages = ["webrtc", "native"]
-python-source = "src"

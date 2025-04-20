@@ -3,10 +3,13 @@ import binascii
 from enum import Enum
 from typing import Protocol
 
-from OpenSSL import SSL
-from pylibsrtp import Policy, Session
+# from OpenSSL import SSL
+# from pylibsrtp import Policy, Session
 
-import native
+# import native
+
+import webrtc_rs
+
 from webrtc import dtls, ice
 from webrtc.dtls.dtls_cipher_suite import Keypair
 from webrtc.dtls.dtls_record import RecordLayer, RecordLayerBatch, is_dtls_record_layer
@@ -14,12 +17,12 @@ from webrtc.dtls.flight_state import Flight
 from webrtc.dtls.fsm import DTLSConn
 from webrtc.ice import net
 
-from .certificate import (
-    SRTPProtectionProfile,
-    Certificate,
-    Fingerprint,
-    SRTP_PROFILES,
-)
+# from .certificate import (
+#     SRTPProtectionProfile,
+#     Certificate,
+#     Fingerprint,
+#     SRTP_PROFILES,
+# )
 
 
 class DTLSRole(Enum):
@@ -51,16 +54,16 @@ class DTLSLocal:
 class DTLSTransport:
     def __init__(
         self,
-        certificate: native.Certificate,
+        certificate: webrtc_rs.Certificate,
         # transport: ICETransportDTLS,
         # certificate: Certificate,
     ) -> None:
         self.__cert = certificate
-        self.__dtls: native.DTLS | None = None
+        self.__dtls: webrtc_rs.DTLS | None = None
 
         self.__srtp_rtp_lock = asyncio.Event()
-        self._srtp_rtp: native.SRTP | None = None
-        self.__srtp_rtcp: native.SRTP | None = None
+        self._srtp_rtp: webrtc_rs.SRTP | None = None
+        self.__srtp_rtcp: webrtc_rs.SRTP | None = None
 
         self.__loop = asyncio.get_running_loop()
 
@@ -229,7 +232,7 @@ class DTLSTransport:
         is_client = True if role == DTLSRole.Client else False
 
         if not self.__dtls:
-            self.__dtls = native.DTLS(
+            self.__dtls = webrtc_rs.DTLS(
                 is_client,
                 self.__cert,
                 4,
@@ -241,7 +244,7 @@ class DTLSTransport:
         async def on_handshake_success():
             await _dtls.handshake_success()
             print("Handshake done success")
-            self._srtp_rtp = native.SRTP(
+            self._srtp_rtp = webrtc_rs.SRTP(
                 is_rtp=True,
                 client=is_client,
                 dtls=_dtls,
@@ -313,7 +316,7 @@ class DTLSTransport:
         #
         # return len(data)
 
-    async def srtp_rtp_stream(self, ssrc: int) -> native.Stream:
+    async def srtp_rtp_stream(self, ssrc: int) -> webrtc_rs.Stream:
         await self.__srtp_rtp_lock.wait()
         if not self._srtp_rtp:
             raise ValueError("SRTP must be started to get the stream")
