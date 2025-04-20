@@ -17,6 +17,7 @@ struct Certificate {
     cert: crypto::Certificate,
 }
 
+
 #[pymethods]
 impl Certificate {
     #[new]

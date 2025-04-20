@@ -885,6 +885,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eventloop"
+version = "0.1.0"
+dependencies = [
+ "pyo3",
+ "pyo3-async-runtimes",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2694,6 +2702,14 @@ dependencies = [
  "tokio",
  "tokio-test",
  "winapi",
+]
+
+[[package]]
+name = "webrtc_rs"
+version = "0.1.0"
+dependencies = [
+ "pyo3",
+ "pyo3-async-runtimes",
 ]
 
 [[package]]

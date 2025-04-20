@@ -6,19 +6,28 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "maturin>=1.8.3",
+    "webrtc_rs",
+    "eventloop",
 ]
 
+[tool.uv.workspace]
+members = [
+    "packages/*",
+]
+
+[tool.uv.sources]
+webrtc_rs = { workspace = true }
+eventloop = { workspace = true }
+
 [tool.uv]
-# cache-keys = [
-#     {file = "pyproject.toml"},
-#     {file = "rust/Cargo.toml"},
-#     {file = "**/*.rs"},
-# ]
 config-settings = { build-args = '--profile=dev' }
 
 [build-system]
-requires = ["maturin>=1.0,<2.0"]
-build-backend = "maturin"
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["webrtc*", "packages*"]
 
 [tool.maturin]
 module-name = "native"

@@ -1,0 +1,21 @@
+[project]
+name = "eventloop"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "romashorodok", email = "108732029+romashorodok@users.noreply.github.com" }
+]
+requires-python = ">=3.13"
+dependencies = []
+
+[tool.maturin]
+module-name = "eventloop._core"
+python-packages = ["eventloop"]
+python-source = "src"
+features = ["pyo3/extension-module"]
+
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"

@@ -2,6 +2,18 @@ version = 1
 revision = 1
 requires-python = ">=3.13"
 
+[manifest]
+members = [
+    "eventloop",
+    "webrtc",
+    "webrtc-rs",
+]
+
+[[package]]
+name = "eventloop"
+version = "0.1.0"
+source = { editable = "packages/eventloop" }
+
 [[package]]
 name = "maturin"
 version = "1.8.3"
@@ -27,8 +39,19 @@ name = "webrtc"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "eventloop" },
     { name = "maturin" },
+    { name = "webrtc-rs" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "maturin", specifier = ">=1.8.3" }]
+requires-dist = [
+    { name = "eventloop", editable = "packages/eventloop" },
+    { name = "maturin", specifier = ">=1.8.3" },
+    { name = "webrtc-rs", editable = "packages/webrtc_rs" },
+]
+
+[[package]]
+name = "webrtc-rs"
+version = "0.1.0"
+source = { editable = "packages/webrtc_rs" }

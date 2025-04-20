@@ -1,4 +1,10 @@
 
+sync:
+	@uv sync --all-extras --dev --all-packages
+
+build:
+	@uv build --all
+
 build:
 	uv run maturin develop --skip-install --uv
 
