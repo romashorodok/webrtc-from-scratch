@@ -39,6 +39,16 @@ docker compose up
 cd web && npm install && npm run dev
 ```
 
+### UV
+```bash
+uv init --package packages/webrtc_rs --lib --build-backend maturin
+```
+
+Add remote repo from git:
+```bash
+uv add --editable git+https://github.com/romashorodok/webrtc-from-scratch/tree/main/examples
+```
+
 ## Architecture
 ![](./docs/architecture_sendrecv.png)
 

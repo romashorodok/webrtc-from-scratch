@@ -7,11 +7,16 @@ authors = [
     { name = "romashorodok", email = "108732029+romashorodok@users.noreply.github.com" }
 ]
 requires-python = ">=3.13"
-dependencies = []
-
-[project.scripts]
-examples = "examples:main"
+dependencies = [
+    "fastapi>=0.115.12",
+    "uvicorn[standard]>=0.34.2",
+    "watchfiles>=1.0.5",
+    "webrtc",
+]
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv.sources]
+webrtc = { path = "../", editable = true }

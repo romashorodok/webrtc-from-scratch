@@ -5,7 +5,7 @@ import time
 from typing import Any, Callable
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from native import SRTP
+from webrtc_rs import SRTP
 from webrtc import media
 from webrtc.media.jitterbuffer import JitterBuffer, JitterFrame
 from webrtc.media.vp8_payloader import vp8_depayload
