@@ -389,13 +389,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "builder"
-version = "0.1.0"
-dependencies = [
- "notify-debouncer-full",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -882,6 +875,14 @@ checksum = "3c3e4e0dd3673c1139bf041f3008816d9cf2946bbfac2945c09e523b8d7b05b2"
 dependencies = [
  "event-listener",
  "pin-project-lite",
+]
+
+[[package]]
+name = "eventloop"
+version = "0.1.0"
+dependencies = [
+ "pyo3",
+ "pyo3-async-runtimes",
 ]
 
 [[package]]
@@ -1405,20 +1406,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "native"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "pyo3",
- "pyo3-async-runtimes",
- "rtp",
- "tokio",
- "webrtc-dtls",
- "webrtc-srtp",
- "webrtc-util",
 ]
 
 [[package]]
@@ -2644,7 +2631,7 @@ dependencies = [
 name = "webrtc-from-scratch"
 version = "0.1.0"
 dependencies = [
- "p256",
+ "notify-debouncer-full",
 ]
 
 [[package]]
@@ -2694,6 +2681,20 @@ dependencies = [
  "tokio",
  "tokio-test",
  "winapi",
+]
+
+[[package]]
+name = "webrtc_rs"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "rtp",
+ "tokio",
+ "webrtc-dtls",
+ "webrtc-srtp",
+ "webrtc-util",
 ]
 
 [[package]]

@@ -1,24 +1,22 @@
-[tool.poetry]
+[project]
 name = "examples"
 version = "0.1.0"
-description = ""
-authors = ["romashorodok <108732029+romashorodok@users.noreply.github.com>"]
+description = "Add your description here"
 readme = "README.md"
-
-[tool.poetry.dependencies]
-python = "^3.13"
-webrtc = { path = "./..", develop = true }
-fastapi = "^0.115.5"
-gunicorn = "^23.0.0"
-uvicorn = "^0.32.0"
-hypercorn = {extras = ["trio"], version = "^0.17.3"}
-starlette = "^0.41.3"
-watchfiles = "^1.0.4"
-
-
-[tool.poetry.group.dev.dependencies]
-ruff = "^0.5.3"
+authors = [
+    { name = "romashorodok", email = "108732029+romashorodok@users.noreply.github.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115.12",
+    "uvicorn[standard]>=0.34.2",
+    "watchfiles>=1.0.5",
+    "webrtc",
+]
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv.sources]
+webrtc = { path = "../", editable = true }

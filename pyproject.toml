@@ -1,40 +1,39 @@
-[tool.poetry]
+[project]
 name = "webrtc"
 version = "0.1.0"
-description = ""
-authors = ["romashorodok <108732029+romashorodok@users.noreply.github.com>"]
+description = "Add your description here"
 readme = "README.md"
-packages = [
-  {include = "webrtc", from = "src"},
-  {include = "tests", from = "src"},
-  {include = "native", from = "src"}
+requires-python = ">=3.13"
+dependencies = [
+    "maturin>=1.8.3",
+    "webrtc_rs",
+    "eventloop",
+    "psutil>=7.0.0",
+]
+authors = [
+    { name = "romashorodok", email = "108732029+romashorodok@users.noreply.github.com" }
 ]
 
-[tool.poetry.dependencies]
-python = "^3.13"
-psutil = "^6.0.0"
-cryptography = "44.0.0"
-pyopenssl = "^24.1.0"
-pylibsrtp = "^0.10.0"
-asn1crypto = "^1.5.1"
-starkbank-ecdsa = "^2.2.0"
-pycryptodome = "^3.21.0"
-ecdsa = "^0.19.0"
-pytest = "^8.3.4"
-maturin = "^1.8.1"
+[tool.uv.workspace]
+members = [
+    "packages/*",
+]
 
-[tool.poetry.group.dev.dependencies]
-ruff = "^0.5.3"
+[tool.uv.sources]
+webrtc_rs = { workspace = true }
+eventloop = { workspace = true }
 
-[tool.maturin]
-python-source = "src"
-features = ["pyo3/extension-module"]
-module-name = "native.native"
-
-# [build-system]
-# requires = ["maturin>=1.8,<2.0"]
-# build-backend = "maturin"
+[tool.uv]
+config-settings = { build-args = '--profile=dev' }
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["webrtc*", "packages*"]
+
+[tool.maturin]
+module-name = "builder"
+bindings = "pyo3"
+features = ["pyo3/extension-module"]
