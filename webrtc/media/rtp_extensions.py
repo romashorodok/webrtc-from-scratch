@@ -227,12 +227,16 @@ DEFAULT_EXT_MAP.configure(
     RTCRtpParameters(
         [
             RTCRtpHeaderExtensionParameters(
-                id=1, uri="urn:ietf:params:rtp-hdrext:sdes:mid"
-            ),
-            RTCRtpHeaderExtensionParameters(
-                id=3,
-                uri="http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time",
-            ),
+                id=1,
+                uri="http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01",
+            )
+            # RTCRtpHeaderExtensionParameters(
+            #     id=1, uri="urn:ietf:params:rtp-hdrext:sdes:mid"
+            # ),
+            # RTCRtpHeaderExtensionParameters(
+            #     id=3,
+            #     uri="http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time",
+            # ),
         ]
     )
 )

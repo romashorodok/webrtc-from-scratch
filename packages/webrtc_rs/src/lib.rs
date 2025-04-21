@@ -172,6 +172,17 @@ impl Stream {
             Ok(data)
         })
     }
+
+     fn recv_rtcp<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+            let stream = self.stream.clone();
+            pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                let stream = stream.lock().await.clone();
+                let mut buf = vec![0u8; 1300];
+                let pkt = stream.read_rtcp(&mut buf).await.unwrap();
+
+                Ok(pkt.to_vec())
+            })
+        }
  }
 
 #[pyclass]
