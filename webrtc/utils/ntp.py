@@ -1,5 +1,6 @@
 import datetime
 
+
 NTP_EPOCH = datetime.datetime(1900, 1, 1, tzinfo=datetime.timezone.utc)
 
 

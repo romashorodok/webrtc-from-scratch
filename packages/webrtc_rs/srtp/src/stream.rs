@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use tokio::sync::mpsc;
 use util::marshal::*;
 use util::Buffer;
@@ -68,10 +69,7 @@ impl Stream {
     }
 
     /// read_rtcp reads and decrypts full RTP packet and its header from the nextConn
-    pub async fn read_rtcp(
-        &self,
-        buf: &mut [u8],
-    ) -> Result<Vec<Box<dyn rtcp::packet::Packet + Send + Sync>>> {
+    pub async fn read_rtcp(&self, buf: &mut [u8]) -> Result<Bytes> {
         if self.is_rtp {
             return Err(Error::InvalidRtcpStream);
         }
@@ -80,7 +78,7 @@ impl Stream {
         let mut b = &buf[..n];
         let pkt = rtcp::packet::unmarshal(&mut b)?;
 
-        Ok(pkt)
+        Ok(rtcp::packet::marshal(&pkt)?)
     }
 
     /// Close removes the ReadStream from the session and cleans up any associated state

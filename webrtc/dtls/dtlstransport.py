@@ -62,8 +62,10 @@ class DTLSTransport:
         self.__dtls: webrtc_rs.DTLS | None = None
 
         self.__srtp_rtp_lock = asyncio.Event()
+        self.__srtp_rtcp_lock = asyncio.Event()
+
         self._srtp_rtp: webrtc_rs.SRTP | None = None
-        self.__srtp_rtcp: webrtc_rs.SRTP | None = None
+        self._srtp_rtcp: webrtc_rs.SRTP | None = None
 
         self.__loop = asyncio.get_running_loop()
 
@@ -250,6 +252,12 @@ class DTLSTransport:
                 dtls=_dtls,
             )
             self.__srtp_rtp_lock.set()
+            self._srtp_rtcp = webrtc_rs.SRTP(
+                is_rtp=False,
+                client=is_client,
+                dtls=_dtls,
+            )
+            self.__srtp_rtcp_lock.set()
 
         self.__loop.create_task(on_handshake_success())
 
@@ -282,45 +290,33 @@ class DTLSTransport:
         # asyncio.ensure_future(self.do_handshake_for(pair, media_fingerprints))
         pass
 
-    def write_rtcp_bytes(self, transport: ICETransportDTLS, data: bytes) -> int:
-        # if not ice.net.is_rtcp(pkt.data):
-        #     return 0
-        #
-        # if not self._tx_srtp:
-        #     return 0
-        # data = self._tx_srtp.protect_rtcp(pkt.data)
-        # return len(data)
-        print("TODO: Handle rtcp")
-        return 0
-
     async def encrypt_rtp_bytes(self, data: bytes):
         if srtp := self._srtp_rtp:
             await srtp.encrypt(data)
+
+    async def write_rtcp_bytes(self, data: bytes) -> int:
+        await self.__srtp_rtcp_lock.wait()
+        if srtp := self._srtp_rtcp:
+            await srtp.write_pkt(data)
+        return 0
 
     async def write_rtp_bytes(self, data: bytes) -> int:
         """Enqueue the encrypted packet into srtp session and then deliver decoded packet into own SSRC stream."""
         if srtp := self._srtp_rtp:
             await srtp.write_pkt(data)
-
         return 0
-
-        # if not self.__tx_srtp:
-        #     return 0
-        #
-        # transport = await self.__transport.get_ice_pair_transport()
-        # if not transport:
-        #     return 0
-        #
-        # data = self.__tx_srtp.protect(data)
-        # transport.sendto(data)
-        #
-        # return len(data)
 
     async def srtp_rtp_stream(self, ssrc: int) -> webrtc_rs.Stream:
         await self.__srtp_rtp_lock.wait()
         if not self._srtp_rtp:
             raise ValueError("SRTP must be started to get the stream")
         return await self._srtp_rtp.ssrc_stream(ssrc)
+
+    async def srtp_rtcp_stream(self, ssrc: int) -> webrtc_rs.Stream:
+        await self.__srtp_rtcp_lock.wait()
+        if not self._srtp_rtcp:
+            raise ValueError("SRTP must be started to get the stream")
+        return await self._srtp_rtcp.ssrc_stream(ssrc)
 
     async def read_rtp_bytes(self) -> tuple[bytes, int]:
         if srtp := self._srtp_rtp:

@@ -252,8 +252,6 @@ def set_default_caps(caps: MediaCaps):
         RTPCodecKind.Audio,
     )
 
-    nack_pli = RTCPFeedback(rtcp_type="nack", parameter="pli")
-    remb = RTCPFeedback(rtcp_type="goog-remb", parameter="")
     vp8 = RTPCodecParameters(
         mime_type="video/VP8",
         clock_rate=90000,
@@ -264,8 +262,18 @@ def set_default_caps(caps: MediaCaps):
         stats_id=f"RTPCodec-{current_ntp_time() >> 32}",
     )
 
-    vp8.rtcp_feedbacks.append(nack_pli)
-    vp8.rtcp_feedbacks.append(remb)
+    receiver_report = RTCPFeedback(rtcp_type="rrtr", parameter="")
+    twcc = RTCPFeedback(rtcp_type="transport-cc", parameter="")
+    extended_reports_round_trip_time = RTCPFeedback(rtcp_type="ccm", parameter="fir")
+
+    vp8.rtcp_feedbacks.append(twcc)
+    vp8.rtcp_feedbacks.append(receiver_report)
+    vp8.rtcp_feedbacks.append(extended_reports_round_trip_time)
+
+    # nack_pli = RTCPFeedback(rtcp_type="nack", parameter="pli")
+    # remb = RTCPFeedback(rtcp_type="goog-remb", parameter="")
+    # vp8.rtcp_feedbacks.append(nack_pli)
+    # vp8.rtcp_feedbacks.append(remb)
 
     caps.register_codec(vp8, RTPCodecKind.Video)
 

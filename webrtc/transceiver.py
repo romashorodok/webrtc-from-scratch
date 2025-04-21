@@ -372,6 +372,7 @@ class RTPSender:
         self._track: TrackLocal | None = None
         self.__transport: dtls.DTLSTransport | None = None
         self.__transport_lock = asyncio.Lock()
+        self._rtcp_stream: webrtc_rs.Stream | None = None
 
     async def bind(self, transport: dtls.DTLSTransport):
         async with self.__transport_lock:
@@ -654,6 +655,10 @@ class RTPTransceiver:
             # TODO: actual rust impl of srtp don't have the write api, encryption the Session
             stream = await self.__dtls.srtp_rtp_stream(encoding.ssrc)
             print(f"SSRC {encoding.ssrc} Local Sender | Done stream", stream)
+
+            stream = await self.__dtls.srtp_rtcp_stream(encoding.ssrc)
+            print(f"SSRC {encoding.ssrc} Local Sender | Done srtcp stream", stream)
+            self._sender._rtcp_stream = stream
             # encoding.stream = stream
 
         if self._receiver and self._receiver.track:

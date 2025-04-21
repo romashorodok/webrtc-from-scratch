@@ -18,6 +18,31 @@ from .peer_connection_types import (
 )
 
 
+class ExtMap:
+    def __init__(
+        self,
+        value: int,
+        direction: RTPTransceiverDirection | None = None,
+        uri: str | None = None,
+        ext_attr: str | None = None,
+    ) -> None:
+        self.value = value
+        self.direction = direction
+        self.uri = uri
+        self.ext_attr = ext_attr
+
+    def marshal(self) -> str:
+        out = f"extmap:{self.value}"
+
+        if self.uri:
+            out += f" {self.uri}"
+
+        if self.ext_attr:
+            out += f" {self.ext_attr}"
+
+        return out
+
+
 class MediaSection:
     def __init__(
         self,
@@ -166,16 +191,21 @@ def add_transceiver_media_description(
 
     media.direction = t.direction
 
-    # ext_map_stub = [
-    #     ExtMap(value=1, uri="urn:ietf:params:rtp-hdrext:sdes:mid"),
-    #     ExtMap(
-    #         value=3, uri="http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
-    #     ),
-    # ]
+    ext_maps = [
+        ExtMap(
+            value=1,
+            uri="http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01",
+        )
+        #     ExtMap(value=2, uri="urn:ietf:params:rtp-hdrext:sdes:mid"),
+        #     ExtMap(
+        #         value=3, uri="http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
+        #     ),
+    ]
     # negotiated_parameters = caps.get_rtp_parameters_by_kind(t.kind, directions)
     # for rtp_ext in negotiated_parameters.header_extensions:
-    # for rtp_ext in ext_map_stub:
-    #     media.add_attribute(SessionDescriptionAttr(rtp_ext.marshal()))
+
+    for rtp_ext in ext_maps:
+        media.add_attribute(SessionDescriptionAttr(rtp_ext.marshal()))
 
     if RTPTransceiverDirection.Recvonly in directions:
         media.add_attribute(
