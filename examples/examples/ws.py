@@ -51,6 +51,37 @@ async def pre_read_frames(file_path: str):
 twcc_seq = Sequencer()
 
 
+class SendTimeCache:
+    def __init__(self, max_age_seconds=5):
+        self.cache = dict[int, float]()  # seq -> (send_time)
+        self.queue = deque[tuple[int, float]]()
+        self.max_age = max_age_seconds
+
+    def add(self, sequence_number: int, send_time: float | None = None):
+        if send_time is None:
+            send_time = time.monotonic()
+            # send_time = time.time()
+
+        self.cache[sequence_number] = send_time
+        self.queue.append((sequence_number, send_time))
+        self._prune()
+
+    def get(self, sequence_number: int):
+        return self.cache.get(sequence_number)
+
+    def _prune(self):
+        """Drop old entries based on age."""
+        # now = time.time()
+        now = time.monotonic()
+        while self.queue:
+            seq, ts = self.queue[0]
+            if now - ts > self.max_age:
+                self.queue.popleft()
+                self.cache.pop(seq, None)
+            else:
+                break
+
+
 def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
     rw_loop = asyncio.new_event_loop()
 
@@ -70,6 +101,8 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
     ms = 1000
     ssrc = encoding.ssrc
 
+    send_time_cache = SendTimeCache()
+
     async def rtcp_handler():
         while True:
             try:
@@ -88,7 +121,43 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
                 pkts = RtcpPacket.parse(rtcp)
                 for feedback in pkts:
                     if isinstance(feedback, TransportLayerCC):
-                        print(feedback)
+                        seq = feedback.base_sequence_number
+                        arrival_times = []
+                        base_time_us = (
+                            feedback.reference_time * 64_000
+                        )  # 64ms = 64,000µs
+
+                        for delta in feedback.recv_deltas:
+                            send_time = send_time_cache.get(seq)
+                            assert send_time
+                            # print(
+                            #     f"Seq {seq}: send_time={send_time}, delta={delta},"
+                            #     f"cache={send_time_cache.cache}"
+                            # )
+                            base_time_us += delta.delta  # microseconds
+                            arrival_time = (
+                                base_time_us / 1_000_000
+                            )  # convert to seconds (optional)
+
+                            delay = max(0.0, arrival_time - send_time)
+
+                            # For metrics, apply a moving average or EWMA filter to absorb jitter.
+                            # EWMA with an alpha of 0.1 gives 90% weight to the previous value and 10% to the new value, making the delay more responsive.
+                            alpha = 0.1
+                            smoothed_delay = (
+                                alpha * delay + (1 - alpha) * smoothed_delay
+                                if "smoothed_delay" in locals()
+                                else delay
+                            )
+
+                            # Print delay in milliseconds for debugging
+                            print(f"Seq {seq}: delay = {smoothed_delay * 1000:.3f} ms")
+                            # delay = arrival_time - send_time
+                            # print("delay", delay)
+                            # print(f"Seq {seq}: delay = {delay * 1000:.3f} ms")
+
+                            arrival_times.append(arrival_time)
+                            seq += 1
 
             except Exception as e:
                 print("rtcp error", e)
@@ -121,9 +190,9 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
                 pkt.extensions.transport_sequence_number = (
                     twcc_seq.next_sequence_number()
                 )
-                print("send sequence number", pkt.extensions.transport_sequence_number)
                 enc = await srtp.encrypt_nonblock(pkt.serialize(DEFAULT_EXT_MAP))
                 assert pc._transport
+                send_time_cache.add(pkt.extensions.transport_sequence_number)
                 pc._transport.sendto(enc)
 
     rw_loop.create_task(rtcp_handler())
