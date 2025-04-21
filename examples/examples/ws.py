@@ -12,10 +12,8 @@ from webrtc import media
 from webrtc.media.jitterbuffer import JitterBuffer, JitterFrame
 from webrtc.media.packetizer import Sequencer
 from webrtc.media.rtcp import (
-    RTCP_PSFB_APP,
     RtcpPacket,
-    RtcpPsfbPacket,
-    unpack_remb_fci,
+    TransportLayerCC,
 )
 from webrtc.media.rtp_extensions import DEFAULT_EXT_MAP
 from webrtc.media.vp8_payloader import vp8_depayload
@@ -53,35 +51,6 @@ async def pre_read_frames(file_path: str):
 twcc_seq = Sequencer()
 
 
-class SendTimeCache:
-    def __init__(self, max_age_seconds=5):
-        self.cache = dict[int, float]()  # seq -> (send_time)
-        self.queue = deque[tuple[int, float]]()
-        self.max_age = max_age_seconds
-
-    def add(self, sequence_number: int, send_time: float):
-        if send_time is None:
-            send_time = time.time()
-
-        self.cache[sequence_number] = send_time
-        self.queue.append((sequence_number, send_time))
-        self._prune()
-
-    def get(self, sequence_number: int):
-        return self.cache.get(sequence_number)
-
-    def _prune(self):
-        """Drop old entries based on age."""
-        now = time.time()
-        while self.queue:
-            seq, ts = self.queue[0]
-            if now - ts > self.max_age:
-                self.queue.popleft()
-                self.cache.pop(seq, None)
-            else:
-                break
-
-
 def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
     rw_loop = asyncio.new_event_loop()
 
@@ -101,8 +70,6 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
     ms = 1000
     ssrc = encoding.ssrc
 
-    send_time_cache = SendTimeCache()
-
     async def rtcp_handler():
         while True:
             try:
@@ -120,10 +87,8 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
                 rtcp = await stream.recv_rtcp()
                 pkts = RtcpPacket.parse(rtcp)
                 for feedback in pkts:
-                    if isinstance(feedback, RtcpPsfbPacket):
-                        if feedback.fmt == RTCP_PSFB_APP:
-                            print("got twcc", feedback)
-                            pass
+                    if isinstance(feedback, TransportLayerCC):
+                        print(feedback)
 
             except Exception as e:
                 print("rtcp error", e)
@@ -153,10 +118,10 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
             )
 
             for pkt in pkts:
-                send_time_cache.add(pkt.sequence_number, time.perf_counter())
                 pkt.extensions.transport_sequence_number = (
                     twcc_seq.next_sequence_number()
                 )
+                print("send sequence number", pkt.extensions.transport_sequence_number)
                 enc = await srtp.encrypt_nonblock(pkt.serialize(DEFAULT_EXT_MAP))
                 assert pc._transport
                 pc._transport.sendto(enc)

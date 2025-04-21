@@ -1,9 +1,8 @@
-import math
-import os
 import struct
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from struct import pack, unpack, unpack_from
-from typing import Any, Optional, Union
+from typing import List, Self, Union
 
 RTP_HISTORY_SIZE = 128
 
@@ -17,12 +16,8 @@ RTCP_HEADER_LENGTH = 4
 PACKETS_LOST_MIN = -(1 << 23)
 PACKETS_LOST_MAX = (1 << 23) - 1
 
-RTCP_SR = 200
-RTCP_RR = 201
-RTCP_SDES = 202
 RTCP_BYE = 203
 RTCP_RTPFB = 205
-RTCP_PSFB = 206
 
 RTCP_RTPFB_NACK = 1
 
@@ -49,113 +44,6 @@ def pack_rtcp_packet(packet_type: int, count: int, payload: bytes) -> bytes:
     return pack("!BBH", (2 << 6) | count, packet_type, len(payload) // 4) + payload
 
 
-def pack_remb_fci(bitrate: int, ssrcs: list[int]) -> bytes:
-    """
-    Pack the FCI for a Receiver Estimated Maximum Bitrate report.
-
-    https://tools.ietf.org/html/draft-alvestrand-rmcat-remb-03
-    """
-    data = b"REMB"
-    exponent = 0
-    mantissa = bitrate
-    while mantissa > 0x3FFFF:
-        mantissa >>= 1
-        exponent += 1
-    data += pack(
-        "!BBH", len(ssrcs), (exponent << 2) | (mantissa >> 16), (mantissa & 0xFFFF)
-    )
-    for ssrc in ssrcs:
-        data += pack("!L", ssrc)
-    return data
-
-
-def unpack_remb_fci(data: bytes) -> tuple[int, list[int]]:
-    """
-    Unpack the FCI for a Receiver Estimated Maximum Bitrate report.
-
-    https://tools.ietf.org/html/draft-alvestrand-rmcat-remb-03
-    """
-    if len(data) < 8 or data[0:4] != b"REMB":
-        raise ValueError("Invalid REMB prefix")
-
-    exponent = (data[5] & 0xFC) >> 2
-    mantissa = ((data[5] & 0x03) << 16) | (data[6] << 8) | data[7]
-    bitrate = mantissa << exponent
-
-    pos = 8
-    ssrcs = []
-    for r in range(data[4]):
-        ssrcs.append(unpack_from("!L", data, pos)[0])
-        pos += 4
-
-    return (bitrate, ssrcs)
-
-
-@dataclass
-class RtcpReceiverInfo:
-    ssrc: int
-    fraction_lost: int
-    packets_lost: int
-    highest_sequence: int
-    jitter: int
-    lsr: int
-    dlsr: int
-
-    def __bytes__(self) -> bytes:
-        data = pack("!LB", self.ssrc, self.fraction_lost)
-        data += pack_packets_lost(self.packets_lost)
-        data += pack("!LLLL", self.highest_sequence, self.jitter, self.lsr, self.dlsr)
-        return data
-
-    @classmethod
-    def parse(cls, data: bytes):
-        ssrc, fraction_lost = unpack("!LB", data[0:5])
-        packets_lost = unpack_packets_lost(data[5:8])
-        highest_sequence, jitter, lsr, dlsr = unpack("!LLLL", data[8:])
-        return cls(
-            ssrc=ssrc,
-            fraction_lost=fraction_lost,
-            packets_lost=packets_lost,
-            highest_sequence=highest_sequence,
-            jitter=jitter,
-            lsr=lsr,
-            dlsr=dlsr,
-        )
-
-
-@dataclass
-class RtcpSenderInfo:
-    ntp_timestamp: int
-    rtp_timestamp: int
-    packet_count: int
-    octet_count: int
-
-    def __bytes__(self) -> bytes:
-        return pack(
-            "!QLLL",
-            self.ntp_timestamp,
-            self.rtp_timestamp,
-            self.packet_count,
-            self.octet_count,
-        )
-
-    @classmethod
-    def parse(cls, data: bytes):
-        ntp_timestamp, rtp_timestamp, packet_count, octet_count = unpack("!QLLL", data)
-        return cls(
-            ntp_timestamp=ntp_timestamp,
-            rtp_timestamp=rtp_timestamp,
-            packet_count=packet_count,
-            octet_count=octet_count,
-        )
-
-
-@dataclass
-class RtcpSourceInfo:
-    ssrc: int
-    items: list[tuple[Any, bytes]]
-
-
 @dataclass
 class RtcpByePacket:
     sources: list[int]
@@ -175,178 +63,231 @@ class RtcpByePacket:
         return cls(sources=sources)
 
 
-@dataclass
-class RtcpPsfbPacket:
-    """
-    Payload-Specific Feedback Message (RFC 4585).
-    """
+TypeTCCRunLengthChunk = 0
+TypeTCCStatusVectorChunk = 1
 
-    fmt: int
-    ssrc: int
+TypeTCCPacketNotReceived = 0
+TypeTCCPacketReceivedSmallDelta = 1
+TypeTCCPacketReceivedLargeDelta = 2
+TypeTCCPacketReceivedWithoutDelta = 3
+
+TypeTCCSymbolSizeOneBit = 0
+TypeTCCSymbolSizeTwoBit = 1
+
+TypeTCCDeltaScaleFactor = 250
+
+
+def set_n_bits_of_uint16(base: int, n: int, offset: int, val: int) -> int:
+    mask = ((1 << n) - 1) << (16 - offset - n)
+    return (base & ~mask) | ((val << (16 - offset - n)) & mask)
+
+
+def get_n_bits_from_byte(b: int, offset: int, length: int) -> int:
+    return (b >> (8 - offset - length)) & ((1 << length) - 1)
+
+
+class PacketStatusChunk(ABC):
+    @abstractmethod
+    def marshal(self) -> bytes:
+        pass
+
+    @abstractmethod
+    def unmarshal(self, raw: bytes):
+        pass
+
+
+class RunLengthChunk(PacketStatusChunk):
+    def __init__(self, packet_status_symbol=0, run_length=0):
+        self.type = TypeTCCRunLengthChunk
+        self.packet_status_symbol = packet_status_symbol
+        self.run_length = run_length
+
+    def marshal(self) -> bytes:
+        dst = set_n_bits_of_uint16(0, 1, 0, 0)
+        dst = set_n_bits_of_uint16(dst, 2, 1, self.packet_status_symbol)
+        dst = set_n_bits_of_uint16(dst, 13, 3, self.run_length)
+        return struct.pack(">H", dst)
+
+    def unmarshal(self, raw: bytes):
+        if len(raw) != 2:
+            raise ValueError("packet status chunk must be 2 bytes")
+        b0, b1 = raw[0], raw[1]
+        self.packet_status_symbol = get_n_bits_from_byte(b0, 1, 2)
+        self.run_length = ((b0 & 0x1F) << 8) | b1
+
+    def __repr__(self) -> str:
+        return f"RunLengthChunk: type:{self.type}, packet_status_symbol:{self.packet_status_symbol}, run_length:{self.run_length}"
+
+
+# TODO: not used why???
+class StatusVectorChunk(PacketStatusChunk):
+    def __init__(self):
+        self.type = TypeTCCStatusVectorChunk
+        self.symbol_size = 0
+        self.symbol_list = []
+
+    def marshal(self) -> bytes:
+        dst = set_n_bits_of_uint16(0, 1, 0, 1)
+        dst = set_n_bits_of_uint16(dst, 1, 1, self.symbol_size)
+        bits_per_symbol = 1 if self.symbol_size == TypeTCCSymbolSizeOneBit else 2
+        for i, sym in enumerate(self.symbol_list):
+            dst = set_n_bits_of_uint16(
+                dst, bits_per_symbol, 2 + i * bits_per_symbol, sym
+            )
+        return struct.pack(">H", dst)
+
+    def unmarshal(self, raw: bytes):
+        if len(raw) != 2:
+            raise ValueError("packet status chunk must be 2 bytes")
+        self.symbol_size = get_n_bits_from_byte(raw[0], 1, 1)
+        self.symbol_list = []
+        if self.symbol_size == TypeTCCSymbolSizeOneBit:
+            for i in range(6):
+                self.symbol_list.append(get_n_bits_from_byte(raw[0], 2 + i, 1))
+            for i in range(8):
+                self.symbol_list.append(get_n_bits_from_byte(raw[1], i, 1))
+        elif self.symbol_size == TypeTCCSymbolSizeTwoBit:
+            for i in range(3):
+                self.symbol_list.append(get_n_bits_from_byte(raw[0], 2 + i * 2, 2))
+            for i in range(4):
+                self.symbol_list.append(get_n_bits_from_byte(raw[1], i * 2, 2))
+        else:
+            raise ValueError("invalid symbol size")
+
+    def __repr__(self) -> str:
+        return f"StatusVectorChunk: type:{self.type}, symbol_size:{self.symbol_size}, symbol_list={self.symbol_list}"
+
+
+@dataclass
+class RecvDelta:
+    delta: int
+    delta_type: int
+    # def __init__(self, delta=0, delta_type=TypeTCCPacketReceivedSmallDelta):
+    #     self.delta = delta
+    #     self.type = delta_type
+
+    def marshal(self) -> bytes:
+        delta_units = self.delta // TypeTCCDeltaScaleFactor
+        if (
+            self.delta_type == TypeTCCPacketReceivedSmallDelta
+            and 0 <= delta_units <= 255
+        ):
+            return struct.pack(">B", delta_units)
+        elif (
+            self.delta_type == TypeTCCPacketReceivedLargeDelta
+            and -32768 <= delta_units <= 32767
+        ):
+            return struct.pack(">h", delta_units)
+        else:
+            raise ValueError("delta exceeds limit")
+
+    @classmethod
+    def unmarshal(cls, raw: bytes) -> Self:
+        if len(raw) == 1:
+            type = TypeTCCPacketReceivedSmallDelta
+            delta = raw[0] * TypeTCCDeltaScaleFactor
+        elif len(raw) == 2:
+            type = TypeTCCPacketReceivedLargeDelta
+            delta = struct.unpack(">h", raw)[0] * TypeTCCDeltaScaleFactor
+        else:
+            raise ValueError("invalid delta length")
+
+        return cls(delta, type)
+
+
+@dataclass
+class TransportLayerCC:
+    sender_ssrc: int
     media_ssrc: int
-    fci: bytes = b""
+    base_sequence_number: int
+    packet_status_count: int
+    reference_time: int
+    fb_pkt_count: int
+    packet_chunks: List[PacketStatusChunk] = field(default_factory=list)
+    recv_deltas: List[RecvDelta] = field(default_factory=list)
 
-    def __bytes__(self) -> bytes:
-        payload = pack("!LL", self.ssrc, self.media_ssrc) + self.fci
-        return pack_rtcp_packet(RTCP_PSFB, self.fmt, payload)
+    def marshal(self) -> bytes:
+        header = bytearray(20)
+        struct.pack_into(
+            ">BBHII",
+            header,
+            0,
+            (2 << 6) | 15,  # V=2, PT=15
+            205,  # FMT=15
+            0,  # Length (placeholder)
+            self.sender_ssrc,
+            self.media_ssrc,
+        )
+        struct.pack_into(">H", header, 8, self.base_sequence_number)
+        struct.pack_into(">H", header, 10, self.packet_status_count)
+        struct.pack_into(
+            ">I", header, 12, (self.reference_time << 8) | self.fb_pkt_count
+        )
 
-    @classmethod
-    def parse(cls, data: bytes, fmt: int):
-        if len(data) < 8:
-            raise ValueError("RTCP payload-specific feedback length is invalid")
+        chunks_bytes = b"".join(chunk.marshal() for chunk in self.packet_chunks)
+        deltas_bytes = b"".join(delta.marshal() for delta in self.recv_deltas)
 
-        ssrc, media_ssrc = unpack("!LL", data[0:8])
-        fci = data[8:]
-        return cls(fmt=fmt, ssrc=ssrc, media_ssrc=media_ssrc, fci=fci)
-
-
-@dataclass
-class RtcpRrPacket:
-    ssrc: int
-    reports: list[RtcpReceiverInfo] = field(default_factory=list)
-
-    def __bytes__(self) -> bytes:
-        payload = pack("!L", self.ssrc)
-        for report in self.reports:
-            payload += bytes(report)
-        return pack_rtcp_packet(RTCP_RR, len(self.reports), payload)
-
-    @classmethod
-    def parse(cls, data: bytes, count: int):
-        if len(data) != 4 + 24 * count:
-            raise ValueError("RTCP receiver report length is invalid")
-
-        ssrc = unpack("!L", data[0:4])[0]
-        pos = 4
-        reports = []
-        for r in range(count):
-            reports.append(RtcpReceiverInfo.parse(data[pos : pos + 24]))
-            pos += 24
-        return cls(ssrc=ssrc, reports=reports)
-
-
-@dataclass
-class RtcpRtpfbPacket:
-    """
-    Generic RTP Feedback Message (RFC 4585).
-    """
-
-    fmt: int
-    ssrc: int
-    media_ssrc: int
-
-    # generick NACK
-    lost: list[int] = field(default_factory=list)
-
-    def __bytes__(self) -> bytes:
-        payload = pack("!LL", self.ssrc, self.media_ssrc)
-        if self.lost:
-            pid = self.lost[0]
-            blp = 0
-            for p in self.lost[1:]:
-                d = p - pid - 1
-                if d < 16:
-                    blp |= 1 << d
-                else:
-                    payload += pack("!HH", pid, blp)
-                    pid = p
-                    blp = 0
-            payload += pack("!HH", pid, blp)
-        return pack_rtcp_packet(RTCP_RTPFB, self.fmt, payload)
+        padding = (4 - (len(chunks_bytes) + len(deltas_bytes)) % 4) % 4
+        packet = header + chunks_bytes + deltas_bytes + bytes(padding)
+        struct.pack_into(">H", packet, 2, (len(packet) // 4) - 1)  # Update Length field
+        return bytes(packet)
 
     @classmethod
-    def parse(cls, data: bytes, fmt: int):
-        if len(data) < 8 or len(data) % 4:
-            raise ValueError("RTCP RTP feedback length is invalid")
+    def unmarshal(cls, raw: bytes) -> Self:
+        if len(raw) < 20:
+            raise ValueError("packet too short")
 
-        ssrc, media_ssrc = unpack("!LL", data[0:8])
-        lost = []
-        for pos in range(8, len(data), 4):
-            pid, blp = unpack("!HH", data[pos : pos + 4])
-            lost.append(pid)
-            for d in range(0, 16):
-                if (blp >> d) & 1:
-                    lost.append(pid + d + 1)
-        return cls(fmt=fmt, ssrc=ssrc, media_ssrc=media_ssrc, lost=lost)
+        # TODO: media_ssrc has different numbers
+        sender_ssrc, media_ssrc = struct.unpack_from(">II", raw, 4)
+        base_sequence_number, packet_status_count = struct.unpack_from(">HH", raw, 8)
+        ref_time_and_count = struct.unpack_from(">I", raw, 12)[0]
 
+        reference_time = ref_time_and_count >> 8
+        fb_pkt_count = ref_time_and_count & 0xFF
 
-@dataclass
-class RtcpSdesPacket:
-    chunks: list[RtcpSourceInfo] = field(default_factory=list)
+        offset = 16
+        packet_chunks = []
+        processed_packets = 0
+        while processed_packets < packet_status_count and offset + 2 <= len(raw):
+            chunk_data = raw[offset : offset + 2]
+            offset += 2
+            if chunk_data[0] & 0x80 == 0:
+                chunk = RunLengthChunk()
+            else:
+                chunk = StatusVectorChunk()
+            chunk.unmarshal(chunk_data)
+            packet_chunks.append(chunk)
+            if isinstance(chunk, RunLengthChunk):
+                processed_packets += chunk.run_length
+            elif isinstance(chunk, StatusVectorChunk):
+                processed_packets += len(chunk.symbol_list)
 
-    def __bytes__(self) -> bytes:
-        payload = b""
-        for chunk in self.chunks:
-            payload += pack("!L", chunk.ssrc)
-            for d_type, d_value in chunk.items:
-                payload += pack("!BB", d_type, len(d_value)) + d_value
-            payload += b"\x00\x00"
-        while len(payload) % 4:
-            payload += b"\x00"
-        return pack_rtcp_packet(RTCP_SDES, len(self.chunks), payload)
+        recv_deltas = []
+        while offset < len(raw):
+            remaining = len(raw) - offset
+            if remaining >= 2 and raw[offset] & 0x80:
+                delta = RecvDelta.unmarshal(raw[offset : offset + 2])
+                offset += 2
+            else:
+                delta = RecvDelta.unmarshal(raw[offset : offset + 1])
+                offset += 1
+            recv_deltas.append(delta)
 
-    @classmethod
-    def parse(cls, data: bytes, count: int):
-        pos = 0
-        chunks = []
-        for r in range(count):
-            if len(data) < pos + 4:
-                raise ValueError("RTCP SDES source is truncated")
-            ssrc = unpack_from("!L", data, pos)[0]
-            pos += 4
-
-            items = []
-            while pos < len(data) - 1:
-                d_type, d_length = unpack_from("!BB", data, pos)
-                pos += 2
-
-                if len(data) < pos + d_length:
-                    raise ValueError("RTCP SDES item is truncated")
-                d_value = data[pos : pos + d_length]
-                pos += d_length
-                if d_type == 0:
-                    break
-                else:
-                    items.append((d_type, d_value))
-            chunks.append(RtcpSourceInfo(ssrc=ssrc, items=items))
-        return cls(chunks=chunks)
-
-
-@dataclass
-class RtcpSrPacket:
-    ssrc: int
-    sender_info: RtcpSenderInfo
-    reports: list[RtcpReceiverInfo] = field(default_factory=list)
-
-    def __bytes__(self) -> bytes:
-        payload = pack("!L", self.ssrc)
-        payload += bytes(self.sender_info)
-        for report in self.reports:
-            payload += bytes(report)
-        return pack_rtcp_packet(RTCP_SR, len(self.reports), payload)
-
-    @classmethod
-    def parse(cls, data: bytes, count: int):
-        if len(data) != 24 + 24 * count:
-            raise ValueError("RTCP sender report length is invalid")
-
-        ssrc = unpack_from("!L", data)[0]
-        sender_info = RtcpSenderInfo.parse(data[4:24])
-        pos = 24
-        reports = []
-        for r in range(count):
-            reports.append(RtcpReceiverInfo.parse(data[pos : pos + 24]))
-            pos += 24
-        return RtcpSrPacket(ssrc=ssrc, sender_info=sender_info, reports=reports)
+        return cls(
+            sender_ssrc,
+            media_ssrc,
+            base_sequence_number,  # pyright: ignore
+            packet_status_count,
+            reference_time,
+            fb_pkt_count,
+            packet_chunks,
+            recv_deltas,
+        )
 
 
 AnyRtcpPacket = Union[
     RtcpByePacket,
-    RtcpPsfbPacket,
-    RtcpRrPacket,
-    RtcpRtpfbPacket,
-    RtcpSdesPacket,
-    RtcpSrPacket,
+    TransportLayerCC,
 ]
 
 
@@ -383,20 +324,14 @@ class RtcpPacket:
 
             if packet_type == RTCP_BYE:
                 packets.append(RtcpByePacket.parse(payload, count))
-            elif packet_type == RTCP_SDES:
-                packets.append(RtcpSdesPacket.parse(payload, count))
-            elif packet_type == RTCP_SR:
-                packets.append(RtcpSrPacket.parse(payload, count))
-            elif packet_type == RTCP_RR:
-                packets.append(RtcpRrPacket.parse(payload, count))
-            # elif packet_type == RTCP_RTPFB:
-            # packets.append(RtcpRtpfbPacket.parse(payload, count))
-            elif packet_type == RTCP_PSFB or packet_type == RTCP_RTPFB:
+            elif packet_type == RTCP_RTPFB:
+                if len(payload) < 20:
+                    continue
+
                 match count:
                     case 15:
-                        print("got TransportLayerCC format")
-                        print(payload)
-                        # packets.append(RtcpPsfbPacket.parse(payload, count))
+                        twcc = TransportLayerCC.unmarshal(payload)
+                        packets.append(twcc)
                     case _:
                         pass
 
