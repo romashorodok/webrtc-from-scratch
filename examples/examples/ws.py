@@ -47,6 +47,18 @@ async def pre_read_frames(file_path: str):
     return frames
 
 
+def pre_read_y4m(file_path: str):
+    with open(file_path, "rb") as file:
+        reader = media.Y4mDecoder(file)
+        n_frames = 0
+        for data in reader:
+            n_frames += 1
+
+        print("done frame", n_frames)
+
+
+pre_read_y4m("output.y4m")
+
 # TWCC sequence numbers must be same across the session
 twcc_seq = Sequencer()
 
