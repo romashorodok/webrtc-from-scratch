@@ -4,6 +4,7 @@ from enum import Enum
 from typing import Self
 
 _FRAME_MAGIC = b"FRAME"
+_FILE_MAGIC = b"YUV4MPEG2"
 
 
 @dataclass
@@ -158,7 +159,7 @@ class Y4mDecoder:
         """
 
         data = self._reader.readline()
-        if len(data) < len(_FRAME_MAGIC) and not data.startswith(_FRAME_MAGIC):
+        if len(data) < len(_FILE_MAGIC) and not data.startswith(_FILE_MAGIC):
             raise ValueError("")
 
         params = data[len(_FRAME_MAGIC) :].split(b" ")
