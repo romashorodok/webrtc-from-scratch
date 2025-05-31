@@ -133,7 +133,7 @@ class TrackEncoding:
             )
         elif self.codec.payload_type == AV1_PAYLOAD_TYPE:
             self._packetizer: PacketizerBase = Av1Packetizer(
-                mtu=1328,
+                mtu=1200,
                 pt=self.codec.payload_type,
                 ssrc=self.ssrc,
                 clock_rate=self.codec.clock_rate,

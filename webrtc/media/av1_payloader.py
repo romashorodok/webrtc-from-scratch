@@ -34,24 +34,17 @@ class Av1Packetizer(PacketizerBase):
         self.start_time = 0
 
     async def next_timestamp(self) -> tuple[int, Fraction]:
-        """
-        Returns the next RTP timestamp, pacing the sending to real time.
-        """
-        if self.start_time is None:
-            self.start_time = time.time()
-            self.timestamp = 0
+        if self._timestamp is not None:
+            self._timestamp += int(self.refresh_rate * self.clock_rate)
+            wait = self._start + (self._timestamp / self.clock_rate) - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
         else:
-            self.timestamp += self.timestamp_increment
-
-        # Calculate when this timestamp should be sent in wall clock time
-        expected_send_time = self.start_time + (self.timestamp / self.clock_rate)
-        now = time.time()
-        wait = expected_send_time - now
-        if wait > 0:
-            await asyncio.sleep(wait)
+            self._start = time.time()
+            self._timestamp = 0
 
         VIDEO_TIME_BASE = Fraction(1, self.clock_rate)
-        return self.timestamp, VIDEO_TIME_BASE
+        return self._timestamp, VIDEO_TIME_BASE
 
     async def ticker(self):
         while True:

@@ -110,9 +110,9 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
     frames = rw_loop.run_until_complete(pre_read_frames("output_av1.ivf"))
     # frames = rw_loop.run_until_complete(pre_read_frames("output.ivf"))
 
-    ptime = encoding.codec.refresh_rate
-    ms = 1000
-    ssrc = encoding.ssrc
+    # ptime = encoding.codec.refresh_rate
+    # ms = 10000
+    # ssrc = encoding.ssrc
 
     send_time_cache = SendTimeCache()
 
@@ -194,7 +194,9 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
             frame, _ = frames[frame_index]
             frame_index += 1
 
-            pkts = encoding._packetizer.packetize(frame, pts)
+            pkts = encoding._packetizer.packetize(
+                frame, encoding.convert_timebase(pts, time_base, time_base)
+            )
 
             for pkt in pkts:
                 pkt.extensions.transport_sequence_number = (

@@ -8,4 +8,15 @@ y4mVerify:
 	ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=nokey=1:noprint_wrappers=1 output.y4m
 
 av1:
-	ffmpeg -f lavfi -i testsrc=duration=30:size=640x480:rate=30 -c:v librav1e -b:v 1M -an -f ivf output_av1.ivf
+	rav1e output.y4m \
+		 -o output_av1.ivf \
+		 -s 10 \
+		 --low-latency \
+		 -I 30 \
+		 -i 15 \
+		 -S 15 \
+		 --tile-rows 1 \
+		 --tile-cols 2 \
+		 --quantizer 90 --min-quantizer 50 \
+		 --tune Psnr \
+		 --threads 4
