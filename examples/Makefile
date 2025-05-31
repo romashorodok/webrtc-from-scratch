@@ -6,3 +6,6 @@ y4m:
 
 y4mVerify:
 	ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=nokey=1:noprint_wrappers=1 output.y4m
+
+av1:
+	ffmpeg -f lavfi -i testsrc=duration=30:size=640x480:rate=30 -c:v librav1e -b:v 1M -an -f ivf output_av1.ivf

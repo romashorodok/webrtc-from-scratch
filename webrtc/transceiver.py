@@ -9,9 +9,12 @@ from typing import Any, Callable, Coroutine, Protocol
 
 import webrtc_rs
 
+from webrtc.media.av1_payloader import AV1_PAYLOAD_TYPE, Av1Packetizer
+from webrtc.media.vp8_payloader import VP8Payloader
+
 from . import media
 from .utils import impl_protocol
-from .media.packetizer import Packetizer, get_payloader_by_payload_type
+from .media.packetizer import Packetizer, PacketizerBase, get_payloader_by_payload_type
 from . import dtls
 
 
@@ -118,18 +121,24 @@ class TrackEncoding:
         self.ssrc = ssrc
         self._dtls: dtls.DTLSTransport | None = None
 
-        payloader = get_payloader_by_payload_type(self.codec.payload_type)
-        if not payloader:
-            raise ValueError("Unknown payloader type")
-
-        self._packetizer = Packetizer(
-            mtu=1200,
-            pt=self.codec.payload_type,
-            ssrc=self.ssrc,
-            payloader=payloader,
-            clock_rate=self.codec.clock_rate,
-            refresh_rate=self.codec.refresh_rate,
-        )
+        if 96 == self.codec.payload_type:
+            payloader = VP8Payloader()
+            self._packetizer: PacketizerBase = Packetizer(
+                mtu=1200,
+                pt=self.codec.payload_type,
+                ssrc=self.ssrc,
+                payloader=payloader,
+                clock_rate=self.codec.clock_rate,
+                refresh_rate=self.codec.refresh_rate,
+            )
+        elif self.codec.payload_type == AV1_PAYLOAD_TYPE:
+            self._packetizer: PacketizerBase = Av1Packetizer(
+                mtu=1328,
+                pt=self.codec.payload_type,
+                ssrc=self.ssrc,
+                clock_rate=self.codec.clock_rate,
+                refresh_rate=self.codec.refresh_rate,
+            )
 
     def bind(self, transport: dtls.DTLSTransport):
         self._dtls = transport
@@ -138,7 +147,8 @@ class TrackEncoding:
         self, pts: int, from_base: fractions.Fraction, to_base: fractions.Fraction
     ) -> int:
         if from_base != to_base:
-            pts = int(pts * from_base / to_base)
+            scale = from_base / to_base  # Fraction
+            pts = int(pts * scale)
         return pts
 
     async def write_rtp_bytes(self, rtp_packet: media.RtpPacket) -> int:
