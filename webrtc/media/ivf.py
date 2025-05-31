@@ -70,7 +70,7 @@ class IVFReader:
 
         self.read_succesfull_count += n
 
-        return frame_payload, header
+        return bytes(frame_payload), header
 
     def _read_frame_header(self) -> IVFFrameHeader | None:
         data = bytearray(IVF_FRAME_HEADER_SIZE)

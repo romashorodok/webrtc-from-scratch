@@ -1,7 +1,9 @@
+from abc import ABC, abstractmethod
 import random
 import time
 import asyncio
 import fractions
+from typing import Any, AsyncGenerator, Generator, NoReturn
 
 from .types import PayloaderProtocol
 from .rtp_packet import RtpPacket
@@ -61,7 +63,20 @@ class SimplePacketizer:
         return pkt.serialize()
 
 
-class Packetizer:
+class PacketizerBase(ABC):
+    @abstractmethod
+    async def next_timestamp(self) -> tuple[int, fractions.Fraction]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def ticker(self) -> AsyncGenerator[tuple[int, fractions.Fraction], NoReturn]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def packetize(self, payload: bytes, samples: int) -> list[RtpPacket]: ...
+
+
+class Packetizer(PacketizerBase):
     def __init__(
         self,
         mtu: int,

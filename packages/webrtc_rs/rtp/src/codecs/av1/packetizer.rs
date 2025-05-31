@@ -78,6 +78,7 @@ pub fn packetize(obus: &[Obu], mtu: usize) -> Vec<PacketMetadata> {
             packet_remaining_bytes = max_payload_size;
             previous_obu_extra_size = 0;
         }
+
         packet.packet_size += previous_obu_extra_size;
         packet_remaining_bytes -= previous_obu_extra_size;
         packet.num_obu_elements += 1;
@@ -192,8 +193,10 @@ pub fn get_aggregation_header(obus: &[Obu], packets: &[PacketMetadata], packet_i
     } else {
         0
     };
+
     let last_obu_is_fragment = last_obu_offset + packet.last_obu_size
         < obus[packet.first_obu_index + packet.num_obu_elements - 1].size;
+
     if last_obu_is_fragment {
         header |= 1 << 6;
     }

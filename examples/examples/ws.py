@@ -57,7 +57,7 @@ def pre_read_y4m(file_path: str):
         print("done frame", n_frames)
 
 
-pre_read_y4m("output.y4m")
+# pre_read_y4m("output.y4m")
 
 # TWCC sequence numbers must be same across the session
 twcc_seq = Sequencer()
@@ -107,11 +107,12 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
 
     encoding = sender._track_encodings[0]
 
-    frames = rw_loop.run_until_complete(pre_read_frames("output.ivf"))
+    frames = rw_loop.run_until_complete(pre_read_frames("output_av1.ivf"))
+    # frames = rw_loop.run_until_complete(pre_read_frames("output.ivf"))
 
-    ptime = encoding.codec.refresh_rate
-    ms = 1000
-    ssrc = encoding.ssrc
+    # ptime = encoding.codec.refresh_rate
+    # ms = 10000
+    # ssrc = encoding.ssrc
 
     send_time_cache = SendTimeCache()
 
@@ -180,7 +181,7 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
 
         srtp: SRTP | None = None
 
-        async for _ in media.ticker(ptime / ms):
+        async for pts, time_base in encoding._packetizer.ticker():
             if not srtp:
                 if srtp_transport := pc._dtls_transport._srtp_rtp:
                     srtp = srtp_transport
@@ -192,7 +193,6 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
 
             frame, _ = frames[frame_index]
             frame_index += 1
-            pts, time_base = await encoding._packetizer.next_timestamp()
 
             pkts = encoding._packetizer.packetize(
                 frame, encoding.convert_timebase(pts, time_base, time_base)

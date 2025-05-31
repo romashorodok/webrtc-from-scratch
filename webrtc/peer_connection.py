@@ -6,6 +6,8 @@ import string
 
 import webrtc_rs
 
+from webrtc.media.av1_payloader import AV1_PAYLOAD_TYPE
+
 from . import ice
 from .ice import net
 from . import dtls
@@ -252,30 +254,40 @@ def set_default_caps(caps: MediaCaps):
         RTPCodecKind.Audio,
     )
 
-    vp8 = RTPCodecParameters(
-        mime_type="video/VP8",
+    av1 = RTPCodecParameters(
+        mime_type="video/AV1",
         clock_rate=90000,
         refresh_rate=1 / 30,
         channels=0,
         sdp_fmtp_line="",
-        payload_type=96,
+        payload_type=AV1_PAYLOAD_TYPE,
         stats_id=f"RTPCodec-{current_ntp_time() >> 32}",
     )
-
-    receiver_report = RTCPFeedback(rtcp_type="rrtr", parameter="")
     twcc = RTCPFeedback(rtcp_type="transport-cc", parameter="")
     extended_reports_round_trip_time = RTCPFeedback(rtcp_type="ccm", parameter="fir")
+    receiver_report = RTCPFeedback(rtcp_type="rrtr", parameter="")
+    av1.rtcp_feedbacks.append(twcc)
+    av1.rtcp_feedbacks.append(receiver_report)
+    av1.rtcp_feedbacks.append(extended_reports_round_trip_time)
+    caps.register_codec(av1, RTPCodecKind.Video)
 
-    vp8.rtcp_feedbacks.append(twcc)
-    vp8.rtcp_feedbacks.append(receiver_report)
-    vp8.rtcp_feedbacks.append(extended_reports_round_trip_time)
+    # vp8 = RTPCodecParameters(
+    #     mime_type="video/VP8",
+    #     clock_rate=90000,
+    #     refresh_rate=1 / 30,
+    #     channels=0,
+    #     sdp_fmtp_line="",
+    #     payload_type=96,
+    #     stats_id=f"RTPCodec-{current_ntp_time() >> 32}",
+    # )
 
-    # nack_pli = RTCPFeedback(rtcp_type="nack", parameter="pli")
-    # remb = RTCPFeedback(rtcp_type="goog-remb", parameter="")
-    # vp8.rtcp_feedbacks.append(nack_pli)
-    # vp8.rtcp_feedbacks.append(remb)
-
-    caps.register_codec(vp8, RTPCodecKind.Video)
+    # receiver_report = RTCPFeedback(rtcp_type="rrtr", parameter="")
+    # twcc = RTCPFeedback(rtcp_type="transport-cc", parameter="")
+    # extended_reports_round_trip_time = RTCPFeedback(rtcp_type="ccm", parameter="fir")
+    # vp8.rtcp_feedbacks.append(twcc)
+    # vp8.rtcp_feedbacks.append(receiver_report)
+    # vp8.rtcp_feedbacks.append(extended_reports_round_trip_time)
+    # caps.register_codec(vp8, RTPCodecKind.Video)
 
 
 class PeerConnectionEvent(StrEnum):

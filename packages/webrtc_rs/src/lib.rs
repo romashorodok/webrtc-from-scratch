@@ -1,16 +1,41 @@
 use std::sync::Arc;
 use std::vec;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use pyo3::prelude::*;
 
 use tokio::runtime::{Builder, Runtime};
 use tokio::select;
 use tokio::sync::{mpsc, Mutex};
 use webrtc_dtls::{crypto, extension};
-use webrtc_srtp::stream::SRTP_BUFFER_SIZE;
+use webrtc_rtp::packetizer::Payloader;
 use webrtc_util::marshal::Marshal;
+use webrtc_rtp::codecs::av1;
 
+#[pyclass]
+struct  Av1Payloader {
+    payloader: av1::Av1Payloader
+}
+
+fn convert_vec_bytes(input: Vec<Bytes>) -> Vec<Vec<u8>> {
+    input.into_iter().map(|b| b.to_vec()).collect()
+}
+
+#[pymethods]
+impl Av1Payloader {
+    #[new]
+    fn new() -> Self {
+        Self {
+            payloader: av1::Av1Payloader {}
+        }
+    }
+
+    fn packetize(&mut self, mtu: usize, frame: Vec<u8>)  -> Vec<Vec<u8>> {
+        let f = Bytes::from(frame);
+        let result = self.payloader.payload(mtu, &f).unwrap();
+        convert_vec_bytes(result)
+    }
+}
 
 #[pyclass]
 struct Certificate {
@@ -334,5 +359,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DTLS>()?;
     m.add_class::<SRTP>()?;
     m.add_class::<Stream>()?;
+    m.add_class::<Av1Payloader>()?;
     Ok(())
 }
