@@ -1,6 +1,6 @@
 import io
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, IntEnum, StrEnum
 from typing import Self
 
 _FRAME_MAGIC = b"FRAME"
@@ -120,6 +120,16 @@ def get_plane_sizes(width: int, height: int, colorspace: Colorspace) -> YUV:
 
 
 @dataclass
+class Planes:
+    # Y (Luma): Brightness or grayscale information.
+    y: bytes
+    # U (Cb, Chroma Blue): Blue projection of the chroma (color) component
+    u: bytes
+    # V (Cr, Chroma Red): Red projection of the chroma (color) component
+    v: bytes
+
+
+@dataclass
 class Y4mFrame:
     """
     Y4m container has YUV color model.
@@ -133,8 +143,86 @@ class Y4mFrame:
     Chroma planes = U (Cb) and V (Cr) planes (color information)
     """
 
-    frame: bytes
-    planes: bytes | None
+    planes: Planes
+    raw_params: bytes | None
+
+
+class ChromaSampling(StrEnum):
+    Cs420 = "4:2:0"
+    Cs422 = "4:2:2"
+    Cs444 = "4:4:4"
+    Cs400 = "Monochrome"
+
+    def get_decimation(self) -> tuple[int, int] | None:
+        """
+        Provides the amount to right shift the luma plane dimensions to get the
+        chroma plane dimensions.
+        Only values 0 or 1 are ever returned.
+        The plane dimensions must also be rounded up to accommodate odd luma plane
+        sizes.
+        Cs400 returns None, as there are no chroma planes.
+        """
+        match self.value:
+            case ChromaSampling.Cs420:
+                return 1, 1
+            case ChromaSampling.Cs422:
+                return 1, 0
+            case ChromaSampling.Cs444:
+                return 0, 0
+            case ChromaSampling.Cs400 | _:
+                return None
+
+    def get_chroma_dimensions(
+        self, luma_width: int, luma_height: int
+    ) -> tuple[int, int]:
+        """
+        Calculates the size of a chroma plane for this sampling type, given the luma plane dimensions.
+        """
+        decimation = self.get_decimation()
+        if not decimation:
+            return 0, 0
+        ss_x, ss_y = decimation
+        return (luma_width + ss_x) >> ss_x, (luma_height + ss_y) >> ss_y
+
+
+class ChromaSamplePosition(IntEnum):
+    # The source video transfer function must be signaled
+    # outside the AV1 bitstream.
+    Unknown = 0
+    # Horizontally co-located with (0, 0) luma sample, vertically positioned
+    # in the middle between two luma samples.
+    Vertical = 1
+    # Co-located with (0, 0) luma sample.
+    Colocated = 2
+
+
+def map_y4m_color_space(
+    color_space: Colorspace,
+) -> tuple[ChromaSampling, ChromaSamplePosition]:
+    match color_space:
+        case Colorspace.Cmono | Colorspace.Cmono12:
+            return ChromaSampling.Cs400, ChromaSamplePosition.Unknown
+        case Colorspace.C420jpeg | Colorspace.C420paldv:
+            return ChromaSampling.Cs420, ChromaSamplePosition.Unknown
+        case Colorspace.C420mpeg2:
+            return ChromaSampling.Cs420, ChromaSamplePosition.Vertical
+        case Colorspace.C420 | Colorspace.C420p10 | Colorspace.C420p12:
+            return ChromaSampling.Cs420, ChromaSamplePosition.Colocated
+        case Colorspace.C422 | Colorspace.C422p10 | Colorspace.C422p12:
+            return ChromaSampling.Cs422, ChromaSamplePosition.Colocated
+        case Colorspace.C444 | Colorspace.C444p10 | Colorspace.C444p12:
+            return ChromaSampling.Cs444, ChromaSamplePosition.Colocated
+
+
+@dataclass
+class VideoDetails:
+    width: int
+    height: int
+    sample_aspect_ratio: Ratio
+    bit_depth: int
+    chroma_sampling: ChromaSampling
+    chroma_sample_position: ChromaSamplePosition
+    time_base: Ratio
 
 
 _BUFFER_SIZE = 1024 * 1024 * 1024  # 1GB
@@ -152,6 +240,27 @@ class Y4mDecoder:
         self.buf = bytearray(0)
         self.y_size = self.u_size = self.v_size = 0
         self.__read_params()
+
+    def get_video_details(self) -> VideoDetails:
+        aspect_ratio = self.pixel_aspect
+        assert aspect_ratio, "unable get the aspect ratio"
+
+        assert self.colorspace, "unable get the colorspace"
+        chroma_sampling, chroma_sample_position = map_y4m_color_space(self.colorspace)
+
+        assert self.framerate, "unable get the framerate"
+
+        return VideoDetails(
+            width=self.width,
+            height=self.height,
+            sample_aspect_ratio=Ratio(1, 1)
+            if aspect_ratio.numerator == 0 and aspect_ratio.denominator == 0
+            else aspect_ratio,
+            bit_depth=self.colorspace.get_bit_depth(),
+            chroma_sampling=chroma_sampling,
+            chroma_sample_position=chroma_sample_position,
+            time_base=self.framerate,
+        )
 
     def __read_params(self):
         """
@@ -221,10 +330,10 @@ class Y4mDecoder:
             raise StopIteration("EOF")
 
         return Y4mFrame(
-            frame=bytes(
-                self.buf[0 : self.y_size]
-                + self.buf[self.y_size : self.y_size + self.u_size]
-                + self.buf[self.y_size + self.u_size :]
+            planes=Planes(
+                y=bytes(self.buf[0 : self.y_size]),
+                u=bytes(self.buf[self.y_size : self.y_size + self.u_size]),
+                v=bytes(self.buf[self.y_size : self.y_size + self.u_size]),
             ),
-            planes=planes,
+            raw_params=planes,
         )

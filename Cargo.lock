@@ -1921,6 +1921,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rav1e"
+version = "0.1.0"
+dependencies = [
+ "pyo3",
+]
+
+[[package]]
 name = "rayon"
 version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

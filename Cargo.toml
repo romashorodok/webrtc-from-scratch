@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace]
-members = ["./packages/webrtc_rs", "./packages/eventloop"]
+members = ["./packages/webrtc_rs", "./packages/eventloop", "./packages/rav1e"]
 
 [dependencies]
 notify-debouncer-full = "0.3.1"
