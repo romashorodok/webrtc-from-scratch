@@ -1,6 +1,6 @@
 import io
 from dataclasses import dataclass
-from enum import Enum, IntEnum, StrEnum
+from enum import Enum, IntEnum, auto
 from typing import Self
 
 _FRAME_MAGIC = b"FRAME"
@@ -147,11 +147,15 @@ class Y4mFrame:
     raw_params: bytes | None
 
 
-class ChromaSampling(StrEnum):
-    Cs420 = "4:2:0"
-    Cs422 = "4:2:2"
-    Cs444 = "4:4:4"
-    Cs400 = "Monochrome"
+class ChromaSampling(IntEnum):
+    # Cs420 = "4:2:0"
+    # Cs422 = "4:2:2"
+    # Cs444 = "4:4:4"
+    # Cs400 = "Monochrome"
+    Cs420 = 0
+    Cs422 = auto()
+    Cs444 = auto()
+    Cs400 = auto()
 
     def get_decimation(self) -> tuple[int, int] | None:
         """

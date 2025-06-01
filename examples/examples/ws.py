@@ -25,6 +25,7 @@ from webrtc.session_description import (
     SessionDescriptionType,
 )
 from webrtc.transceiver import RTPCodecKind, RTPTransceiverDirection
+from rav1e import Rav1e
 
 app = FastAPI()
 
@@ -50,14 +51,28 @@ async def pre_read_frames(file_path: str):
 def pre_read_y4m(file_path: str):
     with open(file_path, "rb") as file:
         reader = media.Y4mDecoder(file)
-        n_frames = 0
-        for data in reader:
-            n_frames += 1
+        yield reader
+        # n_frames = 0
+        # for data in reader:
+        #     n_frames += 1
 
-        print("done frame", n_frames)
+        # print("done frame", n_frames)
 
 
-# pre_read_y4m("output.y4m")
+y4m_reader = next(pre_read_y4m("output.y4m"))
+
+video_details = y4m_reader.get_video_details()
+enc = Rav1e(
+    width=video_details.width,
+    height=video_details.height,
+    sample_aspect_ratio_num=video_details.sample_aspect_ratio.numerator,
+    sample_aspect_ratio_den=video_details.sample_aspect_ratio.denominator,
+    bit_depth=video_details.bit_depth,
+    chroma_sampling=video_details.chroma_sampling.value,
+    time_base_num=video_details.time_base.numerator,
+    time_base_dem=video_details.time_base.denominator,
+)
+
 
 # TWCC sequence numbers must be same across the session
 twcc_seq = Sequencer()
@@ -188,6 +203,8 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
                 else:
                     continue
 
+            await enc.receive_packet()
+
             if frame_index >= len(frames):
                 frame_index = 0
 
@@ -202,10 +219,10 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
                 pkt.extensions.transport_sequence_number = (
                     twcc_seq.next_sequence_number()
                 )
-                enc = await srtp.encrypt_nonblock(pkt.serialize(DEFAULT_EXT_MAP))
+                encoded = await srtp.encrypt_nonblock(pkt.serialize(DEFAULT_EXT_MAP))
                 assert pc._transport
                 send_time_cache.add(pkt.extensions.transport_sequence_number)
-                pc._transport.sendto(enc)
+                pc._transport.sendto(encoded)
 
     rw_loop.create_task(rtcp_handler())
     rw_loop.run_until_complete(encode())

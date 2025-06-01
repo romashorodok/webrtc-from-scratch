@@ -8,6 +8,7 @@ dependencies = [
     "maturin>=1.8.3",
     "webrtc_rs",
     "eventloop",
+    "rav1e",
     "psutil>=7.0.0",
     "pytest>=8.3.5",
 ]
@@ -23,6 +24,7 @@ members = [
 [tool.uv.sources]
 webrtc_rs = { workspace = true }
 eventloop = { workspace = true }
+rav1e = { workspace = true }
 
 [tool.uv]
 config-settings = { build-args = '--profile=dev' }

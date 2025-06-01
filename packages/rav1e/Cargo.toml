@@ -70,6 +70,20 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.23.3", features = ["experimental-async"]}
+pyo3-async-runtimes = { version = "0.23", features = ["attributes", "tokio-runtime"] }
+tokio = { version = "1.32.0", features = [
+    "fs",
+    "io-util",
+    "io-std",
+    "macros",
+    "net",
+    "parking_lot",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+
 arg_enum_proc_macro = "0.3.4"
 bitstream-io = "~2.3.0"
 cfg-if = "1.0"

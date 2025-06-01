@@ -33,7 +33,14 @@
 //! [AV1]: https://aomediacodec.github.io/av1-spec/av1-spec.pdf
 //! [`Context`]: struct.Context.html
 //! [`Context::receive_packet`]: struct.Context.html#method.receive_packet
+use api::{ChromaSamplePosition, PixelRange, Rational};
+use num_traits::FromPrimitive;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio::sync::Mutex;
+use v_frame::pixel::ChromaSampling;
 
 #[macro_use]
 extern crate log; // Override assert! and assert_eq! in tests
@@ -332,17 +339,178 @@ pub mod bench {
 
 #[cfg(fuzzing)]
 pub mod fuzzing;
-
-#[pyfunction]
-fn hello_from_bin() -> String {
-  "Hello from rav1e!!!".to_string()
+pub trait ToError {
+  fn context(&self, msg: &str) -> PyErr {
+    PyValueError::new_err(msg.to_string())
+  }
 }
 
-/// A Python module implemented in Rust. The name of this function must match
-/// the `lib.name` setting in the `Cargo.toml`, else Python will not be able to
-/// import the module.
+impl ToError for InvalidConfig {
+  fn context(&self, msg: &str) -> PyErr {
+    PyValueError::new_err(msg.to_string())
+  }
+}
+
+struct PyFrame {
+  bytes_per_sample: usize,
+  width: usize,
+  chroma_width: usize,
+  y_plane: Vec<u8>,
+  u_plane: Vec<u8>,
+  v_plane: Vec<u8>,
+}
+
+#[pyclass]
+struct Rav1e {
+  ctx: Arc<Mutex<Context<u8>>>,
+  frame_rx: Arc<Mutex<mpsc::Receiver<PyFrame>>>,
+  frame_tx: Arc<Mutex<mpsc::Sender<PyFrame>>>,
+}
+
+#[pymethods]
+impl Rav1e {
+  #[new]
+  fn new(
+    width: usize, height: usize, sample_aspect_ratio_num: u64,
+    sample_aspect_ratio_den: u64, bit_depth: usize, chroma_sampling: u64,
+    time_base_num: u64, time_base_dem: u64,
+  ) -> Self {
+    let mut enc_cfg = EncoderConfig::with_speed_preset(10);
+    enc_cfg.width = width;
+    enc_cfg.height = height;
+    enc_cfg.sample_aspect_ratio =
+      Rational::new(sample_aspect_ratio_num, sample_aspect_ratio_den);
+    enc_cfg.bit_depth = bit_depth;
+    enc_cfg.chroma_sampling =
+      ChromaSampling::from_u64(chroma_sampling).unwrap();
+    enc_cfg.chroma_sample_position = ChromaSamplePosition::Unknown;
+    enc_cfg.pixel_range = PixelRange::Limited;
+    enc_cfg.time_base = Rational::new(time_base_num, time_base_dem);
+
+    let cfg = Config::new().with_encoder_config(enc_cfg).with_threads(4);
+
+    let tiling = cfg
+      .tiling_info()
+      .map_err(|e| e.context("Invalid configuration"))
+      .unwrap();
+
+    if tiling.tile_count() == 1 {
+      println!("Using 1 tile");
+    } else {
+      println!(
+        "Using {} tiles ({}x{})",
+        tiling.tile_count(),
+        tiling.cols,
+        tiling.rows
+      );
+    }
+
+    // TODO: bit depth 8 vs 16
+    let mut ctx = cfg
+      .new_context::<u8>()
+      .map_err(|e| e.context("Invalid encoder config"))
+      .unwrap();
+
+    ctx.send_frame(ctx.new_frame());
+    ctx.send_frame(None);
+
+    let (tx, rx) = mpsc::channel::<PyFrame>(1);
+
+    println!("Rav1e config {:?}", ctx);
+
+    Self {
+      ctx: Arc::new(Mutex::new(ctx)),
+      frame_rx: Arc::new(Mutex::new(rx)),
+      frame_tx: Arc::new(Mutex::new(tx)),
+    }
+  }
+
+  fn receive_packet<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+    let ctx = self.ctx.clone();
+    let frame_rx = self.frame_rx.clone();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+      'l: loop {
+        let mut ctx = ctx.lock().await;
+        let pkt_wrapped = ctx.receive_packet();
+
+        let ret: Result<Vec<u8>, PyErr> = match pkt_wrapped {
+          Ok(pkt) => {
+            println!("encoded packet frame {:?}", pkt);
+            Ok(pkt.data)
+          }
+          Err(EncoderStatus::NeedMoreData) => {
+            let frame = frame_rx.lock().await.recv().await.unwrap();
+            let mut f = ctx.new_frame();
+
+            f.planes[0].copy_from_raw_u8(
+              frame.y_plane.as_slice(),
+              frame.width * frame.bytes_per_sample,
+              frame.bytes_per_sample,
+            );
+            f.planes[1].copy_from_raw_u8(
+              frame.u_plane.as_slice(),
+              frame.chroma_width * frame.bytes_per_sample,
+              frame.bytes_per_sample,
+            );
+            f.planes[2].copy_from_raw_u8(
+              frame.v_plane.as_slice(),
+              frame.chroma_width * frame.bytes_per_sample,
+              frame.bytes_per_sample,
+            );
+
+            ctx.send_frame(f).unwrap();
+            continue 'l;
+          }
+          Err(EncoderStatus::EnoughData) => {
+            unreachable!()
+          }
+          Err(EncoderStatus::LimitReached) => {
+            // println!("limit reached");
+            unreachable!()
+          }
+          Err(e @ EncoderStatus::Failure) => {
+            // Err(e.context("Failed to encode video"))
+            // Err(Some(None))
+            // println!("failure");
+            unreachable!()
+          }
+          Err(e @ EncoderStatus::NotReady) => {
+            // Err(e.context("Mismanaged handling of two-pass stats data"))
+            // println!("not ready");
+            unreachable!()
+          }
+
+          Err(EncoderStatus::Encoded) => unreachable!(),
+        };
+        return Ok(ret.unwrap());
+      }
+    })
+  }
+
+  fn send_packet<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+    let frame_tx = self.frame_tx.clone();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+      frame_tx
+        .lock()
+        .await
+        .send(PyFrame {
+          bytes_per_sample: 0,
+          width: 0,
+          chroma_width: 0,
+          y_plane: vec![],
+          u_plane: vec![],
+          v_plane: vec![],
+        })
+        .await
+        .unwrap();
+
+      Ok(())
+    })
+  }
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-  m.add_function(wrap_pyfunction!(hello_from_bin, m)?)?;
+  m.add_class::<Rav1e>()?;
   Ok(())
 }

@@ -115,6 +115,7 @@ dependencies = [
     { name = "maturin" },
     { name = "psutil" },
     { name = "pytest" },
+    { name = "rav1e" },
     { name = "webrtc-rs" },
 ]
 
@@ -124,6 +125,7 @@ requires-dist = [
     { name = "maturin", specifier = ">=1.8.3" },
     { name = "psutil", specifier = ">=7.0.0" },
     { name = "pytest", specifier = ">=8.3.5" },
+    { name = "rav1e", editable = "packages/rav1e" },
     { name = "webrtc-rs", editable = "packages/webrtc_rs" },
 ]
 
