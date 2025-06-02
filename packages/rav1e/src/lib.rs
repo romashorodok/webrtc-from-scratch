@@ -399,7 +399,8 @@ impl Rav1e {
     enc_cfg.tile_rows = 1;
     enc_cfg.tiles = 0;
     enc_cfg.enable_timing_info = false;
-    enc_cfg.bitrate = 90000;
+    enc_cfg.bitrate = 0;
+    // enc_cfg.bitrate = 90000;
 
     let cfg = Config::new().with_encoder_config(enc_cfg).with_threads(8);
 
@@ -466,28 +467,6 @@ impl Rav1e {
             let u_val = 85u8;
             let v_val = 255u8;
 
-            // Fill luma (Y) plane
-            // let y_plane = vec![y_val; width * height];
-            // f.planes[0].copy_from_raw_u8(
-            //   &y_plane,
-            //   width * bytewidth,
-            //   bytewidth,
-            // );
-            // // Fill chroma U (Cb)
-            // let u_plane = vec![u_val; chroma_width * chroma_height];
-            // f.planes[1].copy_from_raw_u8(
-            //   &u_plane,
-            //   chroma_width * bytewidth,
-            //   bytewidth,
-            // );
-            //
-            // // Fill chroma V (Cr)
-            // let v_plane = vec![v_val; chroma_width * chroma_height];
-            // f.planes[2].copy_from_raw_u8(
-            //   &v_plane,
-            //   chroma_width * bytewidth,
-            //   bytewidth,
-            // );
             println!(
               "Y len {:?} U len {:?} V len {:?} width: {:?} chroma_width: {:?}  bytes_per_sample: {:?}",
               frame.y_plane.len(),

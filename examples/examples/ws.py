@@ -66,13 +66,61 @@ video_details = y4m_reader.get_video_details()
 enc = Rav1e(
     width=video_details.width,
     height=video_details.height,
-    sample_aspect_ratio_num=video_details.sample_aspect_ratio.numerator,
-    sample_aspect_ratio_den=video_details.sample_aspect_ratio.denominator,
+    sample_aspect_ratio_num=video_details.sample_aspect_ratio.denominator,
+    sample_aspect_ratio_den=video_details.sample_aspect_ratio.numerator,
     bit_depth=video_details.bit_depth,
     chroma_sampling=video_details.chroma_sampling.value,
     time_base_num=video_details.time_base.numerator,
     time_base_dem=video_details.time_base.denominator,
 )
+
+loop = asyncio.new_event_loop()
+
+
+def send_thread_fn(loop, enc, frames, video_details, y4m_reader):
+    async def runner():
+        frame_index = 0
+        chroma_width, _ = video_details.chroma_sampling.get_chroma_dimensions(
+            video_details.width,
+            video_details.height,
+        )
+        while True:
+            if frame_index >= len(frames):
+                frame_index = 0
+
+            frame = frames[frame_index]
+            await enc.send_packet(
+                bytes_per_sample=1,
+                width=video_details.width,
+                chroma_width=chroma_width,
+                y_plane=frame.planes.y,
+                u_plane=frame.planes.u,
+                v_plane=frame.planes.v,
+            )
+            frame_index += 1
+
+    asyncio.run(runner())  # Run new event loop in this thread
+
+
+threading.Thread(
+    target=send_thread_fn,
+    args=(asyncio.new_event_loop(), enc, frames, video_details, y4m_reader),
+).start()
+
+
+def recv_thread_fn(loop, enc, frames, video_details, y4m_reader):
+    async def runner():
+        while True:
+            frame = await enc.receive_packet()
+            print("recv data", frame)
+
+    asyncio.run(runner())
+
+
+threading.Thread(
+    target=recv_thread_fn,
+    args=(asyncio.new_event_loop(), enc, frames, video_details, y4m_reader),
+).start()
 
 
 # TWCC sequence numbers must be same across the session

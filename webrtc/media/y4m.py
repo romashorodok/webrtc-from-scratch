@@ -13,13 +13,13 @@ class Ratio:
     F30:1
     """
 
-    numerator: int
     denominator: int
+    numerator: int
 
     @classmethod
     def parse(cls, value: bytes) -> Self:
-        num, den = value.split(b":")
-        return cls(int(num), int(den))
+        den, num = value.split(b":")
+        return cls(int(den), int(num))
 
 
 class Colorspace(Enum):
