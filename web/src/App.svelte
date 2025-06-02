@@ -79,11 +79,11 @@
 
   onMount(async () => {
     // const streams = await navigator.mediaDevices.getDisplayMedia({
-    const streams = await navigator.mediaDevices.getUserMedia({
-      video: true,
-    });
-    const [track] = streams.getVideoTracks();
-    pc.addTrack(track, streams);
+    // const streams = await navigator.mediaDevices.getUserMedia({
+    //   video: true,
+    // });
+    // const [track] = streams.getVideoTracks();
+    // pc.addTrack(track, streams);
 
     pc.onicecandidate = (c) => {
       const candidate = c.candidate?.toJSON();

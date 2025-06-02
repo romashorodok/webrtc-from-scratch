@@ -33,6 +33,7 @@
 //! [AV1]: https://aomediacodec.github.io/av1-spec/av1-spec.pdf
 //! [`Context`]: struct.Context.html
 //! [`Context::receive_packet`]: struct.Context.html#method.receive_packet
+use api::SpeedSettings;
 use api::{ChromaSamplePosition, PixelRange, Rational};
 use num_traits::FromPrimitive;
 use pyo3::exceptions::PyValueError;
@@ -383,11 +384,24 @@ impl Rav1e {
     enc_cfg.bit_depth = bit_depth;
     enc_cfg.chroma_sampling =
       ChromaSampling::from_u64(chroma_sampling).unwrap();
-    enc_cfg.chroma_sample_position = ChromaSamplePosition::Unknown;
+    enc_cfg.chroma_sample_position = ChromaSamplePosition::Vertical;
     enc_cfg.pixel_range = PixelRange::Limited;
     enc_cfg.time_base = Rational::new(time_base_num, time_base_dem);
+    enc_cfg.low_latency = true;
+    enc_cfg.speed_settings = SpeedSettings::from_preset(10);
+    enc_cfg.tune = Tune::Psnr;
+    enc_cfg.quantizer = 90;
+    enc_cfg.min_quantizer = 50;
+    enc_cfg.min_key_frame_interval = 15;
+    enc_cfg.max_key_frame_interval = 30;
+    enc_cfg.reservoir_frame_delay = Some(15);
+    enc_cfg.tile_cols = 2;
+    enc_cfg.tile_rows = 1;
+    enc_cfg.tiles = 0;
+    enc_cfg.enable_timing_info = false;
+    enc_cfg.bitrate = 90000;
 
-    let cfg = Config::new().with_encoder_config(enc_cfg).with_threads(4);
+    let cfg = Config::new().with_encoder_config(enc_cfg).with_threads(8);
 
     let tiling = cfg
       .tiling_info()
@@ -406,15 +420,12 @@ impl Rav1e {
     }
 
     // TODO: bit depth 8 vs 16
-    let mut ctx = cfg
+    let ctx = cfg
       .new_context::<u8>()
       .map_err(|e| e.context("Invalid encoder config"))
       .unwrap();
 
-    ctx.send_frame(ctx.new_frame());
-    ctx.send_frame(None);
-
-    let (tx, rx) = mpsc::channel::<PyFrame>(1);
+    let (tx, rx) = mpsc::channel::<PyFrame>(30 * 4);
 
     println!("Rav1e config {:?}", ctx);
 
@@ -439,70 +450,145 @@ impl Rav1e {
             Ok(pkt.data)
           }
           Err(EncoderStatus::NeedMoreData) => {
+            println!("need more data lock");
             let frame = frame_rx.lock().await.recv().await.unwrap();
             let mut f = ctx.new_frame();
+            println!("need more data unlock");
+
+            let width = 640;
+            let height = 480;
+            let chroma_width = width / 2;
+            let chroma_height = height / 2;
+            let bytewidth = 1; // 8-bit per channel
+
+            // Red color in YUV (BT.601 approximation)
+            let y_val = 76u8;
+            let u_val = 85u8;
+            let v_val = 255u8;
+
+            // Fill luma (Y) plane
+            // let y_plane = vec![y_val; width * height];
+            // f.planes[0].copy_from_raw_u8(
+            //   &y_plane,
+            //   width * bytewidth,
+            //   bytewidth,
+            // );
+            // // Fill chroma U (Cb)
+            // let u_plane = vec![u_val; chroma_width * chroma_height];
+            // f.planes[1].copy_from_raw_u8(
+            //   &u_plane,
+            //   chroma_width * bytewidth,
+            //   bytewidth,
+            // );
+            //
+            // // Fill chroma V (Cr)
+            // let v_plane = vec![v_val; chroma_width * chroma_height];
+            // f.planes[2].copy_from_raw_u8(
+            //   &v_plane,
+            //   chroma_width * bytewidth,
+            //   bytewidth,
+            // );
+            println!(
+              "Y len {:?} U len {:?} V len {:?} width: {:?} chroma_width: {:?}  bytes_per_sample: {:?}",
+              frame.y_plane.len(),
+              frame.u_plane.len(),
+              frame.v_plane.as_slice().len(),
+              frame.width,
+              frame.chroma_width,
+              frame.bytes_per_sample,
+            );
+
+            // f.planes[0].copy_from_raw_u8(
+            //   frame.y_plane.as_slice(),
+            //   frame.width * frame.bytes_per_sample,
+            //   // frame.bytes_per_sample,
+            //   1,
+            // );
+            // f.planes[1].copy_from_raw_u8(
+            //   frame.u_plane.as_slice(),
+            //   frame.chroma_width * frame.bytes_per_sample,
+            //   // frame.bytes_per_sample,
+            //   1,
+            // );
+            // f.planes[2].copy_from_raw_u8(
+            //   frame.v_plane.as_slice(),
+            //   frame.chroma_width * frame.bytes_per_sample,
+            //   // frame.bytes_per_sample,
+            //   1,
+            // );
 
             f.planes[0].copy_from_raw_u8(
               frame.y_plane.as_slice(),
-              frame.width * frame.bytes_per_sample,
-              frame.bytes_per_sample,
-            );
-            f.planes[1].copy_from_raw_u8(
-              frame.u_plane.as_slice(),
-              frame.chroma_width * frame.bytes_per_sample,
-              frame.bytes_per_sample,
-            );
-            f.planes[2].copy_from_raw_u8(
-              frame.v_plane.as_slice(),
-              frame.chroma_width * frame.bytes_per_sample,
-              frame.bytes_per_sample,
+              frame.width, // stride in bytes
+              1,           // bytes per pixel (8-bit)
             );
 
-            ctx.send_frame(f).unwrap();
+            // U plane
+            f.planes[1].copy_from_raw_u8(
+              frame.u_plane.as_slice(),
+              frame.chroma_width,
+              1,
+            );
+
+            // V plane
+            f.planes[2].copy_from_raw_u8(
+              frame.v_plane.as_slice(),
+              frame.chroma_width,
+              1,
+            );
+
+            ctx.send_frame(Some(Arc::new(f))).unwrap();
             continue 'l;
           }
           Err(EncoderStatus::EnoughData) => {
             unreachable!()
           }
           Err(EncoderStatus::LimitReached) => {
-            // println!("limit reached");
+            println!("limit reached");
             unreachable!()
           }
           Err(e @ EncoderStatus::Failure) => {
             // Err(e.context("Failed to encode video"))
             // Err(Some(None))
-            // println!("failure");
+            println!("failure");
             unreachable!()
           }
           Err(e @ EncoderStatus::NotReady) => {
             // Err(e.context("Mismanaged handling of two-pass stats data"))
-            // println!("not ready");
+            println!("not ready");
             unreachable!()
           }
 
-          Err(EncoderStatus::Encoded) => unreachable!(),
+          Err(EncoderStatus::Encoded) => {
+            continue 'l;
+          }
         };
         return Ok(ret.unwrap());
       }
     })
   }
 
-  fn send_packet<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+  fn send_packet<'a>(
+    &self, py: Python<'a>, bytes_per_sample: usize, width: usize,
+    chroma_width: usize, y_plane: Vec<u8>, u_plane: Vec<u8>, v_plane: Vec<u8>,
+  ) -> PyResult<Bound<'a, PyAny>> {
     let frame_tx = self.frame_tx.clone();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
+      println!("send lock");
       frame_tx
         .lock()
         .await
         .send(PyFrame {
-          bytes_per_sample: 0,
-          width: 0,
-          chroma_width: 0,
-          y_plane: vec![],
-          u_plane: vec![],
-          v_plane: vec![],
+          bytes_per_sample,
+          width,
+          chroma_width,
+          y_plane,
+          u_plane,
+          v_plane,
         })
         .await
         .unwrap();
+      println!("send unlock");
 
       Ok(())
     })

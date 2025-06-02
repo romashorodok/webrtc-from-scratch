@@ -17,6 +17,7 @@ from webrtc.media.rtcp import (
 )
 from webrtc.media.rtp_extensions import DEFAULT_EXT_MAP
 from webrtc.media.vp8_payloader import vp8_depayload
+from webrtc.media.y4m import Y4mFrame
 from webrtc.peer_connection import (
     PeerConnection,
 )
@@ -50,16 +51,16 @@ async def pre_read_frames(file_path: str):
 
 def pre_read_y4m(file_path: str):
     with open(file_path, "rb") as file:
+        n_frames = 0
         reader = media.Y4mDecoder(file)
-        yield reader
-        # n_frames = 0
-        # for data in reader:
-        #     n_frames += 1
+        frames: list[Y4mFrame] = []
+        for frame in reader:
+            n_frames += 1
+            frames.append(frame)
+        return frames, reader
 
-        # print("done frame", n_frames)
 
-
-y4m_reader = next(pre_read_y4m("output.y4m"))
+frames, y4m_reader = pre_read_y4m("output.y4m")
 
 video_details = y4m_reader.get_video_details()
 enc = Rav1e(
@@ -122,7 +123,7 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
 
     encoding = sender._track_encodings[0]
 
-    frames = rw_loop.run_until_complete(pre_read_frames("output_av1.ivf"))
+    # frames = rw_loop.run_until_complete(pre_read_frames("output_av1.ivf"))
     # frames = rw_loop.run_until_complete(pre_read_frames("output.ivf"))
 
     # ptime = encoding.codec.refresh_rate
@@ -191,6 +192,27 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
                 print("rtcp error", e)
                 await asyncio.sleep(1)
 
+    async def send_routine():
+        frame_index = 0
+        chroma_width, _ = video_details.chroma_sampling.get_chroma_dimensions(
+            video_details.width,
+            video_details.height,
+        )
+        while True:
+            if frame_index >= len(frames):
+                frame_index = 0
+
+            frame = frames[frame_index]
+            await enc.send_packet(
+                bytes_per_sample=y4m_reader.bytes_per_sample,
+                width=video_details.width,
+                chroma_width=chroma_width,
+                y_plane=frame.planes.y,
+                u_plane=frame.planes.u,
+                v_plane=frame.planes.v,
+            )
+            frame_index += 1
+
     async def encode():
         frame_index = 0
 
@@ -203,13 +225,18 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
                 else:
                     continue
 
-            await enc.receive_packet()
+            # print("try send data")
+            # await enc.send_packet()
+            # print("send dat")
 
-            if frame_index >= len(frames):
-                frame_index = 0
+            frame = await enc.receive_packet()
+            print("recv data", frame)
 
-            frame, _ = frames[frame_index]
-            frame_index += 1
+            # if frame_index >= len(frames):
+            #     frame_index = 0
+
+            # frame, _ = frames[frame_index]
+            # frame_index += 1
 
             pkts = encoding._packetizer.packetize(
                 frame, encoding.convert_timebase(pts, time_base, time_base)
@@ -224,6 +251,7 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
                 send_time_cache.add(pkt.extensions.transport_sequence_number)
                 pc._transport.sendto(encoded)
 
+    rw_loop.create_task(send_routine())
     rw_loop.create_task(rtcp_handler())
     rw_loop.run_until_complete(encode())
 

@@ -243,6 +243,7 @@ class Y4mDecoder:
         self.colorspace: Colorspace | None = None
         self.buf = bytearray(0)
         self.y_size = self.u_size = self.v_size = 0
+        self.bytes_per_sample: int = 0
         self.__read_params()
 
     def get_video_details(self) -> VideoDetails:
@@ -306,6 +307,7 @@ class Y4mDecoder:
         if frame_size > _BUFFER_SIZE:
             raise ValueError("Out of memory")
 
+        self.bytes_per_sample = frame_size
         self.buf = bytearray(frame_size)
 
     def __iter__(self) -> Self:
@@ -337,7 +339,7 @@ class Y4mDecoder:
             planes=Planes(
                 y=bytes(self.buf[0 : self.y_size]),
                 u=bytes(self.buf[self.y_size : self.y_size + self.u_size]),
-                v=bytes(self.buf[self.y_size : self.y_size + self.u_size]),
+                v=bytes(self.buf[self.y_size + self.v_size :]),
             ),
             raw_params=planes,
         )
