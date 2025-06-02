@@ -25,7 +25,7 @@ decode_test_dav1d = ["dav1d-sys"]
 #   "nom",
 # ]
 # 
-# default = ["binaries", "asm", "threading", "signal_support", "git_version"]
+default = ["asm", "check_asm", "threading", "unstable", "signal_support", "git_version"]
 git_version = ["built/git2"]
 asm = ["nasm-rs", "cc"]
 threading = ["rayon/threads"]
@@ -95,7 +95,7 @@ clap = { version = "4.5", optional = true, default-features = false, features = 
 ] }
 clap_complete = { version = "4.5", optional = true }
 libc = "0.2"
-y4m = { version = "0.8", optional = true }
+y4m = { version = "0.8" }
 backtrace = { version = "0.3", optional = true }
 num-traits = "0.2"
 num-derive = "0.4"
