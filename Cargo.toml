@@ -4,7 +4,23 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace]
-members = ["./packages/webrtc_rs", "./packages/eventloop", "./packages/rav1e"]
+members = ["./packages/webrtc_rs", "./packages/eventloop", "./crates/rav1e"]
 
 [dependencies]
+bytes = "1"
 notify-debouncer-full = "0.3.1"
+zeromq = { version = "=0.5.0-pre", default-features = false, features = ["tokio-runtime", "ipc-transport"] }
+tokio = { version = "1.32.0", features = [
+    "fs",
+    "io-util",
+    "io-std",
+    "macros",
+    "net",
+    "parking_lot",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+
+
