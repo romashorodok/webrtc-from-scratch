@@ -1,9 +1,10 @@
+import json
 import asyncio
 import os
 from typing import Awaitable, Callable
 
 import zmq
-from zmq.asyncio import Context
+from zmq.asyncio import Context, Socket
 
 yuv_channel = os.environ.get("YUV_CHANNEL", "ipc:///tmp/yuv.sock")
 transport_channel = os.environ.get("TRANSPORT_CHANNEL", "ipc:///tmp/transport.sock")
@@ -21,7 +22,21 @@ class Encoder:
         self.__yuv = ctx.socket(zmq.PUSH)
         self.nominated = asyncio.Event()
         self._running = True
-        self._on_frame: Callable[[bytes], Awaitable[None]] | None = None
+        self.on_frame = asyncio.Queue(30)
+
+        self._on_nominated: Callable[[Socket], Awaitable[None]] | None = None
+
+    def on_nominated(
+        self, cb: Callable[[Socket], Awaitable[None]] | Callable[[Socket], None]
+    ):
+        if asyncio.iscoroutinefunction(cb):
+            self._on_nominated = cb
+        else:
+
+            async def wrapper(_sock: Socket):
+                cb(self.__sock)
+
+            self._on_nominated = wrapper
 
     async def recv_loop(self):
         self.__sock.connect(transport_channel)
@@ -46,41 +61,55 @@ class Encoder:
         match payload[0]:
             case b"nominated":
                 self.nominated.set()
+                if self._on_nominated:
+                    await self._on_nominated(self.__sock)
             case b"connected":
                 print("connected pair")
             case b"frame":
-                if self._on_frame:
-                    await self._on_frame(payload[1])
+                await self.on_frame.put(payload[1])
             case _:
                 pass
 
     async def send_frame(self, frame: bytes):
         await self.__yuv.send(frame)
 
-    def on_frame(
-        self, cb: Callable[[bytes], Awaitable[None]] | Callable[[bytes], None]
-    ):
-        if asyncio.iscoroutinefunction(cb):
-            self._on_frame = cb
-        else:
 
-            async def wrapper(frame: bytes):
-                cb(frame)
-
-            self._on_frame = wrapper
+async def reader(enc: Encoder):
+    while True:
+        frame = await enc.on_frame.get()
+        print("on frame", frame)
 
 
 async def main():
     encoder = Encoder()
     asyncio.ensure_future(encoder.recv_loop())
 
-    @encoder.on_frame
-    def on_new_frame(frame: bytes):
-        print("on frame")
+    asyncio.ensure_future(reader(encoder))
+
+    @encoder.on_nominated
+    async def on_nominated(sock: Socket):
+        await sock.send_multipart(
+            [
+                b"config",
+                json.dumps(
+                    {
+                        "width": 0,
+                        "height": 0,
+                        "sample_aspect_ratio_num": 0,
+                        "sample_aspect_ratio_den": 0,
+                        "bit_depth": 0,
+                        "chroma_sampling": 0,
+                        "time_base_num": 0,
+                        "time_base_dem": 0,
+                    }
+                ).encode(),
+            ]
+        )
+        print("on nominated")
 
     while True:
         await encoder.nominated.wait()
-
+        await asyncio.sleep(0.4)
         await encoder.send_frame(b"")
 
 

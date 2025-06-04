@@ -2834,8 +2834,6 @@ dependencies = [
  "paste",
  "pretty_assertions",
  "profiling",
- "pyo3",
- "pyo3-async-runtimes",
  "quickcheck",
  "rand",
  "rand_chacha",
@@ -2847,7 +2845,6 @@ dependencies = [
  "simd_helpers",
  "system-deps",
  "thiserror 2.0.12",
- "tokio",
  "toml",
  "tracing",
  "tracing-chrome",
@@ -3915,6 +3912,9 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "notify-debouncer-full",
+ "rav1e",
+ "serde",
+ "serde_json",
  "tokio",
  "zeromq",
 ]
