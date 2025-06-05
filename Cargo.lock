@@ -3912,6 +3912,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "notify-debouncer-full",
+ "num-traits",
  "rav1e",
  "serde",
  "serde_json",

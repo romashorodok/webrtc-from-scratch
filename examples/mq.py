@@ -6,6 +6,9 @@ from typing import Awaitable, Callable
 import zmq
 from zmq.asyncio import Context, Socket
 
+from webrtc import media
+from webrtc.media.y4m import Y4mFrame
+
 yuv_channel = os.environ.get("YUV_CHANNEL", "ipc:///tmp/yuv.sock")
 transport_channel = os.environ.get("TRANSPORT_CHANNEL", "ipc:///tmp/transport.sock")
 
@@ -70,14 +73,46 @@ class Encoder:
             case _:
                 pass
 
-    async def send_frame(self, frame: bytes):
-        await self.__yuv.send(frame)
+    async def send_frame(
+        self,
+        bytes_per_sample: int,
+        width: int,
+        chroma_width: int,
+        y_plane: bytes,
+        u_plane: bytes,
+        v_plane: bytes,
+    ):
+        await self.__yuv.send_multipart(
+            [
+                bytes_per_sample.to_bytes(4, "big"),
+                width.to_bytes(4, "big"),
+                chroma_width.to_bytes(4, "big"),
+                y_plane,
+                u_plane,
+                v_plane,
+            ]
+        )
 
 
 async def reader(enc: Encoder):
     while True:
         frame = await enc.on_frame.get()
         print("on frame", frame)
+
+
+def pre_read_y4m(file_path: str):
+    with open(file_path, "rb") as file:
+        n_frames = 0
+        reader = media.Y4mDecoder(file)
+        frames: list[Y4mFrame] = []
+        for frame in reader:
+            n_frames += 1
+            frames.append(frame)
+        return frames, reader
+
+
+frames, y4m_reader = pre_read_y4m("output.y4m")
+video_details = y4m_reader.get_video_details()
 
 
 async def main():
@@ -93,24 +128,41 @@ async def main():
                 b"config",
                 json.dumps(
                     {
-                        "width": 0,
-                        "height": 0,
-                        "sample_aspect_ratio_num": 0,
-                        "sample_aspect_ratio_den": 0,
-                        "bit_depth": 0,
-                        "chroma_sampling": 0,
-                        "time_base_num": 0,
-                        "time_base_dem": 0,
+                        "width": video_details.width,
+                        "height": video_details.height,
+                        "sample_aspect_ratio_num": video_details.sample_aspect_ratio.denominator,
+                        "sample_aspect_ratio_den": video_details.sample_aspect_ratio.numerator,
+                        "bit_depth": video_details.bit_depth,
+                        "chroma_sampling": video_details.chroma_sampling,
+                        "time_base_num": video_details.time_base.numerator,
+                        "time_base_dem": video_details.time_base.denominator,
                     }
                 ).encode(),
             ]
         )
         print("on nominated")
 
+    frame_index = 0
+    chroma_width, _ = video_details.chroma_sampling.get_chroma_dimensions(
+        video_details.width,
+        video_details.height,
+    )
+
     while True:
         await encoder.nominated.wait()
-        await asyncio.sleep(0.4)
-        await encoder.send_frame(b"")
+        if frame_index >= len(frames):
+            frame_index = 0
+
+        frame = frames[frame_index]
+        await encoder.send_frame(
+            bytes_per_sample=1,
+            width=video_details.width,
+            chroma_width=chroma_width,
+            y_plane=frame.planes.y,
+            u_plane=frame.planes.u,
+            v_plane=frame.planes.v,
+        )
+        frame_index += 1
 
 
 asyncio.run(main())

@@ -1,15 +1,15 @@
 use bytes::Bytes;
+use num_traits::FromPrimitive;
 use rav1e::prelude::*;
 use serde::Deserialize;
 use std::{collections::HashSet, error::Error, sync::Arc, thread::sleep, time::Duration};
-use tokio::{
-    select,
-    sync::{mpsc, RwLock},
-};
+use tokio::sync::mpsc;
+use tokio::{select, sync::RwLock};
+use v_frame::pixel::ChromaSampling;
 use zeromq::{prelude::*, ZmqMessage};
 
 #[derive(Debug, Deserialize)]
-struct EncoderConfig {
+struct RemoteConfig {
     width: usize,
     height: usize,
     bit_depth: usize,
@@ -20,6 +20,75 @@ struct EncoderConfig {
 
     time_base_num: u64,
     time_base_dem: u64,
+}
+
+struct Encoder {
+    ctx: Context<u8>,
+}
+
+impl Encoder {
+    fn new(remote: RemoteConfig) -> Result<Self, Box<dyn Error>> {
+        let mut enc_cfg = EncoderConfig::with_speed_preset(10);
+        enc_cfg.speed_settings = SpeedSettings::from_preset(10);
+
+        enc_cfg.width = remote.width;
+        enc_cfg.height = remote.height;
+        // enc_cfg.bit_depth = remote.bit_depth;
+        // enc_cfg.chroma_sampling = ChromaSampling::from_u64(remote.chroma_sampling).unwrap();
+        // enc_cfg.sample_aspect_ratio = Rational::new(
+        //     remote.sample_aspect_ratio_num,
+        //     remote.sample_aspect_ratio_den,
+        // );
+        // enc_cfg.time_base = Rational::new(remote.time_base_num, remote.time_base_dem);
+
+        let cfg = Config::new().with_encoder_config(enc_cfg).with_threads(8);
+
+        // let tiling = cfg.tiling_info()?;
+
+        // if tiling.tile_count() == 1 {
+        //     println!("Using 1 tile");
+        // } else {
+        //     println!(
+        //         "Using {} tiles ({}x{})",
+        //         tiling.tile_count(),
+        //         tiling.cols,
+        //         tiling.rows
+        //     );
+        // }
+
+        let ctx = cfg.new_context::<u8>()?;
+
+        println!("Encoder context {:?}", ctx);
+
+        Ok(Self { ctx })
+    }
+
+    fn write(
+        &mut self,
+        bytes_per_pixel: usize,
+        width: usize,
+        chroma_width: usize,
+        y_plane: Vec<u8>,
+        u_plane: Vec<u8>,
+        v_plane: Vec<u8>,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut f = self.ctx.new_frame();
+
+        f.planes[0].copy_from_raw_u8(
+            y_plane.as_slice(),
+            width, // stride in bytes
+            1,     // bytes per pixel (8-bit)
+        );
+
+        // U plane
+        f.planes[1].copy_from_raw_u8(u_plane.as_slice(), chroma_width, 1);
+
+        // V plane
+        f.planes[2].copy_from_raw_u8(v_plane.as_slice(), chroma_width, 1);
+
+        self.ctx.send_frame(Some(Arc::new(f))).unwrap();
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -38,15 +107,97 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
+    let encoder: Arc<RwLock<Option<Encoder>>> = Arc::new(RwLock::new(None));
+
+    // tokio::spawn(async move {
+    //     loop {
+    //         sleep(Duration::from_millis(60));
+    //         let _ = tx.send(Bytes::from("test").into());
+    //     }
+    // });
+
+    let enc = encoder.clone();
     tokio::spawn(async move {
-        loop {
-            let msg = frame_receiver.recv().await;
-            match msg {
-                Ok(msg) => {
-                    println!("[Encoder] Got frame, broadcasting {:?} bytes", msg);
+        'l: loop {
+            {
+                if let Some(enc) = enc.write().await.as_mut() {
+                    match enc.ctx.receive_packet() {
+                        Ok(pkt) => {
+                            println!("encoded packet frame {:?}", pkt);
+                            // Ok(pkt.data)
+                        }
+                        Err(EncoderStatus::NeedMoreData) => {
+                            if let Ok(msg) = frame_receiver.recv().await {
+                                let _: Result<_, Box<dyn std::error::Error>> = (|| {
+                                    if msg.len() < 6 {
+                                        return Err("expected at least 6 message parts".into());
+                                    }
+
+                                    let id1 = u32::from_be_bytes(
+                                        msg.get(0)
+                                            .ok_or("missing msg part 0")?
+                                            .slice(0..4)
+                                            .as_ref()
+                                            .try_into()?,
+                                    ) as usize;
+
+                                    let id2 = u32::from_be_bytes(
+                                        msg.get(1)
+                                            .ok_or("missing msg part 1")?
+                                            .slice(0..4)
+                                            .as_ref()
+                                            .try_into()?,
+                                    ) as usize;
+
+                                    let id3 = u32::from_be_bytes(
+                                        msg.get(2)
+                                            .ok_or("missing msg part 2")?
+                                            .slice(0..4)
+                                            .as_ref()
+                                            .try_into()?,
+                                    ) as usize;
+
+                                    let data1 = msg.get(3).ok_or("missing msg part 3")?.to_vec();
+                                    let data2 = msg.get(4).ok_or("missing msg part 4")?.to_vec();
+                                    let data3 = msg.get(5).ok_or("missing msg part 5")?.to_vec();
+
+                                    enc.write(id1, id2, id3, data1, data2, data3)?;
+
+                                    Ok(())
+                                })(
+                                );
+                            }
+
+                            continue 'l;
+                        }
+                        Err(EncoderStatus::EnoughData) => {
+                            unreachable!()
+                        }
+                        Err(EncoderStatus::LimitReached) => {
+                            println!("limit reached");
+                            unreachable!()
+                        }
+                        Err(EncoderStatus::Failure) => {
+                            println!("failure");
+                            unreachable!()
+                        }
+                        Err(EncoderStatus::NotReady) => {
+                            println!("not ready");
+                            unreachable!()
+                        }
+                        Err(EncoderStatus::Encoded) => {
+                            continue 'l;
+                        }
+                    };
                 }
-                Err(_) => continue,
             }
+
+            // match msg {
+            //     Ok(msg) => {
+            //         println!("[Encoder] Got frame, broadcasting {:?} bytes", msg);
+            //     }
+            //     Err(_) => continue,
+            // }
         }
     });
 
@@ -55,13 +206,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let current_sender = Arc::new(RwLock::new(Option::<Bytes>::None));
 
-    tokio::spawn(async move {
-        loop {
-            sleep(Duration::from_millis(60));
-            let _ = tx.send(Bytes::from("test").into());
-        }
-    });
-
+    let enc = encoder.clone();
     println!("hello world");
     'l: loop {
         select! {
@@ -91,8 +236,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             "config" => {
                                 let data = incoming.get(2);
                                 if let Some(json) = data {
-                                    let config: EncoderConfig =  serde_json::from_slice(json.to_vec().as_slice())?;
-                                    println!("got the config {:?}", config);
+                                    let config: RemoteConfig =  serde_json::from_slice(json.to_vec().as_slice())?;
+
+                                    {
+                                        let mut enc_guard = enc.write().await;
+                                        match Encoder::new(config) {
+                                            Ok(encoder) => {
+                                                *enc_guard = Some(encoder);
+                                            }
+                                            Err(err) => {
+                                                println!("Unexpected encoder config {:?}", err);
+                                            }
+                                        }
+
+                                    }
+
                                     continue 'l;
                                 }
                             },
