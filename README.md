@@ -16,6 +16,10 @@ Proof of concept that a WebRTC Media Server can (not) be implemented without too
 rustup default nightly
 ```
 
+```bash
+rustup component add rust-analyzer
+```
+
 Start rust module in watch mode:
 ```bash
 make

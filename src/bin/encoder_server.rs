@@ -2,8 +2,10 @@ use bytes::Bytes;
 use num_traits::FromPrimitive;
 use rav1e::prelude::*;
 use serde::Deserialize;
-use std::{collections::HashSet, error::Error, sync::Arc, thread::sleep, time::Duration};
-use tokio::sync::mpsc;
+use std::thread::sleep;
+use std::time::Duration;
+use std::{collections::HashSet, error::Error, sync::Arc};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::{select, sync::RwLock};
 use v_frame::pixel::ChromaSampling;
 use zeromq::{prelude::*, ZmqMessage};
@@ -33,15 +35,32 @@ impl Encoder {
 
         enc_cfg.width = remote.width;
         enc_cfg.height = remote.height;
-        // enc_cfg.bit_depth = remote.bit_depth;
-        // enc_cfg.chroma_sampling = ChromaSampling::from_u64(remote.chroma_sampling).unwrap();
-        // enc_cfg.sample_aspect_ratio = Rational::new(
-        //     remote.sample_aspect_ratio_num,
-        //     remote.sample_aspect_ratio_den,
-        // );
-        // enc_cfg.time_base = Rational::new(remote.time_base_num, remote.time_base_dem);
+        enc_cfg.enable_timing_info = false;
+        enc_cfg.low_latency = true;
+        enc_cfg.tune = Tune::Psnr;
+        enc_cfg.chroma_sample_position = ChromaSamplePosition::Vertical;
+        enc_cfg.quantizer = 200;
+        enc_cfg.min_quantizer = 200;
+        enc_cfg.min_key_frame_interval = 15;
+        enc_cfg.max_key_frame_interval = 30;
+        enc_cfg.reservoir_frame_delay = Some(15);
+        enc_cfg.tile_cols = 2;
+        enc_cfg.tile_rows = 2;
+        enc_cfg.tiles = 0;
+        enc_cfg.bitrate = 0;
 
-        let cfg = Config::new().with_encoder_config(enc_cfg).with_threads(8);
+        enc_cfg.bit_depth = remote.bit_depth;
+        enc_cfg.chroma_sampling = ChromaSampling::from_u64(remote.chroma_sampling).unwrap();
+        enc_cfg.sample_aspect_ratio = Rational::new(
+            remote.sample_aspect_ratio_num,
+            remote.sample_aspect_ratio_den,
+        );
+        enc_cfg.time_base = Rational::new(remote.time_base_num, remote.time_base_dem);
+
+        let cfg = Config::new()
+            .with_encoder_config(enc_cfg)
+            .with_threads(8)
+            .with_parallel_gops(2);
 
         // let tiling = cfg.tiling_info()?;
 
@@ -105,25 +124,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut frame_receiver = zeromq::PullSocket::new();
     frame_receiver.bind(frame_receiver_ipc).await?;
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(30 * 5);
+
+    let (heartbeat_tx, mut heartbeat_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let heartbeat_tx = Arc::new(Mutex::new(heartbeat_tx));
 
     let encoder: Arc<RwLock<Option<Encoder>>> = Arc::new(RwLock::new(None));
+    let encoder_notify = Arc::new(Notify::new());
 
-    // tokio::spawn(async move {
-    //     loop {
-    //         sleep(Duration::from_millis(60));
-    //         let _ = tx.send(Bytes::from("test").into());
-    //     }
-    // });
+    let heartbeat = Arc::clone(&heartbeat_tx);
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(4));
+            let _ = heartbeat.lock().await.send(Bytes::from("heartbeat").into());
+        }
+    });
 
+    let notify = encoder_notify.clone();
     let enc = encoder.clone();
     tokio::spawn(async move {
         'l: loop {
             {
+                loop {
+                    let read_guard = enc.read().await;
+                    if read_guard.is_some() {
+                        break;
+                    }
+                    drop(read_guard);
+                    notify.notified().await;
+                }
+
                 if let Some(enc) = enc.write().await.as_mut() {
                     match enc.ctx.receive_packet() {
                         Ok(pkt) => {
-                            println!("encoded packet frame {:?}", pkt);
+                            tx.send(pkt.data).await.unwrap();
+                            continue 'l;
+                            // println!("encoded packet frame {:?}", pkt);
                             // Ok(pkt.data)
                         }
                         Err(EncoderStatus::NeedMoreData) => {
@@ -206,8 +242,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let current_sender = Arc::new(RwLock::new(Option::<Bytes>::None));
 
+    let heartbeat = Arc::clone(&heartbeat_tx);
+    let notify = encoder_notify.clone();
     let enc = encoder.clone();
-    println!("hello world");
     'l: loop {
         select! {
             Ok(incoming) = controller.recv() => {
@@ -218,16 +255,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
 
                     {
+                        if let Some(sender) = current_sender.read().await.as_ref() {
+                            let identities = client_identities.read().await;
+                            if !identities.contains(sender) {
+                                let mut new_sender = current_sender.write().await;
+                                *new_sender = None
+                            }
+                        }
+
+                    }
+
+                    {
                         let mut sender_guard = current_sender.write().await;
+                        println!("sender?? {:?}", sender_guard);
                         if sender_guard.is_none() {
                             // Assign the first connected client as sender
                             let msg = ZmqMessage::try_from(vec![identity.clone(), Bytes::from("nominated")]).unwrap();
                             controller.send(msg).await?;
                             *sender_guard = Some(identity.clone());
                             println!("Assigned new sender: {:?}", identity);
+                            notify.notify_waiters();
+
                             continue 'l;
                         }
+
                     }
+
 
                     if let Some(message) = incoming.get(1) {
                         let message_type: &str = std::str::from_utf8(message)?;
@@ -243,6 +296,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         match Encoder::new(config) {
                                             Ok(encoder) => {
                                                 *enc_guard = Some(encoder);
+                                                notify.notify_waiters();
                                             }
                                             Err(err) => {
                                                 println!("Unexpected encoder config {:?}", err);
@@ -263,11 +317,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                     println!("Received: {:?}", incoming);
                     let reply = ZmqMessage::try_from(vec![identity.clone(), Bytes::from("connected")]).unwrap();
+                    notify.notify_waiters();
                     controller.send(reply).await?;
                 }
             }
+
+
             Some(msg) = rx.recv() => {
-                let mut to_remove = Vec::new();
 
                 {
                     let identities_guard = identities.read().await;
@@ -275,12 +331,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         let frame =
                             ZmqMessage::try_from(vec![identity.clone(), Bytes::from("frame") , msg.clone().into()]).unwrap();
 
-                        // println!("send {:?}", frame);
-
                         match controller.send(frame).await {
                             Ok(_) => continue,
                             Err(err) => {
                                 println!("error sending to {:?}: {:?}", identity, err);
+                                let _ = heartbeat.lock().await.send(Bytes::from("heartbeat").into());
+                            }
+                        }
+                    }
+                }
+
+            }
+
+            Some(heartbeat) = heartbeat_rx.recv() => {
+                let mut to_remove = Vec::new();
+
+                {
+                    let identities_guard = identities.read().await;
+                    for identity in identities_guard.iter() {
+                        let message =
+                            ZmqMessage::try_from(vec![identity.clone(), Bytes::from("heartbeat") , heartbeat.clone().into()]).unwrap();
+
+                        match controller.send(message).await {
+                            Ok(_) => continue,
+                            Err(err) => {
+                                println!("error sending heartbeat to {:?}: {:?}", identity, err);
                                 to_remove.push(identity.clone());
                             }
                         }
@@ -312,7 +387,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                 }
-
             }
         }
     }

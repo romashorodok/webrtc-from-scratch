@@ -1,6 +1,6 @@
 [package]
 name = "ivf"
-version = "0.1.3"
+version = "0.1.4"
 authors = ["Thomas Daede <tdaede@xiph.org>"]
 edition = "2021"
 description = "Simple ivf muxer"
@@ -8,7 +8,7 @@ license = "BSD-2-Clause"
 homepage = "https://github.com/xiph/rav1e"
 
 [dependencies]
-bitstream-io = "~2.3.0"
+bitstream-io = "4.1.0"
 
 [lints.clippy]
 doc_link_with_quotes = "warn"

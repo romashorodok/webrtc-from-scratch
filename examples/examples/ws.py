@@ -1,12 +1,18 @@
+import numpy as np
+import math
+
+import os
 import asyncio
 import json
 import threading
 import time
 from collections import deque
-from typing import Any, Callable
+from typing import Any, Callable, Awaitable
 
+import zmq
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from webrtc_rs import SRTP
+from zmq.asyncio import Context, Socket
 
 from webrtc import media
 from webrtc.media.jitterbuffer import JitterBuffer, JitterFrame
@@ -26,7 +32,6 @@ from webrtc.session_description import (
     SessionDescriptionType,
 )
 from webrtc.transceiver import RTPCodecKind, RTPTransceiverDirection
-from rav1e import Rav1e
 
 app = FastAPI()
 
@@ -61,66 +66,10 @@ def pre_read_y4m(file_path: str):
 
 
 frames, y4m_reader = pre_read_y4m("output.y4m")
-
 video_details = y4m_reader.get_video_details()
-enc = Rav1e(
-    width=video_details.width,
-    height=video_details.height,
-    sample_aspect_ratio_num=video_details.sample_aspect_ratio.denominator,
-    sample_aspect_ratio_den=video_details.sample_aspect_ratio.numerator,
-    bit_depth=video_details.bit_depth,
-    chroma_sampling=video_details.chroma_sampling.value,
-    time_base_num=video_details.time_base.numerator,
-    time_base_dem=video_details.time_base.denominator,
-)
+
 
 loop = asyncio.new_event_loop()
-
-
-def send_thread_fn(loop, enc, frames, video_details, y4m_reader):
-    async def runner():
-        frame_index = 0
-        chroma_width, _ = video_details.chroma_sampling.get_chroma_dimensions(
-            video_details.width,
-            video_details.height,
-        )
-        while True:
-            if frame_index >= len(frames):
-                frame_index = 0
-
-            frame = frames[frame_index]
-            await enc.send_packet(
-                bytes_per_sample=1,
-                width=video_details.width,
-                chroma_width=chroma_width,
-                y_plane=frame.planes.y,
-                u_plane=frame.planes.u,
-                v_plane=frame.planes.v,
-            )
-            frame_index += 1
-
-    asyncio.run(runner())  # Run new event loop in this thread
-
-
-threading.Thread(
-    target=send_thread_fn,
-    args=(asyncio.new_event_loop(), enc, frames, video_details, y4m_reader),
-).start()
-
-
-def recv_thread_fn(loop, enc, frames, video_details, y4m_reader):
-    async def runner():
-        while True:
-            frame = await enc.receive_packet()
-            print("recv data", frame)
-
-    asyncio.run(runner())
-
-
-threading.Thread(
-    target=recv_thread_fn,
-    args=(asyncio.new_event_loop(), enc, frames, video_details, y4m_reader),
-).start()
 
 
 # TWCC sequence numbers must be same across the session
@@ -158,6 +107,192 @@ class SendTimeCache:
                 break
 
 
+yuv_channel = os.environ.get("YUV_CHANNEL", "ipc:///tmp/yuv.sock")
+transport_channel = os.environ.get("TRANSPORT_CHANNEL", "ipc:///tmp/transport.sock")
+
+
+class Encoder:
+    def __init__(
+        self,
+    ) -> None:
+        ctx = Context()
+
+        self.__sock = ctx.socket(zmq.DEALER)
+        self.__sock.setsockopt(zmq.IDENTITY, os.urandom(8))
+
+        self.__yuv = ctx.socket(zmq.PUSH)
+        self.nominated = asyncio.Event()
+        self._running = True
+        self.on_frame = asyncio.Queue[bytes](30 * 5)
+
+        self._on_nominated: Callable[[Socket], Awaitable[None]] | None = None
+
+    def on_nominated(
+        self, cb: Callable[[Socket], Awaitable[None]] | Callable[[Socket], None]
+    ):
+        if asyncio.iscoroutinefunction(cb):
+            self._on_nominated = cb
+        else:
+
+            async def wrapper(_sock: Socket):
+                cb(self.__sock)
+
+            self._on_nominated = wrapper
+
+    async def recv_loop(self):
+        self.__sock.connect(transport_channel)
+        self.__yuv.connect(yuv_channel)
+        await self.__sock.send_multipart([b"connect"])
+
+        while self._running:
+            try:
+                payload = await asyncio.wait_for(
+                    self.__sock.recv_multipart(), timeout=5
+                )
+                await self.__handler(payload)
+            except asyncio.TimeoutError:
+                print("[ZMQ] No data received in 5 seconds")
+                asyncio.ensure_future(self.recv_loop())
+                return
+            except Exception as e:
+                print(f"[Receiver] Error: {e}")
+                await asyncio.sleep(0.5)
+
+    async def __handler(self, payload: list[bytes]):
+        match payload[0]:
+            case b"nominated":
+                self.nominated.set()
+                if self._on_nominated:
+                    await self._on_nominated(self.__sock)
+            case b"connected":
+                print("connected pair")
+            case b"frame":
+                await self.on_frame.put(payload[1])
+            case _:
+                pass
+
+    async def send_frame(
+        self,
+        bytes_per_sample: int,
+        width: int,
+        chroma_width: int,
+        y_plane: bytes,
+        u_plane: bytes,
+        v_plane: bytes,
+    ):
+        await self.__yuv.send_multipart(
+            [
+                bytes_per_sample.to_bytes(4, "big"),
+                width.to_bytes(4, "big"),
+                chroma_width.to_bytes(4, "big"),
+                y_plane,
+                u_plane,
+                v_plane,
+            ]
+        )
+
+
+def apply_brightness_wave(
+    y_plane: bytes, width: int, height: int, frame_index: int
+) -> bytes:
+    """
+    Applies a horizontal sine wave brightness modulation on the Y (luma) plane.
+
+    Args:
+        y_plane: Original Y plane bytes.
+        width: Frame width.
+        height: Frame height.
+        frame_index: Current frame number for animation.
+
+    Returns:
+        Transformed Y plane as bytes.
+    """
+    y = np.frombuffer(y_plane, dtype=np.uint8).copy()
+    y = y.reshape((height, width))
+
+    # Create row indices array
+    rows = np.arange(height).reshape(-1, 1)  # shape (height,1)
+
+    # Precompute phase shift per row plus animation phase
+    phase = 2 * np.pi * (rows / 40) + frame_index * 0.1
+
+    # Calculate sine values for all rows, then broadcast over columns
+    wave = 30 * np.sin(phase)
+
+    # Add wave to each pixel in the row (broadcast wave shape: height x 1)
+    y = y + wave
+
+    # Clip to valid 8-bit range
+    np.clip(y, 0, 255, out=y)
+
+    return y.astype(np.uint8).tobytes()
+
+
+def blend_chroma_with_rainbow(
+    u, v, frame_index, chroma_width, chroma_height, strength=0.3
+):
+    """
+    Blend original U,V with a cycling rainbow tint.
+    strength controls how strong the color shift is (0=no shift, 1=full rainbow).
+    """
+
+    u_norm = u.astype(np.int16) - 128
+    v_norm = v.astype(np.int16) - 128
+
+    x = np.arange(chroma_width)
+    phase = 2 * np.pi * (x / chroma_width) + frame_index * 0.1
+
+    offset_u = (np.cos(phase) * 50 * strength).astype(np.int16)
+    offset_v = (np.sin(phase) * 50 * strength).astype(np.int16)
+
+    offset_u = np.tile(offset_u, (chroma_height, 1))
+    offset_v = np.tile(offset_v, (chroma_height, 1))
+
+    u_tinted = u_norm + offset_u
+    v_tinted = v_norm + offset_v
+
+    u_tinted = np.clip(u_tinted, -128, 127)
+    v_tinted = np.clip(v_tinted, -128, 127)
+
+    u_final = (u_tinted + 128).astype(np.uint8)
+    v_final = (v_tinted + 128).astype(np.uint8)
+
+    return u_final, v_final
+
+
+def apply_rainbow_wave(
+    y_plane: bytes,
+    u_plane: bytes,
+    v_plane: bytes,
+    width: int,
+    height: int,
+    chroma_width: int,
+    chroma_height: int,
+    frame_index: int,
+    strength=1,
+):
+    y = np.frombuffer(y_plane, dtype=np.uint8).copy()
+    y = y.reshape((height, width))
+
+    rows = np.arange(height).reshape(-1, 1)
+    phase = 2 * np.pi * (rows / 40) + frame_index * 0.1
+    wave = 30 * np.sin(phase)
+    y = y + wave
+    np.clip(y, 0, 255, out=y)
+
+    u = np.frombuffer(u_plane, dtype=np.uint8).copy()
+    v = np.frombuffer(v_plane, dtype=np.uint8).copy()
+
+    u = u.reshape((chroma_height, chroma_width))
+    v = v.reshape((chroma_height, chroma_width))
+
+    u_tinted, v_tinted = blend_chroma_with_rainbow(
+        u, v, frame_index, chroma_width, chroma_height, strength
+    )
+
+    return y.astype(np.uint8).tobytes(), u_tinted.tobytes(), v_tinted.tobytes()
+
+
 def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
     rw_loop = asyncio.new_event_loop()
 
@@ -179,6 +314,30 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
     # ssrc = encoding.ssrc
 
     send_time_cache = SendTimeCache()
+
+    encoder = Encoder()
+    rw_loop.create_task(encoder.recv_loop())
+
+    @encoder.on_nominated
+    async def on_nominated(sock: Socket):
+        await sock.send_multipart(
+            [
+                b"config",
+                json.dumps(
+                    {
+                        "width": video_details.width,
+                        "height": video_details.height,
+                        "sample_aspect_ratio_num": video_details.sample_aspect_ratio.denominator,
+                        "sample_aspect_ratio_den": video_details.sample_aspect_ratio.numerator,
+                        "bit_depth": video_details.bit_depth,
+                        "chroma_sampling": video_details.chroma_sampling,
+                        "time_base_num": video_details.time_base.numerator,
+                        "time_base_dem": video_details.time_base.denominator,
+                    }
+                ).encode(),
+            ]
+        )
+        print("encoder nominated as the sender")
 
     async def rtcp_handler():
         while True:
@@ -242,28 +401,49 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
 
     async def send_routine():
         frame_index = 0
-        chroma_width, _ = video_details.chroma_sampling.get_chroma_dimensions(
-            video_details.width,
-            video_details.height,
+        chroma_width, chroma_height = (
+            video_details.chroma_sampling.get_chroma_dimensions(
+                video_details.width,
+                video_details.height,
+            )
         )
+        width = video_details.width
+        height = video_details.height
         while True:
+            await encoder.nominated.wait()
+
             if frame_index >= len(frames):
                 frame_index = 0
 
             frame = frames[frame_index]
-            await enc.send_packet(
+
+            # y_bytes = apply_brightness_wave(frame.planes.y, width, height, frame_index)
+
+            y_bytes, u_bytes, v_bytes = apply_rainbow_wave(
+                frame.planes.y,
+                frame.planes.u,
+                frame.planes.v,
+                width=video_details.width,
+                height=video_details.height,
+                chroma_width=chroma_width,
+                chroma_height=chroma_height,
+                frame_index=frame_index,
+            )
+
+            await encoder.send_frame(
                 bytes_per_sample=y4m_reader.bytes_per_sample,
                 width=video_details.width,
                 chroma_width=chroma_width,
-                y_plane=frame.planes.y,
-                u_plane=frame.planes.u,
-                v_plane=frame.planes.v,
+                # y_plane=frame.planes.y,
+                # u_plane=frame.planes.u,
+                # v_plane=frame.planes.v,
+                y_plane=y_bytes,
+                u_plane=u_bytes,
+                v_plane=v_bytes,
             )
             frame_index += 1
 
     async def encode():
-        frame_index = 0
-
         srtp: SRTP | None = None
 
         async for pts, time_base in encoding._packetizer.ticker():
@@ -277,8 +457,8 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
             # await enc.send_packet()
             # print("send dat")
 
-            frame = await enc.receive_packet()
-            print("recv data", frame)
+            frame = await encoder.on_frame.get()
+            # print("recv data", frame)
 
             # if frame_index >= len(frames):
             #     frame_index = 0

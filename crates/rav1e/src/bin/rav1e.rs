@@ -13,6 +13,8 @@ extern crate log;
 mod common;
 mod decoder;
 mod error;
+#[cfg(feature = "serialize")]
+mod kv;
 mod muxer;
 mod stats;
 
@@ -24,7 +26,8 @@ use rav1e::prelude::*;
 
 use crate::decoder::{Decoder, FrameBuilder, VideoDetails};
 use crate::muxer::*;
-use std::io::Read;
+use std::fs::File;
+use std::io::{Read, Seek, Write};
 use std::process::exit;
 use std::sync::Arc;
 
@@ -38,11 +41,36 @@ struct Source<D: Decoder> {
   limit: usize,
   count: usize,
   input: D,
+  #[cfg(all(unix, feature = "signal-hook"))]
+  exit_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<D: Decoder> Source<D> {
-  fn new(limit: usize, input: D) -> Self {
-    Self { limit, input, count: 0 }
+  cfg_if::cfg_if! {
+    if #[cfg(all(unix, feature = "signal-hook"))] {
+      fn new(limit: usize, input: D) -> Self {
+        use signal_hook::{flag, consts};
+
+        // Make sure double CTRL+C and similar kills
+        let exit_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for sig in consts::TERM_SIGNALS {
+            // When terminated by a second term signal, exit with exit code 1.
+            // This will do nothing the first time (because term_now is false).
+            flag::register_conditional_shutdown(*sig, 1, Arc::clone(&exit_requested)).unwrap();
+            // But this will "arm" the above for the second time, by setting it to true.
+            // The order of registering these is important, if you put this one first, it will
+            // first arm and then terminate ‒ all in the first round.
+            flag::register(*sig, Arc::clone(&exit_requested)).unwrap();
+        }
+
+        Self { limit, input, count: 0, exit_requested, }
+      }
+    } else {
+      #[allow(clippy::missing_const_for_fn)]
+      fn new(limit: usize, input: D) -> Self {
+        Self { limit, input, count: 0, }
+      }
+    }
   }
 
   #[profiling::function]
@@ -52,6 +80,14 @@ impl<D: Decoder> Source<D> {
     if self.limit != 0 && self.count == self.limit {
       ctx.flush();
       return Ok(());
+    }
+
+    #[cfg(all(unix, feature = "signal-hook"))]
+    {
+      if self.exit_requested.load(std::sync::atomic::Ordering::SeqCst) {
+        ctx.flush();
+        return Ok(());
+      }
     }
 
     match self.input.read_frame(ctx, &video_info) {
@@ -76,142 +112,258 @@ impl<D: Decoder> Source<D> {
 #[profiling::function]
 fn process_frame<T: Pixel, D: Decoder>(
   ctx: &mut Context<T>, output_file: &mut dyn Muxer, source: &mut Source<D>,
+  pass1file: Option<&mut File>, pass2file: Option<&mut File>,
+  mut y4m_enc: Option<&mut y4m::Encoder<Box<dyn Write + Send>>>,
   metrics_cli: MetricsEnabled,
 ) -> Result<Option<Vec<FrameSummary>>, CliError> {
   let y4m_details = source.input.get_video_details();
-
   let mut frame_summaries = Vec::new();
+  let mut pass1file = pass1file;
+  let mut pass2file = pass2file;
+
+  // Submit first pass data to pass 2.
+  if let Some(passfile) = pass2file.as_mut() {
+    while ctx.rc_second_pass_data_required() > 0 {
+      let mut buflen = [0u8; 8];
+      passfile
+        .read_exact(&mut buflen)
+        .map_err(|e| e.context("Unable to read the two-pass data file."))?;
+      let mut data = vec![0u8; u64::from_be_bytes(buflen) as usize];
+
+      passfile
+        .read_exact(&mut data)
+        .map_err(|e| e.context("Unable to read the two-pass data file."))?;
+
+      ctx
+        .rc_send_pass_data(&data)
+        .map_err(|e| e.context("Corrupted first pass data"))?;
+    }
+  }
 
   let pkt_wrapped = ctx.receive_packet();
-
-  let (ret, _emit_pass_data) = match pkt_wrapped {
+  let (ret, emit_pass_data) = match pkt_wrapped {
     Ok(pkt) => {
       output_file.write_frame(
         pkt.input_frameno,
         pkt.data.as_ref(),
         pkt.frame_type,
       );
-
-      // println!("frame {:?}", pkt.data);
-
+      if let (Some(ref mut y4m_enc_uw), Some(ref rec)) =
+        (y4m_enc.as_mut(), &pkt.rec)
+      {
+        write_y4m_frame(y4m_enc_uw, rec, y4m_details);
+      }
       frame_summaries.push(build_frame_summary(
         pkt,
         y4m_details.bit_depth,
         y4m_details.chroma_sampling,
         metrics_cli,
       ));
-
       Ok((Some(frame_summaries), true))
     }
-
     Err(EncoderStatus::NeedMoreData) => {
-      // TODO: this is the place when i need a get a next frame and add the ctx
-      // ctx.send_frame()
       source.read_frame(ctx, y4m_details)?;
       Ok((Some(frame_summaries), false))
     }
-
     Err(EncoderStatus::EnoughData) => {
       unreachable!()
     }
-
     Err(EncoderStatus::LimitReached) => Ok((None, true)),
-
     Err(e @ EncoderStatus::Failure) => {
       Err(e.context("Failed to encode video"))
     }
-
     Err(e @ EncoderStatus::NotReady) => {
       Err(e.context("Mismanaged handling of two-pass stats data"))
     }
-
     Err(EncoderStatus::Encoded) => Ok((Some(frame_summaries), true)),
   }?;
+
+  // Save first pass data from pass 1.
+  if let Some(passfile) = pass1file.as_mut() {
+    if emit_pass_data {
+      match ctx.rc_receive_pass_data() {
+        Some(RcData::Frame(outbuf)) => {
+          let len = outbuf.len() as u64;
+          passfile.write_all(&len.to_be_bytes()).map_err(|e| {
+            e.context("Unable to write to two-pass data file.")
+          })?;
+
+          passfile.write_all(&outbuf).map_err(|e| {
+            e.context("Unable to write to two-pass data file.")
+          })?;
+        }
+        Some(RcData::Summary(outbuf)) => {
+          // The last packet of rate control data we get is the summary data.
+          // Let's put it at the start of the file.
+          passfile.rewind().map_err(|e| {
+            e.context("Unable to seek in the two-pass data file.")
+          })?;
+          let len = outbuf.len() as u64;
+
+          passfile.write_all(&len.to_be_bytes()).map_err(|e| {
+            e.context("Unable to write to two-pass data file.")
+          })?;
+
+          passfile.write_all(&outbuf).map_err(|e| {
+            e.context("Unable to write to two-pass data file.")
+          })?;
+        }
+        None => {}
+      }
+    }
+  }
 
   Ok(ret)
 }
 
 fn do_encode<T: Pixel, D: Decoder>(
-  cfg: Config,
-  verbose: Verboseness,
-  mut progress: ProgressInfo,
-  output: &mut dyn Muxer,
-  mut source: Source<D>,
-  // mut y4m_enc: Option<y4m::Encoder<Box<dyn Write + Send>>>,
+  cfg: Config, verbose: Verboseness, mut progress: ProgressInfo,
+  output: &mut dyn Muxer, mut source: Source<D>, mut pass1file: Option<File>,
+  mut pass2file: Option<File>,
+  mut y4m_enc: Option<y4m::Encoder<Box<dyn Write + Send>>>,
   metrics_enabled: MetricsEnabled,
 ) -> Result<(), CliError> {
   let mut ctx: Context<T> =
     cfg.new_context().map_err(|e| e.context("Invalid encoder settings"))?;
 
+  // Let's write down a placeholder.
+  if let Some(passfile) = pass1file.as_mut() {
+    let len = ctx.rc_summary_size();
+    let buf = vec![0u8; len];
+
+    passfile
+      .write_all(&(len as u64).to_be_bytes())
+      .map_err(|e| e.context("Unable to write to two-pass data file."))?;
+
+    passfile
+      .write_all(&buf)
+      .map_err(|e| e.context("Unable to write to two-pass data file."))?;
+  }
+
   while let Some(frame_info) = process_frame(
     &mut ctx,
     &mut *output,
     &mut source,
-    // y4m_enc.as_mut(),
+    pass1file.as_mut(),
+    pass2file.as_mut(),
+    y4m_enc.as_mut(),
     metrics_enabled,
   )? {
-    // if verbose != Verboseness::Quiet {
-    for frame in frame_info {
-      progress.add_frame(frame.clone());
-      // if verbose == Verboseness::Verbose {
-      println!("{} - {}", frame.frame_type, progress);
-      // } else {
-      // Print a one-line progress indicator that overrides itself with every update
-      // eprint!("\r{progress}                    ");
-      // };
-    }
+    if verbose != Verboseness::Quiet {
+      for frame in frame_info {
+        progress.add_frame(frame.clone());
+        if verbose == Verboseness::Verbose {
+          info!("{} - {}", frame, progress);
+        } else {
+          // Print a one-line progress indicator that overrides itself with every update
+          eprint!("\r{progress}                    ");
+        };
+      }
 
-    output.flush().unwrap();
-    // }
+      output.flush().unwrap();
+    }
   }
-  // if verbose != Verboseness::Quiet {
-  // if verbose == Verboseness::Verbose {
-  // eprint!("\r");
-  // }
-  progress.print_summary(true);
-  // }
+  if verbose != Verboseness::Quiet {
+    if verbose == Verboseness::Verbose {
+      // Clear out the temporary progress indicator
+      eprint!("\r");
+    }
+    progress.print_summary(verbose == Verboseness::Verbose);
+  }
   Ok(())
 }
 
-fn build_frame<T: Pixel, F: FrameBuilder<T>>(
-  ctx: &F, bytes_per_sample: usize, width: usize, chroma_width: usize,
-  y_plane: &[u8], u_plane: &[u8], v_plane: &[u8],
-) -> Frame<T> {
-  let mut f = ctx.new_frame();
-
-  f.planes[0].copy_from_raw_u8(
-    y_plane,
-    width * bytes_per_sample,
-    bytes_per_sample,
-  );
-
-  f.planes[1].copy_from_raw_u8(
-    u_plane,
-    chroma_width * bytes_per_sample,
-    bytes_per_sample,
-  );
-
-  f.planes[2].copy_from_raw_u8(
-    v_plane,
-    chroma_width * bytes_per_sample,
-    bytes_per_sample,
-  );
-
-  f
-}
-
-fn encode(frames: impl Iterator<Item = Frame<u8>>) {}
-
 fn main() {
+  init_logger();
+
+  #[cfg(feature = "tracing")]
+  let (chrome_layer, _guard) =
+    tracing_chrome::ChromeLayerBuilder::new().build();
+
+  #[cfg(feature = "tracing")]
+  {
+    use tracing_subscriber::layer::SubscriberExt;
+    tracing::subscriber::set_global_default(
+      tracing_subscriber::registry().with(chrome_layer),
+    )
+    .unwrap();
+  }
+
   run().unwrap_or_else(|e| {
     error::print_error(&e);
     exit(1);
   });
 }
 
+fn init_logger() {
+  use std::str::FromStr;
+  fn level_colored(l: log::Level) -> console::StyledObject<&'static str> {
+    use console::style;
+    use log::Level;
+    match l {
+      Level::Trace => style("??").dim(),
+      Level::Debug => style("? ").dim(),
+      Level::Info => style("> ").green(),
+      Level::Warn => style("! ").yellow(),
+      Level::Error => style("!!").red(),
+    }
+  }
+
+  let level = std::env::var("RAV1E_LOG")
+    .ok()
+    .and_then(|l| log::LevelFilter::from_str(&l).ok())
+    .unwrap_or(log::LevelFilter::Info);
+
+  fern::Dispatch::new()
+    .format(move |out, message, record| {
+      out.finish(format_args!(
+        "{level} {message}",
+        level = level_colored(record.level()),
+        message = message,
+      ));
+    })
+    // set the default log level. to filter out verbose log messages from dependencies, set
+    // this to Warn and overwrite the log level for your crate.
+    .level(log::LevelFilter::Warn)
+    // change log levels for individual modules. Note: This looks for the record's target
+    // field which defaults to the module path but can be overwritten with the `target`
+    // parameter:
+    // `info!(target="special_target", "This log message is about special_target");`
+    .level_for("rav1e", level)
+    // output to stdout
+    .chain(std::io::stderr())
+    .apply()
+    .unwrap();
+}
+
+cfg_if::cfg_if! {
+  if #[cfg(any(target_os = "windows", target_arch = "wasm32"))] {
+    fn print_rusage() {
+      eprintln!("Resource usage reporting is not currently supported on this platform");
+    }
+  } else {
+    fn print_rusage() {
+      // SAFETY: This uses an FFI, it is safe because we call it correctly.
+      let (utime, stime, maxrss) = unsafe {
+        let mut usage = std::mem::zeroed();
+        let _ = libc::getrusage(libc::RUSAGE_SELF, &mut usage);
+        (usage.ru_utime, usage.ru_stime, usage.ru_maxrss)
+      };
+      eprintln!(
+        "user time: {} s",
+        utime.tv_sec as f64 + utime.tv_usec as f64 / 1_000_000f64
+      );
+      eprintln!(
+        "system time: {} s",
+        stime.tv_sec as f64 + stime.tv_usec as f64 / 1_000_000f64
+      );
+      eprintln!("maximum rss: {maxrss} KB");
+    }
+  }
+}
+
 fn run() -> Result<(), error::CliError> {
   let mut cli = parse_cli()?;
-
   // Maximum frame size by specification + maximum y4m header
   let limit = y4m::Limits {
     // Use saturating operations to gracefully handle 32-bit architectures
@@ -221,7 +373,6 @@ fn run() -> Result<(), error::CliError> {
       .saturating_mul(2304)
       .saturating_add(1024),
   };
-
   let mut y4m_dec = match y4m::Decoder::new_with_limits(cli.io.input, limit) {
     Err(e) => {
       return Err(CliError::new(match e {
@@ -242,6 +393,23 @@ fn run() -> Result<(), error::CliError> {
     Ok(d) => d,
   };
   let video_info = y4m_dec.get_video_details();
+  let y4m_enc = cli.io.rec.map(|rec| {
+    y4m::encode(
+      video_info.width,
+      video_info.height,
+      y4m::Ratio::new(
+        video_info.time_base.den as usize,
+        video_info.time_base.num as usize,
+      ),
+    )
+    .with_colorspace(y4m_dec.get_colorspace())
+    .with_pixel_aspect(y4m::Ratio {
+      num: video_info.sample_aspect_ratio.num as usize,
+      den: video_info.sample_aspect_ratio.den as usize,
+    })
+    .write_header(rec)
+    .unwrap()
+  });
 
   cli.enc.width = video_info.width;
   cli.enc.height = video_info.height;
@@ -279,9 +447,57 @@ fn run() -> Result<(), error::CliError> {
     )]);
   }
 
+  let mut rc = RateControlConfig::new();
+
+  let pass2file = match cli.pass2file_name {
+    Some(f) => {
+      let mut f = File::open(f).map_err(|e| {
+        e.context("Unable to open file for reading two-pass data")
+      })?;
+      let mut buflen = [0u8; 8];
+      f.read_exact(&mut buflen)
+        .map_err(|e| e.context("Summary data too short"))?;
+      let len = i64::from_be_bytes(buflen);
+      let mut buf = vec![0u8; len as usize];
+
+      f.read_exact(&mut buf)
+        .map_err(|e| e.context("Summary data too short"))?;
+
+      rc = RateControlConfig::from_summary_slice(&buf)
+        .map_err(|e| e.context("Invalid summary"))?;
+
+      Some(f)
+    }
+    None => None,
+  };
+
+  let pass1file = match cli.pass1file_name {
+    Some(f) => {
+      let f = File::create(f).map_err(|e| {
+        e.context("Unable to open file for writing two-pass data")
+      })?;
+      rc = rc.with_emit_data(true);
+      Some(f)
+    }
+    None => None,
+  };
+
   let cfg = Config::new()
     .with_encoder_config(cli.enc.clone())
-    .with_threads(cli.threads);
+    .with_threads(cli.threads)
+    .with_rate_control(rc);
+
+  #[cfg(feature = "serialize")]
+  {
+    if let Some(save_config) = cli.save_config {
+      let mut out = File::create(save_config)
+        .map_err(|e| e.context("Cannot create configuration file"))?;
+      let s = toml::to_string(&cli.enc).unwrap();
+      out
+        .write_all(s.as_bytes())
+        .map_err(|e| e.context("Cannot write the configuration file"))?
+    }
+  }
 
   cli.io.output.write_header(
     video_info.width,
@@ -321,7 +537,7 @@ fn run() -> Result<(), error::CliError> {
   let progress = ProgressInfo::new(
     Rational { num: video_info.time_base.den, den: video_info.time_base.num },
     if cli.limit == 0 { None } else { Some(cli.limit) },
-    MetricsEnabled::All,
+    cli.metrics_enabled,
   );
 
   for _ in 0..cli.skip {
@@ -335,7 +551,6 @@ fn run() -> Result<(), error::CliError> {
 
   let source = Source::new(cli.limit, y4m_dec);
 
-  // output is a `create_muxer` from src/bin/muxer/mod.rs
   if video_info.bit_depth == 8 && !cli.force_highbitdepth {
     do_encode::<u8, y4m::Decoder<Box<dyn Read + Send>>>(
       cfg,
@@ -343,7 +558,10 @@ fn run() -> Result<(), error::CliError> {
       progress,
       &mut *cli.io.output,
       source,
-      MetricsEnabled::All,
+      pass1file,
+      pass2file,
+      y4m_enc,
+      cli.metrics_enabled,
     )?
   } else {
     do_encode::<u16, y4m::Decoder<Box<dyn Read + Send>>>(
@@ -352,8 +570,14 @@ fn run() -> Result<(), error::CliError> {
       progress,
       &mut *cli.io.output,
       source,
-      MetricsEnabled::All,
+      pass1file,
+      pass2file,
+      y4m_enc,
+      cli.metrics_enabled,
     )?
+  }
+  if cli.benchmark {
+    print_rusage();
   }
 
   Ok(())

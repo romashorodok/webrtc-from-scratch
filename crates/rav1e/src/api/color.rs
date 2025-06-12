@@ -12,7 +12,6 @@ use crate::wasm_bindgen::*;
 
 use arg_enum_proc_macro::ArgEnum;
 use num_derive::FromPrimitive;
-use num_traits::FromPrimitive;
 
 /// Sample position for subsampled chroma
 #[wasm_bindgen]

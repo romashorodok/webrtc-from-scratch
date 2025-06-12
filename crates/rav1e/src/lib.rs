@@ -33,8 +33,10 @@
 //! [AV1]: https://aomediacodec.github.io/av1-spec/av1-spec.pdf
 //! [`Context`]: struct.Context.html
 //! [`Context::receive_packet`]: struct.Context.html#method.receive_packet
-#[macro_use]
-extern crate log; // Override assert! and assert_eq! in tests
+
+#![allow(missing_abi)]
+#![allow(unused_unsafe)]
+
 #[cfg(test)]
 #[macro_use]
 extern crate pretty_assertions;
@@ -103,12 +105,7 @@ mod mc;
 mod me;
 mod rate;
 mod recon_intra;
-mod sad_plane;
 mod scan_order;
-#[cfg(feature = "scenechange")]
-pub mod scenechange;
-#[cfg(not(feature = "scenechange"))]
-mod scenechange;
 mod segmentation;
 mod stats;
 #[doc(hidden)]
@@ -327,3 +324,6 @@ pub mod bench {
     pub use crate::cpu_features::*;
   }
 }
+
+#[cfg(fuzzing)]
+pub mod fuzzing;

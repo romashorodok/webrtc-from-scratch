@@ -1,33 +1,33 @@
 import asyncio
+import os
 import queue
-from datetime import datetime, timedelta
-
+import re
+import socket
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from enum import Enum, StrEnum
 from typing import Callable, Protocol
 
-from . import stun
-from . import net
+from webrtc.utils import AsyncEventEmitter, Handler_T, impl_protocol
 
-from .net.types import (
-    Address,
-    MuxConnProtocol,
-    MuxProtocol,
-    NetworkType,
-    LocalCandidate,
-    Packet,
-    RemoteCandidate,
-)
-from .net.udp_mux import Interceptor, MultiUDPMux
-from .stun_message import stun_message_parse_attrs, stun_message_parse_header
-from webrtc.utils import impl_protocol, AsyncEventEmitter, Handler_T
-
+from . import net, stun
 from .candidate_base import (
     CandidateBase,
     CandidateType,
     parse_candidate_str,
 )
-from .utils import generate_pwd, generate_tie_breaker, generate_ufrag, cmp
+from .net.types import (
+    Address,
+    LocalCandidate,
+    MuxConnProtocol,
+    MuxProtocol,
+    NetworkType,
+    Packet,
+    RemoteCandidate,
+)
+from .net.udp_mux import Interceptor, MultiUDPMux
+from .stun_message import stun_message_parse_attrs, stun_message_parse_header
+from .utils import cmp, generate_pwd, generate_tie_breaker, generate_ufrag
 
 
 @dataclass
@@ -301,6 +301,7 @@ class ControllingSelector(AsyncEventEmitter):
             stun.MessageType(stun.Method.Binding, stun.MessageClass.SuccessResponse),
             msg.transaction_id,
         )
+
         msg.add_attribute(
             stun.XORMappedAddress(
                 msg.transaction_id,
@@ -638,6 +639,9 @@ class AgentEvent:
     CANDIDATE_PAIR_CONTROLLER = "candidate-pair-controller"
 
 
+mdns_pattern = re.compile(r"\b(?:[a-zA-Z0-9_-]+\.)*local\.?\b")
+
+
 # Controlling agent must know remote user credentials
 class Agent(AsyncEventEmitter):
     def __init__(self, options: AgentOptions) -> None:
@@ -764,6 +768,15 @@ class Agent(AsyncEventEmitter):
 
         if self._remote_ufrag is None or self._remote_pwd is None:
             raise ValueError("Unable add canddiate ")
+
+        if mdns_pattern.search(remote.address):
+            try:
+                ip = socket.gethostbyname(remote.address)
+                print("Resolved mDNS IP:", ip)
+                remote.set_address(ip)
+            except socket.gaierror:
+                print("Could not resolve mDNS address")
+                exit(1)
 
         # TODO: may be better provide some object ref that hold ufrag, pwd to make dynamic replacement of credentials
         pair = CandidatePair(

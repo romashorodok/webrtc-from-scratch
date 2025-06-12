@@ -69,7 +69,12 @@ class InterfaceMuxUDPHandler(asyncio.DatagramProtocol):
         address_str = str(address)
 
         interceptors_ports = self._interceptors.get(address_str)
+
         if interceptors_ports is None:
+            # TODO: mdns
+            # {'20c9dda7-c874-40b3-8092-f51edf8b8e53.local': {52730: <webrtc.ice.net.udp_mux.Interceptor object at 0x112b27890>}}
+            _addr, interceptors_ports = next(iter(self._interceptors.items()))
+            self._interceptors[address] = interceptors_ports
             print(f"Unbinded datagram recv not found {address_str} address")
             return
 
