@@ -160,6 +160,20 @@ sobel_x = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]], dtype=torch.flo
 sobel_y = torch.tensor([[[[-1, -2, -1], [0, 0, 0], [1, 2, 1]]]], dtype=torch.float32)
 
 
+def gaussian_blur(y_tensor: torch.Tensor, kernel_size=5, sigma=1.0) -> torch.Tensor:
+    def get_gaussian_kernel1d(size, sigma):
+        coords = torch.arange(size).float() - size // 2
+        kernel = torch.exp(-(coords**2) / (2 * sigma**2))
+        kernel /= kernel.sum()
+        return kernel
+
+    k = get_gaussian_kernel1d(kernel_size, sigma).view(1, 1, -1)  # [1,1,K]
+
+    y_blur = F.conv2d(y_tensor, k.unsqueeze(2), padding=(0, kernel_size // 2))
+    y_blur = F.conv2d(y_blur, k.unsqueeze(3), padding=(kernel_size // 2, 0))
+    return y_blur
+
+
 def transform_motion_highlight_Edge_glow_worker(
     curr_shm_name: str,
     prev_shm_name: str,
@@ -183,13 +197,15 @@ def transform_motion_highlight_Edge_glow_worker(
     prev_buf = np.ndarray((y_size,), dtype=np.uint8, buffer=prev_shm.buf)
     y_prev = prev_buf.reshape(height, width)
 
-    # Convert to torch tensor
-    y_t = torch.from_numpy(y).float().unsqueeze(0).unsqueeze(0) / 255.0
+    y_t = torch.from_numpy(y).float().unsqueeze(0).unsqueeze(0) / 255.0  # [1,1,H,W]
     y_prev_t = torch.from_numpy(y_prev).float().unsqueeze(0).unsqueeze(0) / 255.0
+
+    y_t = gaussian_blur(y_t, kernel_size=3, sigma=0.5)
+    y_prev_t = gaussian_blur(y_prev_t, kernel_size=3, sigma=0.5)
 
     # 1) Motion mask by frame difference
     motion = torch.abs(y_t - y_prev_t).squeeze()
-    motion_threshold = 0.5
+    motion_threshold = 0.3
     motion_mask = (motion > motion_threshold).float()
 
     grad_x = F.conv2d(y_t, sobel_x, padding=1)
@@ -227,10 +243,41 @@ def transform_motion_highlight_Edge_glow_worker(
     tint_strength = 0.3
     v_t = (v_t + glow_mask_resized * tint_strength).clamp(0, 1)
 
-    # Write back Y,U,V
-    y[:] = (y_t_new.squeeze().numpy() * 255).astype(np.uint8)
-    u[:] = (u_t.numpy() * 255).astype(np.uint8).flatten()
-    v[:] = (v_t.numpy() * 255).astype(np.uint8).flatten()
+    y_float = y.astype(np.float32)
+    u_float = u.astype(np.float32).reshape(chroma_height, chroma_width)
+    v_float = v.astype(np.float32).reshape(chroma_height, chroma_width)
+
+    # y_t_new is float [0..1], scale to 0..255
+    y_t_new_255 = (y_t_new.numpy() * 255).astype(np.float32)
+
+    # u_t and v_t are float [0..1], scale to 0..255
+    u_t_255 = (u_t.numpy() * 255).astype(np.float32)
+    v_t_255 = (v_t.numpy() * 255).astype(np.float32)
+
+    alpha = 0.4
+
+    # TODO: blend make the encoding soo fast
+    # Blend each channel
+    y_blended = (
+        ((1 - alpha) * y_float + alpha * y_t_new_255).clip(0, 255).astype(np.uint8)
+    )
+    u_blended = ((1 - alpha) * u_float + alpha * u_t_255).clip(0, 255).astype(np.uint8)
+    v_blended = ((1 - alpha) * v_float + alpha * v_t_255).clip(0, 255).astype(np.uint8)
+
+    # Write back to buffers
+    y[:] = y_blended
+    u[:] = u_blended.flatten()
+    v[:] = v_blended.flatten()
+
+    # alpha = 0.4
+    # blended = ((1 - alpha) * y + alpha * y_t_new.numpy()).clip(0, 255).astype(np.uint8)
+
+    # y[:] = blended
+
+    # # Write back Y,U,V
+    # # y[:] = (y_t_new.squeeze().numpy() * 255).astype(np.uint8)
+    # u[:] = (u_t.numpy() * 255).astype(np.uint8).flatten()
+    # v[:] = (v_t.numpy() * 255).astype(np.uint8).flatten()
 
     shm.close()
     prev_shm.close()
