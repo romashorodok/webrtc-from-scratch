@@ -66,6 +66,7 @@ fn run_maturin(root: &Path, path: &Path) -> Result<(), Box<dyn std::error::Error
     cmd.arg("run")
         .arg("maturin")
         .arg("develop")
+        .arg("--release")
         .arg("--skip-install")
         .arg("--bindings=pyo3")
         .arg("--manifest-path")

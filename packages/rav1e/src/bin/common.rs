@@ -357,6 +357,7 @@ pub struct ParsedCliOptions {
   pub save_config: Option<PathBuf>,
   pub photon_noise: u8,
   #[cfg(feature = "unstable")]
+  #[allow(unused)]
   pub slots: usize,
   pub force_highbitdepth: bool,
 }
@@ -459,7 +460,6 @@ pub fn parse_cli() -> Result<ParsedCliOptions, CliError> {
           .map_err(|e| e.context("Cannot open input file"))?,
       ) as Box<dyn Read + Send>,
     },
-
     output: create_muxer(&matches.output, matches.overwrite)?,
     rec,
   };

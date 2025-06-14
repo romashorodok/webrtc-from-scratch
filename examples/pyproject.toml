@@ -12,6 +12,8 @@ dependencies = [
     "uvicorn[standard]>=0.34.2",
     "watchfiles>=1.0.5",
     "webrtc",
+    "rav1e",
+    "numpy>=2.3.0",
 ]
 
 [build-system]

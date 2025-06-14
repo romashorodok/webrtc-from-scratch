@@ -33,6 +33,9 @@
 //! [AV1]: https://aomediacodec.github.io/av1-spec/av1-spec.pdf
 //! [`Context`]: struct.Context.html
 //! [`Context::receive_packet`]: struct.Context.html#method.receive_packet
+#![allow(missing_abi)]
+#![allow(unused_unsafe)]
+
 use api::SpeedSettings;
 use api::{ChromaSamplePosition, PixelRange, Rational};
 use num_traits::FromPrimitive;
@@ -52,6 +55,10 @@ extern crate pretty_assertions;
 pub use crate::api::color;
 pub use crate::api::{
   Config, Context, EncoderConfig, EncoderStatus, InvalidConfig, Packet,
+};
+use crate::api::{
+  PredictionModesSetting, RateControlConfig, SceneDetectionSpeed,
+  SegmentationLevel,
 };
 use crate::encoder::*;
 pub use crate::frame::Frame;
@@ -113,12 +120,7 @@ mod mc;
 mod me;
 mod rate;
 mod recon_intra;
-mod sad_plane;
 mod scan_order;
-#[cfg(feature = "scenechange")]
-pub mod scenechange;
-#[cfg(not(feature = "scenechange"))]
-mod scenechange;
 mod segmentation;
 mod stats;
 #[doc(hidden)]
@@ -377,10 +379,27 @@ impl Rav1e {
     time_base_num: u64, time_base_dem: u64,
   ) -> Self {
     let mut enc_cfg = EncoderConfig::with_speed_preset(10);
+    let mut speed_cfg = SpeedSettings::from_preset(10);
+    speed_cfg.rdo_lookahead_frames = 1;
+    speed_cfg.transform.tx_domain_distortion = true;
+    speed_cfg.transform.tx_domain_rate = true;
+
+    speed_cfg.transform.reduced_tx_set = true;
+    speed_cfg.prediction.fine_directional_intra = false;
+    speed_cfg.prediction.prediction_modes = PredictionModesSetting::Simple;
+
+    speed_cfg.segmentation = SegmentationLevel::Simple;
+    // speed_cfg.scene_detection_mode = SceneDetectionSpeed::None;
+    speed_cfg.scene_detection_mode = SceneDetectionSpeed::Fast;
+
+    enc_cfg.speed_settings = speed_cfg;
+
     enc_cfg.width = width;
     enc_cfg.height = height;
+
     enc_cfg.sample_aspect_ratio =
       Rational::new(sample_aspect_ratio_num, sample_aspect_ratio_den);
+
     enc_cfg.bit_depth = bit_depth;
     enc_cfg.chroma_sampling =
       ChromaSampling::from_u64(chroma_sampling).unwrap();
@@ -388,18 +407,35 @@ impl Rav1e {
     enc_cfg.pixel_range = PixelRange::Limited;
     enc_cfg.time_base = Rational::new(time_base_num, time_base_dem);
     enc_cfg.low_latency = true;
-    enc_cfg.speed_settings = SpeedSettings::from_preset(10);
     enc_cfg.tune = Tune::Psnr;
-    enc_cfg.quantizer = 90;
-    enc_cfg.min_quantizer = 50;
-    enc_cfg.min_key_frame_interval = 15;
+    enc_cfg.quantizer = 100;
+    enc_cfg.min_quantizer = 60;
+    // enc_cfg.min_key_frame_interval = 60;
+    // enc_cfg.max_key_frame_interval = 300;
+    // Best
+    // enc_cfg.min_key_frame_interval = 15;
+    // enc_cfg.max_key_frame_interval = 30;
+    enc_cfg.min_key_frame_interval = 1;
     enc_cfg.max_key_frame_interval = 30;
-    enc_cfg.reservoir_frame_delay = Some(15);
+
+    // enc_cfg.min_key_frame_interval = 30;
+    // enc_cfg.max_key_frame_interval = 90;
+
+    enc_cfg.reservoir_frame_delay = None;
+    // enc_cfg.reservoir_frame_delay = Some(30);
+
+    // enc_cfg.tile_cols = 2;
+    // enc_cfg.tile_rows = 2;
     enc_cfg.tile_cols = 2;
     enc_cfg.tile_rows = 1;
+
     enc_cfg.tiles = 0;
-    enc_cfg.enable_timing_info = false;
-    enc_cfg.bitrate = 90000;
+    enc_cfg.enable_timing_info = true;
+
+    enc_cfg.bitrate = 60000;
+    // enc_cfg.bitrate = 90000;
+    // enc_cfg.bitrate = 150000;
+    // enc_cfg.bitrate = 250000;
 
     let cfg = Config::new().with_encoder_config(enc_cfg).with_threads(8);
 
@@ -446,14 +482,14 @@ impl Rav1e {
 
         let ret: Result<Vec<u8>, PyErr> = match pkt_wrapped {
           Ok(pkt) => {
-            println!("encoded packet frame {:?}", pkt);
+            // println!("encoded packet frame {:?}", pkt);
             Ok(pkt.data)
           }
           Err(EncoderStatus::NeedMoreData) => {
-            println!("need more data lock");
+            // println!("need more data lock");
             let frame = frame_rx.lock().await.recv().await.unwrap();
             let mut f = ctx.new_frame();
-            println!("need more data unlock");
+            // println!("need more data unlock");
 
             let width = 640;
             let height = 480;
@@ -488,15 +524,6 @@ impl Rav1e {
             //   chroma_width * bytewidth,
             //   bytewidth,
             // );
-            println!(
-              "Y len {:?} U len {:?} V len {:?} width: {:?} chroma_width: {:?}  bytes_per_sample: {:?}",
-              frame.y_plane.len(),
-              frame.u_plane.len(),
-              frame.v_plane.as_slice().len(),
-              frame.width,
-              frame.chroma_width,
-              frame.bytes_per_sample,
-            );
 
             // f.planes[0].copy_from_raw_u8(
             //   frame.y_plane.as_slice(),
@@ -574,7 +601,7 @@ impl Rav1e {
   ) -> PyResult<Bound<'a, PyAny>> {
     let frame_tx = self.frame_tx.clone();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-      println!("send lock");
+      // println!("send lock");
       frame_tx
         .lock()
         .await
@@ -588,7 +615,7 @@ impl Rav1e {
         })
         .await
         .unwrap();
-      println!("send unlock");
+      // println!("send unlock");
 
       Ok(())
     })

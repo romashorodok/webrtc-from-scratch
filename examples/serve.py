@@ -9,8 +9,12 @@ from watchfiles import DefaultFilter, run_process
 
 async def run_server(module: str, app: str):
     mod = importlib.import_module(module)
-    application = getattr(mod, app)
 
+    # process_bench = getattr(mod, "process_bench")
+
+    # await process_bench()
+
+    application = getattr(mod, app)
     config = uvicorn.Config(application, port=9000, loop="asyncio")
     server = uvicorn.Server(config)
     await server.serve()

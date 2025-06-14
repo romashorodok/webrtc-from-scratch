@@ -316,8 +316,8 @@ impl ProgressInfo {
 
   pub fn print_summary(&self, verbose: bool) {
     eprint!("\r");
-    println!("{}", self);
-    println!("----------");
+    info!("{}", self);
+    info!("----------");
     self.print_frame_type_summary(FrameType::KEY);
     self.print_frame_type_summary(FrameType::INTER);
     self.print_frame_type_summary(FrameType::INTRA_ONLY);
@@ -327,9 +327,8 @@ impl ProgressInfo {
       self.print_transform_type_summary();
       self.print_prediction_modes_summary();
     }
-
     match self.metrics_enabled {
-      MetricsEnabled::None => println!("----"),
+      MetricsEnabled::None => info!("----"),
       MetricsEnabled::Psnr => self.print_video_psnr(),
       MetricsEnabled::All => {
         self.print_video_psnr();
@@ -342,7 +341,7 @@ impl ProgressInfo {
     let count = self.get_frame_type_count(frame_type);
     let size = self.get_frame_type_avg_size(frame_type);
     let avg_qp = self.get_frame_type_avg_qp(frame_type);
-    println!(
+    info!(
       "{:17} {:>6} | avg QP: {:6.2} | avg size: {:>7} B",
       format!("{frame_type}:"),
       count,
@@ -352,29 +351,29 @@ impl ProgressInfo {
   }
 
   fn print_video_psnr(&self) {
-    println!("----------");
+    info!("----------");
     let psnr_y = sum_metric(&self.frame_info, |fi| fi.metrics.psnr.unwrap().y);
     let psnr_u = sum_metric(&self.frame_info, |fi| fi.metrics.psnr.unwrap().u);
     let psnr_v = sum_metric(&self.frame_info, |fi| fi.metrics.psnr.unwrap().v);
     let psnr_avg =
       sum_metric(&self.frame_info, |fi| fi.metrics.psnr.unwrap().avg);
-    println!(
+    info!(
       "Mean PSNR: Avg: {:.4}  Y: {:.4}  Cb: {:.4}  Cr: {:.4}",
       psnr_avg, psnr_y, psnr_u, psnr_v
     );
   }
   fn print_video_all(&self) {
-    println!("----------");
+    info!("----------");
     let psnr_hvs =
       sum_metric(&self.frame_info, |fi| fi.metrics.psnr_hvs.unwrap().avg);
     let ssim = sum_metric(&self.frame_info, |fi| fi.metrics.ssim.unwrap().avg);
     let ms_ssim =
       sum_metric(&self.frame_info, |fi| fi.metrics.ms_ssim.unwrap().avg);
     let ciede = sum_metric(&self.frame_info, |fi| fi.metrics.ciede.unwrap());
-    println!("PSNR HVS: {:.4}", psnr_hvs);
-    println!("SSIM: {:.4}  MS SSIM: {:.4}", ssim, ms_ssim);
-    println!("CIEDE2000: {:.4}", ciede);
-    println!("----------");
+    info!("PSNR HVS: {:.4}", psnr_hvs);
+    info!("SSIM: {:.4}  MS SSIM: {:.4}", ssim, ms_ssim);
+    info!("CIEDE2000: {:.4}", ciede);
+    info!("----------");
   }
 
   fn print_block_type_summary(&self) {
@@ -385,12 +384,12 @@ impl ProgressInfo {
   fn print_block_type_summary_for_frame_type(
     &self, frame_type: FrameType, type_label: char,
   ) {
-    println!("----------");
-    println!(
+    info!("----------");
+    info!(
       "bsize {}: {:>6} {:>6} {:>6} {:>6} {:>6} {:>6}",
       type_label, "x128", "x64", "x32", "x16", "x8", "x4"
     );
-    println!(
+    info!(
       "   128x: {:>5.1}% {:>5.1}%                              {}",
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_128X128, frame_type),
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_128X64, frame_type),
@@ -400,21 +399,21 @@ impl ProgressInfo {
         String::new()
       }
     );
-    println!(
+    info!(
       "    64x: {:>5.1}% {:>5.1}% {:>5.1}% {:>5.1}%",
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_64X128, frame_type),
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_64X64, frame_type),
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_64X32, frame_type),
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_64X16, frame_type),
     );
-    println!(
+    info!(
       "    32x:        {:>5.1}% {:>5.1}% {:>5.1}% {:>5.1}%",
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_32X64, frame_type),
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_32X32, frame_type),
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_32X16, frame_type),
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_32X8, frame_type),
     );
-    println!(
+    info!(
       "    16x:        {:>5.1}% {:>5.1}% {:>5.1}% {:>5.1}% {:>5.1}%",
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_16X64, frame_type),
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_16X32, frame_type),
@@ -422,14 +421,14 @@ impl ProgressInfo {
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_16X8, frame_type),
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_16X4, frame_type),
     );
-    println!(
+    info!(
       "     8x:               {:>5.1}% {:>5.1}% {:>5.1}% {:>5.1}%",
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_8X32, frame_type),
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_8X16, frame_type),
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_8X8, frame_type),
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_8X4, frame_type),
     );
-    println!(
+    info!(
       "     4x:                      {:>5.1}% {:>5.1}% {:>5.1}%",
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_4X16, frame_type),
       self.get_bsize_pct_by_frame_type(BlockSize::BLOCK_4X8, frame_type),
@@ -438,7 +437,7 @@ impl ProgressInfo {
   }
 
   fn print_transform_type_summary(&self) {
-    println!("----------");
+    info!("----------");
     self.print_transform_type_summary_by_frame_type(FrameType::KEY, 'I');
     self.print_transform_type_summary_by_frame_type(FrameType::INTER, 'P');
   }
@@ -446,7 +445,7 @@ impl ProgressInfo {
   fn print_transform_type_summary_by_frame_type(
     &self, frame_type: FrameType, type_label: char,
   ) {
-    println!(
+    info!(
       "txtypes {}: DCT_DCT: {:.1}% | ADST_DCT: {:.1}% | DCT_ADST: {:.1}% | ADST_ADST: {:.1}%",
       type_label,
       self.get_txtype_pct_by_frame_type(TxType::DCT_DCT, frame_type),
@@ -454,7 +453,7 @@ impl ProgressInfo {
       self.get_txtype_pct_by_frame_type(TxType::DCT_ADST, frame_type),
       self.get_txtype_pct_by_frame_type(TxType::ADST_ADST, frame_type)
     );
-    println!(
+    info!(
       "           IDTX: {:.1}% | V_DCT: {:.1}% | H_DCT: {:.1}%",
       self.get_txtype_pct_by_frame_type(TxType::IDTX, frame_type),
       self.get_txtype_pct_by_frame_type(TxType::V_DCT, frame_type),
@@ -463,11 +462,11 @@ impl ProgressInfo {
   }
 
   fn print_prediction_modes_summary(&self) {
-    println!("----------");
+    info!("----------");
     self.print_luma_prediction_mode_summary_by_frame_type(FrameType::KEY, 'I');
     self
       .print_chroma_prediction_mode_summary_by_frame_type(FrameType::KEY, 'I');
-    println!("----------");
+    info!("----------");
     self
       .print_luma_prediction_mode_summary_by_frame_type(FrameType::INTER, 'P');
     self.print_chroma_prediction_mode_summary_by_frame_type(
@@ -480,7 +479,7 @@ impl ProgressInfo {
     &self, frame_type: FrameType, type_label: char,
   ) {
     if frame_type == FrameType::KEY {
-      println!(
+      info!(
         "y modes {}: DC: {:.1}% | V: {:.1}% | H: {:.1}% | Paeth: {:.1}%",
         type_label,
         self.get_luma_pred_mode_pct_by_frame_type(
@@ -500,7 +499,7 @@ impl ProgressInfo {
           frame_type
         ),
       );
-      println!(
+      info!(
         "           Smooth: {:.1}% | Smooth V: {:.1}% | Smooth H: {:.1}%",
         self.get_luma_pred_mode_pct_by_frame_type(
           PredictionMode::SMOOTH_PRED,
@@ -516,7 +515,7 @@ impl ProgressInfo {
         ),
       );
       // Keep angular order for presentation here, rather than enum order.
-      println!(
+      info!(
       "        D: 45: {:.1}% | 67: {:.1}% | 113: {:.1}% | 135: {:.1}% | 157: {:.1}% | 203: {:.1}%",
       self.get_luma_pred_mode_pct_by_frame_type(PredictionMode::D45_PRED, frame_type),
       self.get_luma_pred_mode_pct_by_frame_type(PredictionMode::D67_PRED, frame_type),
@@ -526,7 +525,7 @@ impl ProgressInfo {
       self.get_luma_pred_mode_pct_by_frame_type(PredictionMode::D203_PRED, frame_type),
       );
     } else if frame_type == FrameType::INTER {
-      println!(
+      info!(
         "y modes {}: Nearest: {:.1}% | Near0: {:.1}% | Near1: {:.1}% | NearNear0: {:.1}% | NearNear1: {:.1}% | NearNear2: {:.1}%",
         type_label,
         self.get_luma_pred_mode_pct_by_frame_type(PredictionMode::NEARESTMV, frame_type),
@@ -536,7 +535,7 @@ impl ProgressInfo {
         self.get_luma_pred_mode_pct_by_frame_type(PredictionMode::NEAR_NEAR1MV, frame_type),
         self.get_luma_pred_mode_pct_by_frame_type(PredictionMode::NEAR_NEAR2MV, frame_type),
       );
-      println!(
+      info!(
         "y modes {}: NearNew0: {:.1}% | NearNew1: {:.1}% | NearNew2: {:.1}%",
         type_label,
         self.get_luma_pred_mode_pct_by_frame_type(
@@ -552,7 +551,7 @@ impl ProgressInfo {
           frame_type
         ),
       );
-      println!(
+      info!(
         "y modes {}: NewNear0: {:.1}% | NewNear1: {:.1}% | NewNear2: {:.1}%",
         type_label,
         self.get_luma_pred_mode_pct_by_frame_type(
@@ -575,7 +574,7 @@ impl ProgressInfo {
     &self, frame_type: FrameType, type_label: char,
   ) {
     if frame_type == FrameType::KEY {
-      println!(
+      info!(
         "uv modes {}: DC: {:.1}% | V: {:.1}% | H: {:.1}% | Paeth: {:.1}%",
         type_label,
         self.get_chroma_pred_mode_pct_by_frame_type(
@@ -595,7 +594,7 @@ impl ProgressInfo {
           frame_type
         ),
       );
-      println!(
+      info!(
         "            Smooth: {:.1}% | Smooth V: {:.1}% | Smooth H: {:.1}% | UV CFL: {:.1}%",
         self.get_chroma_pred_mode_pct_by_frame_type(PredictionMode::SMOOTH_PRED, frame_type),
         self.get_chroma_pred_mode_pct_by_frame_type(PredictionMode::SMOOTH_V_PRED, frame_type),
@@ -603,7 +602,7 @@ impl ProgressInfo {
         self.get_chroma_pred_mode_pct_by_frame_type(PredictionMode::UV_CFL_PRED, frame_type),
       );
       // Keep angular order for presentation here, rather than enum order.
-      println!(
+      info!(
         "         D: 45: {:.1}% | 67: {:.1}% | 113: {:.1}% | 135: {:.1}% | 157: {:.1}% | 203: {:.1}%",
         self.get_chroma_pred_mode_pct_by_frame_type(PredictionMode::D45_PRED, frame_type),
         self.get_chroma_pred_mode_pct_by_frame_type(PredictionMode::D67_PRED, frame_type),
@@ -613,7 +612,7 @@ impl ProgressInfo {
         self.get_chroma_pred_mode_pct_by_frame_type(PredictionMode::D203_PRED, frame_type),
       );
     } else if frame_type == FrameType::INTER {
-      println!(
+      info!(
         "uv modes {}: Nearest: {:.1}% | Near0: {:.1}% | Near1: {:.1}% | NearNear0: {:.1}% | NearNear1: {:.1}% | NearNear2: {:.1}%",
         type_label,
         self.get_chroma_pred_mode_pct_by_frame_type(PredictionMode::NEARESTMV, frame_type),
@@ -623,7 +622,7 @@ impl ProgressInfo {
         self.get_chroma_pred_mode_pct_by_frame_type(PredictionMode::NEAR_NEAR1MV, frame_type),
         self.get_chroma_pred_mode_pct_by_frame_type(PredictionMode::NEAR_NEAR2MV, frame_type),
       );
-      println!(
+      info!(
         "uv modes {}: NearNew0: {:.1}% | NearNew1: {:.1}% | NearNew2: {:.1}%",
         type_label,
         self.get_chroma_pred_mode_pct_by_frame_type(
@@ -639,7 +638,7 @@ impl ProgressInfo {
           frame_type
         ),
       );
-      println!(
+      info!(
         "uv modes {}: NewNear0: {:.1}% | NewNear1: {:.1}% | NewNear2: {:.1}%",
         type_label,
         self.get_chroma_pred_mode_pct_by_frame_type(
@@ -655,7 +654,7 @@ impl ProgressInfo {
           frame_type
         ),
       );
-      println!("            New: {:.1}% | NewNew: {:.1}% | NearestNearest: {:.1}% | GlobalGlobal: {:.1}%",
+      info!("            New: {:.1}% | NewNew: {:.1}% | NearestNearest: {:.1}% | GlobalGlobal: {:.1}%",
             self.get_chroma_pred_mode_pct_by_frame_type(PredictionMode::NEWMV, frame_type),
             self.get_chroma_pred_mode_pct_by_frame_type(PredictionMode::NEW_NEWMV, frame_type),
             self.get_chroma_pred_mode_pct_by_frame_type(PredictionMode::NEAREST_NEARESTMV, frame_type),

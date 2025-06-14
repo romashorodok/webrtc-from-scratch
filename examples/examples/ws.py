@@ -1,3 +1,11 @@
+from concurrent.futures import ProcessPoolExecutor
+
+from dataclasses import dataclass
+from multiprocessing import shared_memory, Process
+
+
+import numpy as np
+
 import asyncio
 import json
 import threading
@@ -53,14 +61,18 @@ def pre_read_y4m(file_path: str):
     with open(file_path, "rb") as file:
         n_frames = 0
         reader = media.Y4mDecoder(file)
-        frames: list[Y4mFrame] = []
+        frames = list[Y4mFrame]()
         for frame in reader:
             n_frames += 1
             frames.append(frame)
-        return frames, reader
+        return frames, n_frames, reader
 
 
-frames, y4m_reader = pre_read_y4m("output.y4m")
+# filename = "output.y4m"
+filename = "test.y4m"
+frames, frame_count, y4m_reader = pre_read_y4m(filename)
+# frames, y4m_reader = pre_read_y4m("test.y4m")
+
 
 video_details = y4m_reader.get_video_details()
 enc = Rav1e(
@@ -73,6 +85,133 @@ enc = Rav1e(
     time_base_num=video_details.time_base.numerator,
     time_base_dem=video_details.time_base.denominator,
 )
+# chroma_width, chroma_height = video_details.chroma_sampling.get_chroma_dimensions(
+#     video_details.width,
+#     video_details.height,
+# )
+
+
+NUM_SLOTS = 2
+
+
+def apply_rainbow_wave_numpy(
+    y: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    width: int,
+    height: int,
+    chroma_width: int,
+    chroma_height: int,
+    frame_index: int,
+):
+    """
+    Applies a rainbow wave across the image using sine-based modulation on Y, U, V.
+    All inputs are 1D NumPy arrays from shared memory.
+    """
+    # Reshape to 2D planes
+    y_2d = y.reshape((height, width))
+    u_2d = u.reshape((chroma_height, chroma_width))
+    v_2d = v.reshape((chroma_height, chroma_width))
+
+    # Luma wave (horizontal brightness)
+    for x in range(width):
+        brightness = 32 * np.sin(2 * np.pi * (x + frame_index) / 64)
+        y_2d[:, x] = np.clip(y_2d[:, x] + brightness, 0, 255)
+
+    # Chroma waves (color cycling)
+    for x in range(chroma_width):
+        u_wave = 40 * np.sin(2 * np.pi * (x + frame_index) / 64 + np.pi / 2)
+        v_wave = 40 * np.sin(2 * np.pi * (x + frame_index) / 64)
+        u_2d[:, x] = np.clip(u_2d[:, x] + u_wave, 0, 255)
+        v_2d[:, x] = np.clip(v_2d[:, x] + v_wave, 0, 255)
+
+
+def transform_worker(
+    shm_name: str,
+    width: int,
+    height: int,
+    chroma_width: int,
+    chroma_height: int,
+    frame_index: int,
+):
+    import numpy as np
+
+    shm = shared_memory.SharedMemory(name=shm_name)
+    y_size = width * height
+    u_size = chroma_width * chroma_height
+    v_size = chroma_width * chroma_height
+
+    buf = np.ndarray((y_size + u_size + v_size,), dtype=np.uint8, buffer=shm.buf)
+
+    y = buf[0:y_size]
+    u = buf[y_size : y_size + u_size]
+    v = buf[y_size + u_size :]
+
+    apply_rainbow_wave_numpy(
+        y, u, v, width, height, chroma_width, chroma_height, frame_index
+    )
+
+    shm.close()
+
+
+async def process_frame(
+    slot_idx: int,
+    shm_slots: list[shared_memory.SharedMemory],
+    frame: Y4mFrame,
+    executor: ProcessPoolExecutor,
+    frame_index: int,
+):
+    shm = shm_slots[slot_idx]
+    shm_buf = shm.buf
+
+    shm_size = y4m_reader.buffer_bytes_size
+    shm_np = np.ndarray((shm_size,), dtype=np.uint8, buffer=shm_buf)
+
+    # Step 1: Write original frame into shared memory
+
+    chroma_width, chroma_height = video_details.chroma_sampling.get_chroma_dimensions(
+        video_details.width,
+        video_details.height,
+    )
+    y_size = video_details.width * video_details.height
+    chroma_size = chroma_width * chroma_height
+
+    y, u, v = frame.planes.y, frame.planes.u, frame.planes.v
+    shm_np[0:y_size] = np.frombuffer(y, dtype=np.uint8)
+    shm_np[y_size : y_size + chroma_size] = np.frombuffer(u, dtype=np.uint8)
+    shm_np[y_size + chroma_size :] = np.frombuffer(v, dtype=np.uint8)
+
+    # await asyncio.get_running_loop().run_in_executor(
+    #     executor,
+    #     transform_worker,
+    #     shm.name,
+    #     video_details.width,
+    #     video_details.height,
+    #     chroma_width,
+    #     chroma_height,
+    #     frame_index,
+    # )
+
+    await enc.send_packet(
+        1,
+        width=video_details.width,
+        chroma_width=chroma_width,
+        # y_plane=y,
+        # u_plane=u,
+        # v_plane=v,
+        y_plane=shm_np[0:y_size].tobytes(),
+        u_plane=shm_np[y_size : y_size + chroma_size].tobytes(),
+        v_plane=shm_np[y_size + chroma_size :].tobytes(),
+    )
+
+    return ""
+
+
+executor = ProcessPoolExecutor(max_workers=NUM_SLOTS)
+shm_slots = [
+    shared_memory.SharedMemory(create=True, size=y4m_reader.buffer_bytes_size)
+    for _ in range(NUM_SLOTS)
+]
 
 
 # TWCC sequence numbers must be same across the session
@@ -108,6 +247,10 @@ class SendTimeCache:
                 self.cache.pop(seq, None)
             else:
                 break
+
+
+TARGET_FPS = 30
+FRAME_PERIOD = 1 / TARGET_FPS
 
 
 def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
@@ -194,24 +337,85 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
 
     async def send_routine():
         frame_index = 0
-        chroma_width, _ = video_details.chroma_sampling.get_chroma_dimensions(
-            video_details.width,
-            video_details.height,
+        chroma_width, chroma_height = (
+            video_details.chroma_sampling.get_chroma_dimensions(
+                video_details.width,
+                video_details.height,
+            )
         )
-        while True:
-            if frame_index >= len(frames):
+        max_inflight_tasks = len(shm_slots)
+        inflight_tasks = set()
+
+        async for pts, time_base in encoding._packetizer.ticker():
+            start_time = asyncio.get_event_loop().time()
+
+            if frame_index >= frame_count:
                 frame_index = 0
 
+                # Wait if all slots are busy
+            if len(inflight_tasks) >= max_inflight_tasks:
+                # Wait for any one task to finish before submitting another
+                _done, inflight_tasks = await asyncio.wait(
+                    inflight_tasks, return_when=asyncio.FIRST_COMPLETED
+                )
+
+            slot_idx = frame_index % max_inflight_tasks
             frame = frames[frame_index]
-            await enc.send_packet(
-                bytes_per_sample=y4m_reader.bytes_per_sample,
-                width=video_details.width,
-                chroma_width=chroma_width,
-                y_plane=frame.planes.y,
-                u_plane=frame.planes.u,
-                v_plane=frame.planes.v,
+
+            # Launch a non-blocking task for this frame
+            task = asyncio.create_task(
+                process_frame(slot_idx, shm_slots, frame, executor, frame_index)
             )
+            inflight_tasks.add(task)
+
             frame_index += 1
+
+            # await asyncio.sleep(0)
+            elapsed = asyncio.get_event_loop().time() - start_time
+            sleep_time = max(0, FRAME_PERIOD - elapsed)
+            await asyncio.sleep(sleep_time)
+
+            # if frame_index >= len(frames):
+            #     frame_index = 0
+
+            # frame = frames[frame_index]
+
+            # await process_frame(0, shm_slots, frame, executor, frame_index)
+
+            # y_bytes, u_bytes, v_bytes = apply_rainbow_wave(
+            #     frame.planes.y,
+            #     frame.planes.u,
+            #     frame.planes.v,
+            #     width=video_details.width,
+            #     height=video_details.height,
+            #     chroma_width=chroma_width,
+            #     chroma_height=chroma_height,
+            #     frame_index=frame_index,
+            # )
+
+            # await enc.send_packet(
+            #     bytes_per_sample=y4m_reader.buffer_bytes_size,
+            #     width=video_details.width,
+            #     chroma_width=chroma_width,
+            #     y_plane=frame.planes.y,
+            #     u_plane=frame.planes.u,
+            #     v_plane=frame.planes.v,
+            #     # y_plane=y_bytes,
+            #     # u_plane=u_bytes,
+            #     # v_plane=v_bytes,
+            # )
+            frame_index += 1
+
+    encoded_frames = asyncio.Queue[bytes]()
+
+    async def encoded_result():
+        while True:
+            # start_time = asyncio.get_event_loop().time()
+            frame = await enc.receive_packet()
+            await encoded_frames.put(frame)
+            # elapsed = asyncio.get_event_loop().time() - start_time
+            # sleep_time = max(0, FRAME_PERIOD - elapsed)
+            # await asyncio.sleep(sleep_time)
 
     async def encode():
         frame_index = 0
@@ -229,8 +433,10 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
             # await enc.send_packet()
             # print("send dat")
 
-            frame = await enc.receive_packet()
-            print("recv data", frame)
+            # frame = await enc.receive_packet()
+
+            frame = await encoded_frames.get()
+            # print("recv data", frame)
 
             # if frame_index >= len(frames):
             #     frame_index = 0
@@ -251,6 +457,7 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
                 send_time_cache.add(pkt.extensions.transport_sequence_number)
                 pc._transport.sendto(encoded)
 
+    rw_loop.create_task(encoded_result())
     rw_loop.create_task(send_routine())
     rw_loop.create_task(rtcp_handler())
     rw_loop.run_until_complete(encode())

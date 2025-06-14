@@ -243,7 +243,7 @@ class Y4mDecoder:
         self.colorspace: Colorspace | None = None
         self.buf = bytearray(0)
         self.y_size = self.u_size = self.v_size = 0
-        self.bytes_per_sample: int = 0
+        self.buffer_bytes_size: int = 0
         self.__read_params()
 
     def get_video_details(self) -> VideoDetails:
@@ -307,7 +307,7 @@ class Y4mDecoder:
         if frame_size > _BUFFER_SIZE:
             raise ValueError("Out of memory")
 
-        self.bytes_per_sample = frame_size
+        self.buffer_bytes_size = frame_size
         self.buf = bytearray(frame_size)
 
     def __iter__(self) -> Self:

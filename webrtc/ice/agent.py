@@ -1,3 +1,5 @@
+import socket
+import re
 import asyncio
 import queue
 from datetime import datetime, timedelta
@@ -638,6 +640,9 @@ class AgentEvent:
     CANDIDATE_PAIR_CONTROLLER = "candidate-pair-controller"
 
 
+mdns_pattern = re.compile(r"\b(?:[a-zA-Z0-9_-]+\.)*local\.?\b")
+
+
 # Controlling agent must know remote user credentials
 class Agent(AsyncEventEmitter):
     def __init__(self, options: AgentOptions) -> None:
@@ -764,6 +769,15 @@ class Agent(AsyncEventEmitter):
 
         if self._remote_ufrag is None or self._remote_pwd is None:
             raise ValueError("Unable add canddiate ")
+
+        if mdns_pattern.search(remote.address):
+            try:
+                ip = socket.gethostbyname(remote.address)
+                print("Resolved mDNS IP:", ip)
+                remote.set_address(ip)
+            except socket.gaierror:
+                print("Could not resolve mDNS address")
+                exit(1)
 
         # TODO: may be better provide some object ref that hold ufrag, pwd to make dynamic replacement of credentials
         pair = CandidatePair(

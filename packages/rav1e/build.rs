@@ -124,7 +124,6 @@ fn build_nasm_files() {
     "src/x86/mc16_sse.asm",
     "src/x86/me.asm",
     "src/x86/sad_avx.asm",
-    "src/x86/sad_plane.asm",
     "src/x86/sad_sse2.asm",
     "src/x86/satd.asm",
     "src/x86/satd16_avx2.asm",
@@ -135,8 +134,6 @@ fn build_nasm_files() {
   if let Some((hash, hash_path)) =
     hash_changed(asm_files, &out_dir, &dest_path)
   {
-    // NOTE: can be found
-    // find . -type f -name "*rav1easm*"
     let obj = nasm_rs::Build::new()
       .min_version(2, 15, 0)
       .include(&out_dir)

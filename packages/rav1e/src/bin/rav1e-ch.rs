@@ -131,13 +131,6 @@ fn do_encode<T: Pixel, D: Decoder>(
   let y4m_details = source.input.get_video_details();
 
   crossbeam::thread::scope(move |s| -> Result<(), CliError> {
-    // NOTE: Not use pass file because it double encode the video
-    //
-    // Two-pass encoding is a technique used to improve bitrate control and video quality. It's especially useful when you need to target a specific bitrate (e.g., for WebRTC bandwidth limits or streaming constraints).
-    //
-    // First pass: The encoder analyzes the video without focusing on quality or compression. It gathers information (like motion, complexity, scene changes, etc.) and writes it to a passfile (the stats file).
-    // Second pass: The encoder uses the stats from the passfile to allocate bits more intelligently — giving more bits to complex scenes and fewer bits to simpler scenes — while maintaining the target bitrate.
-
     // Receive pass data
     let receive_pass_data = s.spawn(move |_| -> Result<(), CliError> {
       if let (Some(mut passfile), Some(receive_rc)) = (pass1file, receive_rc) {
@@ -298,7 +291,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
   #[cfg(feature = "tracing")]
   {
-    use tracing_subscriber::layer::subscriberext;
+    use tracing_subscriber::layer::SubscriberExt;
     tracing::subscriber::set_global_default(
       tracing_subscriber::registry().with(chrome_layer),
     )

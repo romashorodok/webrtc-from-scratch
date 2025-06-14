@@ -4,6 +4,12 @@ run:
 y4m:
 	ffmpeg -f lavfi -i testsrc=duration=5:size=640x480:rate=30 -pix_fmt yuv420p -f yuv4mpegpipe output.y4m
 
+
+transcode:
+	ffmpeg -i test.mp4  -vf "scale=600:360,fps=30,setdar=1/1,setsar=1"  -pix_fmt yuv420p -f yuv4mpegpipe test.y4m
+
+
+
 y4mVerify:
 	ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=nokey=1:noprint_wrappers=1 output.y4m
 

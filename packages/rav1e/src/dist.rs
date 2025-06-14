@@ -9,7 +9,9 @@
 
 cfg_if::cfg_if! {
   if #[cfg(nasm_x86_64)] {
-    pub use crate::asm::x86::dist::*;
+    pub use self::rust::*;
+    #[allow(unused_imports)]
+    pub use crate::asm::x86::*;
   } else if #[cfg(asm_neon)] {
     pub use crate::asm::aarch64::dist::*;
   } else {

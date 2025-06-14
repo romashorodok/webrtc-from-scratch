@@ -8,11 +8,10 @@
 // PATENTS file, you can obtain it at www.aomedia.org/license/patent.
 
 pub mod cdef;
-pub mod dist;
+// pub mod dist;
 pub mod ec;
 pub mod lrf;
 pub mod mc;
 pub mod predict;
 pub mod quantize;
-pub mod sad_plane;
 pub mod transform;
