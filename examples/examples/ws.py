@@ -1,4 +1,9 @@
 import torch
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as T
+
+
 from concurrent.futures import ProcessPoolExecutor
 
 from dataclasses import dataclass
@@ -95,40 +100,9 @@ enc = Rav1e(
 NUM_SLOTS = 2
 
 
-def apply_rainbow_wave_numpy(
-    y: np.ndarray,
-    u: np.ndarray,
-    v: np.ndarray,
-    width: int,
-    height: int,
-    chroma_width: int,
-    chroma_height: int,
-    frame_index: int,
-):
-    """
-    Applies a rainbow wave across the image using sine-based modulation on Y, U, V.
-    All inputs are 1D NumPy arrays from shared memory.
-    """
-    # Reshape to 2D planes
-    y_2d = y.reshape((height, width))
-    u_2d = u.reshape((chroma_height, chroma_width))
-    v_2d = v.reshape((chroma_height, chroma_width))
-
-    # Luma wave (horizontal brightness)
-    for x in range(width):
-        brightness = 32 * np.sin(2 * np.pi * (x + frame_index) / 64)
-        y_2d[:, x] = np.clip(y_2d[:, x] + brightness, 0, 255)
-
-    # Chroma waves (color cycling)
-    for x in range(chroma_width):
-        u_wave = 40 * np.sin(2 * np.pi * (x + frame_index) / 64 + np.pi / 2)
-        v_wave = 40 * np.sin(2 * np.pi * (x + frame_index) / 64)
-        u_2d[:, x] = np.clip(u_2d[:, x] + u_wave, 0, 255)
-        v_2d[:, x] = np.clip(v_2d[:, x] + v_wave, 0, 255)
-
-
 def transform_worker(
     shm_name: str,
+    prev_shm_name: str,
     width: int,
     height: int,
     chroma_width: int,
@@ -145,8 +119,8 @@ def transform_worker(
     buf = np.ndarray((y_size + u_size + v_size,), dtype=np.uint8, buffer=shm.buf)
 
     y = buf[0:y_size]
-    u = buf[y_size : y_size + u_size]
-    v = buf[y_size + u_size :]
+    # u = buf[y_size : y_size + u_size]
+    # v = buf[y_size + u_size :]
 
     # apply_rainbow_wave_numpy(
     #     y, u, v, width, height, chroma_width, chroma_height, frame_index
@@ -155,14 +129,6 @@ def transform_worker(
     y_t = (
         torch.from_numpy(y).float().unsqueeze(0).unsqueeze(0) / 255.0
     )  # shape [1,1,H,W]
-
-    # Define Sobel kernels (3x3) as conv filters
-    sobel_x = torch.tensor(
-        [[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]], dtype=torch.float32
-    )
-    sobel_y = torch.tensor(
-        [[[[-1, -2, -1], [0, 0, 0], [1, 2, 1]]]], dtype=torch.float32
-    )
 
     # Apply conv2d with padding=1 to keep size
     grad_x = torch.nn.functional.conv2d(y_t, sobel_x, padding=1)
@@ -188,6 +154,86 @@ def transform_worker(
     y[:] = blended.flatten()
 
     shm.close()
+
+
+sobel_x = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]], dtype=torch.float32)
+sobel_y = torch.tensor([[[[-1, -2, -1], [0, 0, 0], [1, 2, 1]]]], dtype=torch.float32)
+
+
+def transform_motion_highlight_Edge_glow_worker(
+    curr_shm_name: str,
+    prev_shm_name: str,
+    width: int,
+    height: int,
+    chroma_width: int,
+    chroma_height: int,
+    frame_index: int,
+):
+    shm = shared_memory.SharedMemory(name=curr_shm_name)
+    y_size = width * height
+    u_size = chroma_width * chroma_height
+    v_size = chroma_width * chroma_height
+    buf = np.ndarray((y_size + u_size + v_size,), dtype=np.uint8, buffer=shm.buf)
+    y = buf[0:y_size].reshape(height, width)
+    u = buf[y_size : y_size + u_size]
+    v = buf[y_size + u_size :]
+
+    # Previous frame shm
+    prev_shm = shared_memory.SharedMemory(name=prev_shm_name)
+    prev_buf = np.ndarray((y_size,), dtype=np.uint8, buffer=prev_shm.buf)
+    y_prev = prev_buf.reshape(height, width)
+
+    # Convert to torch tensor
+    y_t = torch.from_numpy(y).float().unsqueeze(0).unsqueeze(0) / 255.0
+    y_prev_t = torch.from_numpy(y_prev).float().unsqueeze(0).unsqueeze(0) / 255.0
+
+    # 1) Motion mask by frame difference
+    motion = torch.abs(y_t - y_prev_t).squeeze()
+    motion_threshold = 0.5
+    motion_mask = (motion > motion_threshold).float()
+
+    grad_x = F.conv2d(y_t, sobel_x, padding=1)
+    grad_y = F.conv2d(y_t, sobel_y, padding=1)
+    edges = torch.sqrt(grad_x**2 + grad_y**2).squeeze()
+    edges = edges / edges.max()
+    edge_threshold = 0.15
+    edges_mask = (edges > edge_threshold).float()
+
+    # 3) Create glow mask where motion AND edges are strong
+    glow_mask = (motion_mask * edges_mask).clamp(0, 1)
+
+    # 4) Increase Y luminance where glow is detected (boost brightness)
+    glow_strength = 0.5
+    y_t_new = y_t.squeeze() + glow_mask * glow_strength
+    y_t_new = y_t_new.clamp(0, 1)
+
+    # 5) Boost blue tint in U/V near glow (simple)
+    # Normalize U/V
+    u_t = torch.from_numpy(u).float().reshape(chroma_height, chroma_width) / 255.0
+    v_t = torch.from_numpy(v).float().reshape(chroma_height, chroma_width) / 255.0
+
+    glow_mask_resized = glow_mask.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+    glow_mask_resized = F.interpolate(
+        glow_mask_resized,
+        size=(chroma_height, chroma_width),
+        mode="bilinear",
+        align_corners=False,
+    )
+    glow_mask_resized = glow_mask_resized.squeeze(0).squeeze(
+        0
+    )  # [chroma_height, chroma_width]
+
+    # Add blue tint: increase V (blue chroma) in glow areas, clip to [0,1]
+    tint_strength = 0.3
+    v_t = (v_t + glow_mask_resized * tint_strength).clamp(0, 1)
+
+    # Write back Y,U,V
+    y[:] = (y_t_new.squeeze().numpy() * 255).astype(np.uint8)
+    u[:] = (u_t.numpy() * 255).astype(np.uint8).flatten()
+    v[:] = (v_t.numpy() * 255).astype(np.uint8).flatten()
+
+    shm.close()
+    prev_shm.close()
 
 
 async def process_frame(
@@ -217,10 +263,15 @@ async def process_frame(
     shm_np[y_size : y_size + chroma_size] = np.frombuffer(u, dtype=np.uint8)
     shm_np[y_size + chroma_size :] = np.frombuffer(v, dtype=np.uint8)
 
+    prev_slot_idx = (slot_idx - 1) % len(shm_slots)
+    prev_shm = shm_slots[prev_slot_idx]
+
     await asyncio.get_running_loop().run_in_executor(
         executor,
-        transform_worker,
+        # transform_worker,
+        transform_motion_highlight_Edge_glow_worker,
         shm.name,
+        prev_shm.name,
         video_details.width,
         video_details.height,
         chroma_width,

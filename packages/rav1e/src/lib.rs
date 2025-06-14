@@ -409,7 +409,7 @@ impl Rav1e {
     enc_cfg.low_latency = true;
     enc_cfg.tune = Tune::Psnr;
     enc_cfg.quantizer = 100;
-    enc_cfg.min_quantizer = 100;
+    enc_cfg.min_quantizer = 60;
 
     // enc_cfg.min_quantizer = 60;
     // enc_cfg.min_key_frame_interval = 60;
