@@ -1,3 +1,4 @@
+import torch
 from concurrent.futures import ProcessPoolExecutor
 
 from dataclasses import dataclass
@@ -147,9 +148,44 @@ def transform_worker(
     u = buf[y_size : y_size + u_size]
     v = buf[y_size + u_size :]
 
-    apply_rainbow_wave_numpy(
-        y, u, v, width, height, chroma_width, chroma_height, frame_index
+    # apply_rainbow_wave_numpy(
+    #     y, u, v, width, height, chroma_width, chroma_height, frame_index
+    # )
+
+    y_t = (
+        torch.from_numpy(y).float().unsqueeze(0).unsqueeze(0) / 255.0
+    )  # shape [1,1,H,W]
+
+    # Define Sobel kernels (3x3) as conv filters
+    sobel_x = torch.tensor(
+        [[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]], dtype=torch.float32
     )
+    sobel_y = torch.tensor(
+        [[[[-1, -2, -1], [0, 0, 0], [1, 2, 1]]]], dtype=torch.float32
+    )
+
+    # Apply conv2d with padding=1 to keep size
+    grad_x = torch.nn.functional.conv2d(y_t, sobel_x, padding=1)
+    grad_y = torch.nn.functional.conv2d(y_t, sobel_y, padding=1)
+
+    # Compute gradient magnitude
+    edges = torch.sqrt(grad_x**2 + grad_y**2).squeeze()
+
+    # Normalize to 0-1
+    edges = edges / edges.max()
+    threshold = 0.1
+    edges = torch.where(edges > threshold, edges, torch.zeros_like(edges))
+
+    # Scale edges back to 0-255 uint8
+    edges_uint8 = (edges * 255).clamp(0, 255).to(torch.uint8)
+
+    # Blend with original y (uint8)
+    alpha = 0.5
+    blended = (
+        ((1 - alpha) * y + alpha * edges_uint8.numpy()).clip(0, 255).astype(np.uint8)
+    )
+
+    y[:] = blended.flatten()
 
     shm.close()
 
@@ -181,16 +217,16 @@ async def process_frame(
     shm_np[y_size : y_size + chroma_size] = np.frombuffer(u, dtype=np.uint8)
     shm_np[y_size + chroma_size :] = np.frombuffer(v, dtype=np.uint8)
 
-    # await asyncio.get_running_loop().run_in_executor(
-    #     executor,
-    #     transform_worker,
-    #     shm.name,
-    #     video_details.width,
-    #     video_details.height,
-    #     chroma_width,
-    #     chroma_height,
-    #     frame_index,
-    # )
+    await asyncio.get_running_loop().run_in_executor(
+        executor,
+        transform_worker,
+        shm.name,
+        video_details.width,
+        video_details.height,
+        chroma_width,
+        chroma_height,
+        frame_index,
+    )
 
     await enc.send_packet(
         1,

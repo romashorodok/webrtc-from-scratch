@@ -6,14 +6,16 @@ readme = "README.md"
 authors = [
     { name = "romashorodok", email = "108732029+romashorodok@users.noreply.github.com" }
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115.12",
     "uvicorn[standard]>=0.34.2",
     "watchfiles>=1.0.5",
     "webrtc",
     "rav1e",
-    "numpy>=2.3.0",
+    "numpy<2",
+    "torch==2.2.2",
+    "torchvision>=0.17.2",
 ]
 
 [build-system]

@@ -3,7 +3,7 @@ name = "webrtc"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "maturin>=1.8.3",
     "webrtc_rs",
