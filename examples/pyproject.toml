@@ -16,6 +16,7 @@ dependencies = [
     "numpy<2",
     "torch==2.2.2",
     "torchvision>=0.17.2",
+    "pyzmq>=27.0.0",
 ]
 
 [build-system]

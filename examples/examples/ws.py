@@ -1,25 +1,20 @@
-import torch
-import torch.nn.functional as F
-import torchvision
-import torchvision.transforms as T
-
-
-from concurrent.futures import ProcessPoolExecutor
-
-from dataclasses import dataclass
-from multiprocessing import shared_memory, Process
-
-
-import numpy as np
-
 import asyncio
+import contextlib
 import json
 import threading
 import time
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import shared_memory
 from typing import Any, Callable
 
+# import numpy as np
+
+# NOTE: it create 1 thread
+# import torch
+# import torch.nn.functional as F
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from rav1e import Rav1e
 from webrtc_rs import SRTP
 
 from webrtc import media
@@ -40,7 +35,7 @@ from webrtc.session_description import (
     SessionDescriptionType,
 )
 from webrtc.transceiver import RTPCodecKind, RTPTransceiverDirection
-from rav1e import Rav1e
+
 
 app = FastAPI()
 
@@ -76,21 +71,21 @@ def pre_read_y4m(file_path: str):
 
 # filename = "output.y4m"
 filename = "test.y4m"
-frames, frame_count, y4m_reader = pre_read_y4m(filename)
+# frames, frame_count, y4m_reader = pre_read_y4m(filename)
 # frames, y4m_reader = pre_read_y4m("test.y4m")
 
 
-video_details = y4m_reader.get_video_details()
-enc = Rav1e(
-    width=video_details.width,
-    height=video_details.height,
-    sample_aspect_ratio_num=video_details.sample_aspect_ratio.numerator,
-    sample_aspect_ratio_den=video_details.sample_aspect_ratio.denominator,
-    bit_depth=video_details.bit_depth,
-    chroma_sampling=video_details.chroma_sampling.value,
-    time_base_num=video_details.time_base.numerator,
-    time_base_dem=video_details.time_base.denominator,
-)
+# video_details = y4m_reader.get_video_details()
+# enc = Rav1e(
+#     width=video_details.width,
+#     height=video_details.height,
+#     sample_aspect_ratio_num=video_details.sample_aspect_ratio.numerator,
+#     sample_aspect_ratio_den=video_details.sample_aspect_ratio.denominator,
+#     bit_depth=video_details.bit_depth,
+#     chroma_sampling=video_details.chroma_sampling.value,
+#     time_base_num=video_details.time_base.numerator,
+#     time_base_dem=video_details.time_base.denominator,
+# )
 # chroma_width, chroma_height = video_details.chroma_sampling.get_chroma_dimensions(
 #     video_details.width,
 #     video_details.height,
@@ -156,22 +151,22 @@ def transform_worker(
     shm.close()
 
 
-sobel_x = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]], dtype=torch.float32)
-sobel_y = torch.tensor([[[[-1, -2, -1], [0, 0, 0], [1, 2, 1]]]], dtype=torch.float32)
+# sobel_x = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]], dtype=torch.float32)
+# sobel_y = torch.tensor([[[[-1, -2, -1], [0, 0, 0], [1, 2, 1]]]], dtype=torch.float32)
 
 
-def gaussian_blur(y_tensor: torch.Tensor, kernel_size=5, sigma=1.0) -> torch.Tensor:
-    def get_gaussian_kernel1d(size, sigma):
-        coords = torch.arange(size).float() - size // 2
-        kernel = torch.exp(-(coords**2) / (2 * sigma**2))
-        kernel /= kernel.sum()
-        return kernel
+# def gaussian_blur(y_tensor: torch.Tensor, kernel_size=5, sigma=1.0) -> torch.Tensor:
+#     def get_gaussian_kernel1d(size, sigma):
+#         coords = torch.arange(size).float() - size // 2
+#         kernel = torch.exp(-(coords**2) / (2 * sigma**2))
+#         kernel /= kernel.sum()
+#         return kernel
 
-    k = get_gaussian_kernel1d(kernel_size, sigma).view(1, 1, -1)  # [1,1,K]
+#     k = get_gaussian_kernel1d(kernel_size, sigma).view(1, 1, -1)  # [1,1,K]
 
-    y_blur = F.conv2d(y_tensor, k.unsqueeze(2), padding=(0, kernel_size // 2))
-    y_blur = F.conv2d(y_blur, k.unsqueeze(3), padding=(kernel_size // 2, 0))
-    return y_blur
+#     y_blur = F.conv2d(y_tensor, k.unsqueeze(2), padding=(0, kernel_size // 2))
+#     y_blur = F.conv2d(y_blur, k.unsqueeze(3), padding=(kernel_size // 2, 0))
+#     return y_blur
 
 
 def transform_motion_highlight_Edge_glow_worker(
@@ -341,11 +336,11 @@ async def process_frame(
     return ""
 
 
-executor = ProcessPoolExecutor(max_workers=NUM_SLOTS)
-shm_slots = [
-    shared_memory.SharedMemory(create=True, size=y4m_reader.buffer_bytes_size)
-    for _ in range(NUM_SLOTS)
-]
+# executor = ProcessPoolExecutor(max_workers=NUM_SLOTS)
+# shm_slots = [
+#     shared_memory.SharedMemory(create=True, size=y4m_reader.buffer_bytes_size)
+#     for _ in range(NUM_SLOTS)
+# ]
 
 
 # TWCC sequence numbers must be same across the session
