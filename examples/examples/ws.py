@@ -1,25 +1,17 @@
-import torch
-import torch.nn.functional as F
-import torchvision
-import torchvision.transforms as T
-
-
-from concurrent.futures import ProcessPoolExecutor
-
-from dataclasses import dataclass
-from multiprocessing import shared_memory, Process
-
-
-import numpy as np
-
 import asyncio
 import json
 import threading
 import time
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import shared_memory
 from typing import Any, Callable
 
+import numpy as np
+import torch
+import torch.nn.functional as F
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from rav1e import Rav1e
 from webrtc_rs import SRTP
 
 from webrtc import media
@@ -40,7 +32,6 @@ from webrtc.session_description import (
     SessionDescriptionType,
 )
 from webrtc.transceiver import RTPCodecKind, RTPTransceiverDirection
-from rav1e import Rav1e
 
 app = FastAPI()
 
@@ -76,9 +67,11 @@ def pre_read_y4m(file_path: str):
 
 # filename = "output.y4m"
 filename = "test.y4m"
-frames, frame_count, y4m_reader = pre_read_y4m(filename)
 # frames, y4m_reader = pre_read_y4m("test.y4m")
 
+
+with open(filename, "rb") as file:
+    y4m_reader = media.Y4mDecoder(file)
 
 video_details = y4m_reader.get_video_details()
 enc = Rav1e(
@@ -399,6 +392,8 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
         raise ValueError("Not found local track")
 
     encoding = sender._track_encodings[0]
+
+    frames, frame_count, y4m_reader = pre_read_y4m(filename)
 
     # frames = rw_loop.run_until_complete(pre_read_frames("output_av1.ivf"))
     # frames = rw_loop.run_until_complete(pre_read_frames("output.ivf"))

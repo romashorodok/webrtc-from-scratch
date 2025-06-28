@@ -22,5 +22,9 @@ dependencies = [
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.packages.find]
+where = ["../"]
+include = ["*"]
+
 [tool.uv.sources]
 webrtc = { path = "../", editable = true }

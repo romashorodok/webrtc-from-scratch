@@ -28,6 +28,7 @@ rav1e = { workspace = true }
 
 [tool.uv]
 config-settings = { build-args = '--profile=dev' }
+package = true
 
 [build-system]
 requires = ["setuptools>=61"]
