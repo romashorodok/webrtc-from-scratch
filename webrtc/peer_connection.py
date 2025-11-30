@@ -297,9 +297,11 @@ class PeerConnectionEvent(StrEnum):
 async def dtls_ice_pair_queue_handshake_routine(
     pair_transport: ice.CandidatePairTransport, dtls_transport: dtls.DTLSTransport
 ):
+    print("dtls_ice_pair_queue_handshake_routine: STARTED - listening for DTLS packets")
     while True:
         try:
             pkt = await pair_transport.recv_dtls()
+            print(f"dtls_ice_pair_queue_handshake_routine: received DTLS packet, {len(pkt.data)} bytes")
             await dtls_transport.enqueue_record(pkt.data)
         except Exception as e:
             print("dtls_ice_pair_queue_routine error:", e)
@@ -369,11 +371,12 @@ class PeerConnection(AsyncEventEmitter):
         async def _bind_transport_on_nominated_to_transceivers(
             transport: ice.CandidatePairTransport,
         ):
-            print("on __bind_transport_on_nominated_to_transceivers")
+            print(f"[PC] on NOMINATE_TRANSPORT: starting DTLS as {dtls_role}")
             self._transport = transport
 
-            # TODO: Check if it started
-            self._dtls_transport.start(dtls_role)
+            # Start DTLS with the nominated transport
+            self._dtls_transport.start(dtls_role, transport)
+            print(f"[PC] DTLS transport started, creating handshake routines")
             self.__loop.create_task(
                 dtls_ice_pair_queue_handshake_routine(transport, self._dtls_transport)
             )

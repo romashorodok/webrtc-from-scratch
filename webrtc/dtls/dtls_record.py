@@ -1,11 +1,9 @@
 import binascii
+import logging
 from dataclasses import dataclass
 from enum import IntEnum
 
 from typing import Self
-
-
-from asn1crypto import x509
 
 from webrtc.dtls.dtls_typing import (
     NAMED_CURVE_TYPE,
@@ -16,6 +14,8 @@ from webrtc.dtls.dtls_typing import (
 
 from webrtc.ice.stun import utils as byteops
 from webrtc.dtls.certificate import RemoteCertificate as CertificateDTLS
+
+logger = logging.getLogger("webrtc.dtls.record")
 
 
 class ContentType(IntEnum):
@@ -474,14 +474,15 @@ class Message:
 
         result = list[CipherSuiteID]()
         for _ in range(cipher_suites_count):
+            cipher_id = self.buf.next_uint16()
             try:
-                result.append(CipherSuiteID(self.buf.next_uint16()))
-            except Exception as e:
-                print("not found cipher sute", e)
-                pass
+                result.append(CipherSuiteID(cipher_id))
+            except ValueError:
+                # TLS 1.3 cipher suites (4865-4867) and others not supported by DTLS 1.2
+                # are expected and can be safely ignored
+                logger.debug(f"Skipping unsupported cipher suite 0x{cipher_id:04X} ({cipher_id})")
 
         self.cipher_suites = result
-        # print("cipher_suites", self.cipher_suites)
 
         return self
 
@@ -861,10 +862,11 @@ class Finished(Message):
     message_type = HandshakeMessageType.Finished
 
     def __init__(self, data: bytes) -> None:
-        self.encrypted_payload = data
+        # The Finished message contains verify_data (12 bytes for TLS 1.2)
+        self.verify_data = data
 
     def marshal(self) -> bytes:
-        return self.encrypted_payload
+        return self.verify_data
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self:
@@ -907,7 +909,7 @@ class ChangeCipherSpec(RecordContentType):
     content_type = ContentType.CHANGE_CIPHER_SPEC
 
     def marshal(self) -> bytes:
-        return bytes(0x01)
+        return bytes([0x01])  # Single byte with value 1
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self:
@@ -1036,9 +1038,31 @@ class EncryptedHandshakeMessage(RecordContentType):
         return cls(data)
 
 
+class Alert(RecordContentType):
+    """DTLS Alert message for error signaling."""
+    content_type = ContentType.ALERT
+
+    def __init__(self, level: int = 0, description: int = 0) -> None:
+        self.level = level  # 1=warning, 2=fatal
+        self.description = description
+
+    def marshal(self) -> bytes:
+        return bytes([self.level, self.description])
+
+    @classmethod
+    def unmarshal(cls, data: bytes) -> Self:
+        if len(data) >= 2:
+            return cls(level=data[0], description=data[1])
+        return cls()
+
+    def __repr__(self) -> str:
+        return f"Alert(level={self.level}, description={self.description})"
+
+
 CONTENT_TYPE_CLASSES: dict[ContentType, type[RecordContentType]] = {
     Handshake.content_type: Handshake,
     ChangeCipherSpec.content_type: ChangeCipherSpec,
+    Alert.content_type: Alert,
 }
 
 
@@ -1189,6 +1213,10 @@ class RecordLayer:
 
         match content_type:
             case ContentType.CHANGE_CIPHER_SPEC:
+                layer = cls.unmarshal(data)
+            case ContentType.ALERT:
+                # Alert messages - log and skip for now
+                print(f"[DTLS] Received Alert message (epoch={epoch}, length={length})")
                 layer = cls.unmarshal(data)
             # TODO: ref it
             case ContentType.HANDSHAKE if epoch > 0:  # it's encrypted message

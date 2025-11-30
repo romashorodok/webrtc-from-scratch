@@ -1,7 +1,5 @@
 import abc
 
-from asn1crypto import x509
-
 from webrtc.dtls.dtls_record import (
     Certificate,
     CertificateRequest,
@@ -155,7 +153,7 @@ class FlightRecordFactory(RecordFactory):
         server_hello.extensions = [
             # RegonitiationInfo(bytes()),
             # ExtendedMasterSecret(bytes()),
-            # use_srtp,
+            use_srtp,
             ec_point_formats,
         ]
 

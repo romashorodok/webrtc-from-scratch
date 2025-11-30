@@ -1,22 +1,13 @@
 import binascii
 import hashlib
-import os
+import logging
 
-from dataclasses import dataclass
-from typing import Callable, Protocol, Self
-from datetime import datetime, UTC, timedelta
+from dataclasses import dataclass, field
+from typing import Any, Callable, Protocol, Self
 
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.hashes import SHA256
-from cryptography.hazmat.backends import default_backend
+# Structured logging for crypto operations
+logger = logging.getLogger("webrtc.dtls.cipher_suite")
 
-
-from ecdsa import Ed25519, SigningKey, VerifyingKey, NIST256p
-from ecdsa.ecdh import ECDH
-from asn1crypto import x509, keys, algos
-from ecdsa.util import sha256
-
-import native
 from webrtc.dtls.dtls_record import (
     EllipticCurvePointFormat,
     RecordHeader,
@@ -25,103 +16,63 @@ from webrtc.dtls.dtls_record import (
 )
 from webrtc.dtls.dtls_typing import NAMED_CURVE_TYPE, CipherSuiteID, EllipticCurveGroup
 from webrtc.dtls.gcm import (
-    GCMCipherRecordLayer,
     generate_aead_additional_data,
     p_hash,
     prf_generate_encryption_keys,
 )
 
 from webrtc.ice.stun import utils as byteops
+from webrtc_rs import AesGcmCipher, ECDHKeyPair
 
 
 @dataclass
 class Keypair:
-    privateKey: SigningKey
-    publicKey: VerifyingKey
+    """
+    ECDH Keypair using Rust ECDHKeyPair for cryptographic operations.
+    """
+    _rust_keypair: ECDHKeyPair = field(repr=False)
     curve: EllipticCurveGroup
     signature_hash_algorithm: SignatureHashAlgorithm = (
         SignatureHashAlgorithm.ECDSA_SECP256R1_SHA256
     )
 
+    @property
+    def publicKey(self) -> Any:
+        """For compatibility - returns self to access public_key_bytes()"""
+        return self
+
+    def to_der(self) -> bytes:
+        """Get public key in DER format (uncompressed point for P-256)"""
+        return self._rust_keypair.public_key_bytes()
+
+    def public_key_bytes(self) -> bytes:
+        """Get public key bytes"""
+        return self._rust_keypair.public_key_bytes()
+
     @classmethod
     def generate_X25519(cls) -> Self:
-        pkey = SigningKey.generate(curve=Ed25519, hashfunc=hashlib.sha256)
-        pubkey = pkey.get_verifying_key()
-        if not isinstance(pubkey, VerifyingKey):
-            raise ValueError("Unable generate X25519 Keypair")
+        rust_kp = ECDHKeyPair("X25519")
         return cls(
-            pkey,
-            pubkey,
-            EllipticCurveGroup.X25519,
+            _rust_keypair=rust_kp,
+            curve=EllipticCurveGroup.X25519,
         )
 
     @classmethod
     def generate_P256(cls) -> Self:
-        pkey = SigningKey.generate(curve=NIST256p, hashfunc=hashlib.sha256)
-        pubkey = pkey.get_verifying_key()
-        if not isinstance(pubkey, VerifyingKey):
-            raise ValueError("Unable generate SECP256R1 Keypair")
+        rust_kp = ECDHKeyPair("P-256")
         return cls(
-            pkey,
-            pubkey,
-            EllipticCurveGroup.SECP256R1,
+            _rust_keypair=rust_kp,
+            curve=EllipticCurveGroup.SECP256R1,
         )
 
-    # def __ecdh_params(self) -> bytes:
-    #     # server_ecdh_params = bytearray(4)
-    #     # server_ecdh_params[0] = NAMED_CURVE_TYPE
-    #     # server_ecdh_params[1:3] = byteops.pack_unsigned_short(self.curve)
-    #     # server_ecdh_params[3:4] = byteops.pack_byte_int(len(self.publicKey.to_der()))
-    #     server_ecdh_params = byteops.pack_byte_int(NAMED_CURVE_TYPE)
-    #     server_ecdh_params += byteops.pack_unsigned_short(self.curve)
-    #     server_ecdh_params += byteops.pack_byte_int(len(self.publicKey.to_der()))
-    #     return server_ecdh_params
-
-    # def generate_server_signature(
-    #     self, remote_random: bytes, local_random: bytes, private_key: SigningKey
-    # ) -> bytes:
-    #     ecdh_params = self.__ecdh_params()
-    #     msg = bytes(
-    #         remote_random + local_random + ecdh_params + self.publicKey.to_der()
-    #     )
-    #     # print("Expected server expected_ecdh_secret_message", binascii.hexlify(msg))
-    #     # print(
-    #     #     "Expected server expected_ecdh_secret_message digest",
-    #     #     binascii.hexlify(hashlib.sha256(msg).digest()),
-    #     # )
-    #
-    #     # msg = hashlib.sha256(msg).digest()
-    #
-    #     result = private_key.sign(msg, hashfunc=hashlib.sha256)
-    #     return result
-
-    # NOTE: Must be a len(bytes(...)) == 32
-    def generate_shared_key(self) -> bytes:
-        """
-        Need for creating a pre master secret
-        """
-        ecdh = ECDH(
-            curve=self.privateKey.curve,
-            private_key=self.privateKey,
-            public_key=self.publicKey,
-        )
-        return ecdh.generate_sharedsecret_bytes()
+    def compute_shared_secret(self, peer_public: bytes) -> bytes:
+        """Compute ECDH shared secret (pre-master secret)"""
+        return self._rust_keypair.compute_shared_secret(peer_public)
 
     def sign(self, data: bytes) -> bytes:
-        # TODO: pass hash func as arg
-        return self.privateKey.sign(data, hashfunc=hashlib.sha256)
-
-    @staticmethod
-    def pre_master_secret_from_pub_and_priv_key(
-        pubkey: VerifyingKey,
-        privkey: SigningKey,
-    ) -> bytes:
-        ecdh = ECDH(
-            curve=privkey.curve,
-            private_key=privkey,
-            public_key=pubkey,
-        )
-        return ecdh.generate_sharedsecret_bytes()
+        """Sign data - currently a placeholder, signing handled by Rust Certificate"""
+        # TODO: Implement signing via Rust if needed
+        raise NotImplementedError("Signing should be done via Rust Certificate")
 
 
 def __ecdh_params(curve: EllipticCurveGroup, pubkey: bytes) -> bytes:
@@ -147,70 +98,13 @@ def generate_server_signature(
 
 
 def create_self_signed_cert_with_ecdsa(keypair: Keypair):
-    sk = keypair.privateKey
+    """
+    Create self-signed certificate.
 
-    public_key_der = keypair.publicKey.to_der()
-
-    ecdomain_params = keys.ECDomainParameters(("named", "secp256r1"))
-
-    ec_point_bit_string = keys.ECPointBitString(public_key_der)
-
-    # if public_key_der[0] != 0x04:
-    #     raise ValueError("Public key is not in uncompressed format")
-
-    public_key_info = keys.PublicKeyInfo(
-        {
-            "algorithm": {
-                "algorithm": "1.2.840.10045.2.1",
-                "parameters": ecdomain_params,
-            },
-            "public_key": ec_point_bit_string,
-        }
-    )
-
-    subject = x509.Name.build(
-        {
-            "common_name": "WebRTC",
-            # "country_name": "US",
-            # "organization_name": "Example Org",
-        },
-        True,
-    )
-
-    issuer = subject
-
-    not_before = x509.Time({"utc_time": datetime.now(UTC)})
-    not_after = x509.Time({"utc_time": datetime.now(UTC) + timedelta(days=30)})
-
-    tbs_certificate = x509.TbsCertificate(
-        {
-            "version": "v3",
-            "serial_number": int.from_bytes(os.urandom(16), "big"),
-            "signature": algos.SignedDigestAlgorithm({"algorithm": "sha256_ecdsa"}),
-            "issuer": issuer,
-            "validity": x509.Validity(
-                {"not_before": not_before, "not_after": not_after}
-            ),
-            "subject": subject,
-            "subject_public_key_info": public_key_info,
-        }
-    )
-
-    # signature = sk.sign(tbs_certificate.dump(), hashfunc=hashlib.sha256)
-    signature = sk.sign_digest(hashlib.sha256(tbs_certificate.dump()).digest())
-    # signature = sk.sign(tbs_certificate.dump(), hashfunc=hashlib.sha256)
-
-    certificate = x509.Certificate(
-        {
-            "tbs_certificate": tbs_certificate,
-            "signature_algorithm": algos.SignedDigestAlgorithm(
-                {"algorithm": "sha256_ecdsa"}
-            ),
-            "signature_value": signature,
-        }
-    )
-
-    return certificate
+    NOTE: Certificate generation is handled by Rust webrtc_rs.Certificate.
+    This function is kept for API compatibility but should not be used.
+    """
+    raise NotImplementedError("Certificate generation should be done via Rust webrtc_rs.Certificate")
 
 
 # TODO: Same as Keypair.generate_signature
@@ -231,36 +125,31 @@ def verify_certificate_signature(
     ecdh_shared_secret_message: bytes,
     signature: bytes,
     hash_func: Callable,
-    certificates: list[x509.Certificate],
+    certificates: list[Any],
 ) -> bool:
     """
-    Why Certificates + ECDH:
-    - ECDH alone provides confidentiality:
-        * It ensures that a shared secret can be computed securely without transmitting private keys.
-    - Certificates add authentication:
-        * They ensure that the public key used in the ECDH process belongs to the intended entity (e.g., the server in a TLS session).
-        * They prevent MITM attacks by binding the public key to the server’s identity.
+    Verify certificate signature.
+
+    NOTE: This is client-side functionality. Certificate verification
+    should be handled by Rust when implemented.
     """
-    if hash_func is not hashlib.sha256:
-        raise ValueError("verify_certificate_signature support only sha256")
-
-    for certificate in certificates:
-        pubkey: x509.PublicKeyInfo = certificate.public_key
-        verifying_key = VerifyingKey.from_der(pubkey.dump())
-        digest = hashlib.sha256(ecdh_shared_secret_message).digest()
-        if verified := verifying_key.verify_digest(signature, digest):
-            return verified
-
-    return False
+    # TODO: Implement via Rust certificate verification
+    raise NotImplementedError("Certificate verification should be done via Rust")
 
 
 class CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:
+    """
+    TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 cipher suite.
+
+    Uses Rust AesGcmCipher for AES-128-GCM encryption/decryption.
+    """
     __PRF_MAC_LEN = 0
     __PRF_KEY_LEN = 16
     __PRF_IV_LEN = 4
 
     def __init__(self) -> None:
-        self.gcm: GCMCipherRecordLayer | None = None
+        self.gcm: AesGcmCipher | None = None
+        self._is_client: bool = False
 
     def start(
         self,
@@ -280,47 +169,58 @@ class CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:
         if not keys:
             raise ValueError("Unable generate prf encryption keys")
 
-        # print("Master Secret:", binascii.hexlify(master_secret))
-        # print("Client Random:", binascii.hexlify(client_random))
-        # print("Server Random:", binascii.hexlify(server_random))
-        # print("Generated Keys:", keys)
-        # print("is client", client)
+        self._is_client = client
 
-        if client:
-            gcm = GCMCipherRecordLayer(
-                keys.client_write_key,
-                keys.client_write_iv,
-                keys.server_write_key,
-                keys.server_write_iv,
-            )
-        else:
-            gcm = GCMCipherRecordLayer(
-                keys.server_write_key,
-                keys.server_write_iv,
-                keys.client_write_key,
-                keys.client_write_iv,
-            )
-
-        self.gcm = gcm
+        # Use Rust AesGcmCipher - it handles local/remote key assignment internally
+        self.gcm = AesGcmCipher(
+            keys.client_write_key,
+            keys.client_write_iv,
+            keys.server_write_key,
+            keys.server_write_iv,
+            client,
+        )
 
     def encrypt(self, pkt: RecordLayer) -> bytes:
         if not self.gcm:
             raise ValueError("Unable encrypt start gcm first")
 
-        return self.gcm.encrypt(pkt)
+        # Use Rust cipher to encrypt
+        pkt_bytes = pkt.marshal()
+        return self.gcm.encrypt(
+            pkt.header.content_type,
+            pkt.header.epoch,
+            pkt.header.sequence_number,
+            pkt_bytes[pkt.header_size():],  # payload only
+        )
 
     def decrypt(self, pkt: RecordLayer, raw: bytes) -> bytes:
         if not self.gcm:
             raise ValueError("Unable decrypt start gcm first")
-        return self.gcm.decrypt(pkt)
+
+        # Use Rust cipher to decrypt - pass the full raw record
+        return self.gcm.decrypt(raw)
 
     def cipher_suite_id(self) -> CipherSuiteID:
         return CipherSuiteID.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
 
 
-class CipherSuiteNative:
+class CipherSuite_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:
+    """
+    TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 cipher suite.
+
+    Uses RSA for authentication (vs ECDSA) but same ECDHE key exchange
+    and AES-128-GCM encryption.
+
+    NOTE: This is a stub for browser compatibility. RSA certificate
+    signing is not yet implemented in Rust bindings.
+    """
+    __PRF_MAC_LEN = 0
+    __PRF_KEY_LEN = 16
+    __PRF_IV_LEN = 4
+
     def __init__(self) -> None:
-        self.suite = native.CipherSuiteAes128GcmSha256()
+        self.gcm: AesGcmCipher | None = None
+        self._is_client: bool = False
 
     def start(
         self,
@@ -329,22 +229,48 @@ class CipherSuiteNative:
         server_random: bytes,
         client: bool,
     ):
-        self.suite.init(master_secret, client_random, server_random, client)
+        keys = prf_generate_encryption_keys(
+            master_secret,
+            client_random,
+            server_random,
+            self.__PRF_MAC_LEN,
+            self.__PRF_KEY_LEN,
+            self.__PRF_IV_LEN,
+        )
+        if not keys:
+            raise ValueError("Unable generate prf encryption keys")
+
+        self._is_client = client
+
+        # Use Rust AesGcmCipher - same as ECDSA version
+        self.gcm = AesGcmCipher(
+            keys.client_write_key,
+            keys.client_write_iv,
+            keys.server_write_key,
+            keys.server_write_iv,
+            client,
+        )
 
     def encrypt(self, pkt: RecordLayer) -> bytes:
-        raw = pkt.marshal()
-        return self.suite.encrypt(raw)
+        if not self.gcm:
+            raise ValueError("Unable encrypt start gcm first")
+
+        pkt_bytes = pkt.marshal()
+        return self.gcm.encrypt(
+            pkt.header.content_type,
+            pkt.header.epoch,
+            pkt.header.sequence_number,
+            pkt_bytes[pkt.header_size():],
+        )
 
     def decrypt(self, pkt: RecordLayer, raw: bytes) -> bytes:
-        """
-        AEAD for cipher suite must be taken from record header - len of TAG: [...16]
+        if not self.gcm:
+            raise ValueError("Unable decrypt start gcm first")
 
-        :param pkt - Record looks like that | Header | Nonce | Encoded Payload | Tag |
-        """
-        return self.suite.decrypt(ciphertext=raw)
+        return self.gcm.decrypt(raw)
 
     def cipher_suite_id(self) -> CipherSuiteID:
-        return CipherSuiteID.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        return CipherSuiteID.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
 
 
 class CipherSuite(Protocol):
@@ -363,9 +289,34 @@ class CipherSuite(Protocol):
     def cipher_suite_id(self) -> CipherSuiteID: ...
 
 
+# Registry of supported cipher suites
 CIPHER_SUITES_CLASSES: dict[CipherSuiteID, type[CipherSuite]] = {
     CipherSuiteID.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256: CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+    CipherSuiteID.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256: CipherSuite_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 }
+
+
+# Preferred cipher suite order for negotiation (server preference)
+CIPHER_SUITE_PREFERENCE: list[CipherSuiteID] = [
+    CipherSuiteID.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,  # Prefer ECDSA
+    CipherSuiteID.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,    # Fallback to RSA
+]
+
+
+def select_cipher_suite(client_suites: list[CipherSuiteID]) -> CipherSuiteID | None:
+    """
+    Select the best cipher suite based on server preference and client support.
+
+    Args:
+        client_suites: List of cipher suites offered by the client
+
+    Returns:
+        The selected cipher suite ID, or None if no common suite found
+    """
+    for suite in CIPHER_SUITE_PREFERENCE:
+        if suite in client_suites and suite in CIPHER_SUITES_CLASSES:
+            return suite
+    return None
 
 
 VERIFY_DATA_CLIENT_LABEL = b"client finished"
@@ -376,7 +327,11 @@ def prf_verify_data(master_secret: bytes, handshake_bodies: bytes, label: bytes)
     # TODO: dynamic hashfunc
     digest = hashlib.sha256(handshake_bodies).digest()
     seed = label + digest
-    return p_hash(master_secret, seed, 12, hashlib.sha256)
+    print(f"[prf_verify_data] label={label}, digest={digest.hex()}")
+    print(f"[prf_verify_data] master_secret_len={len(master_secret)}, handshake_bodies_len={len(handshake_bodies)}")
+    result = p_hash(master_secret, seed, 12, hashlib.sha256)
+    print(f"[prf_verify_data] result={result.hex()}")
+    return result
 
 
 def verify_data_client(master_secret: bytes, handshake_bodies: bytes):

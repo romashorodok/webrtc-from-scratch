@@ -581,10 +581,14 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
                 pkt.extensions.transport_sequence_number = (
                     twcc_seq.next_sequence_number()
                 )
-                encoded = await srtp.encrypt_nonblock(pkt.serialize(DEFAULT_EXT_MAP))
-                assert pc._transport
+                serialized = pkt.serialize(DEFAULT_EXT_MAP)
+                encoded = await srtp.encrypt_nonblock(serialized)
+                if not pc._transport:
+                    print(f"[WS] ERROR: pc._transport is None!")
+                    continue
                 send_time_cache.add(pkt.extensions.transport_sequence_number)
                 pc._transport.sendto(encoded)
+                print(f"[WS] RTP sent: seq={pkt.sequence_number}, ts={pkt.timestamp}, raw={len(serialized)}B -> enc={len(encoded)}B, transport={type(pc._transport).__name__}")
 
     rw_loop.create_task(encoded_result())
     rw_loop.create_task(send_routine())

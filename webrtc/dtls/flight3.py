@@ -1,9 +1,6 @@
 import asyncio
 import binascii
 
-from ecdsa import VerifyingKey
-
-from webrtc.dtls.dtls_cipher_suite import Keypair
 from webrtc.dtls.dtls_record import (
     Certificate,
     HandshakeMessageType,
@@ -34,10 +31,11 @@ class Flight3(FlightTransition):
         ]
 
     def __handle_server_key_exchange(self, state: State, message: KeyServerExchange):
-        verifying_key = VerifyingKey.from_der(message.pubkey)
-        state.pre_master_secret = Keypair.pre_master_secret_from_pub_and_priv_key(
-            verifying_key,
-            state.local_keypair.privateKey,
+        # Compute pre-master secret using ECDH with Rust keypair
+        if not message.pubkey:
+            raise ValueError("KeyServerExchange must have pubkey")
+        state.pre_master_secret = state.local_keypair.compute_shared_secret(
+            message.pubkey
         )
 
     async def parse(

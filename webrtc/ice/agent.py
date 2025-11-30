@@ -270,6 +270,7 @@ class ControllingSelector(AsyncEventEmitter):
         print("Start ControllingSelector agent selector")
 
     def _set_nominate_pair(self, pair: CandidatePair):
+        print(f"[ICE] _set_nominate_pair: nominating pair {pair.get_pair_id()}")
         self._nominated_pair = pair
         self.emit(SelectorEvent.NOMINATE, pair)
 
@@ -395,10 +396,9 @@ class ControlledSelector(AsyncEventEmitter):
         useCandidate = msg.get_attribute(stun.UseCandidate)
 
         if useCandidate:
-            print("Controlled selector has found use candidate to nominate pair")
+            print("[ICE] ControlledSelector.on_binding_success: UseCandidate attribute found")
             if pair.state == CandidatePairState.SUCCEEDED:
-                print(f"Controlled selector pair has correct state {pair.state}")
-                print(f"Controlled selector pair: {self._selected_pair}")
+                print(f"[ICE] ControlledSelector: pair state is SUCCEEDED, checking for nomination")
                 # If the state of this pair is Succeeded, it means that the check
                 # previously sent by this pair produced a successful response and
                 # generated a valid pair (Section 7.2.5.3.2).  The agent sets the
@@ -408,9 +408,10 @@ class ControlledSelector(AsyncEventEmitter):
                 if self._selected_pair is None or self._selected_pair.get_pair_priority(
                     False
                 ) < pair.get_pair_priority(False):
-                    print(
-                        f"Controlled selector must set remote({pair.remote_ufrag}) local({pair.local_ufrag})"
-                    )
+                    print(f"[ICE] ControlledSelector: nominating pair via UseCandidate {pair.get_pair_id()}")
+                    self._selected_pair = pair
+                    # Emit NOMINATE event to trigger DTLS transport setup
+                    self.emit(SelectorEvent.NOMINATE, pair)
                 elif self._selected_pair != pair:
                     print(
                         f"Ignore nominated new pair {pair}, already selected {self._selected_pair}"
@@ -456,9 +457,10 @@ class ControlledSelector(AsyncEventEmitter):
             if self._selected_pair is None or self._selected_pair.get_pair_priority(
                 False
             ) < pair.get_pair_priority(False):
-                # TODO: set selected pair
-                print(f"Controlled selector Nominate pair on {pair}")
+                print(f"[ICE] ControlledSelector: nominating pair {pair.get_pair_id()}")
                 self._selected_pair = pair
+                # Emit NOMINATE event to trigger DTLS transport setup
+                self.emit(SelectorEvent.NOMINATE, pair)
             elif self._selected_pair != pair:
                 print(
                     f"Ignore nominated new pair {pair}, already selected {self._selected_pair}"
@@ -505,6 +507,7 @@ class CandidatePairTransport:
     def pipe(self, pkt: Packet):
         first_byte = pkt.data[0]
         if first_byte > 19 and first_byte < 64:
+            print(f"[ICE] CandidatePairTransport.pipe: DTLS packet ({len(pkt.data)} bytes) -> dtls queue")
             self._dtls.put_nowait(pkt)
         elif net.is_rtcp(pkt.data):
             self._rtcp.put_nowait(pkt)
@@ -521,6 +524,11 @@ class CandidatePairTransport:
         return await self._rtcp.get()
 
     def sendto(self, data: bytes):
+        # Debug: log first byte to distinguish packet types (RTP starts with 0x80-0x8f)
+        first_byte = data[0] if data else 0
+        is_rtp = 128 <= first_byte <= 191
+        if is_rtp:
+            print(f"[ICE] sendto: RTP packet {len(data)}B, first_byte={first_byte}")
         self._conn.sendto(data)
 
 
@@ -544,6 +552,7 @@ class CandidatePairController(AsyncEventEmitter):
         self.__transport = CandidatePairTransport(self.__conn)
 
     def __pair_nominate(self, _: CandidatePair):
+        print(f"[ICE] __pair_nominate: emitting NOMINATE_TRANSPORT event")
         self.emit(CandidatePairControllerEvent.NOMINATE_TRANSPORT, self.__transport)
 
     async def start(self):
@@ -561,7 +570,8 @@ class CandidatePairController(AsyncEventEmitter):
                 await self._on_inbound_pkt(pkt)
 
     async def _on_inbound_pkt(self, pkt: Packet):
-        # print("Recv rtp wait 10 sec.", pkt.data.tolist())
+        first_byte = pkt.data[0] if pkt.data else 0
+        print(f"[ICE] _on_inbound_pkt: received {len(pkt.data)} bytes, first_byte={first_byte}")
         self.__transport.pipe(pkt)
 
     async def _on_stun_binding_request(self, pkt: Packet, msg: stun.Message):
