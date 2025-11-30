@@ -57,9 +57,9 @@ FLIGHT_TRANSITIONS: dict[Flight, FlightTransition] = {
     Flight.FLIGHT4: Flight4(),
     Flight.FLIGHT6: Flight6(),
     # Client side
-    # Flight.FLIGHT1: Flight1(),
-    # Flight.FLIGHT3: Flight3(),
-    # Flight.FLIGHT5: Flight5(),
+    Flight.FLIGHT1: Flight1(),
+    Flight.FLIGHT3: Flight3(),
+    Flight.FLIGHT5: Flight5(),
 }
 
 
@@ -337,6 +337,21 @@ class FSM:
                 logger.debug(f"Duplicate flight {new_flight} detected, retransmitting last flight")
                 # Retransmit last sent flight
                 if self._last_sent_flight:
+                    await self.remote.sendto(self._last_sent_flight)
+                return FSMState.Waiting
+
+            # Check if handshake is complete (client-side: Flight5.parse returns None)
+            if new_flight is None:
+                logger.info("FSM: Client-side handshake complete (Flight5 received server Finished)")
+                self._complete_handshake()
+                return FSMState.Finished
+
+            # If parse() returns the same flight, it means we received retransmitted
+            # messages from peer. Retransmit our last sent flight and stay waiting.
+            if new_flight == self.flight:
+                logger.debug(f"Flight{self.flight.value}.parse() returned same flight - peer retransmission detected")
+                if self._last_sent_flight:
+                    logger.debug(f"Retransmitting last sent flight ({len(self._last_sent_flight)} bytes)")
                     await self.remote.sendto(self._last_sent_flight)
                 return FSMState.Waiting
 

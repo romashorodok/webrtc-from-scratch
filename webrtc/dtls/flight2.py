@@ -1,6 +1,6 @@
 import asyncio
 
-from webrtc.dtls.dtls_record import ClientHello, Message, RecordLayer
+from webrtc.dtls.dtls_record import ClientHello, ExtendedMasterSecret, Message, RecordLayer
 from webrtc.dtls.dtls_record_factory import DEFAULT_FACTORY
 from webrtc.dtls.flight_state import Flight, FlightTransition, State
 
@@ -33,5 +33,14 @@ class Flight2(FlightTransition):
         if state.cookie != client_hello.cookie:
             print("Flight 0 must contain a same remote and local cookie")
             return Flight.FLIGHT0
+
+        # Check for Extended Master Secret extension (RFC 7627)
+        # This ClientHello (with cookie) is the one used for handshake hash
+        if client_hello.extensions:
+            for ext in client_hello.extensions:
+                if isinstance(ext, ExtendedMasterSecret):
+                    state.use_extended_master_secret = True
+                    print("Flight 2: Extended Master Secret requested by client")
+                    break
 
         return Flight.FLIGHT4

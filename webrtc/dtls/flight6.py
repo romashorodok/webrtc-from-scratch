@@ -127,7 +127,7 @@ class Flight6(FlightTransition):
 
     async def parse(
         self, state: State, handshake_message_ch: asyncio.Queue[Message]
-    ) -> Flight:
+    ) -> Flight | None:
         """
         Verify client Finished message.
 
@@ -225,7 +225,7 @@ class Flight6(FlightTransition):
                 return Flight.FLIGHT6
 
             print("Flight 6 parse: Client Finished verified successfully!")
-            return Flight.FLIGHT6
+            return None  # Signal handshake completion
 
         except Exception as e:
             print(f"Flight 6 parse error: {e}")

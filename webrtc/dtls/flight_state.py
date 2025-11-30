@@ -266,6 +266,9 @@ class State:
         self.pre_master_secret: bytes | None = None
         self.master_secret: bytes | None = None
 
+        # Extended Master Secret (RFC 7627) - set if both sides negotiate it
+        self.use_extended_master_secret: bool = False
+
         # Event to signal when cipher suite is initialized (pending_cipher_suite.start() called)
         self.cipher_suite_ready = asyncio.Event()
 

@@ -4,7 +4,7 @@ from . import ice
 import itertools
 from typing import Callable
 
-from .transceiver import RTPTransceiver, RTPTransceiverDirection, MediaCaps
+from .transceiver import RTPTransceiver, RTPTransceiverDirection, MediaCaps, RTPCodecParameters
 from .session_description import (
     SessionDescription,
     SessionDescriptionAttr,
@@ -123,13 +123,14 @@ def add_sender_sdp(desc: MediaDescription, media_section: MediaSection):
                 SessionDescriptionAttr(f"msid:{track.stream_id} {track.id}")
             )
 
-        if send_params.encodings:
-            for encoding in send_params.encodings:
-                desc.add_attribute(
-                    SessionDescriptionAttr(
-                        SessionDescriptionAttrKey.RID, f"{encoding.rid} send"
-                    )
-                )
+        # NOTE: rid is only for simulcast - don't include for single stream
+        # if send_params.encodings:
+        #     for encoding in send_params.encodings:
+        #         desc.add_attribute(
+        #             SessionDescriptionAttr(
+        #                 SessionDescriptionAttrKey.RID, f"{encoding.rid} send"
+        #             )
+        #         )
 
         break
 
@@ -144,6 +145,7 @@ def add_transceiver_media_description(
     candidates: list[ice.CandidateProtocol] | None,
     role: ConnectionRole,
     caps: MediaCaps,
+    remote_media: MediaDescription | None = None,
 ) -> bool:
     transceivers = media_section.transceivers
     if len(transceivers) < 1:
@@ -154,8 +156,33 @@ def add_transceiver_media_description(
     if t.mid is None:
         return False
 
-    codecs = t.get_codecs()
-    if codecs is None:
+    # When creating an answer, use the codecs from the offer (remote_media)
+    # to ensure payload types match what the offerer expects
+    if remote_media and remote_media.codecs:
+        # Filter remote codecs to only include ones we support
+        local_codecs = t.get_codecs() or []
+        codecs = []
+        for remote_codec in remote_media.codecs:
+            # Check if we support this codec (fuzzy match by mime type)
+            for local_codec in local_codecs:
+                if remote_codec.mime_type.lower() == local_codec.mime_type.lower():
+                    # Use remote codec's payload type with our RTCP feedback
+                    negotiated_codec = RTPCodecParameters(
+                        mime_type=remote_codec.mime_type,
+                        clock_rate=remote_codec.clock_rate,
+                        refresh_rate=local_codec.refresh_rate,
+                        channels=remote_codec.channels,
+                        sdp_fmtp_line=local_codec.sdp_fmtp_line or remote_codec.sdp_fmtp_line,
+                        payload_type=remote_codec.payload_type,  # Use offer's payload type!
+                        stats_id=local_codec.stats_id,
+                    )
+                    negotiated_codec.rtcp_feedbacks = local_codec.rtcp_feedbacks.copy()
+                    codecs.append(negotiated_codec)
+                    break
+    else:
+        codecs = t.get_codecs()
+
+    if not codecs:
         return False
 
     media = MediaDescription(
@@ -191,28 +218,45 @@ def add_transceiver_media_description(
 
     media.direction = t.direction
 
-    ext_maps = [
-        ExtMap(
-            value=1,
-            uri="http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01",
-        )
-        #     ExtMap(value=2, uri="urn:ietf:params:rtp-hdrext:sdes:mid"),
-        #     ExtMap(
-        #         value=3, uri="http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
-        #     ),
-    ]
-    # negotiated_parameters = caps.get_rtp_parameters_by_kind(t.kind, directions)
-    # for rtp_ext in negotiated_parameters.header_extensions:
+    # For answers, use extmap IDs from the offer
+    # For offers, use our default values
+    ext_maps: list[ExtMap] = []
+
+    if remote_media:
+        # Extract extmap attributes from the offer
+        for attr in remote_media.attributes:
+            if attr.key == SessionDescriptionAttrKey.ExtMap.value and attr.value:
+                # Parse extmap value: "id uri" or "id/direction uri"
+                parts = attr.value.split(" ", 1)
+                if len(parts) >= 2:
+                    id_part = parts[0]
+                    uri = parts[1].split(" ")[0]  # URI is the second part
+                    # Handle "id/direction" format
+                    if "/" in id_part:
+                        ext_id = int(id_part.split("/")[0])
+                    else:
+                        ext_id = int(id_part)
+                    ext_maps.append(ExtMap(value=ext_id, uri=uri))
+
+    if not ext_maps:
+        # Default extmap for offers
+        ext_maps = [
+            ExtMap(
+                value=4,
+                uri="http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01",
+            )
+        ]
 
     for rtp_ext in ext_maps:
         media.add_attribute(SessionDescriptionAttr(rtp_ext.marshal()))
 
-    if RTPTransceiverDirection.Recvonly in directions:
-        media.add_attribute(
-            SessionDescriptionAttr(
-                SessionDescriptionAttrKey.RID, f"{media_section.rid} recv"
-            )
-        )
+    # NOTE: rid is only for simulcast - don't include for single stream
+    # if RTPTransceiverDirection.Recvonly in directions:
+    #     media.add_attribute(
+    #         SessionDescriptionAttr(
+    #             SessionDescriptionAttrKey.RID, f"{media_section.rid} recv"
+    #         )
+    #     )
 
     # if media_section.rid_map:
     #     for rid in media_section.rid_map.items():
@@ -259,11 +303,20 @@ def populate_session_descriptor(
     media_sections: list[MediaSection],
     match_bundle_group: str | None,
     caps: MediaCaps,
+    remote_description: SessionDescription | None = None,
 ):
     bundle_value: str = "BUNDLE"
     bundle_count: int = 0
 
     bundle_matcher = bundle_match_from_remote(match_bundle_group)
+
+    # Build a map of MID -> remote media for codec negotiation
+    remote_media_by_mid: dict[str, MediaDescription] = {}
+    if remote_description:
+        for remote_media in remote_description.media_descriptions:
+            mid = remote_media.get_attribute_value(SessionDescriptionAttrKey.MID.value)
+            if mid:
+                remote_media_by_mid[mid] = remote_media
 
     def bundle_appender(mid: str):
         nonlocal bundle_value, bundle_count
@@ -278,6 +331,9 @@ def populate_session_descriptor(
             print("media session desc contain SCTP. Not supported")
             continue
 
+        # Get the corresponding remote media for this MID (for codec negotiation)
+        remote_media = remote_media_by_mid.get(media.id)
+
         should_add_id = add_transceiver_media_description(
             desc,
             media,
@@ -288,6 +344,7 @@ def populate_session_descriptor(
             candidates,
             role,
             caps,
+            remote_media,
         )
 
         if should_add_id:

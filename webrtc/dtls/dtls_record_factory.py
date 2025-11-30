@@ -43,7 +43,7 @@ class RecordFactory(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def server_hello(self, random: bytes, cipher_suite: CipherSuite) -> RecordLayer:
+    def server_hello(self, random: bytes, cipher_suite: CipherSuite, use_extended_master_secret: bool = False) -> RecordLayer:
         raise NotImplementedError()
 
     @abc.abstractmethod
@@ -132,6 +132,7 @@ class FlightRecordFactory(RecordFactory):
         self,
         random: bytes,
         cipher_suite: CipherSuite,
+        use_extended_master_secret: bool = False,
     ) -> RecordLayer:
         server_hello = ServerHello(bytes())
         server_hello.version = DTLSVersion.V1_2
@@ -150,12 +151,16 @@ class FlightRecordFactory(RecordFactory):
         ec_point_formats = EcPointFormats(bytes())
         ec_point_formats.ec_point_formats = [EllipticCurvePointFormat.UNCOMPRESSED]
 
-        server_hello.extensions = [
-            # RegonitiationInfo(bytes()),
-            # ExtendedMasterSecret(bytes()),
+        extensions = [
             use_srtp,
             ec_point_formats,
         ]
+
+        # Include Extended Master Secret extension if client requested it (RFC 7627)
+        if use_extended_master_secret:
+            extensions.append(ExtendedMasterSecret(bytes()))
+
+        server_hello.extensions = extensions
 
         return RecordLayer(
             RecordHeader(ContentType.HANDSHAKE, DTLSVersion.V1_2, 0, 0),
@@ -254,7 +259,7 @@ class FlightRecordFactory(RecordFactory):
         signature_hash_algorithms: list[SignatureHashAlgorithm],
     ) -> RecordLayer:
         client_hello = ClientHello(bytes())
-        client_hello.version = DTLSVersion.V1_0
+        client_hello.version = DTLSVersion.V1_2
         client_hello.compression_methods = [CompressionMethod.Null]
 
         client_hello.random = random

@@ -197,18 +197,20 @@ impl AesGcmCipher {
         // For client: local=client, remote=server
         // For server: local=server, remote=client
         let gcm = if is_client {
-            CryptoGcm::new(
+            CryptoGcm::new_with_role(
                 &client_write_key,
                 &client_write_iv,
                 &server_write_key,
                 &server_write_iv,
+                true,  // is_client: use epoch+seq for nonce
             )
         } else {
-            CryptoGcm::new(
+            CryptoGcm::new_with_role(
                 &server_write_key,
                 &server_write_iv,
                 &client_write_key,
                 &client_write_iv,
+                false,  // is_client: use random nonce
             )
         };
 
@@ -525,6 +527,135 @@ impl Stream {
         }
  }
 
+/// Lightweight SRTP context for direct encrypt/decrypt operations.
+///
+/// Unlike the SRTP class which uses tokio channels and async I/O,
+/// this exposes the raw Context for synchronous crypto operations.
+/// Python handles stream demuxing and packet routing.
+#[pyclass]
+struct SrtpContext {
+    /// Context for encrypting outgoing packets (local keys)
+    local_context: std::sync::Mutex<webrtc_srtp::context::Context>,
+    /// Context for decrypting incoming packets (remote keys)
+    remote_context: std::sync::Mutex<webrtc_srtp::context::Context>,
+}
+
+#[pymethods]
+impl SrtpContext {
+    /// Create SRTP context from keying material.
+    ///
+    /// Args:
+    ///     tx_key: Local master key + salt (30 bytes for AES-128-CM-HMAC-SHA1-80)
+    ///     rx_key: Remote master key + salt (30 bytes for AES-128-CM-HMAC-SHA1-80)
+    #[new]
+    fn new(tx_key: Vec<u8>, rx_key: Vec<u8>) -> PyResult<Self> {
+        const KEY_LEN: usize = 16;
+        const SALT_LEN: usize = 14;
+
+        if tx_key.len() != KEY_LEN + SALT_LEN {
+            return Err(PyValueError::new_err(format!(
+                "tx_key must be {} bytes (key + salt), got {}", KEY_LEN + SALT_LEN, tx_key.len()
+            )));
+        }
+        if rx_key.len() != KEY_LEN + SALT_LEN {
+            return Err(PyValueError::new_err(format!(
+                "rx_key must be {} bytes (key + salt), got {}", KEY_LEN + SALT_LEN, rx_key.len()
+            )));
+        }
+
+        let profile = webrtc_srtp::protection_profile::ProtectionProfile::Aes128CmHmacSha1_80;
+
+        let local_context = webrtc_srtp::context::Context::new(
+            &tx_key[..KEY_LEN],
+            &tx_key[KEY_LEN..],
+            profile,
+            None,
+            None,
+        ).map_err(|e| PyRuntimeError::new_err(format!("Failed to create local context: {:?}", e)))?;
+
+        let remote_context = webrtc_srtp::context::Context::new(
+            &rx_key[..KEY_LEN],
+            &rx_key[KEY_LEN..],
+            profile,
+            Some(webrtc_srtp::option::srtp_replay_protection(DEFAULT_SESSION_SRTP_REPLAY_PROTECTION_WINDOW)),
+            Some(webrtc_srtp::option::srtcp_replay_protection(DEFAULT_SESSION_SRTCP_REPLAY_PROTECTION_WINDOW)),
+        ).map_err(|e| PyRuntimeError::new_err(format!("Failed to create remote context: {:?}", e)))?;
+
+        Ok(SrtpContext {
+            local_context: std::sync::Mutex::new(local_context),
+            remote_context: std::sync::Mutex::new(remote_context),
+        })
+    }
+
+    /// Encrypt an RTP packet.
+    ///
+    /// Args:
+    ///     plaintext: Complete RTP packet bytes
+    ///
+    /// Returns:
+    ///     Encrypted SRTP packet with auth tag
+    fn encrypt_rtp(&self, plaintext: Vec<u8>) -> PyResult<Vec<u8>> {
+        let mut ctx = self.local_context.lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {:?}", e)))?;
+
+        let encrypted = ctx.encrypt_rtp(&plaintext)
+            .map_err(|e| PyRuntimeError::new_err(format!("Encrypt failed: {:?}", e)))?;
+
+        Ok(encrypted.to_vec())
+    }
+
+    /// Decrypt an SRTP packet.
+    ///
+    /// Args:
+    ///     ciphertext: Complete SRTP packet (header + encrypted payload + auth tag)
+    ///
+    /// Returns:
+    ///     Decrypted RTP packet
+    fn decrypt_rtp(&self, ciphertext: Vec<u8>) -> PyResult<Vec<u8>> {
+        let mut ctx = self.remote_context.lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {:?}", e)))?;
+
+        let decrypted = ctx.decrypt_rtp(&ciphertext)
+            .map_err(|e| PyRuntimeError::new_err(format!("Decrypt failed: {:?}", e)))?;
+
+        Ok(decrypted.to_vec())
+    }
+
+    /// Encrypt an RTCP packet.
+    ///
+    /// Args:
+    ///     plaintext: Complete RTCP packet bytes
+    ///
+    /// Returns:
+    ///     Encrypted SRTCP packet with index and auth tag
+    fn encrypt_rtcp(&self, plaintext: Vec<u8>) -> PyResult<Vec<u8>> {
+        let mut ctx = self.local_context.lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {:?}", e)))?;
+
+        let encrypted = ctx.encrypt_rtcp(&plaintext)
+            .map_err(|e| PyRuntimeError::new_err(format!("Encrypt RTCP failed: {:?}", e)))?;
+
+        Ok(encrypted.to_vec())
+    }
+
+    /// Decrypt an SRTCP packet.
+    ///
+    /// Args:
+    ///     ciphertext: Complete SRTCP packet
+    ///
+    /// Returns:
+    ///     Decrypted RTCP packet
+    fn decrypt_rtcp(&self, ciphertext: Vec<u8>) -> PyResult<Vec<u8>> {
+        let mut ctx = self.remote_context.lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {:?}", e)))?;
+
+        let decrypted = ctx.decrypt_rtcp(&ciphertext)
+            .map_err(|e| PyRuntimeError::new_err(format!("Decrypt RTCP failed: {:?}", e)))?;
+
+        Ok(decrypted.to_vec())
+    }
+}
+
 #[pyclass]
 struct SRTP {
     session: Arc<Mutex<webrtc_srtp::session::Session>>,
@@ -747,6 +878,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Certificate>()?;
     m.add_class::<DTLS>()?;
     m.add_class::<SRTP>()?;
+    m.add_class::<SrtpContext>()?;
     m.add_class::<Stream>()?;
     m.add_class::<Av1Payloader>()?;
     m.add_class::<ECDHKeyPair>()?;

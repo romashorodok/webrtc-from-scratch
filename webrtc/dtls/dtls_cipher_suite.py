@@ -171,6 +171,15 @@ class CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:
 
         self._is_client = client
 
+        print(f"[CipherSuite] client_random={client_random.hex()}")
+        print(f"[CipherSuite] server_random={server_random.hex()}")
+        print(f"[CipherSuite] master_secret={master_secret.hex()}")
+        print(f"[CipherSuite] client_write_key={keys.client_write_key.hex()}")
+        print(f"[CipherSuite] client_write_iv={keys.client_write_iv.hex()}")
+        print(f"[CipherSuite] server_write_key={keys.server_write_key.hex()}")
+        print(f"[CipherSuite] server_write_iv={keys.server_write_iv.hex()}")
+        print(f"[CipherSuite] is_client={client}")
+
         # Use Rust AesGcmCipher - it handles local/remote key assignment internally
         self.gcm = AesGcmCipher(
             keys.client_write_key,

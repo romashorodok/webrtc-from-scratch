@@ -1,5 +1,6 @@
 import asyncio
 import binascii
+import hashlib
 import logging
 
 logger = logging.getLogger("webrtc.dtls.flight4")
@@ -18,7 +19,7 @@ from webrtc.dtls.dtls_record import (
 from webrtc.dtls.dtls_record_factory import DEFAULT_FACTORY
 from webrtc.dtls.dtls_typing import EllipticCurveGroup
 from webrtc.dtls.flight_state import Flight, FlightTransition, HandshakeCacheKey, State
-from webrtc.dtls.prf import prf_master_secret
+from webrtc.dtls.prf import prf_master_secret, prf_extended_master_secret
 
 
 class Flight4(FlightTransition):
@@ -68,7 +69,9 @@ class Flight4(FlightTransition):
 
         return [
             self.__msg.server_hello(
-                state.local_random.marshal_fixed(), state.pending_cipher_suite
+                state.local_random.marshal_fixed(),
+                state.pending_cipher_suite,
+                state.use_extended_master_secret,
             ),
             self.__msg.certificate([state.local_certificate]),
             self.__msg.key_server_exchange(
@@ -85,7 +88,7 @@ class Flight4(FlightTransition):
         ]
 
     def __setup_cipher_suite(
-        self, state: State, client_key_exchange: ClientKeyExchange
+        self, state: State, client_key_exchange: ClientKeyExchange, session_hash_for_ems: bytes | None = None
     ):
         logger.info("__setup_cipher_suite: starting cipher suite initialization")
 
@@ -110,12 +113,27 @@ class Flight4(FlightTransition):
         logger.debug(f"__setup_cipher_suite: remote_random={binascii.hexlify(state.remote_random).decode()}")
         logger.debug(f"__setup_cipher_suite: local_random={binascii.hexlify(state.local_random.marshal_fixed()).decode()}")
 
-        # Use Python PRF implementation for master secret derivation
-        state.master_secret = prf_master_secret(
-            pre_master_secret,
-            state.remote_random,
-            state.local_random.marshal_fixed(),
-        )
+        # Compute master secret - use Extended Master Secret (RFC 7627) if negotiated
+        if state.use_extended_master_secret and session_hash_for_ems is not None:
+            # Extended Master Secret: master_secret = PRF(pre_master_secret, "extended master secret", session_hash)
+            # session_hash is Hash(handshake messages from ClientHello through ClientKeyExchange)
+            session_hash_digest = hashlib.sha256(session_hash_for_ems).digest()
+            logger.info("__setup_cipher_suite: Using Extended Master Secret (RFC 7627)")
+            logger.debug(f"__setup_cipher_suite: session_hash_for_ems length={len(session_hash_for_ems)}")
+            logger.debug(f"__setup_cipher_suite: session_hash_digest={session_hash_digest.hex()}")
+            state.master_secret = prf_extended_master_secret(
+                pre_master_secret,
+                session_hash_digest,
+                hashlib.sha256,
+            )
+        else:
+            # Standard master secret: master_secret = PRF(pre_master_secret, "master secret", client_random + server_random)
+            logger.info("__setup_cipher_suite: Using standard master secret")
+            state.master_secret = prf_master_secret(
+                pre_master_secret,
+                state.remote_random,
+                state.local_random.marshal_fixed(),
+            )
 
         logger.debug(f"__setup_cipher_suite: master_secret={binascii.hexlify(state.master_secret).decode()}")
 
@@ -251,9 +269,60 @@ class Flight4(FlightTransition):
             logger.error(f"parse: expected ClientKeyExchange but got {type(client_key_exchange.message)}")
             raise ValueError("Not a client key exchange")
 
+        # For Extended Master Secret (RFC 7627), compute session hash from
+        # handshake messages: ClientHello through ClientKeyExchange
+        session_hash_for_ems: bytes | None = None
+        if state.use_extended_master_secret:
+            logger.info("parse: computing session hash for Extended Master Secret")
+            session_hash_for_ems = state.cache.pull_and_merge(
+                [
+                    HandshakeCacheKey(
+                        message_type=HandshakeMessageType.ClientHello,
+                        epoch=0,
+                        is_remote=True,
+                    ),
+                    HandshakeCacheKey(
+                        message_type=HandshakeMessageType.ServerHello,
+                        epoch=0,
+                        is_remote=False,
+                    ),
+                    HandshakeCacheKey(
+                        message_type=HandshakeMessageType.Certificate,
+                        epoch=0,
+                        is_remote=False,
+                    ),
+                    HandshakeCacheKey(
+                        message_type=HandshakeMessageType.KeyServerExchange,
+                        epoch=0,
+                        is_remote=False,
+                    ),
+                    HandshakeCacheKey(
+                        message_type=HandshakeMessageType.CertificateRequest,
+                        epoch=0,
+                        is_remote=False,
+                    ),
+                    HandshakeCacheKey(
+                        message_type=HandshakeMessageType.ServerHelloDone,
+                        epoch=0,
+                        is_remote=False,
+                    ),
+                    HandshakeCacheKey(
+                        message_type=HandshakeMessageType.Certificate,
+                        epoch=0,
+                        is_remote=True,
+                    ),
+                    HandshakeCacheKey(
+                        message_type=HandshakeMessageType.ClientKeyExchange,
+                        epoch=0,
+                        is_remote=True,
+                    ),
+                ]
+            )
+            logger.debug(f"parse: session_hash_for_ems length={len(session_hash_for_ems)}")
+
         logger.info("parse: calling __setup_cipher_suite to initialize encryption")
         # Initialize the cipher suite NOW, before encrypted messages arrive
-        self.__setup_cipher_suite(state, client_key_exchange.message)
+        self.__setup_cipher_suite(state, client_key_exchange.message, session_hash_for_ems)
         logger.info("parse: cipher suite initialized, can now decrypt incoming messages")
 
         # Step 3: Now wait for the encrypted Finished message (epoch=1)

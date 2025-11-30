@@ -12,6 +12,7 @@ from webrtc.dtls.dtls_record import RecordLayer, is_dtls_record_layer
 from webrtc.dtls.flight_state import Flight
 from webrtc.dtls.fsm import DTLSConn
 from webrtc.dtls.prf import SRTPKeyingMaterial
+from webrtc.srtp import Session as SrtpSession, Stream as SrtpStream
 
 logger = logging.getLogger("webrtc.dtls.transport")
 
@@ -66,11 +67,11 @@ class DTLSTransport:
         # Record layer channel for incoming DTLS packets
         self.record_layer_chan: asyncio.Queue[tuple[RecordLayer, bytes]] = asyncio.Queue()
 
-        # SRTP state - uses Rust SRTP with Python-derived keys
+        # SRTP state - Python Session with Rust SrtpContext for crypto
         self.__srtp_rtp_lock = asyncio.Event()
         self.__srtp_rtcp_lock = asyncio.Event()
-        self._srtp_rtp: webrtc_rs.SRTP | None = None
-        self._srtp_rtcp: webrtc_rs.SRTP | None = None
+        self._srtp_rtp: SrtpSession | None = None
+        self._srtp_rtcp: SrtpSession | None = None
 
         # Handshake completion
         self.__handshake_complete = asyncio.Event()
@@ -98,6 +99,17 @@ class DTLSTransport:
             transport: Optional ICE transport (if not already bound)
         """
         print(f"[DTLS] start: role={role}, transport provided={transport is not None}")
+
+        # If handshake already completed, skip
+        if self.__handshake_complete.is_set():
+            print("[DTLS] start: handshake already complete, skipping")
+            return
+
+        # If there's already a DTLS connection in progress, skip (don't restart mid-handshake)
+        if self.__dtls_conn is not None:
+            print("[DTLS] start: DTLS connection already in progress, skipping duplicate start")
+            return
+
         self.__role = role
         is_client = role == DTLSRole.Client
 
@@ -173,9 +185,10 @@ class DTLSTransport:
 
     async def _init_srtp(self, is_client: bool):
         """
-        Initialize Rust SRTP sessions using Python-derived keying material.
+        Initialize Python SRTP sessions with Rust cipher backend.
 
-        The SRTP keys are derived by Python PRF, but encryption is done by Rust.
+        The SRTP keys are derived by Python PRF, crypto is done by Rust SrtpContext.
+        Stream demuxing is handled by Python.
         """
         if not self._srtp_keying_material:
             logger.error("No SRTP keying material available")
@@ -184,7 +197,7 @@ class DTLSTransport:
         keys = self._srtp_keying_material
 
         try:
-            # Create Rust SRTP with Python-derived keys
+            # Create SRTP with Python-derived keys
             # The SRTP master key format is: key (16 bytes) + salt (14 bytes) = 30 bytes
             if is_client:
                 # Client sends with client key, receives with server key
@@ -196,31 +209,31 @@ class DTLSTransport:
                 rx_master_key = keys.client_write_key + keys.client_write_salt
 
             print(f"[DTLS] _init_srtp: is_client={is_client}")
-            print(f"[DTLS] _init_srtp: client_write_key={keys.client_write_key.hex()}")
-            print(f"[DTLS] _init_srtp: server_write_key={keys.server_write_key.hex()}")
-            print(f"[DTLS] _init_srtp: client_write_salt={keys.client_write_salt.hex()}")
-            print(f"[DTLS] _init_srtp: server_write_salt={keys.server_write_salt.hex()}")
             print(f"[DTLS] _init_srtp: tx_key (for encryption)={tx_master_key.hex()}")
             print(f"[DTLS] _init_srtp: rx_key (for decryption)={rx_master_key.hex()}")
 
-            # Initialize SRTP sessions with raw keys
-            self._srtp_rtp = webrtc_rs.SRTP.from_keying_material(
-                is_rtp=True,
+            # Initialize Python SRTP sessions (uses Rust SrtpContext internally)
+            self._srtp_rtp = SrtpSession.from_keying_material(
                 tx_key=tx_master_key,
                 rx_key=rx_master_key,
+                is_rtp=True,
             )
             self.__srtp_rtp_lock.set()
-            print("[DTLS] _init_srtp: RTP SRTP session created")
+            print("[DTLS] _init_srtp: RTP SRTP session created (Python + Rust crypto)")
 
-            self._srtp_rtcp = webrtc_rs.SRTP.from_keying_material(
-                is_rtp=False,
+            self._srtp_rtcp = SrtpSession.from_keying_material(
                 tx_key=tx_master_key,
                 rx_key=rx_master_key,
+                is_rtp=False,
             )
             self.__srtp_rtcp_lock.set()
-            print("[DTLS] _init_srtp: RTCP SRTP session created")
+            print("[DTLS] _init_srtp: RTCP SRTP session created (Python + Rust crypto)")
 
-            logger.info("SRTP sessions initialized with Python-derived keys")
+            logger.info("SRTP sessions initialized with Python Session + Rust crypto")
+
+            # Start internal receive loops to route incoming packets to streams
+            asyncio.create_task(self._rtp_receive_loop())
+            asyncio.create_task(self._rtcp_receive_loop())
 
         except Exception as e:
             logger.error(f"Failed to initialize SRTP: {e}")
@@ -289,10 +302,17 @@ class DTLSTransport:
         except asyncio.TimeoutError:
             return False
 
-    async def encrypt_rtp_bytes(self, data: bytes):
-        """Encrypt RTP packet using SRTP."""
+    def encrypt_rtp_bytes(self, data: bytes) -> bytes:
+        """Encrypt RTP packet using SRTP (synchronous)."""
         if srtp := self._srtp_rtp:
-            await srtp.encrypt(data)
+            return srtp.encrypt(data)
+        raise ValueError("SRTP not initialized")
+
+    def encrypt_rtcp_bytes(self, data: bytes) -> bytes:
+        """Encrypt RTCP packet using SRTP (synchronous)."""
+        if srtp := self._srtp_rtcp:
+            return srtp.encrypt(data)
+        raise ValueError("SRTP not initialized")
 
     async def write_rtcp_bytes(self, data: bytes) -> int:
         """Write RTCP packet (encrypted via SRTP) and send to network."""
@@ -300,8 +320,8 @@ class DTLSTransport:
         if not self._srtp_rtcp or not self.__transport:
             return 0
         try:
-            # Encrypt and get the encrypted packet directly
-            encrypted = await self._srtp_rtcp.encrypt_nonblock(data)
+            # Encrypt synchronously (Rust crypto is fast)
+            encrypted = self._srtp_rtcp.encrypt(data)
             # Send via ICE transport
             self.__transport.sendto(encrypted)
             return len(encrypted)
@@ -316,11 +336,10 @@ class DTLSTransport:
             print(f"[DTLS] write_rtp_bytes: skipped - srtp={self._srtp_rtp is not None}, transport={self.__transport is not None}")
             return 0
         try:
-            # Encrypt and get the encrypted packet directly
-            encrypted = await self._srtp_rtp.encrypt_nonblock(data)
+            # Encrypt synchronously (Rust crypto is fast)
+            encrypted = self._srtp_rtp.encrypt(data)
             # Send via ICE transport
             self.__transport.sendto(encrypted)
-            print(f"[DTLS] write_rtp_bytes: sent {len(data)}B -> {len(encrypted)}B encrypted")
             return len(encrypted)
         except Exception as e:
             print(f"[DTLS] write_rtp_bytes: ERROR - {e}")
@@ -329,23 +348,50 @@ class DTLSTransport:
             traceback.print_exc()
             return 0
 
-    async def srtp_rtp_stream(self, ssrc: int) -> webrtc_rs.Stream:
-        """Get SRTP stream for given SSRC."""
+    async def srtp_rtp_stream(self, ssrc: int) -> SrtpStream:
+        """Get or create SRTP stream for given SSRC."""
         await self.__srtp_rtp_lock.wait()
         if not self._srtp_rtp:
             raise ValueError("SRTP must be started to get the stream")
-        return await self._srtp_rtp.ssrc_stream(ssrc)
+        return await self._srtp_rtp.open_stream(ssrc)
 
-    async def srtp_rtcp_stream(self, ssrc: int) -> webrtc_rs.Stream:
-        """Get SRTCP stream for given SSRC."""
+    async def srtp_rtcp_stream(self, ssrc: int) -> SrtpStream:
+        """Get or create SRTCP stream for given SSRC."""
         await self.__srtp_rtcp_lock.wait()
         if not self._srtp_rtcp:
             raise ValueError("SRTP must be started to get the stream")
-        return await self._srtp_rtcp.ssrc_stream(ssrc)
+        return await self._srtp_rtcp.open_stream(ssrc)
 
-    async def read_rtp_bytes(self) -> tuple[bytes, int]:
-        """Read decrypted RTP packet from SRTP session."""
-        if srtp := self._srtp_rtp:
-            data = await srtp.read_pkt()
-            return data, len(data)
-        return bytes(), 0
+    async def _rtp_receive_loop(self):
+        """Internal loop that reads RTP from ICE and routes to SRTP streams."""
+        if not self.__transport:
+            logger.error("No transport for RTP receive loop")
+            return
+
+        logger.info("RTP receive loop started")
+        while True:
+            try:
+                packet = await self.__transport.recv_rtp()
+                if self._srtp_rtp:
+                    await self._srtp_rtp.write_incoming(packet.data)
+            except Exception as e:
+                logger.error(f"RTP receive loop error: {e}")
+                await asyncio.sleep(0.1)
+
+    async def _rtcp_receive_loop(self):
+        """Internal loop that reads RTCP from ICE and routes to SRTP streams."""
+        if not self.__transport:
+            logger.error("No transport for RTCP receive loop")
+            return
+
+        logger.info("RTCP receive loop started")
+        while True:
+            try:
+                packet = await self.__transport.recv_rtcp()
+                if self._srtp_rtcp:
+                    await self._srtp_rtcp.write_incoming(packet.data)
+            except Exception as e:
+                logger.error(f"RTCP receive loop error: {e}")
+                import traceback
+                traceback.print_exc()
+                await asyncio.sleep(0.1)

@@ -1,6 +1,6 @@
 import asyncio
 
-from webrtc.dtls.dtls_record import ClientHello, Message, RecordLayer
+from webrtc.dtls.dtls_record import ClientHello, ExtendedMasterSecret, Message, RecordLayer
 from webrtc.dtls.flight_state import Flight, FlightTransition, State
 
 
@@ -24,5 +24,13 @@ class Flight0(FlightTransition):
         elif not state.remote_random:
             print("Flight 0 client hello must contain a random.")
             return Flight.FLIGHT0
+
+        # Check for Extended Master Secret extension (RFC 7627)
+        if client_hello.extensions:
+            for ext in client_hello.extensions:
+                if isinstance(ext, ExtendedMasterSecret):
+                    state.use_extended_master_secret = True
+                    print("Flight 0: Extended Master Secret requested by client")
+                    break
 
         return Flight.FLIGHT2

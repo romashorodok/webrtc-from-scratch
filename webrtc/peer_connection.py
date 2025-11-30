@@ -162,6 +162,16 @@ class ICEGatherer(AsyncEventEmitter):
 
         self.__agent.dial()
 
+    async def accept(self):
+        """Start ICE as Controlled agent (answerer role)."""
+        if not self.__agent:
+            await self.gather()
+
+        if not self.__agent:
+            return
+
+        self.__agent.accept()
+
     async def gather(self):
         try:
             if not self.__agent:
@@ -210,7 +220,7 @@ class ICETransport:
 
     def get_ice_role(self) -> ice.AgentRole:
         role = self.__gatherer.get_role()
-        if not role or ice.AgentRole.Unknown:
+        if not role or role == ice.AgentRole.Unknown:
             return ice.AgentRole.Controlling
         return role
 
@@ -259,16 +269,16 @@ def set_default_caps(caps: MediaCaps):
         clock_rate=90000,
         refresh_rate=1 / 30,
         channels=0,
-        sdp_fmtp_line="",
+        sdp_fmtp_line="level-idx=5;profile=0;tier=0",
         payload_type=AV1_PAYLOAD_TYPE,
         stats_id=f"RTPCodec-{current_ntp_time() >> 32}",
     )
-    twcc = RTCPFeedback(rtcp_type="transport-cc", parameter="")
-    extended_reports_round_trip_time = RTCPFeedback(rtcp_type="ccm", parameter="fir")
-    receiver_report = RTCPFeedback(rtcp_type="rrtr", parameter="")
-    av1.rtcp_feedbacks.append(twcc)
-    av1.rtcp_feedbacks.append(receiver_report)
-    av1.rtcp_feedbacks.append(extended_reports_round_trip_time)
+    # Match Chrome's expected RTCP feedback types
+    av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="goog-remb", parameter=""))
+    av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="transport-cc", parameter=""))
+    av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="ccm", parameter="fir"))
+    av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="nack", parameter=""))
+    av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="nack", parameter="pli"))
     caps.register_codec(av1, RTPCodecKind.Video)
 
     # vp8 = RTPCodecParameters(
@@ -371,6 +381,11 @@ class PeerConnection(AsyncEventEmitter):
         async def _bind_transport_on_nominated_to_transceivers(
             transport: ice.CandidatePairTransport,
         ):
+            # Guard against duplicate NOMINATE_TRANSPORT events
+            if self._transport is not None:
+                print(f"[PC] on NOMINATE_TRANSPORT: already have transport, ignoring duplicate")
+                return
+
             print(f"[PC] on NOMINATE_TRANSPORT: starting DTLS as {dtls_role}")
             self._transport = transport
 
@@ -389,17 +404,7 @@ class PeerConnection(AsyncEventEmitter):
                     pkt = await transport.recv_rtp()
                     await self._dtls_transport.write_rtp_bytes(pkt.data)
 
-            async def run_rtp_send_loop():
-                while True:
-                    if result := await self._dtls_transport.read_rtp_bytes():
-                        pkt, _ = result
-                        print("send ?", pkt)
-                        transport.sendto(pkt)
-
-                    await asyncio.sleep(1)
-
             self.__loop.create_task(run_rtp_recv_loop())
-            self.__loop.create_task(run_rtp_send_loop())
 
         self.__loop.create_task(pair_ctrl.start())
 
@@ -579,6 +584,40 @@ class PeerConnection(AsyncEventEmitter):
             print("Invalid local state transition", e)
             return
 
+    async def _match_transceivers_with_offer(self, offer: SessionDescription):
+        """
+        Match local transceivers with remote offer media sections.
+
+        When receiving an offer, we need to:
+        1. Match our transceivers by kind (video/audio) with the offer's media sections
+        2. Assign the MIDs from the offer to our transceivers
+        """
+        unassigned_transceivers = [t for t in self._transceivers if t.mid is None]
+
+        for media in offer.media_descriptions:
+            mid = media.get_attribute_value(SessionDescriptionAttrKey.MID.value)
+            if not mid:
+                continue
+
+            kind = RTPCodecKind(media.kind)
+            if kind != RTPCodecKind.Audio and kind != RTPCodecKind.Video:
+                continue
+
+            # Find an unassigned transceiver with matching kind
+            for i, transceiver in enumerate(unassigned_transceivers):
+                if transceiver.kind == kind:
+                    # Assign the MID from the offer
+                    transceiver.set_mid(int(mid) if mid.isdigit() else 0)
+                    print(f"[PC] Assigned MID {mid} to transceiver with kind {kind}")
+
+                    # Track greater mid for future use
+                    if mid.isdigit() and int(mid) > self._greater_mid:
+                        self._greater_mid = int(mid)
+
+                    # Remove from unassigned list
+                    unassigned_transceivers.pop(i)
+                    break
+
     async def set_remote_description(
         self, desc_type: SessionDescriptionType, desc: SessionDescription
     ):
@@ -615,6 +654,10 @@ class PeerConnection(AsyncEventEmitter):
                         desc_type,
                     )
                     self._pending_remote_description = desc
+
+                    # Match local transceivers with remote offer media sections
+                    # Assign MIDs from the offer to our transceivers
+                    await self._match_transceivers_with_offer(desc)
 
                     self.emit(
                         PeerConnectionEvent.SignalingStateChange,
@@ -758,18 +801,21 @@ class PeerConnection(AsyncEventEmitter):
     async def _generate_matched_sdp(
         self,
         transceivers: list[RTPTransceiver],
+        remote_description: SessionDescription | None = None,
     ) -> SessionDescription | None:
-        if not self._current_remote_description:
+        # Use provided remote description or fall back to current
+        remote_desc = remote_description or self._current_remote_description
+        if not remote_desc:
             raise ValueError(
                 "Unable generate stateful desc. Set _current_remote_description"
             )
 
-        if len(self._current_remote_description.media_descriptions) == 0:
+        if len(remote_desc.media_descriptions) == 0:
             raise ValueError(
                 "Unable generate stateful desc. Not found media to generate"
             )
 
-        group = self._current_remote_description.get_attribute_value(
+        group = remote_desc.get_attribute_value(
             SessionDescriptionAttrKey.Group.value
         )
         if not group:
@@ -783,7 +829,7 @@ class PeerConnection(AsyncEventEmitter):
                 "Unable generate stateful desc. Desc bundle must contain at least one partition"
             )
 
-        ice_params = self.gatherer.get_local_parameters()
+        ice_params = await self.gatherer.get_local_parameters()
         if ice_params is None:
             return
 
@@ -792,14 +838,13 @@ class PeerConnection(AsyncEventEmitter):
 
         ice_candidates = await self.gatherer.get_local_candidates()
 
-        remote_desc = self._current_remote_description
         remote_desc.add_attribute(
             SessionDescriptionAttr(SessionDescriptionAttrKey.MsidSemantic, "WMS*")
         )
 
         media_sections = list[MediaSection]()
 
-        for media in self._current_remote_description.media_descriptions:
+        for media in remote_desc.media_descriptions:
             mid = media.get_attribute_value(SessionDescriptionAttrKey.MID.value)
             if not mid:
                 print("Not found mid")
@@ -857,6 +902,7 @@ class PeerConnection(AsyncEventEmitter):
             media_sections=media_sections,
             match_bundle_group=group,
             caps=self._caps,
+            remote_description=remote_desc,  # Pass remote for codec negotiation
         )
 
     async def create_offer(self, options: OfferOption | None = None):
@@ -892,3 +938,36 @@ class PeerConnection(AsyncEventEmitter):
 
         except RuntimeError as e:
             print("Create offer error", e)
+
+    async def create_answer(self):
+        """
+        Create an SDP answer in response to an offer from a remote peer.
+
+        Must be called after set_remote_description with an offer.
+        """
+        # When creating an answer, the remote offer is in _pending_remote_description
+        # (set by set_remote_description with Offer type)
+        remote_offer = self._pending_remote_description or self._current_remote_description
+        if remote_offer is None:
+            raise ValueError("Cannot create answer without remote offer")
+
+        try:
+            current_transceivers = self._transceivers.copy()
+
+            # Match transceivers with remote offer
+            for transceiver in current_transceivers:
+                if transceiver.mid and (mid := transceiver.mid.numeric_mid):
+                    if mid > self._greater_mid:
+                        self._greater_mid = mid
+
+            # Generate answer based on the remote offer
+            desc = await self._generate_matched_sdp(current_transceivers, remote_offer)
+
+            if desc:
+                desc.origin.session_version = self.origin.session_version
+                self.origin.session_version += 1
+
+            return desc
+
+        except RuntimeError as e:
+            print("Create answer error", e)

@@ -3,7 +3,8 @@ import binascii
 import hashlib
 from typing import Callable
 
-from webrtc.dtls.prf import prf_master_secret
+from webrtc.dtls.prf import prf_master_secret, prf_extended_master_secret
+from webrtc.dtls.dtls_cipher_suite import verify_data_client
 from webrtc.dtls.dtls_record import (
     Handshake,
     HandshakeHeader,
@@ -24,7 +25,7 @@ class Flight5(FlightTransition):
         self,
         state: State,
         key_server_exchange: KeyServerExchange,
-        handshake_messages_merged: bytes,
+        session_hash_for_ems: bytes | None = None,
     ):
         if not state.pending_cipher_suite:
             raise ValueError("Flight5 cipher suite must be defined")
@@ -58,12 +59,28 @@ class Flight5(FlightTransition):
             binascii.hexlify(state.pre_master_secret),
         )
 
-        state.master_secret = prf_master_secret(
-            state.pre_master_secret,
-            state.local_random.marshal_fixed(),
-            state.remote_random,
-            hashlib.sha256,
-        )
+        # Compute master secret - use Extended Master Secret (RFC 7627) if negotiated
+        if state.use_extended_master_secret and session_hash_for_ems is not None:
+            # Extended Master Secret: master_secret = PRF(pre_master_secret, "extended master secret", session_hash)
+            # session_hash is Hash(handshake messages from ClientHello through ClientKeyExchange)
+            session_hash_digest = hashlib.sha256(session_hash_for_ems).digest()
+            print(f"Flight 5: Using Extended Master Secret (RFC 7627)")
+            print(f"Flight 5: session_hash_for_ems length={len(session_hash_for_ems)}")
+            print(f"Flight 5: session_hash_digest={session_hash_digest.hex()}")
+            state.master_secret = prf_extended_master_secret(
+                state.pre_master_secret,
+                session_hash_digest,
+                hashlib.sha256,
+            )
+        else:
+            # Standard master secret: master_secret = PRF(pre_master_secret, "master secret", client_random + server_random)
+            print(f"Flight 5: Using standard master secret")
+            state.master_secret = prf_master_secret(
+                state.pre_master_secret,
+                state.local_random.marshal_fixed(),
+                state.remote_random,
+                hashlib.sha256,
+            )
 
         print("Flight 5 master secret", binascii.hexlify(state.master_secret))
 
@@ -77,9 +94,11 @@ class Flight5(FlightTransition):
             state.master_secret,
             state.local_random.marshal_fixed(),
             state.remote_random,
-            False,
+            True,  # We are the client, so use client_write_key for encryption
         )
 
+        # Signal that cipher suite is ready for decryption
+        state.cipher_suite_ready.set()
         print("Flight 5 cipher suite started")
 
     def generate(
@@ -95,11 +114,10 @@ class Flight5(FlightTransition):
         # print("flight 5 messages", state.pending_remote_handshake_messages)
 
         cache_fingerprint = bytes()
-        seq_pred = state.handshake_sequence_number
 
         # print("pending messages", state.pending_remote_handshake_messages)
 
-        key_server_exchange = state.cache.pull(
+        key_server_exchange_bytes = state.cache.pull(
             KeyServerExchange,
             HandshakeCacheKey(
                 message_type=HandshakeMessageType.KeyServerExchange,
@@ -108,9 +126,34 @@ class Flight5(FlightTransition):
             ),
         )
 
+        # Unmarshal the bytes to get the actual KeyServerExchange object
+        key_server_exchange_handshake = Handshake.unmarshal(key_server_exchange_bytes)
+        if not isinstance(key_server_exchange_handshake.message, KeyServerExchange):
+            raise ValueError("Flight5: Expected KeyServerExchange message")
+        key_server_exchange = key_server_exchange_handshake.message
+
         result = list[RecordLayer]()
 
         print("Flight 5 block???")
+
+        # Debug: Print each cached message's msg_seq
+        for key in [
+            HandshakeCacheKey(message_type=HandshakeMessageType.ClientHello, epoch=0, is_remote=False),
+            HandshakeCacheKey(message_type=HandshakeMessageType.ServerHello, epoch=0, is_remote=True),
+            HandshakeCacheKey(message_type=HandshakeMessageType.Certificate, epoch=0, is_remote=True),
+            HandshakeCacheKey(message_type=HandshakeMessageType.KeyServerExchange, epoch=0, is_remote=True),
+            HandshakeCacheKey(message_type=HandshakeMessageType.CertificateRequest, epoch=0, is_remote=True),
+            HandshakeCacheKey(message_type=HandshakeMessageType.ServerHelloDone, epoch=0, is_remote=True),
+        ]:
+            try:
+                data = state.cache._cache.get(key)
+                if data:
+                    # msg_seq is at bytes 4-5 of handshake header
+                    msg_seq = int.from_bytes(data[4:6], 'big')
+                    print(f"Flight5: cache {key.message_type.name} msg_seq={msg_seq}")
+            except Exception as e:
+                print(f"Flight5: cache error for {key.message_type.name}: {e}")
+
         cache_fingerprint = state.cache.pull_and_merge(
             [
                 HandshakeCacheKey(
@@ -178,40 +221,50 @@ class Flight5(FlightTransition):
         #         "Require KeyServerExchange to be present for cipher suite init"
         #     )
 
+        # Get the next message sequence that will be assigned by FSM.prepare()
+        # We need to set msg_seq BEFORE marshaling to fingerprint so the hash matches
+        next_msg_seq = state.handshake_send_sequence
+
+        # Create client Certificate first
+        layer_certificate = self.__msg.certificate([state.local_certificate])
+        if isinstance(layer_certificate.content, Handshake):
+            layer_certificate.content.header.message_sequence = next_msg_seq
+            print(f"Flight5: client Certificate using msg_seq={next_msg_seq}")
+            next_msg_seq += 1
+
+        result.append(layer_certificate)
+        # Use content.marshal() to get only the handshake body, not the full record
+        cert_bytes = layer_certificate.content.marshal()
+        cert_msg_seq = int.from_bytes(cert_bytes[4:6], 'big')
+        print(f"Flight5: client Certificate marshaled msg_seq={cert_msg_seq}")
+        cache_fingerprint += cert_bytes
+
+        # Create ClientKeyExchange
+        layer_client_key_exchange = self.__msg.client_key_exchange(
+            state.local_keypair.publicKey.to_der()
+        )
+        if isinstance(layer_client_key_exchange.content, Handshake):
+            layer_client_key_exchange.content.header.message_sequence = next_msg_seq
+            next_msg_seq += 1
+
+        result.append(layer_client_key_exchange)
+        # Use content.marshal() to get only the handshake body, not the full record
+        client_key_exchange_bytes = layer_client_key_exchange.content.marshal()
+        cache_fingerprint += client_key_exchange_bytes
+
+        # For Extended Master Secret (RFC 7627), the session_hash is computed over
+        # handshake messages from ClientHello through ClientKeyExchange (inclusive)
+        # This is: cache_fingerprint at this point
+        session_hash_for_ems = cache_fingerprint if state.use_extended_master_secret else None
+
+        # NOW initialize cipher suite - with session_hash for EMS if negotiated
         try:
             self.__initialize_cipher_suite(
-                state, key_server_exchange, cache_fingerprint
+                state, key_server_exchange, session_hash_for_ems
             )
         except Exception as e:
             print("Flight5 Unable init cipher suite", e)
             raise e
-
-        # certificate = Certificate(bytes())
-        # state.local_certificate = create_self_signed_cert_with_ecdsa(
-        #     state.local_keypair
-        # )
-        # certificate.certificates = [state.local_certificate]
-
-        layer_certificate = self.__msg.certificate([state.local_certificate])
-        # if isinstance(layer_certificate.content, Handshake):
-        #     layer_certificate.content.header.message_sequence = seq_pred
-
-        result.append(layer_certificate)
-        # seq_pred += 1
-        cache_fingerprint += layer_certificate.marshal()
-
-        # print("merged data", merged)
-        # print("remote state", binascii.hexlify(state.remote_random))
-
-        layer_client_key_exchange = self.__msg.client_key_exchange(
-            state.local_keypair.publicKey.to_der()
-        )
-        # if isinstance(layer_client_key_exchange.content, Handshake):
-        #     layer_client_key_exchange.content.header.message_sequence = seq_pred
-
-        result.append(layer_client_key_exchange)
-        # seq_pred += 1
-        cache_fingerprint += layer_client_key_exchange.marshal()
 
         # TODO: Why client side separate a pubkey and signature of the cert ?
         # KeyServerExchange sends pubkey and signature in one layer
@@ -241,9 +294,8 @@ class Flight5(FlightTransition):
             SignatureHashAlgorithm.ECDSA_SECP256R1_SHA256,
         )
         if isinstance(layer_certificate_verify_signature.content, Handshake):
-            layer_certificate_verify_signature.content.header.message_sequence = (
-                seq_pred
-            )
+            layer_certificate_verify_signature.content.header.message_sequence = next_msg_seq
+            next_msg_seq += 1
 
         # RecordLayer(
         #     header=RecordHeader(
@@ -263,34 +315,25 @@ class Flight5(FlightTransition):
         # )
 
         result.append(layer_certificate_verify_signature)
-        seq_pred += 1
         cache_fingerprint += layer_certificate_verify_signature.content.marshal()
 
-        # TODO: This not a handshake
+        # ChangeCipherSpec is not a handshake message, don't include in fingerprint
         layer_change_cipher_spec = self.__msg.change_cipher_spec()
-        # RecordLayer(
-        #     header=RecordHeader(
-        #         content_type=ContentType.CHANGE_CIPHER_SPEC,
-        #         version=DTLSVersion.V1_2,
-        #         epoch=0,
-        #         sequence_number=state.local_sequence_number,
-        #     ),
-        #     content=ChangeCipherSpec(),
-        # )
         result.append(layer_change_cipher_spec)
-        # seq_pred += 1
-        # merged += layer_change_cipher_spec.content.marshal()
 
         if not state.master_secret:
-            raise ValueError("Flight 5 master_secret must be defined by cuite")
+            raise ValueError("Flight 5 master_secret must be defined by cipher suite")
 
-        # if not state.local_verify:
-        #     state.local_verify = verify_data_client(state.master_secret, merged)
-        # print(state.local_verify, len(state.local_verify))
+        print(f"Flight 5: fingerprint for verify_data ({len(cache_fingerprint)} bytes): {binascii.hexlify(cache_fingerprint[:100]).decode()}...")
 
-        layer_finished = self.__msg.finished()
+        # Compute client verify_data for Finished message
+        # This is PRF(master_secret, "client finished", Hash(handshake_messages))[0..11]
+        verifying_data = verify_data_client(state.master_secret, cache_fingerprint)
+        print(f"Flight 5: client verifying_data: {binascii.hexlify(verifying_data).decode()}")
+
+        layer_finished = self.__msg.finished(verifying_data)
         if isinstance(layer_finished.content, Handshake):
-            layer_finished.content.header.message_sequence = seq_pred
+            layer_finished.content.header.message_sequence = next_msg_seq
 
         # RecordLayer(
         #     header=RecordHeader(
@@ -322,10 +365,33 @@ class Flight5(FlightTransition):
 
     async def parse(
         self, state: State, handshake_message_ch: asyncio.Queue[Message]
-    ) -> Flight:
-        # TODO: time out if not recv send flight 5 again
-        finished = await handshake_message_ch.get()
-        print("Flight 5 finished recv", finished)
+    ) -> Flight | None:
+        # Wait for server's Finished message (encrypted, epoch=1)
+        # After receiving this, the DTLS handshake is complete for the client
+        while True:
+            message = await handshake_message_ch.get()
+            print(f"Flight 5: Received message type {message.message_type}")
 
-        # await asyncio.sleep(2)
-        return
+            if message.message_type == HandshakeMessageType.Finished:
+                print("Flight 5: Handshake complete (client side)")
+                # Return None to signal handshake completion
+                return None
+
+            # Non-Finished messages are likely retransmissions from the server
+            # (ServerHello, Certificate, etc. from Flight 4)
+            # Drain them and signal FSM to retransmit our Flight 5
+            print(f"Flight 5: Expected Finished but got {message.message_type} - draining retransmitted messages")
+
+            # Check if there are more messages in the queue to drain
+            while not handshake_message_ch.empty():
+                try:
+                    extra_msg = handshake_message_ch.get_nowait()
+                    print(f"Flight 5: Drained retransmitted message type {extra_msg.message_type}")
+                    if extra_msg.message_type == HandshakeMessageType.Finished:
+                        print("Flight 5: Found Finished in queue - handshake complete")
+                        return None
+                except asyncio.QueueEmpty:
+                    break
+
+            # Return same flight to trigger retransmission
+            return Flight.FLIGHT5

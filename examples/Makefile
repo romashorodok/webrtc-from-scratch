@@ -1,6 +1,9 @@
 run:
 	uv run serve.py examples.ws:app
 
+client:
+	uv run serve.py examples.client:app
+
 y4m:
 	ffmpeg -f lavfi -i testsrc=duration=5:size=640x480:rate=30 -pix_fmt yuv420p -f yuv4mpegpipe output.y4m
 
