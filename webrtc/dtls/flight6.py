@@ -1,9 +1,6 @@
 import asyncio
-import time
+import binascii
 
-from ecdsa.util import binascii
-
-import native
 from webrtc.dtls.dtls_cipher_suite import (
     prf_verify_data,
     verify_data_client,
@@ -89,23 +86,39 @@ class Flight6(FlightTransition):
             raise ValueError("Master secret required")
 
         try:
+            # Debug: Check what's in the cache
+            print("[Flight6] generate: checking cache for server verify_data computation")
+            print(f"[Flight6] cache has {len(state.cache._items)} items total")
+            for key in server_verifying_data:
+                try:
+                    data = state.cache._cache.get(key)
+                    # Find the item to show message_sequence
+                    item_seq = None
+                    for item in state.cache._items:
+                        if item.message_type == key.message_type and item.epoch == key.epoch and item.is_remote == key.is_remote:
+                            item_seq = item.message_sequence
+                    print(f"[Flight6] cache key {key}: {'present' if data else 'MISSING'} ({len(data) if data else 0} bytes, msg_seq={item_seq})")
+                except:
+                    print(f"[Flight6] cache key {key}: MISSING")
+
             verify = state.cache.pull_and_merge(server_verifying_data)
 
-            certificate = state.cache.pull(
-                Certificate,
-                HandshakeCacheKey(
-                    message_type=HandshakeMessageType.Certificate,
-                    epoch=0,
-                    is_remote=True,
-                ),
-            )
+            print(f"[Flight6] verify data for server finished: {len(verify)} bytes")
+            print(f"[Flight6] verify data hex (first 100): {binascii.hexlify(verify[:100]).decode()}...")
+            print(f"[Flight6] verify data hex (last 50): {binascii.hexlify(verify[-50:]).decode()}")
 
-            print("Flight 6 verify data", binascii.hexlify(verify))
-            verifying_data = native.prf_verify_data_server(state.master_secret, verify)
-            # verifying_data = verify_data_server(state.master_secret, verify)
-            print("Flight 6 verifying data", binascii.hexlify(verifying_data))
+            # Show SHA256 hash of all handshake messages
+            import hashlib
+            verify_hash = hashlib.sha256(verify).digest()
+            print(f"[Flight6] SHA256 of handshake messages: {binascii.hexlify(verify_hash).decode()}")
+
+            # Use Python PRF implementation instead of native
+            verifying_data = verify_data_server(state.master_secret, verify)
+            print(f"[Flight6] server verifying_data: {binascii.hexlify(verifying_data).decode()}")
         except Exception as e:
-            print("FLight 6 error", e)
+            print(f"[Flight6] generate error: {e}")
+            import traceback
+            traceback.print_exc()
             return
 
         finished = self.__msg.finished(verifying_data)
@@ -114,96 +127,108 @@ class Flight6(FlightTransition):
 
     async def parse(
         self, state: State, handshake_message_ch: asyncio.Queue[Message]
-    ) -> Flight:
-        ...
-        # cache_result = state.cache.pull(
-        #     Finished,
-        #     HandshakeCacheKey(
-        #         message_type=HandshakeMessageType.Finished,
-        #         epoch=1,
-        #         is_remote=True,
-        #     ),
-        # )
-        # print("Finish has data??", cache_result.encrypted_payload)
-        #
-        # await asyncio.sleep(5)
-        #
-        # if not state.master_secret:
-        #     raise ValueError("Master secret required")
-        #
-        # try:
-        #     verify = state.cache.pull_and_merge(server_verifying_data)
-        #
-        #     certificate = state.cache.pull(
-        #         Certificate,
-        #         HandshakeCacheKey(
-        #             message_type=HandshakeMessageType.Certificate,
-        #             epoch=0,
-        #             is_remote=True,
-        #         ),
-        #     )
-        #     # print(certificate.header)
-        #
-        #     print("Flight 6 verify data", binascii.hexlify(verify))
-        #     # verifying_data = native.prf_verify_data_server(state.master_secret, verify)
-        #     verifying_data = native.prf_verify_data_server(state.master_secret, verify)
-        #     print("Flight 6 verifying data", binascii.hexlify(verifying_data))
-        # except Exception as e:
-        #     print("FLight 6 error", e)
-        #     return Flight.FLIGHT6
-        #
-        # finished = self.__msg.finished(verifying_data)
-        #
-        # pending_record_layers = [self.__msg.change_cipher_spec(), finished]
-        #
-        # message_sequence = 1
-        # for record in pending_record_layers:
-        #     record.header.sequence_number += state.handshake_sequence_number
-        #     state.handshake_sequence_number += 1
-        #
-        #     if (
-        #         record.header.content_type == ContentType.HANDSHAKE
-        #         or record.header.content_type == ContentType.CHANGE_CIPHER_SPEC
-        #     ):
-        #         if not isinstance(record.content, Handshake) or not isinstance(
-        #             record.content, ChangeCipherSpec
-        #         ):
-        #             continue
-        #
-        #         record.content.header.message_sequence = message_sequence
-        #
-        # send_batch = bytes()
-        # MAX_MTU = 1280
-        #
-        # for layer in pending_record_layers:
-        #     try:
-        #         data = layer.marshal()
-        #
-        #         if layer.encrypt:
-        #             if not state.pending_cipher_suite:
-        #                 raise ValueError(
-        #                     "layer data must be encrypted but cipher suite undefined"
-        #                 )
-        #
-        #             print("Send seq number", layer.header.sequence_number)
-        #
-        #             data = state.pending_cipher_suite.encrypt(layer)
-        #             if not data:
-        #                 raise ValueError("None data after encrypt,")
-        #
-        #         if len(data) > MAX_MTU and len(send_batch) > MAX_MTU:
-        #             raise ValueError(
-        #                 "layer data has too much bytes. Message must be fragmented"
-        #             )
-        #
-        #         send_batch += data
-        #
-        #     except Exception as e:
-        #         # TODO: backoff
-        #         print("Unable send packet. Err:", e, "layer", layer)
-        #         await asyncio.sleep(10)
-        #
-        # await state.remote.sendto(send_batch)
-        #
-        # await asyncio.sleep(2)
-        # return Flight.FLIGHT6
+    ) -> Flight | None:
+        """
+        Verify client Finished message.
+
+        The client Finished message contains verify_data which is:
+        PRF(master_secret, "client finished", Hash(handshake_messages))[0..11]
+
+        We compute the expected value and compare it to the received value.
+
+        Note: Flight 4 already received and cached the Finished message.
+        We just need to verify it here.
+        """
+        if not state.master_secret:
+            raise ValueError("Master secret required to verify client Finished")
+
+        # Get the handshake messages for client verify_data computation
+        # Client verify_data uses messages up to but NOT including client Finished
+        client_verify_cache_keys = [
+            HandshakeCacheKey(
+                message_type=HandshakeMessageType.ClientHello,
+                epoch=0,
+                is_remote=True,
+            ),
+            HandshakeCacheKey(
+                message_type=HandshakeMessageType.ServerHello,
+                epoch=0,
+                is_remote=False,
+            ),
+            HandshakeCacheKey(
+                message_type=HandshakeMessageType.Certificate,
+                epoch=0,
+                is_remote=False,
+            ),
+            HandshakeCacheKey(
+                message_type=HandshakeMessageType.KeyServerExchange,
+                epoch=0,
+                is_remote=False,
+            ),
+            HandshakeCacheKey(
+                message_type=HandshakeMessageType.CertificateRequest,
+                epoch=0,
+                is_remote=False,
+            ),
+            HandshakeCacheKey(
+                message_type=HandshakeMessageType.ServerHelloDone,
+                epoch=0,
+                is_remote=False,
+            ),
+            HandshakeCacheKey(
+                message_type=HandshakeMessageType.Certificate,
+                epoch=0,
+                is_remote=True,
+            ),
+            HandshakeCacheKey(
+                message_type=HandshakeMessageType.ClientKeyExchange,
+                epoch=0,
+                is_remote=True,
+            ),
+            HandshakeCacheKey(
+                message_type=HandshakeMessageType.CertificateVerify,
+                epoch=0,
+                is_remote=True,
+            ),
+        ]
+
+        try:
+            handshake_messages = state.cache.pull_and_merge(client_verify_cache_keys)
+
+            # Get the client Finished message from cache
+            finished_bytes = state.cache.pull(
+                Finished,
+                HandshakeCacheKey(
+                    message_type=HandshakeMessageType.Finished,
+                    epoch=1,
+                    is_remote=True,
+                ),
+            )
+
+            # Parse the Finished message - skip the handshake header (12 bytes)
+            # Handshake header: type(1) + length(3) + msg_seq(2) + frag_offset(3) + frag_length(3) = 12 bytes
+            finished = Handshake.unmarshal(finished_bytes)
+            if not isinstance(finished.message, Finished):
+                print(f"Flight 6 parse: expected Finished in cache, got {type(finished.message)}")
+                return Flight.FLIGHT6
+
+            # Compute expected client verify_data using Python PRF
+            expected_verify_data = verify_data_client(state.master_secret, handshake_messages)
+
+            print(f"Flight 6 parse: received verify_data: {binascii.hexlify(finished.message.verify_data)}")
+            print(f"Flight 6 parse: expected verify_data: {binascii.hexlify(expected_verify_data)}")
+
+            # Compare received vs expected
+            if finished.message.verify_data != expected_verify_data:
+                print("Flight 6 parse: Client Finished verify_data MISMATCH!")
+                # TODO: Send decrypt_error alert
+                return Flight.FLIGHT6
+
+            print("Flight 6 parse: Client Finished verified successfully!")
+            return None  # Signal handshake completion
+
+        except Exception as e:
+            print(f"Flight 6 parse error: {e}")
+            import traceback
+            traceback.print_exc()
+            return Flight.FLIGHT6

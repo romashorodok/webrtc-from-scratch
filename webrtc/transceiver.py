@@ -11,6 +11,7 @@ import webrtc_rs
 
 from webrtc.media.av1_payloader import AV1_PAYLOAD_TYPE, Av1Packetizer
 from webrtc.media.vp8_payloader import VP8Payloader
+from webrtc.srtp import Stream as SrtpStream
 
 from . import media
 from .utils import impl_protocol
@@ -382,7 +383,7 @@ class RTPSender:
         self._track: TrackLocal | None = None
         self.__transport: dtls.DTLSTransport | None = None
         self.__transport_lock = asyncio.Lock()
-        self._rtcp_stream: webrtc_rs.Stream | None = None
+        self._rtcp_stream: SrtpStream | None = None
 
     async def bind(self, transport: dtls.DTLSTransport):
         async with self.__transport_lock:
@@ -457,21 +458,22 @@ class TrackRemote:
         self.rtx_ssrc = rtx_ssrc
         self.rid = rid
 
-        self.__stream: webrtc_rs.Stream | None = None
+        self.__stream: SrtpStream | None = None
         self.__queue = asyncio.Queue[bytes]()
 
     async def recv(self) -> bytes:
-        return await self.stream.recv()
+        """Read decrypted RTP packet from stream."""
+        return await self.stream.read()
 
     @property
-    def stream(self) -> webrtc_rs.Stream:
+    def stream(self) -> SrtpStream:
         if not self.__stream:
             raise ValueError("Unable get stream")
 
         return self.__stream
 
     @stream.setter
-    def stream(self, value: webrtc_rs.Stream):
+    def stream(self, value: SrtpStream):
         self.__stream = value
 
         # self._rtp_packet_queue = queue.Queue[media.RtpPacket]()

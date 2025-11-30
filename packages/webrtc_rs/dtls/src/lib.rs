@@ -26,6 +26,11 @@ pub mod state;
 
 use cipher_suite::*;
 pub use error::Error;
+
+// Re-export dependencies for use by webrtc_rs PyO3 bindings
+pub use p256;
+pub use x25519_dalek;
+pub use rand_core;
 use extension::extension_use_srtp::SrtpProtectionProfile;
 
 pub(crate) fn find_matching_srtp_profile(

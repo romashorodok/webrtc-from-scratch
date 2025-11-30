@@ -1,19 +1,18 @@
 import abc
 import asyncio
+import logging
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Protocol, TypeVar
+from typing import Any, Protocol, TypeVar
 
-from asn1crypto import x509
+logger = logging.getLogger("webrtc.dtls.flight_state")
 
 from webrtc.dtls.certificate import Certificate
 from webrtc.dtls.dtls_cipher_suite import (
     CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-    CipherSuiteNative,
     Keypair,
     CipherSuite,
-    create_self_signed_cert_with_ecdsa,
 )
 from webrtc.dtls.dtls_record import (
     Handshake,
@@ -22,6 +21,7 @@ from webrtc.dtls.dtls_record import (
     RecordLayer,
 )
 from webrtc.dtls.dtls_typing import EllipticCurveGroup, Random
+from webrtc.dtls.prf import SRTPKeyingMaterial, get_srtp_keying_material
 
 #                     [RFC6347 Section-4.2.4]
 #                      +-----------+
@@ -81,27 +81,45 @@ _HANDSHAKE_CACHE_MESSAGE_T = TypeVar(
 
 @dataclass(frozen=True)
 class HandshakeCacheKey:
+    """Key for looking up cached handshake messages (without message_sequence)."""
     message_type: HandshakeMessageType
     epoch: int
     is_remote: bool
 
+    def __str__(self) -> str:
+        return f"CacheKey({self.message_type.name}, epoch={self.epoch}, remote={self.is_remote})"
+
+
+@dataclass
+class HandshakeCacheItem:
+    """Cache item storing handshake message with sequence number (like Rust)."""
+    message_type: HandshakeMessageType
+    epoch: int
+    is_remote: bool
+    message_sequence: int
+    data: bytes
+
 
 class HandshakeCache:
-    def __init__(self) -> None:
-        self._cache = dict[HandshakeCacheKey, bytes]()
+    """
+    Handshake message cache matching Rust implementation behavior.
 
-        self.__subscribers = list[tuple[list[HandshakeCacheKey], asyncio.Event]]()
+    Stores multiple messages with same (type, epoch, is_remote) but different
+    message_sequence. When pulling, returns the one with highest message_sequence.
+    This handles retransmissions correctly (e.g., ClientHello without cookie vs with cookie).
+    """
+
+    def __init__(self) -> None:
+        # Store as list of items (like Rust) to handle multiple message_sequences
+        self._items: list[HandshakeCacheItem] = []
+        # Quick lookup dict: key -> highest message_sequence item
+        self._cache: dict[HandshakeCacheKey, bytes] = {}
+
+        self.__subscribers: list[tuple[list[HandshakeCacheKey], asyncio.Event]] = []
 
     def __emit_ready_at_once(self):
         to_remove = []
         for cache_keys, event in self.__subscribers:
-            # needed_keys = set(cache_keys)  # Convert to a set for faster lookup
-            # present_keys = set(self._cache.keys())
-
-            # all_needed_keys_present = needed_keys.issubset(present_keys)
-            # print("all keys in???", self._cache)
-            # print("present keys", present_keys)
-
             if all(key in self._cache for key in cache_keys):
                 event.set()
                 to_remove.append((cache_keys, event))
@@ -110,10 +128,12 @@ class HandshakeCache:
             self.__subscribers.remove(item)
 
     async def once(self, cache_keys: list[HandshakeCacheKey]):
+        logger.info(f"cache.once: waiting for keys={[str(k) for k in cache_keys]}")
         event = asyncio.Event()
         self.__subscribers.append((cache_keys, event))
         self.__emit_ready_at_once()
         await event.wait()
+        logger.info(f"cache.once: all keys received!")
 
     def put_and_notify_once(
         self,
@@ -121,17 +141,62 @@ class HandshakeCache:
         epoch: int,
         message_type: HandshakeMessageType,
         message: bytes,
+        message_sequence: int = 0,
     ):
+        """
+        Cache a handshake message.
+
+        Like Rust, we store multiple items and when pulling we return the one
+        with the highest message_sequence for a given (type, epoch, is_remote).
+        """
+        logger.info(f"cache.put_and_notify_once: message_type={message_type}, epoch={epoch}, is_remote={is_client}, msg_seq={message_sequence}, length={len(message)}")
+
+        # Check if we already have this exact message_sequence (avoid duplicates)
+        for item in self._items:
+            if (item.message_type == message_type and
+                item.epoch == epoch and
+                item.is_remote == is_client and
+                item.message_sequence == message_sequence):
+                # Already have this message, skip
+                return
+
+        # Add to items list
+        self._items.append(HandshakeCacheItem(
+            message_type=message_type,
+            epoch=epoch,
+            is_remote=is_client,
+            message_sequence=message_sequence,
+            data=message,
+        ))
+
+        # Update quick lookup cache with highest message_sequence
         key = HandshakeCacheKey(
             message_type=message_type,
             epoch=epoch,
             is_remote=is_client,
         )
-        self._cache[key] = message
+
+        # Find the item with highest message_sequence for this key
+        best_item: HandshakeCacheItem | None = None
+        for item in self._items:
+            if (item.message_type == message_type and
+                item.epoch == epoch and
+                item.is_remote == is_client):
+                if best_item is None or item.message_sequence > best_item.message_sequence:
+                    best_item = item
+
+        if best_item:
+            self._cache[key] = best_item.data
+
         self.__emit_ready_at_once()
-        # print("Put flight state", self.__subscribers)
 
     def pull_and_merge(self, cache_keys: list[HandshakeCacheKey]) -> bytes:
+        """
+        Pull messages matching the keys and merge them in order.
+
+        For each key, returns the message with the highest message_sequence
+        (matching Rust behavior for handling retransmissions).
+        """
         merged = bytes()
 
         for key in cache_keys:
@@ -163,9 +228,10 @@ class DTLSRemote(Protocol):
 
 class State:
     def __init__(
-        self, remote: DTLSRemote, certificate: Certificate, keypair: Keypair
+        self, remote: DTLSRemote, certificate: Certificate, keypair: Keypair, is_server: bool = True
     ) -> None:
         self.remote = remote
+        self.is_server = is_server
 
         self.local_random = Random()
         self.local_random.populate()
@@ -188,24 +254,68 @@ class State:
 
         self.elliptic_curve: EllipticCurveGroup = _DEFAULT_CURVE
 
-        self.remote_peer_certificates: list[x509.Certificate] | None = None
+        self.remote_peer_certificates: list[Any] | None = None
 
-        self.pending_cipher_suite: CipherSuite = CipherSuiteNative()
-        # self.pending_cipher_suite: CipherSuite = (
-        #     CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256()
-        # )
+        # Use Python cipher suite implementation
+        self.pending_cipher_suite: CipherSuite = (
+            CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256()
+        )
 
         self.cipher_suite: CipherSuite | None = None
 
         self.pre_master_secret: bytes | None = None
         self.master_secret: bytes | None = None
 
+        # Extended Master Secret (RFC 7627) - set if both sides negotiate it
+        self.use_extended_master_secret: bool = False
+
+        # Event to signal when cipher suite is initialized (pending_cipher_suite.start() called)
+        self.cipher_suite_ready = asyncio.Event()
+
         # self.pending_local_handshake_layers: list[RecordLayer] | None = None
         # self.pending_remote_handshake_messages: list[Message] | None = None
 
         self.handshake_sequence_number = 0
+        # Track message_sequence for outgoing handshake messages (continuous across flights)
+        self.handshake_send_sequence = 0
 
         self.cache = HandshakeCache()
+
+    def get_srtp_keying_material(self) -> SRTPKeyingMaterial:
+        """
+        Get SRTP keying material after DTLS handshake completion.
+
+        This derives SRTP keys using the TLS exporter mechanism with
+        the "EXTRACTOR-dtls_srtp" label per RFC 5764.
+
+        Returns:
+            SRTPKeyingMaterial: Contains client/server write keys (16 bytes each)
+                               and client/server write salts (14 bytes each)
+
+        Raises:
+            ValueError: If master_secret or remote_random not set (handshake incomplete)
+        """
+        if not self.master_secret:
+            raise ValueError("Master secret not available - handshake incomplete")
+        if not self.remote_random:
+            raise ValueError("Remote random not available - handshake incomplete")
+
+        # Determine client_random and server_random based on our role
+        # local_random is OUR random, remote_random is PEER's random
+        if self.is_server:
+            # We are server: local=server_random, remote=client_random
+            client_random = self.remote_random
+            server_random = self.local_random.marshal_fixed()
+        else:
+            # We are client: local=client_random, remote=server_random
+            client_random = self.local_random.marshal_fixed()
+            server_random = self.remote_random
+
+        return get_srtp_keying_material(
+            master_secret=self.master_secret,
+            client_random=client_random,
+            server_random=server_random,
+        )
 
 
 # DTLS messages are grouped into a series of message flights, according

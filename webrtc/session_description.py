@@ -179,9 +179,10 @@ class MediaDescription:
             )
 
     def add_rtcp_feedback(self, codec: RTPCodecParameters, rtcp_feedback: RTCPFeedback):
-        feedback = (
-            f"{codec.payload_type} {rtcp_feedback.rtcp_type} {rtcp_feedback.parameter}"
-        )
+        if rtcp_feedback.parameter:
+            feedback = f"{codec.payload_type} {rtcp_feedback.rtcp_type} {rtcp_feedback.parameter}"
+        else:
+            feedback = f"{codec.payload_type} {rtcp_feedback.rtcp_type}"
         self.add_attribute(
             SessionDescriptionAttr(SessionDescriptionAttrKey.RTCPfb, feedback)
         )

@@ -226,8 +226,9 @@ DEFAULT_EXT_MAP = HeaderExtensionsMap()
 DEFAULT_EXT_MAP.configure(
     RTCRtpParameters(
         [
+            # Chrome uses extmap:4 for transport-wide-cc by default
             RTCRtpHeaderExtensionParameters(
-                id=1,
+                id=4,
                 uri="http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01",
             )
             # RTCRtpHeaderExtensionParameters(

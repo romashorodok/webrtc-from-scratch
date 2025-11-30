@@ -1,136 +1,113 @@
 <script lang="ts">
-  import { EventEmitter } from "events";
-  import { onMount } from "svelte";
+  import ClientPage from "./lib/ClientPage.svelte";
+  import ServerPage from "./lib/ServerPage.svelte";
 
-  export class Mutex {
-    wait: Promise<void>;
-    private _locks: number;
+  type Page = "client" | "server";
+  let currentPage: Page = "client";
 
-    constructor() {
-      this.wait = Promise.resolve();
-      this._locks = 0;
+  // Simple hash-based routing
+  const updatePage = () => {
+    const hash = window.location.hash.slice(1);
+    if (hash === "server") {
+      currentPage = "server";
+    } else {
+      currentPage = "client";
     }
+  };
 
-    isLocked() {
-      return this._locks > 0;
-    }
+  // Initialize on load
+  updatePage();
+  window.addEventListener("hashchange", updatePage);
 
-    lock() {
-      this._locks += 1;
-      let unlockNext: () => void;
-      const willLock = new Promise<void>(
-        (resolve) =>
-          (unlockNext = () => {
-            this._locks -= 1;
-            resolve();
-          }),
-      );
-      const willUnlock = this.wait.then(() => unlockNext);
-      this.wait = this.wait.then(() => willLock);
-      return willUnlock;
-    }
-  }
-
-  class Signal extends EventEmitter {
-    ws?: WebSocket;
-
-    connectedLock = new Mutex();
-    connected: Promise<() => void>;
-
-    constructor() {
-      super();
-      this.connected = this.connectedLock.lock();
-    }
-
-    connect() {
-      this.ws = new WebSocket("ws://localhost:9000/ws");
-      this.ws.onopen = async () => (await this.connected)();
-      this.ws.onmessage = (evt) => {
-        const { event = null, data = null } = JSON.parse(evt.data);
-        if (!event) {
-          return;
-        }
-        this.emit(event, data);
-      };
-    }
-
-    close() {
-      this.ws?.close();
-    }
-
-    send(event: string, data: any) {
-      if (!this.ws) {
-        console.log("start connection first");
-        return;
-      }
-      this.ws.send(
-        JSON.stringify({
-          event,
-          data: JSON.stringify({
-            ...data,
-          }),
-        }),
-      );
-    }
-  }
-
-  const signal = new Signal();
-  const pc = new RTCPeerConnection();
-
-  onMount(async () => {
-    // const streams = await navigator.mediaDevices.getDisplayMedia({
-    // const streams = await navigator.mediaDevices.getUserMedia({
-    //   video: true,
-    // });
-    // const [track] = streams.getVideoTracks();
-    // pc.addTrack(track, streams);
-
-    pc.onicecandidate = (c) => {
-      const candidate = c.candidate?.toJSON();
-      if (!candidate) {
-        return;
-      }
-
-      signal.send("trickle-ice", candidate);
-      console.log(c);
-    };
-
-    signal.on("offer", async function (desc) {
-      console.log("offer", desc);
-      const session = new RTCSessionDescription({
-        type: "offer",
-        sdp: desc,
-      });
-
-      await pc.setRemoteDescription(session);
-
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      console.log("answer", answer);
-      signal.send("answer", answer);
-    });
-
-    signal.connect();
-    await signal.connectedLock.wait;
-    signal.send("offer", undefined);
-  });
-
-  const start = () => signal.send("negotiate", undefined);
-
-  let videoRef: HTMLVideoElement;
-  $: if (videoRef && pc) {
-    pc.ontrack = (track) => {
-      videoRef.srcObject = track.streams[0];
-      console.log("Got receiver", track);
-    };
-  }
+  const navigate = (page: Page) => {
+    window.location.hash = page;
+  };
 </script>
 
 <main>
-  <video bind:this={videoRef} controls autoplay>
-    <track kind="captions" />
-  </video>
-  <div>
-    <button type="button" on:click={start}>Start</button>
-  </div>
+  <nav>
+    <h1>WebRTC Demo</h1>
+    <div class="nav-links">
+      <button
+        class:active={currentPage === "client"}
+        on:click={() => navigate("client")}
+      >
+        Client Mode
+      </button>
+      <button
+        class:active={currentPage === "server"}
+        on:click={() => navigate("server")}
+      >
+        Server Mode
+      </button>
+    </div>
+    <p class="hint">
+      {#if currentPage === "client"}
+        Use with: <code>make run</code> (Python as server)
+      {:else}
+        Use with: <code>make client</code> (Python as client)
+      {/if}
+    </p>
+  </nav>
+
+  {#key currentPage}
+    {#if currentPage === "client"}
+      <ClientPage />
+    {:else}
+      <ServerPage />
+    {/if}
+  {/key}
 </main>
+
+<style>
+  main {
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 1rem;
+  }
+
+  nav {
+    border-bottom: 1px solid #ccc;
+    padding-bottom: 1rem;
+    margin-bottom: 1rem;
+  }
+
+  h1 {
+    margin: 0 0 1rem 0;
+  }
+
+  .nav-links {
+    display: flex;
+    gap: 0.5rem;
+  }
+
+  .nav-links button {
+    padding: 0.5rem 1rem;
+    border: 1px solid #ccc;
+    background: #f5f5f5;
+    cursor: pointer;
+    font-size: 1rem;
+  }
+
+  .nav-links button:hover {
+    background: #e5e5e5;
+  }
+
+  .nav-links button.active {
+    background: #007bff;
+    color: white;
+    border-color: #007bff;
+  }
+
+  .hint {
+    margin-top: 0.5rem;
+    font-size: 0.9rem;
+    color: #666;
+  }
+
+  .hint code {
+    background: #f0f0f0;
+    padding: 0.2rem 0.4rem;
+    border-radius: 3px;
+  }
+</style>

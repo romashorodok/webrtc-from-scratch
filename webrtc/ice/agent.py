@@ -270,6 +270,7 @@ class ControllingSelector(AsyncEventEmitter):
         print("Start ControllingSelector agent selector")
 
     def _set_nominate_pair(self, pair: CandidatePair):
+        print(f"[ICE] _set_nominate_pair: nominating pair {pair.get_pair_id()}")
         self._nominated_pair = pair
         self.emit(SelectorEvent.NOMINATE, pair)
 
@@ -395,26 +396,20 @@ class ControlledSelector(AsyncEventEmitter):
         useCandidate = msg.get_attribute(stun.UseCandidate)
 
         if useCandidate:
-            print("Controlled selector has found use candidate to nominate pair")
-            if pair.state == CandidatePairState.SUCCEEDED:
-                print(f"Controlled selector pair has correct state {pair.state}")
-                print(f"Controlled selector pair: {self._selected_pair}")
-                # If the state of this pair is Succeeded, it means that the check
-                # previously sent by this pair produced a successful response and
-                # generated a valid pair (Section 7.2.5.3.2).  The agent sets the
-                # nominated flag value of the valid pair to true.
-
-                # Or even if use candidate exists may be force nominate that pair
-                if self._selected_pair is None or self._selected_pair.get_pair_priority(
-                    False
-                ) < pair.get_pair_priority(False):
-                    print(
-                        f"Controlled selector must set remote({pair.remote_ufrag}) local({pair.local_ufrag})"
-                    )
-                elif self._selected_pair != pair:
-                    print(
-                        f"Ignore nominated new pair {pair}, already selected {self._selected_pair}"
-                    )
+            print("[ICE] ControlledSelector.on_binding_success: UseCandidate attribute found")
+            # When the controlling agent sends UseCandidate, we should nominate the pair
+            # The controlling agent has already verified connectivity, so we can trust this
+            if self._selected_pair is None or self._selected_pair.get_pair_priority(
+                False
+            ) < pair.get_pair_priority(False):
+                print(f"[ICE] ControlledSelector: nominating pair via UseCandidate {pair.get_pair_id()}")
+                self._selected_pair = pair
+                # Emit NOMINATE event to trigger DTLS transport setup
+                self.emit(SelectorEvent.NOMINATE, pair)
+            elif self._selected_pair != pair:
+                print(
+                    f"Ignore nominated new pair {pair}, already selected {self._selected_pair}"
+                )
         else:
             # If the received Binding request triggered a new check to be
             # enqueued in the triggered-check queue (Section 7.3.1.4), once the
@@ -456,9 +451,10 @@ class ControlledSelector(AsyncEventEmitter):
             if self._selected_pair is None or self._selected_pair.get_pair_priority(
                 False
             ) < pair.get_pair_priority(False):
-                # TODO: set selected pair
-                print(f"Controlled selector Nominate pair on {pair}")
+                print(f"[ICE] ControlledSelector: nominating pair {pair.get_pair_id()}")
                 self._selected_pair = pair
+                # Emit NOMINATE event to trigger DTLS transport setup
+                self.emit(SelectorEvent.NOMINATE, pair)
             elif self._selected_pair != pair:
                 print(
                     f"Ignore nominated new pair {pair}, already selected {self._selected_pair}"
@@ -505,6 +501,7 @@ class CandidatePairTransport:
     def pipe(self, pkt: Packet):
         first_byte = pkt.data[0]
         if first_byte > 19 and first_byte < 64:
+            print(f"[ICE] CandidatePairTransport.pipe: DTLS packet ({len(pkt.data)} bytes) -> dtls queue (transport={id(self)})")
             self._dtls.put_nowait(pkt)
         elif net.is_rtcp(pkt.data):
             self._rtcp.put_nowait(pkt)
@@ -521,6 +518,7 @@ class CandidatePairTransport:
         return await self._rtcp.get()
 
     def sendto(self, data: bytes):
+        # Debug: log first byte to distinguish packet types (RTP starts with 0x80-0x8f)
         self._conn.sendto(data)
 
 
@@ -544,6 +542,7 @@ class CandidatePairController(AsyncEventEmitter):
         self.__transport = CandidatePairTransport(self.__conn)
 
     def __pair_nominate(self, _: CandidatePair):
+        print(f"[ICE] __pair_nominate: emitting NOMINATE_TRANSPORT event")
         self.emit(CandidatePairControllerEvent.NOMINATE_TRANSPORT, self.__transport)
 
     async def start(self):
@@ -561,7 +560,6 @@ class CandidatePairController(AsyncEventEmitter):
                 await self._on_inbound_pkt(pkt)
 
     async def _on_inbound_pkt(self, pkt: Packet):
-        # print("Recv rtp wait 10 sec.", pkt.data.tolist())
         self.__transport.pipe(pkt)
 
     async def _on_stun_binding_request(self, pkt: Packet, msg: stun.Message):
@@ -699,26 +697,20 @@ class Agent(AsyncEventEmitter):
         print("TODO: _on_nominate_pair", pair)
 
     def _start_controller(self, pair: CandidatePair):
-        if self._role:
+        if self._role == AgentRole.Controlling:
             selector = ControllingSelector(self._pair_registry, self._tie_breaker)
         else:
             selector = ControlledSelector(self._pair_registry, self._tie_breaker)
 
-        # selector.start()
-        # selector.on(SelectorEvent.NOMINATE, self._on_nominate_pair)
+        # Create controller and register it to prevent duplicates
+        pair_controller = CandidatePairController(pair, selector, self._tie_breaker)
+        self._controller_registry.append(pair_controller)
 
-        # pair_controller =
         print("Emit controller??")
         self.emit(
             AgentEvent.CANDIDATE_PAIR_CONTROLLER,
-            CandidatePairController(pair, selector, self._tie_breaker),
+            pair_controller,
         )
-
-        # self._controller_registry.append(pair_controller)
-        # self._candidate_pair_transports.append(pair_controller.get_transport())
-        # self._loop.create_task(pair_controller.start())
-        # self._loop.create_task(pair_controller.ping_remote_candidate())
-        # self._loop.create_task(ping_routine(selector, pair, pair_controller._conn))
 
     # Look at func (s *controllingSelector) ContactCandidates() to know more
     def connect(self, controlling: bool):
@@ -792,6 +784,13 @@ class Agent(AsyncEventEmitter):
         print("Added candidate pair", pair.get_pair_id())
 
         self._pair_registry.append(pair)
+
+        # If role is already set (connect() was called), start controller for this new pair
+        if self._role != AgentRole.Unknown:
+            controller = self._controller_registry.get(pair.get_pair_id())
+            if not controller:
+                print(f"Starting controller for late-added pair {pair.get_pair_id()}")
+                self._start_controller(pair)
 
     async def _add_local_candidate(self, local: LocalCandidate):
         # async with self._candidate_lock:

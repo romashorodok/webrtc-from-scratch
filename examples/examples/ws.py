@@ -12,13 +12,14 @@ import torch
 import torch.nn.functional as F
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from rav1e import Rav1e
-from webrtc_rs import SRTP
+from webrtc.srtp import Session as SrtpSession
 
 from webrtc import media
 from webrtc.media.jitterbuffer import JitterBuffer, JitterFrame
 from webrtc.media.packetizer import Sequencer
 from webrtc.media.rtcp import (
     RtcpPacket,
+    RunLengthChunk,
     TransportLayerCC,
 )
 from webrtc.media.rtp_extensions import DEFAULT_EXT_MAP
@@ -405,59 +406,99 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
     send_time_cache = SendTimeCache()
 
     async def rtcp_handler():
+        # Persistent state across TWCC feedback packets
+        smoothed_gradient = 0.0
+
         while True:
             try:
-                transport = pc._transport
-                assert transport
-                srtp = pc._dtls_transport._srtp_rtcp
-                assert srtp
-
-                rtcp_packet = await transport.recv_rtcp()
-                await srtp.write_pkt(rtcp_packet.data)
-
+                # DTLSTransport now handles incoming RTCP routing internally
+                # Just read from the stream (already decrypted and routed)
                 stream = sender._rtcp_stream
                 assert stream
 
-                rtcp = await stream.recv_rtcp()
+                # Read decrypted RTCP from stream
+                rtcp = await stream.read()
                 pkts = RtcpPacket.parse(rtcp)
                 for feedback in pkts:
                     if isinstance(feedback, TransportLayerCC):
                         seq = feedback.base_sequence_number
-                        arrival_times = []
                         base_time_us = (
                             feedback.reference_time * 64_000
                         )  # 64ms = 64,000µs
 
-                        for delta in feedback.recv_deltas:
+                        # Build list of packet statuses from chunks
+                        # Status: 0=not received, 1=small delta, 2=large delta, 3=received without delta
+                        packet_statuses = []
+                        for chunk in feedback.packet_chunks:
+                            if isinstance(chunk, RunLengthChunk):
+                                # Same status repeated run_length times
+                                packet_statuses.extend([chunk.packet_status_symbol] * chunk.run_length)
+                            elif hasattr(chunk, 'symbol_list'):
+                                # StatusVectorChunk - list of individual statuses
+                                packet_statuses.extend(chunk.symbol_list)
+
+                        # Track previous packet within this feedback only
+                        # (arrival times are only comparable within same reference_time)
+                        prev_seq = None
+                        prev_send_time = None
+                        prev_arrival_time_us = None
+                        delta_idx = 0
+
+                        for status in packet_statuses:
+                            if status == 0:  # TypeTCCPacketNotReceived
+                                # Packet lost - reset tracking
+                                prev_seq = None
+                                prev_send_time = None
+                                prev_arrival_time_us = None
+                                seq += 1
+                                continue
+
+                            # Packet was received - get delta
+                            if delta_idx >= len(feedback.recv_deltas):
+                                seq += 1
+                                continue
+
+                            delta = feedback.recv_deltas[delta_idx]
+                            delta_idx += 1
+
                             send_time = send_time_cache.get(seq)
-                            assert send_time
-                            # print(
-                            #     f"Seq {seq}: send_time={send_time}, delta={delta},"
-                            #     f"cache={send_time_cache.cache}"
-                            # )
+                            if not send_time:
+                                # Not in our cache - reset tracking
+                                prev_seq = None
+                                prev_send_time = None
+                                prev_arrival_time_us = None
+                                seq += 1
+                                continue
+
+                            # Accumulate arrival time from deltas
                             base_time_us += delta.delta  # microseconds
-                            arrival_time = (
-                                base_time_us / 1_000_000
-                            )  # convert to seconds (optional)
+                            arrival_time_us = base_time_us
 
-                            delay = max(0.0, arrival_time - send_time)
+                            # Only calculate gradient for consecutive received packets
+                            if (prev_seq is not None and
+                                prev_send_time is not None and
+                                prev_arrival_time_us is not None and
+                                seq == prev_seq + 1):
 
-                            # For metrics, apply a moving average or EWMA filter to absorb jitter.
-                            # EWMA with an alpha of 0.1 gives 90% weight to the previous value and 10% to the new value, making the delay more responsive.
-                            alpha = 0.1
-                            smoothed_delay = (
-                                alpha * delay + (1 - alpha) * smoothed_delay
-                                if "smoothed_delay" in locals()
-                                else delay
-                            )
+                                # Inter-send time (time between sending packets)
+                                send_delta = (send_time - prev_send_time) * 1_000_000  # to µs
 
-                            # Print delay in milliseconds for debugging
-                            print(f"Seq {seq}: delay = {smoothed_delay * 1000:.3f} ms")
-                            # delay = arrival_time - send_time
-                            # print("delay", delay)
-                            # print(f"Seq {seq}: delay = {delay * 1000:.3f} ms")
+                                # Inter-arrival time (time between receiving packets at browser)
+                                arrival_delta = arrival_time_us - prev_arrival_time_us  # already in µs
 
-                            arrival_times.append(arrival_time)
+                                # Delay gradient: positive = congestion building, negative = recovering
+                                delay_gradient_us = arrival_delta - send_delta
+
+                                # Clamp extreme values (likely measurement errors)
+                                if abs(delay_gradient_us) < 100_000:  # < 100ms
+                                    # Apply EWMA smoothing
+                                    alpha = 0.1
+                                    smoothed_gradient = alpha * delay_gradient_us + (1 - alpha) * smoothed_gradient
+                                    print(f"Seq {seq}: delay_gradient = {smoothed_gradient / 1000:.3f} ms")
+
+                            prev_seq = seq
+                            prev_send_time = send_time
+                            prev_arrival_time_us = arrival_time_us
                             seq += 1
 
             except Exception as e:
@@ -549,7 +590,7 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
     async def encode():
         frame_index = 0
 
-        srtp: SRTP | None = None
+        srtp: SrtpSession | None = None
 
         async for pts, time_base in encoding._packetizer.ticker():
             if not srtp:
@@ -558,20 +599,7 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
                 else:
                     continue
 
-            # print("try send data")
-            # await enc.send_packet()
-            # print("send dat")
-
-            # frame = await enc.receive_packet()
-
             frame = await encoded_frames.get()
-            # print("recv data", frame)
-
-            # if frame_index >= len(frames):
-            #     frame_index = 0
-
-            # frame, _ = frames[frame_index]
-            # frame_index += 1
 
             pkts = encoding._packetizer.packetize(
                 frame, encoding.convert_timebase(pts, time_base, time_base)
@@ -581,14 +609,19 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
                 pkt.extensions.transport_sequence_number = (
                     twcc_seq.next_sequence_number()
                 )
-                encoded = await srtp.encrypt_nonblock(pkt.serialize(DEFAULT_EXT_MAP))
-                assert pc._transport
+                serialized = pkt.serialize(DEFAULT_EXT_MAP)
+                # Offload encrypt to thread pool to avoid blocking event loop
+                encoded = await asyncio.to_thread(srtp.encrypt, serialized)
+                if not pc._transport:
+                    print(f"[WS] ERROR: pc._transport is None!")
+                    continue
                 send_time_cache.add(pkt.extensions.transport_sequence_number)
                 pc._transport.sendto(encoded)
 
     rw_loop.create_task(encoded_result())
     rw_loop.create_task(send_routine())
-    rw_loop.create_task(rtcp_handler())
+    # Run rtcp_handler in the MAIN event loop since Stream._queue was created there
+    asyncio.run_coroutine_threadsafe(rtcp_handler(), loop)
     rw_loop.run_until_complete(encode())
 
 
@@ -630,7 +663,8 @@ def start_read_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
                 assert pc._transport
 
                 for pkt in pkts:
-                    enc = await srtp.encrypt_nonblock(pkt.serialize(DEFAULT_EXT_MAP))
+                    # Offload encrypt to thread pool to avoid blocking event loop
+                    enc = await asyncio.to_thread(srtp.encrypt, pkt.serialize(DEFAULT_EXT_MAP))
                     pc._transport.sendto(enc)
 
             except Exception as e:

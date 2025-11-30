@@ -268,7 +268,7 @@ impl CryptoPrivateKey {
 // hash/signature algorithm pair that appears in that extension
 //
 // https://tools.ietf.org/html/rfc5246#section-7.4.2
-pub(crate) fn generate_key_signature(
+pub fn generate_key_signature(
     client_random: &[u8],
     server_random: &[u8],
     public_key: &[u8],
@@ -394,7 +394,7 @@ pub(crate) fn verify_key_signature(
 // CertificateVerify message is sent to explicitly verify possession of
 // the private key in the certificate.
 // https://tools.ietf.org/html/rfc5246#section-7.3
-pub(crate) fn generate_certificate_verify(
+pub fn generate_certificate_verify(
     handshake_bodies: &[u8],
     private_key: &CryptoPrivateKey, /*, hashAlgorithm hashAlgorithm*/
 ) -> Result<Vec<u8>> {

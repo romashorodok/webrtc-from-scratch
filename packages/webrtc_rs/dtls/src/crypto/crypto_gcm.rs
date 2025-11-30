@@ -28,6 +28,7 @@ pub struct CryptoGcm {
     remote_gcm: Aes128Gcm,
     local_write_iv: Vec<u8>,
     remote_write_iv: Vec<u8>,
+    is_client: bool,
 }
 
 impl CryptoGcm {
@@ -36,6 +37,16 @@ impl CryptoGcm {
         local_write_iv: &[u8],
         remote_key: &[u8],
         remote_write_iv: &[u8],
+    ) -> Self {
+        Self::new_with_role(local_key, local_write_iv, remote_key, remote_write_iv, false)
+    }
+
+    pub fn new_with_role(
+        local_key: &[u8],
+        local_write_iv: &[u8],
+        remote_key: &[u8],
+        remote_write_iv: &[u8],
+        is_client: bool,
     ) -> Self {
         let key = GenericArray::from_slice(local_key);
         let local_gcm = Aes128Gcm::new(key);
@@ -48,6 +59,7 @@ impl CryptoGcm {
             local_write_iv: local_write_iv.to_vec(),
             remote_gcm,
             remote_write_iv: remote_write_iv.to_vec(),
+            is_client,
         }
     }
 
@@ -55,9 +67,22 @@ impl CryptoGcm {
         let payload = &raw[RECORD_LAYER_HEADER_SIZE..];
         let raw = &raw[..RECORD_LAYER_HEADER_SIZE];
 
+        // DTLS 1.2 GCM nonce construction (RFC 5288):
+        // - Bytes 0-3: Implicit IV (from key derivation)
+        // - Bytes 4-11: Explicit nonce (sent with ciphertext)
         let mut nonce = vec![0u8; CRYPTO_GCM_NONCE_LENGTH];
         nonce[..4].copy_from_slice(&self.local_write_iv[..4]);
-        rand::thread_rng().fill(&mut nonce[4..]);
+
+        if self.is_client {
+            // Client: Use epoch + sequence_number as explicit nonce (deterministic)
+            // This matches what browsers expect when they decrypt our messages
+            nonce[4..6].copy_from_slice(&pkt_rlh.epoch.to_be_bytes());
+            nonce[6..12].copy_from_slice(&pkt_rlh.sequence_number.to_be_bytes()[2..]);
+        } else {
+            // Server: Use random explicit nonce
+            rand::thread_rng().fill(&mut nonce[4..]);
+        }
+
         let nonce = GenericArray::from_slice(&nonce);
 
         let additional_data = generate_aead_additional_data(pkt_rlh, payload.len());

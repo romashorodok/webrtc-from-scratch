@@ -1,3 +1,7 @@
+.claude
+.specify
+specs
+
 test.*
 output.y4m
 .DS_Store
