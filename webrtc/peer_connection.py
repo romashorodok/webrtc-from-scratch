@@ -258,6 +258,7 @@ def set_default_caps(caps: MediaCaps):
             refresh_rate=0.020,  # 20ms per packet (50 Hz) - standard for Opus
             channels=2,
             # https://datatracker.ietf.org/doc/html/rfc7587#section-6.1
+            # https://datatracker.ietf.org/doc/html/draft-ietf-payload-rtp-opus-04
             sdp_fmtp_line="minptime=10;useinbandfec=1",
             payload_type=111,
             stats_id=f"RTPCodec-{current_ntp_time() >> 32}",

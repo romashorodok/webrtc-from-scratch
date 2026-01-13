@@ -13,6 +13,7 @@ dependencies = [
     "watchfiles>=1.0.5",
     "webrtc",
     "rav1e",
+    "opus",
     "numpy<2",
     "torch==2.2.2",
     "torchvision>=0.17.2",
