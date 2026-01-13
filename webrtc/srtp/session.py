@@ -14,6 +14,10 @@ from typing import Optional, Callable, Awaitable
 # Import Rust SRTP context
 from webrtc_rs import SrtpContext
 
+# Import logger
+from webrtc.logger import get_logger, Component
+from webrtc.config import get_config
+
 
 # Buffer limits
 SRTP_BUFFER_SIZE = 1_000_000  # 1MB for RTP
@@ -89,11 +93,24 @@ class Stream:
         if self._closed:
             return False
 
+        logger = get_logger()
+        config = get_config()
+
         try:
             self._queue.put_nowait(data)
+            queue_size = self._queue.qsize()
+
+            # Log first N writes to see queue growth
+            if queue_size <= config.log_first_n_packets:
+                seq = int.from_bytes(data[2:4], 'big') if len(data) >= 4 else -1
+                logger.log_queue_size(Component.SRTP, f"stream_{self.ssrc}", queue_size, self._queue.maxsize)
+                logger.trace(Component.SRTP, f"Wrote packet to stream", ssrc=self.ssrc, seq=seq)
             return True
         except asyncio.QueueFull:
-            # Silently drop when buffer full (like Rust impl)
+            # Drop packet when buffer full
+            seq = int.from_bytes(data[2:4], 'big') if len(data) >= 4 else -1
+            logger.warn(Component.SRTP, f"DROPPED packet - stream queue full",
+                       ssrc=self.ssrc, seq=seq, maxsize=self._queue.maxsize)
             return False
 
     async def read(self) -> bytes:
@@ -167,6 +184,11 @@ class Session:
 
         # Channel for notifying about new streams
         self._new_stream_queue: asyncio.Queue[tuple[Stream, int]] = asyncio.Queue()
+
+        # Debug counters
+        self._decrypt_count = 0
+        self._decrypt_errors = 0
+        self._ssrc_counters: dict[int, int] = {}
 
     @classmethod
     def from_keying_material(
@@ -280,8 +302,26 @@ class Session:
         Args:
             ciphertext: Encrypted incoming packet
         """
-        # Decrypt
-        decrypted = self.decrypt(ciphertext)
+        logger = get_logger()
+        config = get_config()
+
+        self._decrypt_count += 1
+
+        try:
+            # Decrypt
+            decrypted = self.decrypt(ciphertext)
+        except Exception as e:
+            self._decrypt_errors += 1
+            if config.log_srtp_decrypt_errors and (self._decrypt_errors <= 20 or self._decrypt_errors % 100 == 0):
+                # Extract sequence number from encrypted packet for debugging
+                if len(ciphertext) >= 4:
+                    seq = int.from_bytes(ciphertext[2:4], 'big')
+                    logger.error(Component.SRTP, f"Decrypt error #{self._decrypt_errors}/{self._decrypt_count}",
+                               seq=seq, error=str(e))
+                else:
+                    logger.error(Component.SRTP, f"Decrypt error #{self._decrypt_errors}/{self._decrypt_count}",
+                               error=str(e))
+            raise  # Re-raise so caller can handle
 
         # Get SSRC from decrypted packet
         if self.is_rtp:
@@ -289,13 +329,28 @@ class Session:
         else:
             ssrc = parse_rtcp_ssrc(decrypted)
 
+        # Track SSRC stats
+        self._ssrc_counters[ssrc] = self._ssrc_counters.get(ssrc, 0) + 1
+        if config.log_packet_counts and self._decrypt_count % 100 == 0 and self.is_rtp:
+            error_pct = 100 * self._decrypt_errors / self._decrypt_count if self._decrypt_count > 0 else 0
+            logger.log_stats(Component.SRTP,
+                           packets=self._decrypt_count,
+                           errors=self._decrypt_errors,
+                           error_pct=f"{error_pct:.1f}%",
+                           SSRCs=len(self._ssrc_counters))
+
         # Route to stream
         stream, is_new = await self._get_or_create_stream(ssrc)
 
-        if is_new:
+        if is_new and config.log_srtp_new_streams:
             await self._new_stream_queue.put((stream, ssrc))
+            logger.info(Component.SRTP, f"New stream created", ssrc=ssrc)
 
-        await stream.write(decrypted)
+        # Check if write succeeded (could fail if stream queue is full)
+        write_success = await stream.write(decrypted)
+        if not write_success:
+            seq = int.from_bytes(decrypted[2:4], 'big') if len(decrypted) >= 4 else -1
+            logger.warn(Component.SRTP, f"Stream write FAILED - queue full", ssrc=ssrc, seq=seq)
 
     async def accept_stream(self) -> tuple[Stream, int]:
         """

@@ -255,8 +255,9 @@ def set_default_caps(caps: MediaCaps):
         RTPCodecParameters(
             mime_type="audio/opus",
             clock_rate=48000,
-            refresh_rate=0.020,
+            refresh_rate=0.020,  # 20ms per packet (50 Hz) - standard for Opus
             channels=2,
+            # https://datatracker.ietf.org/doc/html/rfc7587#section-6.1
             sdp_fmtp_line="minptime=10;useinbandfec=1",
             payload_type=111,
             stats_id=f"RTPCodec-{current_ntp_time() >> 32}",
@@ -264,22 +265,22 @@ def set_default_caps(caps: MediaCaps):
         RTPCodecKind.Audio,
     )
 
-    av1 = RTPCodecParameters(
-        mime_type="video/AV1",
-        clock_rate=90000,
-        refresh_rate=1 / 30,
-        channels=0,
-        sdp_fmtp_line="level-idx=5;profile=0;tier=0",
-        payload_type=AV1_PAYLOAD_TYPE,
-        stats_id=f"RTPCodec-{current_ntp_time() >> 32}",
-    )
+    # av1 = RTPCodecParameters(
+    #     mime_type="video/AV1",
+    #     clock_rate=90000,
+    #     refresh_rate=1 / 30,
+    #     channels=0,
+    #     sdp_fmtp_line="level-idx=5;profile=0;tier=0",
+    #     payload_type=AV1_PAYLOAD_TYPE,
+    #     stats_id=f"RTPCodec-{current_ntp_time() >> 32}",
+    # )
     # Match Chrome's expected RTCP feedback types
-    av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="goog-remb", parameter=""))
-    av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="transport-cc", parameter=""))
-    av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="ccm", parameter="fir"))
-    av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="nack", parameter=""))
-    av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="nack", parameter="pli"))
-    caps.register_codec(av1, RTPCodecKind.Video)
+    # av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="goog-remb", parameter=""))
+    # av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="transport-cc", parameter=""))
+    # av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="ccm", parameter="fir"))
+    # av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="nack", parameter=""))
+    # av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="nack", parameter="pli"))
+    # caps.register_codec(av1, RTPCodecKind.Video)
 
     # vp8 = RTPCodecParameters(
     #     mime_type="video/VP8",
@@ -311,7 +312,9 @@ async def dtls_ice_pair_queue_handshake_routine(
     while True:
         try:
             pkt = await pair_transport.recv_dtls()
-            print(f"dtls_ice_pair_queue_handshake_routine: received DTLS packet, {len(pkt.data)} bytes")
+            print(
+                f"dtls_ice_pair_queue_handshake_routine: received DTLS packet, {len(pkt.data)} bytes"
+            )
             await dtls_transport.enqueue_record(pkt.data)
         except Exception as e:
             print("dtls_ice_pair_queue_routine error:", e)
@@ -383,7 +386,9 @@ class PeerConnection(AsyncEventEmitter):
         ):
             # Guard against duplicate NOMINATE_TRANSPORT events
             if self._transport is not None:
-                print(f"[PC] on NOMINATE_TRANSPORT: already have transport, ignoring duplicate")
+                print(
+                    f"[PC] on NOMINATE_TRANSPORT: already have transport, ignoring duplicate"
+                )
                 return
 
             print(f"[PC] on NOMINATE_TRANSPORT: starting DTLS as {dtls_role}")
@@ -399,12 +404,20 @@ class PeerConnection(AsyncEventEmitter):
                 dtls_ice_pair_dequeue_handshake_routine(transport, self._dtls_transport)
             )
 
-            async def run_rtp_recv_loop():
-                while True:
-                    pkt = await transport.recv_rtp()
-                    await self._dtls_transport.write_rtp_bytes(pkt.data)
-
-            self.__loop.create_task(run_rtp_recv_loop())
+            # OBSOLETE: This loop was stealing 50% of packets from DTLSTransport._rtp_receive_loop()
+            # The DTLSTransport already has its own _rtp_receive_loop() that reads from
+            # transport.recv_rtp() and routes to SRTP. Having two loops reading from the
+            # same queue causes 50% packet loss as they compete for packets.
+            #
+            # async def run_rtp_recv_loop():
+            #     while True:
+            #         pkt = await transport.recv_rtp()
+            #         await self._dtls_transport.write_rtp_bytes(pkt.data)
+            #
+            # self.__loop.create_task(run_rtp_recv_loop())
+            print(
+                "[PeerConnection] Skipping obsolete run_rtp_recv_loop - DTLSTransport._rtp_receive_loop handles this"
+            )
 
         self.__loop.create_task(pair_ctrl.start())
 
@@ -815,9 +828,7 @@ class PeerConnection(AsyncEventEmitter):
                 "Unable generate stateful desc. Not found media to generate"
             )
 
-        group = remote_desc.get_attribute_value(
-            SessionDescriptionAttrKey.Group.value
-        )
+        group = remote_desc.get_attribute_value(SessionDescriptionAttrKey.Group.value)
         if not group:
             raise ValueError(
                 "Unable generate stateful desc. Desc must contain BUNDLE attr"
@@ -947,7 +958,9 @@ class PeerConnection(AsyncEventEmitter):
         """
         # When creating an answer, the remote offer is in _pending_remote_description
         # (set by set_remote_description with Offer type)
-        remote_offer = self._pending_remote_description or self._current_remote_description
+        remote_offer = (
+            self._pending_remote_description or self._current_remote_description
+        )
         if remote_offer is None:
             raise ValueError("Cannot create answer without remote offer")
 

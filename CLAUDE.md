@@ -72,6 +72,53 @@ Three-layer hybrid Rust/Python system:
 
 **Signaling:** Browser ↔ WebSocket ↔ FastAPI ↔ Python WebRTC ↔ Rust core
 
+## Logging Guidelines
+
+**IMPORTANT:** Always use the structured logger instead of print statements for debugging and diagnostic output.
+
+**Usage:**
+```python
+from webrtc.logger import get_logger, Component
+from webrtc.config import get_config
+
+logger = get_logger()
+config = get_config()
+
+# Use appropriate log level
+logger.info(Component.ICE, "ICE agent started")
+logger.debug(Component.SRTP, "Decrypting packet", seq=12345, ssrc=67890)
+logger.error(Component.DTLS, "Handshake failed", error=str(e))
+
+# Use specialized methods for common patterns
+logger.log_packet(Component.RTP, "RX", packet_count, seq=seq, ssrc=ssrc)
+logger.log_stats(Component.SRTP, packets=100, errors=5)
+logger.log_queue_size(Component.SRTP, "stream_queue", size, maxsize)
+logger.log_sequence_gap(Component.OPUS, last_seq, current_seq, gap)
+```
+
+**Benefits:**
+- Configurable verbosity without code changes (via environment variables or config)
+- Color-coded output by component and log level
+- Structured formatting with automatic key-value pairs
+- Smart packet logging throttling (first N packets, then every Nth)
+- Per-component log level control
+- Production-ready with file logging support
+
+**Configuration:**
+```bash
+# Environment variables
+export WEBRTC_LOG_LEVEL=DEBUG
+export WEBRTC_SRTP_LOG=TRACE
+export WEBRTC_ICE_LOG=INFO
+
+# Or in code
+config = get_config()
+config.verbose_mode()  # Development
+config.production_mode()  # Production (WARN only)
+```
+
+See `webrtc/DEBUG_CONFIG.md` for complete documentation.
+
 ## Rust Workspace Structure
 
 Root `Cargo.toml` defines workspace members. Each package under `packages/` builds as a Python extension module via maturin.
