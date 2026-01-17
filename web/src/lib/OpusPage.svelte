@@ -13,6 +13,8 @@
    */
   import { onMount, onDestroy } from "svelte";
   import { Signal } from "./Signal";
+  import AudioSpectrogram from "./AudioSpectrogram.svelte";
+  import FilterSettings from "./FilterSettings.svelte";
 
   // Use different port for Opus server
   const OPUS_SERVER_PORT = 9001;
@@ -29,6 +31,18 @@
   let reconnectAttempt = 0;
   let isReconnecting = false;
   let shouldReconnect = true;
+
+  // Audio visualization state
+  let spectrogramRef: AudioSpectrogram;
+  let audioFeatures = { rms: 0, zcr: 0, spectral_centroid: 0 };
+  let thresholdTriggered = false;
+  let analysisEnabled = true;
+
+  // Audio filter state
+  let currentFilter = "none";
+  let filterPresets: Record<string, { name: string; description: string }> = {};
+  let vadActive = false;
+  let playFiltered = false;
 
   // WebRTC Stats Logging
   const logStats = async () => {
@@ -192,6 +206,61 @@
       signal.send("answer", answer);
       status = "Answer sent, waiting for connection...";
     });
+
+    // Listen for audio spectrum data
+    signal.on("audio_spectrum", (data) => {
+      if (spectrogramRef && analysisEnabled) {
+        spectrogramRef.update(data);
+        audioFeatures = data.features;
+      }
+    });
+
+    // Listen for threshold triggers
+    signal.on("audio_threshold", (data) => {
+      thresholdTriggered = data.triggered;
+      if (data.triggered) {
+        console.log("[Opus] ML threshold triggered:", data);
+      }
+    });
+
+    // Listen for filter presets
+    signal.on("filter_presets", (data) => {
+      filterPresets = data;
+      console.log("[Opus] Received filter presets:", filterPresets);
+    });
+
+    // Listen for VAD status from features
+    signal.on("audio_spectrum", (data) => {
+      if (data.features && data.features.is_voice !== undefined) {
+        vadActive = data.features.is_voice;
+      }
+    });
+  };
+
+  const changeFilter = (preset: string) => {
+    console.log(`[Opus] Changing filter to: ${preset}`);
+    currentFilter = preset;
+    signal.send(
+      "audio_config",
+      JSON.stringify({ filter_preset: preset })
+    );
+  };
+
+  const togglePlayFiltered = () => {
+    console.log(`[Opus] Play filtered audio: ${playFiltered}`);
+    signal.send(
+      "audio_config",
+      JSON.stringify({ play_filtered: playFiltered })
+    );
+  };
+
+  const applyCustomFilters = (event: CustomEvent) => {
+    const config = event.detail;
+    console.log("[Opus] Applying custom filter config:", config);
+    signal.send(
+      "audio_config",
+      JSON.stringify({ custom_filter_config: config })
+    );
   };
 
   const attemptReconnect = async () => {
@@ -287,6 +356,9 @@
     console.log("[Opus] Requesting offer from server");
     signal.send("offer", undefined);
     status = "Requested offer from server...";
+
+    // Request available filter presets
+    signal.send("get_filter_presets", undefined);
   });
 
   onDestroy(() => {
@@ -363,6 +435,79 @@
       <track kind="captions" />
     </audio>
   </div>
+
+  <!-- Audio Filter Controls -->
+  {#if Object.keys(filterPresets).length > 0}
+    <div class="filter-controls">
+      <label for="filter-select">Audio Filter:</label>
+      <select
+        id="filter-select"
+        bind:value={currentFilter}
+        on:change={() => changeFilter(currentFilter)}
+      >
+        {#each Object.entries(filterPresets) as [key, preset]}
+          <option value={key}>{preset.name}</option>
+        {/each}
+      </select>
+      <span class="filter-description">
+        {filterPresets[currentFilter]?.description || ""}
+      </span>
+
+      <div class="filter-toggle">
+        <input
+          type="checkbox"
+          id="play-filtered"
+          bind:checked={playFiltered}
+          on:change={togglePlayFiltered}
+        />
+        <label for="play-filtered">
+          🔊 Play Filtered Audio
+          <span class="toggle-hint">(hear the filter effect)</span>
+        </label>
+      </div>
+
+      {#if vadActive}
+        <span class="vad-indicator">🎤 Voice Detected</span>
+      {/if}
+    </div>
+  {/if}
+
+  <!-- Custom Filter Settings -->
+  <FilterSettings on:apply={applyCustomFilters} />
+
+  <!-- Audio Spectrogram -->
+  {#if analysisEnabled}
+    <div class="visualization">
+      <h3>Real-time Audio Spectrogram</h3>
+      <AudioSpectrogram
+        bind:this={spectrogramRef}
+        threshold={0.6}
+        height={300}
+        width={700}
+      />
+
+      <div class="features">
+        <div class="feature">
+          <span class="label">RMS:</span>
+          <span class="value">{audioFeatures.rms.toFixed(3)}</span>
+        </div>
+        <div class="feature">
+          <span class="label">ZCR:</span>
+          <span class="value">{audioFeatures.zcr.toFixed(3)}</span>
+        </div>
+        <div class="feature">
+          <span class="label">Spectral Centroid:</span>
+          <span class="value">{audioFeatures.spectral_centroid.toFixed(0)} Hz</span>
+        </div>
+        {#if thresholdTriggered}
+          <div class="feature threshold-indicator">
+            <span class="label">🎯 ML Threshold:</span>
+            <span class="value">TRIGGERED</span>
+          </div>
+        {/if}
+      </div>
+    </div>
+  {/if}
 
   <div class="controls">
     <button type="button" on:click={stopMicrophone} disabled={!isSendingAudio || isReconnecting}>
@@ -525,5 +670,132 @@
     margin: 0.5rem 0;
     font-size: 0.9rem;
     color: #004085;
+  }
+
+  .visualization {
+    margin: 1rem 0;
+    padding: 1rem;
+    background: #f8f9fa;
+    border-radius: 8px;
+  }
+
+  .visualization h3 {
+    margin: 0 0 1rem 0;
+    font-size: 1.1rem;
+  }
+
+  .features {
+    display: flex;
+    gap: 1.5rem;
+    margin-top: 1rem;
+    padding: 0.75rem;
+    background: white;
+    border-radius: 4px;
+    flex-wrap: wrap;
+  }
+
+  .feature {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+  }
+
+  .feature .label {
+    font-weight: 600;
+    color: #666;
+  }
+
+  .feature .value {
+    font-family: monospace;
+    color: #007bff;
+  }
+
+  .threshold-indicator {
+    background: #fff3cd;
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    border: 1px solid #ffc107;
+  }
+
+  .threshold-indicator .value {
+    color: #856404;
+    font-weight: bold;
+  }
+
+  .filter-controls {
+    margin: 1rem 0;
+    padding: 1rem;
+    background: #e7f3ff;
+    border-left: 4px solid #007bff;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
+  }
+
+  .filter-controls label {
+    font-weight: 600;
+    color: #004085;
+  }
+
+  .filter-controls select {
+    padding: 0.5rem;
+    border: 1px solid #007bff;
+    border-radius: 4px;
+    background: white;
+    font-size: 0.95rem;
+    cursor: pointer;
+  }
+
+  .filter-controls select:focus {
+    outline: 2px solid #007bff;
+    outline-offset: 2px;
+  }
+
+  .filter-description {
+    font-size: 0.9rem;
+    color: #666;
+    font-style: italic;
+  }
+
+  .vad-indicator {
+    padding: 0.25rem 0.75rem;
+    background: #28a745;
+    color: white;
+    border-radius: 12px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    animation: pulse 1.5s infinite;
+  }
+
+  .filter-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    background: white;
+    border: 1px solid #007bff;
+    border-radius: 4px;
+  }
+
+  .filter-toggle input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    cursor: pointer;
+  }
+
+  .filter-toggle label {
+    cursor: pointer;
+    font-weight: 600;
+    color: #004085;
+    margin: 0;
+  }
+
+  .toggle-hint {
+    font-size: 0.85rem;
+    font-weight: normal;
+    color: #666;
+    font-style: italic;
   }
 </style>
