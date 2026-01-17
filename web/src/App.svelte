@@ -1,8 +1,9 @@
 <script lang="ts">
   import ClientPage from "./lib/ClientPage.svelte";
   import ServerPage from "./lib/ServerPage.svelte";
+  import OpusPage from "./lib/OpusPage.svelte";
 
-  type Page = "client" | "server";
+  type Page = "client" | "server" | "opus";
   let currentPage: Page = "client";
 
   // Simple hash-based routing
@@ -10,6 +11,8 @@
     const hash = window.location.hash.slice(1);
     if (hash === "server") {
       currentPage = "server";
+    } else if (hash === "opus") {
+      currentPage = "opus";
     } else {
       currentPage = "client";
     }
@@ -40,12 +43,20 @@
       >
         Server Mode
       </button>
+      <button
+        class:active={currentPage === "opus"}
+        on:click={() => navigate("opus")}
+      >
+        Opus Audio
+      </button>
     </div>
     <p class="hint">
       {#if currentPage === "client"}
         Use with: <code>make run</code> (Python as server)
-      {:else}
+      {:else if currentPage === "server"}
         Use with: <code>make client</code> (Python as client)
+      {:else}
+        Use with: <code>uvicorn examples.opus_ws:app --reload --port 9001</code> (Opus audio server)
       {/if}
     </p>
   </nav>
@@ -53,8 +64,10 @@
   {#key currentPage}
     {#if currentPage === "client"}
       <ClientPage />
-    {:else}
+    {:else if currentPage === "server"}
       <ServerPage />
+    {:else if currentPage === "opus"}
+      <OpusPage />
     {/if}
   {/key}
 </main>

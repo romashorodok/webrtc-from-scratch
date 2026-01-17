@@ -1,7 +1,10 @@
 import asyncio
+import socket
 from typing import override, Any
 
 from webrtc.utils.types import impl_protocol
+from webrtc.logger import get_logger, Component
+from webrtc.config import get_config
 
 from .interface import Interface
 from .types import (
@@ -55,27 +58,58 @@ class InterfaceMuxUDPHandler(asyncio.DatagramProtocol):
 
     @override
     def connection_made(self, transport: asyncio.transports.DatagramTransport) -> None:
+        logger = get_logger()
+        config = get_config()
+
         self._transport = transport
         # If zero port os will assign it by itself
         _, port = transport.get_extra_info("sockname")
         self._port = port
+
+        # Increase UDP socket receive buffer to prevent packet loss
+        # Default is ~768KB, we increase to 4MB for high-bandwidth RTP
+        sock = transport.get_extra_info("socket")
+        if sock and config.log_udp_socket_buffers:
+            try:
+                # Get current buffer size
+                current_rcvbuf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+                current_sndbuf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+                logger.debug(Component.UDP, "Socket buffer sizes before",
+                           RCV=current_rcvbuf, SND=current_sndbuf)
+
+                # Set receive buffer to 4MB (4 * 1024 * 1024)
+                # Note: macOS kern.ipc.maxsockbuf limits total buffer space
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4194304)
+                # Set send buffer to 1MB (less critical than receive)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)
+
+                # Verify new buffer sizes
+                new_rcvbuf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+                new_sndbuf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+                logger.info(Component.UDP, "Socket buffer sizes configured",
+                          RCV=new_rcvbuf, SND=new_sndbuf)
+            except Exception as e:
+                logger.error(Component.UDP, "Failed to set socket buffer sizes", error=str(e))
 
     @override
     def datagram_received(self, data: bytes, addr: tuple[str | Any, int]) -> None:
         if self._transport is None:
             return
 
+        logger = get_logger()
         address, port = addr
         address_str = str(address)
 
         interceptors_ports = self._interceptors.get(address_str)
         if interceptors_ports is None:
-            print(f"Unbinded datagram recv not found {address_str} address")
+            logger.warn(Component.UDP, "Unbound datagram received - address not found",
+                       address=address_str)
             return
 
         interceptor = interceptors_ports.get(port)
         if interceptor is None:
-            print(f"Unbinded datagram recv not found {address_str} port")
+            logger.warn(Component.UDP, "Unbound datagram received - port not found",
+                       address=address_str, port=port)
             return
 
         interceptor.put_nowait(Packet(Address(address, port), data))

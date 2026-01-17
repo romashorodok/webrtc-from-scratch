@@ -1,5 +1,9 @@
+
 run:
 	uv run serve.py examples.ws:app
+
+opus:
+	uv run serve.py examples.opus_ws:app --port 9001
 
 client:
 	uv run serve.py examples.client:app

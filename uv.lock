@@ -5,6 +5,7 @@ requires-python = ">=3.12"
 [manifest]
 members = [
     "eventloop",
+    "opus",
     "rav1e",
     "webrtc",
     "webrtc-rs",
@@ -52,6 +53,11 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/d5/62/f92a130a370dd7aca13c316844b82853647f048cfe1594a81f628ab7101f/maturin-1.8.3-py3-none-win_amd64.whl", hash = "sha256:85f2b882d8235c1c1cb0a38d382ccd5b3ba0674d99cb548d49df9342cc688e36", size = 7953286, upload-time = "2025-03-13T11:07:52.556Z" },
     { url = "https://files.pythonhosted.org/packages/04/95/8379140838cd95472de843e982d0bf674e8dbf25a899c44e2f76b15704d9/maturin-1.8.3-py3-none-win_arm64.whl", hash = "sha256:33939aabf9a06a8a14ca6c399d32616c7e574fcca8d4ff6dcd984441051f32fb", size = 6687772, upload-time = "2025-03-13T11:07:54.871Z" },
 ]
+
+[[package]]
+name = "opus"
+version = "0.1.0"
+source = { editable = "packages/opus" }
 
 [[package]]
 name = "packaging"

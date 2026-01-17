@@ -1,15 +1,14 @@
 import asyncio
 from dataclasses import dataclass
 import fractions
-import queue
 import secrets
 from enum import Enum
-import threading
 from typing import Any, Callable, Coroutine, Protocol
 
 import webrtc_rs
 
 from webrtc.media.av1_payloader import AV1_PAYLOAD_TYPE, Av1Packetizer
+from webrtc.media.opus_payloader import OPUS_PAYLOAD_TYPE, OpusPacketizer
 from webrtc.media.vp8_payloader import VP8Payloader
 from webrtc.srtp import Stream as SrtpStream
 
@@ -139,6 +138,15 @@ class TrackEncoding:
                 ssrc=self.ssrc,
                 clock_rate=self.codec.clock_rate,
                 refresh_rate=self.codec.refresh_rate,
+            )
+        elif self.codec.payload_type == OPUS_PAYLOAD_TYPE:
+            # Opus audio - always use 20ms packet time (standard for Opus)
+            self._packetizer: PacketizerBase = OpusPacketizer(
+                mtu=1200,
+                pt=self.codec.payload_type,
+                ssrc=self.ssrc,
+                clock_rate=self.codec.clock_rate,
+                ptime=0.020,  # Fixed 20ms for Opus, not codec.refresh_rate
             )
 
     def bind(self, transport: dtls.DTLSTransport):
@@ -459,10 +467,19 @@ class TrackRemote:
         self.rid = rid
 
         self.__stream: SrtpStream | None = None
-        self.__queue = asyncio.Queue[bytes]()
+        self.__queue = asyncio.Queue[bytes](maxsize=1000)
 
     async def recv(self) -> bytes:
-        """Read decrypted RTP packet from stream."""
+        """
+        Read decrypted RTP packet from stream.
+
+        WARNING: This method reads directly from SRTP stream and will compete
+        with _receive_task if both are used. Use recv_rtp_pkt_sync() instead
+        to read from the queue.
+        """
+        import traceback
+        print(f"[TrackRemote.recv] CALLED for SSRC={self.ssrc} - THIS STEALS PACKETS FROM _receive_task!")
+        print(f"[TrackRemote.recv] Call stack:\n{''.join(traceback.format_stack())}")
         return await self.stream.read()
 
     @property
@@ -476,49 +493,53 @@ class TrackRemote:
     def stream(self, value: SrtpStream):
         self.__stream = value
 
-        # self._rtp_packet_queue = queue.Queue[media.RtpPacket]()
+    async def write_rtp_bytes(self, data: bytes):
+        """Write RTP bytes to queue (async)."""
+        try:
+            await self.__queue.put(data)
+        except asyncio.QueueFull:
+            # Drop packet if queue is full (backpressure)
+            pass
 
-    async def write_rtp_bytes_sync(self, data: bytes):
-        await self.__queue.put(data)
-        # self._rtp_packet_queue.put(media.RtpPacket.parse(data))
-
-    #
     async def recv_rtp_pkt_sync(self):
+        """Read RTP bytes from queue (async)."""
         return await self.__queue.get()
 
-        # return self._rtp_packet_queue.get()
 
-
-def _receive_worker(
-    done_signal: threading.Event,
+async def _receive_task(
     reader: Callable[[], Coroutine[Any, Any, tuple[bytes, int]]],
     track: TrackRemote,
 ):
-    loop = asyncio.new_event_loop()
+    """
+    Async task that reads from SRTP stream and writes to TrackRemote queue.
+
+    This runs as an asyncio task in the main event loop.
+    """
+    packet_count = 0
+    print(f"[_receive_task] STARTED for track SSRC={track.ssrc}")
 
     while True:
         try:
-            if done_signal.is_set():
-                return
+            data, n = await reader()
 
-            future = reader()
-            if not asyncio.iscoroutine(future):
-                raise TypeError(
-                    f"Reader expected to be a coroutine, got {type(future)}"
-                )
-
-            data, n = loop.run_until_complete(future)
             if n == 0:
-                # print("__rtp_reader EOF")
-                loop.run_until_complete(asyncio.sleep(1))
+                # EOF or no data
+                await asyncio.sleep(1)
                 continue
 
-            loop.run_until_complete(track.write_rtp_bytes_sync(data))
-            # print("Recv rtp??", data)
-            # track.write_rtp_bytes_sync(data)
+            # Write to async queue
+            await track.write_rtp_bytes(data)
+            packet_count += 1
+
+            if packet_count <= 20 or packet_count % 100 == 0:
+                print(f"[_receive_task] SSRC={track.ssrc}: received {packet_count} packets")
 
         except ValueError:
             pass
+        except Exception as e:
+            # Log unexpected errors but continue
+            print(f"_receive_task error: {e}")
+            await asyncio.sleep(0.1)
 
 
 class RTPReceiver:
@@ -527,41 +548,51 @@ class RTPReceiver:
         self._kind = kind
         self._dtls: dtls.DTLSTransport | None = None
         self._track: TrackRemote | None = None
-        self._receive_thread: threading.Thread | None = None
-        self._done_signal = threading.Event()
+        self._receive_task: asyncio.Task | None = None
 
     def bind(self, transport: dtls.DTLSTransport):
         self._dtls = transport
 
     def __rtp_reader(self) -> Callable[[], Coroutine[Any, Any, tuple[bytes, int]]]:
         async def read() -> tuple[bytes, int]:
-            reader = self._dtls
-            if not reader:
-                print("Not found dtls transport for __rtp_reader")
+            # Read from track's SRTP stream
+            if not self._track:
+                print("Not found track for __rtp_reader")
                 return (bytes(), 0)
-            return await reader.read_rtp_bytes()
+            try:
+                # Read decrypted RTP bytes from SRTP stream
+                data = await self._track.stream.read()
+                return (data, len(data))
+            except Exception as e:
+                print(f"__rtp_reader error: {e}")
+                return (bytes(), 0)
 
         return read
 
     def receive(self, params: RTPDecodingParameters):
-        if self._receive_thread:
-            print("Receiver already started")
+        """
+        Start receiving RTP packets.
+
+        Args:
+            params: RTP decoding parameters
+        """
+        print(f"[RTPReceiver.receive] CALLED for SSRC={params.ssrc}, existing_task={self._receive_task is not None}")
+        if self._receive_task:
+            print(f"[RTPReceiver.receive] Receiver already started for SSRC={params.ssrc}, SKIPPING")
             return
 
         self._track = TrackRemote(self._kind, params.ssrc, params.rtx.ssrc, params.rid)
-        self._done_signal.clear()
-        self._receive_thread = threading.Thread(
-            # TODO: pass into worker queue and send None if worker should stop
-            target=_receive_worker,
-            name=f"RTPReceiver-{self._track.ssrc}",
-            args=(self._done_signal, self.__rtp_reader(), self._track),
+
+        # Create async task to read from SRTP stream
+        self._receive_task = asyncio.create_task(
+            _receive_task(self.__rtp_reader(), self._track),
+            name=f"RTPReceiver-{self._track.ssrc}"
         )
-        self._receive_thread.start()
+        print(f"[RTPReceiver.receive] Started _receive_task for SSRC={params.ssrc}")
 
     def stop(self):
-        if self._receive_thread:
-            self._receive_thread.join()
-            self._done_signal.set()
+        if self._receive_task:
+            self._receive_task.cancel()
 
     @property
     def track(self) -> TrackRemote | None:

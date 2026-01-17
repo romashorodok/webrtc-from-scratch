@@ -23,6 +23,8 @@ from .net.types import (
 from .net.udp_mux import Interceptor, MultiUDPMux
 from .stun_message import stun_message_parse_attrs, stun_message_parse_header
 from webrtc.utils import impl_protocol, AsyncEventEmitter, Handler_T
+from webrtc.logger import get_logger, Component
+from webrtc.config import get_config
 
 from .candidate_base import (
     CandidateBase,
@@ -498,15 +500,64 @@ class CandidatePairTransport:
         self._rtcp = Interceptor()
         self._dtls = Interceptor()
 
+        # Packet classification stats
+        self._total_packets = 0
+        self._dtls_count = 0
+        self._rtcp_count = 0
+        self._rtp_count = 0
+
     def pipe(self, pkt: Packet):
+        logger = get_logger()
+        config = get_config()
+
+        self._total_packets += 1
         first_byte = pkt.data[0]
+
+        # Extract RTP info if it looks like RTP (starts with 0x80-0x9f typically)
+        pkt_type = "UNKNOWN"
+
         if first_byte > 19 and first_byte < 64:
-            print(f"[ICE] CandidatePairTransport.pipe: DTLS packet ({len(pkt.data)} bytes) -> dtls queue (transport={id(self)})")
+            # DTLS packet
+            self._dtls_count += 1
+            pkt_type = "DTLS"
+            if self._dtls_count <= config.log_first_n_packets or self._dtls_count % config.log_every_n_packets == 0:
+                logger.trace(Component.ICE, f"DTLS packet -> dtls queue",
+                           count=self._dtls_count, size=len(pkt.data))
             self._dtls.put_nowait(pkt)
         elif net.is_rtcp(pkt.data):
+            # RTCP packet
+            self._rtcp_count += 1
+            pkt_type = "RTCP"
             self._rtcp.put_nowait(pkt)
         else:
+            # RTP packet
+            self._rtp_count += 1
+            pkt_type = "RTP"
+
+            # Parse RTP header for debugging (first 12 bytes minimum)
+            if len(pkt.data) >= 12 and config.log_packet_details:
+                seq = int.from_bytes(pkt.data[2:4], 'big')
+                ssrc = int.from_bytes(pkt.data[8:12], 'big')
+                payload_type = pkt.data[1] & 0x7F
+
+                # Log using packet logger
+                if self._rtp_count <= config.log_first_n_packets or self._rtp_count % config.log_every_n_packets == 0:
+                    logger.log_packet(Component.ICE, "RX", self._rtp_count,
+                                    seq=seq, ssrc=ssrc, size=len(pkt.data), pt=payload_type)
+
             self._rtp.put_nowait(pkt)
+
+        # Log demux statistics periodically
+        if config.log_packet_counts and (self._total_packets <= 50 or self._total_packets % 100 == 0):
+            rtp_pct = 100 * self._rtp_count / self._total_packets
+            rtcp_pct = 100 * self._rtcp_count / self._total_packets
+            dtls_pct = 100 * self._dtls_count / self._total_packets
+
+            logger.log_stats(Component.ICE,
+                           total=self._total_packets,
+                           RTP=f"{self._rtp_count} ({rtp_pct:.1f}%)",
+                           RTCP=f"{self._rtcp_count} ({rtcp_pct:.1f}%)",
+                           DTLS=f"{self._dtls_count} ({dtls_pct:.1f}%)")
 
     async def recv_dtls(self) -> Packet:
         return await self._dtls.get()

@@ -58,6 +58,7 @@ source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "numpy" },
+    { name = "opus" },
     { name = "rav1e" },
     { name = "torch" },
     { name = "torchvision" },
@@ -70,6 +71,7 @@ dependencies = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115.12" },
     { name = "numpy", specifier = "<2" },
+    { name = "opus" },
     { name = "rav1e" },
     { name = "torch", specifier = "==2.2.2" },
     { name = "torchvision", specifier = ">=0.17.2" },
@@ -369,6 +371,11 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/da/d3/8057f0587683ed2fcd4dbfbdfdfa807b9160b809976099d36b8f60d08f03/nvidia_nvtx_cu12-12.1.105-py3-none-manylinux1_x86_64.whl", hash = "sha256:dc21cf308ca5691e7c04d962e213f8a4aa9bbfa23d95412f452254c2caeb09e5", size = 99138, upload-time = "2023-04-19T15:48:43.556Z" },
 ]
+
+[[package]]
+name = "opus"
+version = "0.1.0"
+source = { editable = "../packages/opus" }
 
 [[package]]
 name = "packaging"
@@ -745,6 +752,7 @@ source = { editable = "../" }
 dependencies = [
     { name = "eventloop" },
     { name = "maturin" },
+    { name = "opus" },
     { name = "psutil" },
     { name = "pytest" },
     { name = "rav1e" },
@@ -755,6 +763,7 @@ dependencies = [
 requires-dist = [
     { name = "eventloop", editable = "../packages/eventloop" },
     { name = "maturin", specifier = ">=1.8.3" },
+    { name = "opus", editable = "../packages/opus" },
     { name = "psutil", specifier = ">=7.0.0" },
     { name = "pytest", specifier = ">=8.3.5" },
     { name = "rav1e", editable = "../packages/rav1e" },
