@@ -1,0 +1,289 @@
+# 8.  SSRC Identifier Allocation and Use
+
+The SSRC identifier carried in the RTP header and in various fields
+of RTCP packets is a random 32-bit number that is required to be
+globally unique within an RTP session.  It is crucial that the number
+be chosen with care in order that participants on the same network or
+starting at the same time are not likely to choose the same number.
+
+It is not sufficient to use the local network address (such as an
+IPv4 address) for the identifier because the address may not be
+unique.  Since RTP translators and mixers enable interoperation among
+multiple networks with different address spaces, the allocation
+patterns for addresses within two spaces might result in a much
+higher rate of collision than would occur with random allocation.
+
+Multiple sources running on one host would also conflict.
+
+It is also not sufficient to obtain an SSRC identifier simply by
+calling random() without carefully initializing the state.  An
+example of how to generate a random identifier is presented in
+Appendix A.6.
+
+## 8.1 Probability of Collision
+
+Since the identifiers are chosen randomly, it is possible that two or
+more sources will choose the same number.  Collision occurs with the
+highest probability when all sources are started simultaneously, for
+example when triggered automatically by some session management
+event.  If N is the number of sources and L the length of the
+identifier (here, 32 bits), the probability that two sources
+independently pick the same value can be approximated for large N
+[26] as 1 - exp(-N**2 / 2**(L+1)).  For N=1000, the probability is
+roughly 10**-4.
+
+The typical collision probability is much lower than the worst-case
+above.  When one new source joins an RTP session in which all the
+other sources already have unique identifiers, the probability of
+collision is just the fraction of numbers used out of the space.
+Again, if N is the number of sources and L the length of the
+identifier, the probability of collision is N / 2**L.  For N=1000,
+the probability is roughly 2*10**-7.
+
+The probability of collision is further reduced by the opportunity
+for a new source to receive packets from other participants before
+sending its first packet (either data or control).  If the new source
+keeps track of the other participants (by SSRC identifier), then
+
+
+before transmitting its first packet the new source can verify that
+its identifier does not conflict with any that have been received, or
+else choose again.
+
+## 8.2 Collision Resolution and Loop Detection
+
+Although the probability of SSRC identifier collision is low, all RTP
+implementations MUST be prepared to detect collisions and take the
+appropriate actions to resolve them.  If a source discovers at any
+time that another source is using the same SSRC identifier as its
+own, it MUST send an RTCP BYE packet for the old identifier and
+choose another random one.  (As explained below, this step is taken
+only once in case of a loop.)  If a receiver discovers that two other
+sources are colliding, it MAY keep the packets from one and discard
+the packets from the other when this can be detected by different
+source transport addresses or CNAMEs.  The two sources are expected
+to resolve the collision so that the situation doesn't last.
+
+Because the random SSRC identifiers are kept globally unique for each
+RTP session, they can also be used to detect loops that may be
+introduced by mixers or translators.  A loop causes duplication of
+data and control information, either unmodified or possibly mixed, as
+in the following examples:
+
+o  A translator may incorrectly forward a packet to the same
+    multicast group from which it has received the packet, either
+    directly or through a chain of translators.  In that case, the
+    same packet appears several times, originating from different
+    network sources.
+
+o  Two translators incorrectly set up in parallel, i.e., with the
+    same multicast groups on both sides, would both forward packets
+    from one multicast group to the other.  Unidirectional translators
+    would produce two copies; bidirectional translators would form a
+    loop.
+
+o  A mixer can close a loop by sending to the same transport
+    destination upon which it receives packets, either directly or
+    through another mixer or translator.  In this case a source might
+    show up both as an SSRC on a data packet and a CSRC in a mixed
+    data packet.
+
+A source may discover that its own packets are being looped, or that
+packets from another source are being looped (a third-party loop).
+Both loops and collisions in the random selection of a source
+identifier result in packets arriving with the same SSRC identifier
+but a different source transport address, which may be that of the
+end system originating the packet or an intermediate system.
+
+Therefore, if a source changes its source transport address, it MAY
+also choose a new SSRC identifier to avoid being interpreted as a
+looped source.  (This is not MUST because in some applications of RTP
+sources may be expected to change addresses during a session.)  Note
+that if a translator restarts and consequently changes the source
+transport address (e.g., changes the UDP source port number) on which
+it forwards packets, then all those packets will appear to receivers
+to be looped because the SSRC identifiers are applied by the original
+source and will not change.  This problem can be avoided by keeping
+the source transport address fixed across restarts, but in any case
+will be resolved after a timeout at the receivers.
+
+Loops or collisions occurring on the far side of a translator or
+mixer cannot be detected using the source transport address if all
+copies of the packets go through the translator or mixer, however,
+collisions may still be detected when chunks from two RTCP SDES
+packets contain the same SSRC identifier but different CNAMEs.
+
+To detect and resolve these conflicts, an RTP implementation MUST
+include an algorithm similar to the one described below, though the
+implementation MAY choose a different policy for which packets from
+colliding third-party sources are kept.  The algorithm described
+below ignores packets from a new source or loop that collide with an
+established source.  It resolves collisions with the participant's
+own SSRC identifier by sending an RTCP BYE for the old identifier and
+choosing a new one.  However, when the collision was induced by a
+loop of the participant's own packets, the algorithm will choose a
+new identifier only once and thereafter ignore packets from the
+looping source transport address.  This is required to avoid a flood
+of BYE packets.
+
+This algorithm requires keeping a table indexed by the source
+identifier and containing the source transport addresses from the
+first RTP packet and first RTCP packet received with that identifier,
+along with other state for that source.  Two source transport
+addresses are required since, for example, the UDP source port
+numbers may be different on RTP and RTCP packets.  However, it may be
+assumed that the network address is the same in both source transport
+addresses.
+
+Each SSRC or CSRC identifier received in an RTP or RTCP packet is
+looked up in the source identifier table in order to process that
+data or control information.  The source transport address from the
+packet is compared to the corresponding source transport address in
+the table to detect a loop or collision if they don't match.  For
+control packets, each element with its own SSRC identifier, for
+example an SDES chunk, requires a separate lookup.  (The SSRC
+identifier in a reception report block is an exception because it
+
+identifies a source heard by the reporter, and that SSRC identifier
+is unrelated to the source transport address of the RTCP packet sent
+by the reporter.)  If the SSRC or CSRC is not found, a new entry is
+created.  These table entries are removed when an RTCP BYE packet is
+received with the corresponding SSRC identifier and validated by a
+matching source transport address, or after no packets have arrived
+for a relatively long time (see Section 6.2.1).
+
+Note that if two sources on the same host are transmitting with the
+same source identifier at the time a receiver begins operation, it
+would be possible that the first RTP packet received came from one of
+the sources while the first RTCP packet received came from the other.
+This would cause the wrong RTCP information to be associated with the
+RTP data, but this situation should be sufficiently rare and harmless
+that it may be disregarded.
+
+In order to track loops of the participant's own data packets, the
+implementation MUST also keep a separate list of source transport
+addresses (not identifiers) that have been found to be conflicting.
+As in the source identifier table, two source transport addresses
+MUST be kept to separately track conflicting RTP and RTCP packets.
+Note that the conflicting address list should be short, usually
+empty.  Each element in this list stores the source addresses plus
+the time when the most recent conflicting packet was received.  An
+element MAY be removed from the list when no conflicting packet has
+arrived from that source for a time on the order of 10 RTCP report
+intervals (see Section 6.2).
+
+For the algorithm as shown, it is assumed that the participant's own
+source identifier and state are included in the source identifier
+table.  The algorithm could be restructured to first make a separate
+comparison against the participant's own source identifier.
+
+    if (SSRC or CSRC identifier is not found in the source
+        identifier table) {
+        create a new entry storing the data or control source
+            transport address, the SSRC or CSRC and other state;
+    }
+
+    /* Identifier is found in the table */
+
+    else if (table entry was created on receipt of a control packet
+            and this is the first data packet or vice versa) {
+        store the source transport address from this packet;
+    }
+    else if (source transport address from the packet does not match
+            the one saved in the table entry for this identifier) {
+
+
+        /* An identifier collision or a loop is indicated */
+
+        if (source identifier is not the participant's own) {
+            /* OPTIONAL error counter step */
+            if (source identifier is from an RTCP SDES chunk
+                containing a CNAME item that differs from the CNAME
+                in the table entry) {
+                count a third-party collision;
+            } else {
+                count a third-party loop;
+            }
+            abort processing of data packet or control element;
+            /* MAY choose a different policy to keep new source */
+        }
+
+        /* A collision or loop of the participant's own packets */
+
+        else if (source transport address is found in the list of
+                conflicting data or control source transport
+                addresses) {
+            /* OPTIONAL error counter step */
+            if (source identifier is not from an RTCP SDES chunk
+                containing a CNAME item or CNAME is the
+                participant's own) {
+                count occurrence of own traffic looped;
+            }
+            mark current time in conflicting address list entry;
+            abort processing of data packet or control element;
+        }
+
+        /* New collision, change SSRC identifier */
+
+        else {
+            log occurrence of a collision;
+            create a new entry in the conflicting data or control
+                source transport address list and mark current time;
+            send an RTCP BYE packet with the old SSRC identifier;
+            choose a new SSRC identifier;
+            create a new entry in the source identifier table with
+                the old SSRC plus the source transport address from
+                the data or control packet being processed;
+        }
+    }
+
+In this algorithm, packets from a newly conflicting source address
+will be ignored and packets from the original source address will be
+kept.  If no packets arrive from the original source for an extended
+period, the table entry will be timed out and the new source will be
+
+able to take over.  This might occur if the original source detects
+the collision and moves to a new source identifier, but in the usual
+case an RTCP BYE packet will be received from the original source to
+delete the state without having to wait for a timeout.
+
+If the original source address was received through a mixer (i.e.,
+learned as a CSRC) and later the same source is received directly,
+the receiver may be well advised to switch to the new source address
+unless other sources in the mix would be lost.  Furthermore, for
+applications such as telephony in which some sources such as mobile
+entities may change addresses during the course of an RTP session,
+the RTP implementation SHOULD modify the collision detection
+algorithm to accept packets from the new source transport address.
+To guard against flip-flopping between addresses if a genuine
+collision does occur, the algorithm SHOULD include some means to
+detect this case and avoid switching.
+
+When a new SSRC identifier is chosen due to a collision, the
+candidate identifier SHOULD first be looked up in the source
+identifier table to see if it was already in use by some other
+source.  If so, another candidate MUST be generated and the process
+repeated.
+
+A loop of data packets to a multicast destination can cause severe
+network flooding.  All mixers and translators MUST implement a loop
+detection algorithm like the one here so that they can break loops.
+This should limit the excess traffic to no more than one duplicate
+copy of the original traffic, which may allow the session to continue
+so that the cause of the loop can be found and fixed.  However, in
+extreme cases where a mixer or translator does not properly break the
+loop and high traffic levels result, it may be necessary for end
+systems to cease transmitting data or control packets entirely.  This
+decision may depend upon the application.  An error condition SHOULD
+be indicated as appropriate.  Transmission MAY be attempted again
+periodically after a long, random time (on the order of minutes).
+
+## 8.3 Use with Layered Encodings
+
+For layered encodings transmitted on separate RTP sessions (see
+Section 2.4), a single SSRC identifier space SHOULD be used across
+the sessions of all layers and the core (base) layer SHOULD be used
+for SSRC identifier allocation and collision resolution.  When a
+source discovers that it has collided, it transmits an RTCP BYE
+packet on only the base layer but changes the SSRC identifier to the
+new value in all layers.

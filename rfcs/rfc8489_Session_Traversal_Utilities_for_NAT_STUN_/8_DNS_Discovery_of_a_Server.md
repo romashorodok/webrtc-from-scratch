@@ -1,0 +1,72 @@
+# 8.  DNS Discovery of a Server
+
+This section describes an optional procedure for STUN that allows a
+client to use DNS to determine the IP address and port of a server.
+A STUN Usage must describe if and when this extension is used.  To
+
+use this procedure, the client must know a STUN URI [RFC7064]; the
+usage must also describe how the client obtains this URI.  Hard-
+coding a STUN URI into software is NOT RECOMMENDED in case the domain
+name is lost or needs to change for legal or other reasons.
+
+When a client wishes to locate a STUN server on the public Internet
+that accepts Binding request/response transactions, the STUN URI
+scheme is "stun".  When it wishes to locate a STUN server that
+accepts Binding request/response transactions over a TLS or DTLS
+session, the URI scheme is "stuns".
+
+The syntax of the "stun" and "stuns" URIs is defined in Section 3.1
+of [RFC7064].  STUN Usages MAY define additional URI schemes.
+
+## 8.1.  STUN URI Scheme Semantics
+
+If the <host> part of a "stun" URI contains an IP address, then this
+IP address is used directly to contact the server.  A "stuns" URI
+containing an IP address MUST be rejected.  A future STUN extension
+or usage may relax this requirement, provided it demonstrates how to
+authenticate the STUN server and prevent man-in-the-middle attacks.
+
+If the URI does not contain an IP address, the domain name contained
+in the <host> part is resolved to a transport address using the SRV
+procedures specified in [RFC2782].  The DNS SRV service name is the
+content of the <scheme> part.  The protocol in the SRV lookup is the
+transport protocol the client will run STUN over: "udp" for UDP and
+"tcp" for TCP.
+
+The procedures of RFC 2782 are followed to determine the server to
+contact.  RFC 2782 spells out the details of how a set of SRV records
+is sorted and then tried.  However, RFC 2782 only states that the
+client should "try to connect to the (protocol, address, service)"
+without giving any details on what happens in the event of failure.
+When following these procedures, if the STUN transaction times out
+without receipt of a response, the client SHOULD retry the request to
+the next server in the order defined by RFC 2782.  Such a retry is
+only possible for request/response transmissions, since indication
+transactions generate no response or timeout.
+
+In addition, instead of querying either the A or the AAAA resource
+records for a domain name, a dual-stack IPv4/IPv6 client MUST query
+both and try the requests with all the IP addresses received, as
+specified in [RFC8305].
+
+The default port for STUN requests is 3478, for both TCP and UDP.
+The default port for STUN over TLS and STUN over DTLS requests is
+5349.  Servers can run STUN over DTLS on the same port as STUN over
+
+UDP if the server software supports determining whether the initial
+message is a DTLS or STUN message.  Servers can run STUN over TLS on
+the same port as STUN over TCP if the server software supports
+determining whether the initial message is a TLS or STUN message.
+
+Administrators of STUN servers SHOULD use these ports in their SRV
+records for UDP and TCP.  In all cases, the port in DNS MUST reflect
+the one on which the server is listening.
+
+If no SRV records are found, the client performs both an A and AAAA
+record lookup of the domain name, as described in [RFC8305].  The
+result will be a list of IP addresses, each of which can be
+simultaneously contacted at the default port using UDP or TCP,
+independent of the STUN Usage.  For usages that require TLS, the
+client connects to the IP addresses using the default STUN over TLS
+port.  For usages that require DTLS, the client connects to the IP
+addresses using the default STUN over DTLS port.
