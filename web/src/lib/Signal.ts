@@ -1,41 +1,25 @@
-import { EventEmitter } from "events";
+type Listener = (data: unknown) => void;
 
-export class Mutex {
-  wait: Promise<void>;
-  private _locks: number;
+type Deferred<T> = {
+  wait: Promise<T>;
+  resolve: (value: T) => void;
+};
 
-  constructor() {
-    this.wait = Promise.resolve();
-    this._locks = 0;
-  }
-
-  isLocked() {
-    return this._locks > 0;
-  }
-
-  lock() {
-    this._locks += 1;
-    let unlockNext: () => void;
-    const willLock = new Promise<void>(
-      (resolve) =>
-        (unlockNext = () => {
-          this._locks -= 1;
-          resolve();
-        }),
-    );
-    const willUnlock = this.wait.then(() => unlockNext);
-    this.wait = this.wait.then(() => willLock);
-    return willUnlock;
-  }
+function createDeferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const wait = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { wait, resolve };
 }
 
-export class Signal extends EventEmitter {
+export class Signal {
   ws?: WebSocket;
   port: number;
 
-  connectedLock = new Mutex();
-  connected: Promise<() => void>;
+  connectedLock: Deferred<void>;
 
+  private listeners = new Map<string, Set<Listener>>();
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
   private reconnectTimeout?: number;
@@ -43,60 +27,97 @@ export class Signal extends EventEmitter {
   private isManualClose = false;
 
   constructor(port: number = 9000) {
-    super();
     this.port = port;
-    this.connected = this.connectedLock.lock();
+    this.connectedLock = createDeferred<void>();
   }
 
-  connect() {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      console.log("[Signal] Already connected");
+  on(event: string, listener: Listener) {
+    const listeners = this.listeners.get(event) ?? new Set<Listener>();
+    listeners.add(listener);
+    this.listeners.set(event, listeners);
+    return () => this.off(event, listener);
+  }
+
+  off(event: string, listener: Listener) {
+    const listeners = this.listeners.get(event);
+    if (!listeners) {
       return;
     }
 
-    console.log(`[Signal] Connecting to ws://localhost:${this.port}/ws (attempt ${this.reconnectAttempts + 1})`);
-    this.ws = new WebSocket(`ws://localhost:${this.port}/ws`);
+    listeners.delete(listener);
+    if (listeners.size === 0) {
+      this.listeners.delete(event);
+    }
+  }
 
-    this.ws.onopen = async () => {
-      console.log("[Signal] WebSocket connected");
+  private emit(event: string, data?: unknown) {
+    const listeners = this.listeners.get(event);
+    if (!listeners) {
+      return;
+    }
+
+    for (const listener of listeners) {
+      try {
+        listener(data);
+      } catch (error) {
+        console.error(`[Signal] Listener for "${event}" failed`, error);
+      }
+    }
+  }
+
+  connect() {
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+
+    this.connectedLock = createDeferred<void>();
+    this.isManualClose = false;
+
+    const url = `ws://localhost:${this.port}/ws`;
+    this.ws = new WebSocket(url);
+
+    this.ws.onopen = () => {
       this.reconnectAttempts = 0;
       this.emit("connected");
-      (await this.connected)();
+      this.connectedLock.resolve();
     };
 
     this.ws.onmessage = (evt) => {
-      const { event = null, data = null } = JSON.parse(evt.data);
-      if (!event) {
-        return;
+      try {
+        const message = JSON.parse(String(evt.data)) as { event?: string; data?: unknown };
+        if (!message.event) {
+          return;
+        }
+
+        this.emit(message.event, message.data);
+      } catch (error) {
+        console.error("[Signal] Failed to parse message", error);
+        this.emit("error", error);
       }
-      this.emit(event, data);
     };
 
     this.ws.onerror = (error) => {
-      console.error("[Signal] WebSocket error:", error);
       this.emit("error", error);
     };
 
     this.ws.onclose = (event) => {
-      console.log(`[Signal] WebSocket closed (code: ${event.code}, clean: ${event.wasClean})`);
-      this.emit("disconnected");
+      this.emit("disconnected", event);
 
-      // Only attempt reconnection if not manually closed and under max attempts
-      if (this.shouldReconnect && !this.isManualClose && this.reconnectAttempts < this.maxReconnectAttempts) {
+      if (
+        this.shouldReconnect &&
+        !this.isManualClose &&
+        this.reconnectAttempts < this.maxReconnectAttempts
+      ) {
         this.scheduleReconnect();
       } else if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-        console.error("[Signal] Max reconnection attempts reached");
         this.emit("max-reconnect-reached");
       }
     };
   }
 
   private scheduleReconnect() {
-    // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
-    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
-    console.log(`[Signal] Reconnecting in ${delay}ms...`);
-
-    this.reconnectAttempts++;
+    const delay = Math.min(1000 * 2 ** this.reconnectAttempts, 30000);
+    this.reconnectAttempts += 1;
     this.emit("reconnecting", { attempt: this.reconnectAttempts, delay });
 
     this.reconnectTimeout = window.setTimeout(() => {
@@ -109,18 +130,20 @@ export class Signal extends EventEmitter {
     this.shouldReconnect = false;
 
     if (this.reconnectTimeout) {
-      clearTimeout(this.reconnectTimeout);
+      window.clearTimeout(this.reconnectTimeout);
       this.reconnectTimeout = undefined;
     }
 
-    this.ws?.close();
+    if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
+      this.ws.close();
+    }
   }
 
-  send(event: string, data: any) {
+  send(event: string, data: unknown) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      console.warn("[Signal] Cannot send - not connected");
       return;
     }
+
     this.ws.send(
       JSON.stringify({
         event,
@@ -129,8 +152,11 @@ export class Signal extends EventEmitter {
     );
   }
 
-  getConnectionState(): string {
-    if (!this.ws) return "not-initialized";
+  getConnectionState() {
+    if (!this.ws) {
+      return "not-initialized";
+    }
+
     switch (this.ws.readyState) {
       case WebSocket.CONNECTING:
         return "connecting";
