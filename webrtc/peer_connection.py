@@ -266,22 +266,21 @@ def set_default_caps(caps: MediaCaps):
         RTPCodecKind.Audio,
     )
 
-    # av1 = RTPCodecParameters(
-    #     mime_type="video/AV1",
-    #     clock_rate=90000,
-    #     refresh_rate=1 / 30,
-    #     channels=0,
-    #     sdp_fmtp_line="level-idx=5;profile=0;tier=0",
-    #     payload_type=AV1_PAYLOAD_TYPE,
-    #     stats_id=f"RTPCodec-{current_ntp_time() >> 32}",
-    # )
+    av1 = RTPCodecParameters(
+        mime_type="video/AV1",
+        clock_rate=90000,
+        refresh_rate=1 / 30,
+        channels=0,
+        sdp_fmtp_line="level-idx=5;profile=0;tier=0",
+        payload_type=AV1_PAYLOAD_TYPE,
+        stats_id=f"RTPCodec-{current_ntp_time() >> 32}",
+    )
     # Match Chrome's expected RTCP feedback types
     # av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="goog-remb", parameter=""))
-    # av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="transport-cc", parameter=""))
+    av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="transport-cc", parameter=""))
     # av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="ccm", parameter="fir"))
-    # av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="nack", parameter=""))
     # av1.rtcp_feedbacks.append(RTCPFeedback(rtcp_type="nack", parameter="pli"))
-    # caps.register_codec(av1, RTPCodecKind.Video)
+    caps.register_codec(av1, RTPCodecKind.Video)
 
     # vp8 = RTPCodecParameters(
     #     mime_type="video/VP8",

@@ -24,13 +24,6 @@ from webrtc.session_description import (
     SessionDescriptionType,
 )
 from webrtc.transceiver import RTPCodecKind, RTPTransceiverDirection
-from webrtc.audio import (
-    AudioAnalyzer,
-    ThresholdDetector,
-    SpectrumAggregator,
-    create_filter_chain,
-    FILTER_PRESETS,
-)
 
 app = FastAPI()
 
@@ -71,31 +64,14 @@ async def on_recv(ws: WebSocket, on_close: Callable | None = None):
 async def analyze_and_send(
     pcm_bytes: bytes,
     timestamp: int,
-    analyzer: AudioAnalyzer,
-    detector: ThresholdDetector,
-    aggregator: SpectrumAggregator,
 ):
-    """Analyze PCM frame and send results via WebSocket (non-blocking)"""
-    try:
-        # Compute spectrum and features (in thread pool to avoid blocking)
-        result = await analyzer.analyze_frame(pcm_bytes, timestamp)
-
-        # Check threshold
-        threshold_result = detector.update(result["features"])
-
-        # Add to aggregator (will batch and send at 10 Hz)
-        await aggregator.add_frame(result, result["features"], threshold_result)
-
-    except Exception as e:
-        logger.error(Component.OPUS, "Analysis error", error=str(e))
+    _ = timestamp
+    return pcm_bytes
 
 
 async def start_audio_loop(
     pc: PeerConnection,
     config: OpusConfig | None = None,
-    audio_analyzer: AudioAnalyzer | None = None,
-    threshold_detector: ThresholdDetector | None = None,
-    spectrum_aggregator: SpectrumAggregator | None = None,
 ):
     """
     Handle bidirectional audio with Opus encode/decode.
@@ -274,18 +250,6 @@ async def start_audio_loop(
                         decode_fec=config.decode_fec,
                     )
 
-                    # Non-blocking audio analysis (fire and forget)
-                    if audio_analyzer and threshold_detector and spectrum_aggregator:
-                        asyncio.create_task(
-                            analyze_and_send(
-                                pcm_bytes,
-                                pkt.timestamp,
-                                audio_analyzer,
-                                threshold_detector,
-                                spectrum_aggregator,
-                            )
-                        )
-
                     if packet_count < 20:
                         logger.debug(
                             Component.OPUS,
@@ -295,27 +259,10 @@ async def start_audio_loop(
                             pcm_bytes=len(pcm_bytes),
                         )
 
-                    # Optionally apply filter to audio for playback (debugging)
-                    pcm_to_play = pcm_bytes
-                    if audio_analyzer.filter_chain and audio_analyzer.filter_chain.enabled:
-                        # Convert PCM to float samples
-                        import numpy as np
-                        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-
-                        # Apply filter chain
-                        filtered_samples, _ = audio_analyzer.filter_chain.process(samples)
-
-                        # Convert back to PCM bytes
-                        filtered_i16 = (filtered_samples * 32768.0).astype(np.int16)
-                        pcm_to_play = filtered_i16.tobytes()
-
-                        if packet_count < 5:
-                            logger.debug(Component.OPUS, "Playing filtered audio", filter_enabled=True)
-
                     # Put PCM into queue for encoding
                     try:
                         await asyncio.wait_for(
-                            pcm_frames_queue.put(pcm_to_play), timeout=0.5
+                            pcm_frames_queue.put(pcm_bytes), timeout=0.5
                         )
                     except asyncio.TimeoutError:
                         if packet_count % 100 == 0:
@@ -522,26 +469,6 @@ async def ws_endpoint(ws: WebSocket):
         decode_fec=False,
     )
 
-    # Audio analysis setup
-    # Create filter chain (default: "none" - no filtering)
-    filter_chain = create_filter_chain("none", sample_rate=config.sample_rate)
-
-    # Flag to enable/disable playing filtered audio (for debugging)
-    play_filtered_audio = False
-
-    audio_analyzer = AudioAnalyzer(
-        sample_rate=config.sample_rate, fft_size=1024, filter_chain=filter_chain
-    )
-    threshold_detector = ThresholdDetector(
-        {
-            "rms_threshold": 0.1,
-            "zcr_threshold": 0.05,
-            "duration_ms": 500,
-            "hysteresis": 0.8,
-        }
-    )
-    spectrum_aggregator = SpectrumAggregator(target_rate_hz=10, ws=ws)
-
     # Flag to ensure start() is only called once
     audio_loop_started = False
 
@@ -553,12 +480,7 @@ async def ws_endpoint(ws: WebSocket):
             return
         audio_loop_started = True
         logger.info(Component.OPUS, "Starting audio loop", config=config)
-        asyncio.create_task(
-            start_audio_loop(
-                pc, config, audio_analyzer, threshold_detector, spectrum_aggregator
-            ),
-            name="OpusAudioLoop",
-        )
+        asyncio.create_task(start_audio_loop(pc, config), name="OpusAudioLoop")
         logger.info(Component.OPUS, "Audio loop task created")
 
     def on_close():
@@ -657,119 +579,8 @@ async def ws_endpoint(ws: WebSocket):
                 await pc.gatherer.add_remote_candidate(candidate_str)
                 print("[Opus] Added ICE candidate")
 
-            case "audio_config":
-                data = msg.get("data")
-                if not data:
-                    continue
-
-                # Parse JSON if it's a string
-                if isinstance(data, str):
-                    try:
-                        payload = json.loads(data)
-                    except json.JSONDecodeError:
-                        print(f"[Opus] Failed to parse audio_config data: {data}")
-                        continue
-                else:
-                    payload = data
-
-                # Update threshold detector config
-                if threshold_config := payload.get("threshold_config"):
-                    threshold_detector.update_config(threshold_config)
-
-                # Update aggregator rate
-                if update_rate := payload.get("update_rate_hz"):
-                    spectrum_aggregator.set_rate(update_rate)
-
-                # Change filter preset
-                if filter_preset := payload.get("filter_preset"):
-                    print(f"[Opus] Changing filter preset to: {filter_preset}")
-                    new_filter_chain = create_filter_chain(
-                        filter_preset, sample_rate=config.sample_rate
-                    )
-                    audio_analyzer.filter_chain = new_filter_chain
-
-                # Apply custom filter configuration
-                if custom_filter_config := payload.get("custom_filter_config"):
-                    print(f"[Opus] Applying custom filter config: {custom_filter_config}")
-                    from webrtc.audio.filters import (
-                        HighPassFilter,
-                        BandPassFilter,
-                        NoiseGate,
-                        PreEmphasisFilter,
-                        VoiceActivityDetector,
-                        FilterChain,
-                    )
-
-                    # Create new filter chain from custom config
-                    new_chain = FilterChain(sample_rate=config.sample_rate)
-
-                    # Add filters based on config
-                    for filter_def in custom_filter_config.get("filters", []):
-                        filter_type = filter_def["type"]
-
-                        if filter_type == "highpass":
-                            filter = HighPassFilter(
-                                config.sample_rate,
-                                cutoff_hz=filter_def.get("cutoff_hz", 80)
-                            )
-                        elif filter_type == "bandpass":
-                            filter = BandPassFilter(
-                                config.sample_rate,
-                                low_cutoff_hz=filter_def.get("low_cutoff_hz", 300),
-                                high_cutoff_hz=filter_def.get("high_cutoff_hz", 3400)
-                            )
-                        elif filter_type == "noise_gate":
-                            filter = NoiseGate(
-                                config.sample_rate,
-                                threshold_db=filter_def.get("threshold_db", -40),
-                                attack_ms=filter_def.get("attack_ms", 5),
-                                release_ms=filter_def.get("release_ms", 50)
-                            )
-                        elif filter_type == "preemphasis":
-                            filter = PreEmphasisFilter(
-                                config.sample_rate,
-                                alpha=filter_def.get("alpha", 0.97)
-                            )
-                        else:
-                            continue
-
-                        new_chain.add_filter(filter)
-
-                    # Add VAD if configured
-                    if vad_config := custom_filter_config.get("vad"):
-                        vad = VoiceActivityDetector(
-                            config.sample_rate,
-                            energy_threshold=vad_config.get("energy_threshold", 0.05),
-                            zcr_threshold=vad_config.get("zcr_threshold", 0.1),
-                            hangover_frames=vad_config.get("hangover_frames", 10)
-                        )
-                        new_chain.set_vad(vad)
-
-                    audio_analyzer.filter_chain = new_chain
-                    print("[Opus] Custom filter chain applied")
-
-                # Enable/disable playing filtered audio
-                if "play_filtered" in payload:
-                    enabled = payload["play_filtered"]
-                    if audio_analyzer.filter_chain:
-                        audio_analyzer.filter_chain.set_enabled(enabled)
-                        print(f"[Opus] Play filtered audio: {'enabled' if enabled else 'disabled'}")
-
-                print(f"[Opus] Audio config updated: {payload}")
-
-            case "get_filter_presets":
-                # Send available filter presets to frontend
-                presets_info = {
-                    key: {
-                        "name": val["name"],
-                        "description": val["description"],
-                    }
-                    for key, val in FILTER_PRESETS.items()
-                }
-                await ws.send_json(
-                    {"event": "filter_presets", "data": presets_info}
-                )
-                print("[Opus] Sent filter presets to client")
+            case "audio_config" | "get_filter_presets":
+                print(f"[Opus] Ignoring control event: {msg.get('event')}")
 
             case _:
                 print(f"[Opus] Unknown event: {msg.get('event')}")

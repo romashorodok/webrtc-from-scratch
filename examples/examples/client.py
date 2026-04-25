@@ -24,9 +24,6 @@ from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import shared_memory
 from typing import Any, Callable
 
-import numpy as np
-import torch
-import torch.nn.functional as F
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from rav1e import Rav1e
 from webrtc.srtp import Session as SrtpSession
@@ -92,70 +89,26 @@ def pre_read_y4m(file_path: str):
         return frames, n_frames, reader
 
 
-def transform_motion_highlight_worker(
+def stage_frame_worker(
     shm_name: str,
-    prev_shm_name: str,
     width: int,
     height: int,
     chroma_width: int,
     chroma_height: int,
     frame_index: int,
 ):
-    """Motion detection with edge glow effect."""
+    """Keep the shared-memory worker stage, but do no image processing."""
+    _ = frame_index
     shm = shared_memory.SharedMemory(name=shm_name)
-    prev_shm = shared_memory.SharedMemory(name=prev_shm_name)
 
     y_size = width * height
     chroma_size = chroma_width * chroma_height
 
-    y = np.ndarray((height, width), dtype=np.uint8, buffer=shm.buf[0:y_size])
-    u = np.ndarray((chroma_size,), dtype=np.uint8, buffer=shm.buf[y_size : y_size + chroma_size])
-    v = np.ndarray((chroma_size,), dtype=np.uint8, buffer=shm.buf[y_size + chroma_size :])
-
-    prev_y = np.ndarray((height, width), dtype=np.uint8, buffer=prev_shm.buf[0:y_size])
-
-    y_t = torch.from_numpy(y.copy()).float().unsqueeze(0).unsqueeze(0) / 255.0
-    prev_y_t = torch.from_numpy(prev_y.copy()).float().unsqueeze(0).unsqueeze(0) / 255.0
-
-    diff = torch.abs(y_t - prev_y_t)
-    motion_mask = (diff > 0.05).float()
-
-    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
-    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
-
-    edges_x = F.conv2d(motion_mask * y_t, sobel_x, padding=1)
-    edges_y = F.conv2d(motion_mask * y_t, sobel_y, padding=1)
-    edges = torch.sqrt(edges_x**2 + edges_y**2)
-    edges = (edges / edges.max()).clamp(0, 1) if edges.max() > 0 else edges
-
-    glow = F.avg_pool2d(edges, kernel_size=5, stride=1, padding=2)
-    glow = (glow * 2).clamp(0, 1)
-
-    y_t_new = y_t + glow * 0.5
-    y_t_new = y_t_new.clamp(0, 1)
-    y_t_new_255 = (y_t_new.squeeze() * 255).numpy()
-
-    u_t = torch.from_numpy(u.copy().reshape(chroma_height, chroma_width)).float() / 255.0
-    v_t = torch.from_numpy(v.copy().reshape(chroma_height, chroma_width)).float() / 255.0
-
-    u_t_255 = (u_t * 255).numpy()
-    v_t_255 = (v_t * 255).numpy()
-
-    y_float = y.astype(np.float32)
-    u_float = u.astype(np.float32)
-    v_float = v.astype(np.float32)
-
-    alpha = 0.4
-    y_blended = ((1 - alpha) * y_float + alpha * y_t_new_255).clip(0, 255).astype(np.uint8)
-    u_blended = ((1 - alpha) * u_float + alpha * u_t_255.flatten()).clip(0, 255).astype(np.uint8)
-    v_blended = ((1 - alpha) * v_float + alpha * v_t_255.flatten()).clip(0, 255).astype(np.uint8)
-
-    y[:] = y_blended
-    u[:] = u_blended
-    v[:] = v_blended
+    # Explicit copy keeps the examples structured as ingest -> worker -> encode.
+    staged = bytes(shm.buf[: y_size + 2 * chroma_size])
+    shm.buf[: y_size + 2 * chroma_size] = staged
 
     shm.close()
-    prev_shm.close()
 
 
 class SendTimeCache:
@@ -203,7 +156,6 @@ async def process_frame(
     shm_buf = shm.buf
 
     shm_size = y4m_reader.buffer_bytes_size
-    shm_np = np.ndarray((shm_size,), dtype=np.uint8, buffer=shm_buf)
 
     chroma_width, chroma_height = video_details.chroma_sampling.get_chroma_dimensions(
         video_details.width,
@@ -213,18 +165,14 @@ async def process_frame(
     chroma_size = chroma_width * chroma_height
 
     y, u, v = frame.planes.y, frame.planes.u, frame.planes.v
-    shm_np[0:y_size] = np.frombuffer(y, dtype=np.uint8)
-    shm_np[y_size : y_size + chroma_size] = np.frombuffer(u, dtype=np.uint8)
-    shm_np[y_size + chroma_size :] = np.frombuffer(v, dtype=np.uint8)
-
-    prev_slot_idx = (slot_idx - 1) % len(shm_slots)
-    prev_shm = shm_slots[prev_slot_idx]
+    shm_buf[0:y_size] = y
+    shm_buf[y_size : y_size + chroma_size] = u
+    shm_buf[y_size + chroma_size : shm_size] = v
 
     await asyncio.get_running_loop().run_in_executor(
         executor,
-        transform_motion_highlight_worker,
+        stage_frame_worker,
         shm.name,
-        prev_shm.name,
         video_details.width,
         video_details.height,
         chroma_width,
@@ -236,9 +184,9 @@ async def process_frame(
         1,
         width=video_details.width,
         chroma_width=chroma_width,
-        y_plane=shm_np[0:y_size].tobytes(),
-        u_plane=shm_np[y_size : y_size + chroma_size].tobytes(),
-        v_plane=shm_np[y_size + chroma_size :].tobytes(),
+        y_plane=bytes(shm_buf[0:y_size]),
+        u_plane=bytes(shm_buf[y_size : y_size + chroma_size]),
+        v_plane=bytes(shm_buf[y_size + chroma_size : shm_size]),
     )
 
 
