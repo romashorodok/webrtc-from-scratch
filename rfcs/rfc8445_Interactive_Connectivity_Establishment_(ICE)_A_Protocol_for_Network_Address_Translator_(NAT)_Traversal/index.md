@@ -1,0 +1,94 @@
+# RFC 8445: Interactive Connectivity Establishment (ICE) A Protocol for Network Address Translator (NAT) Traversal
+
+Source: `../rfc8445_Interactive_Connectivity_Establishment_(ICE)_A_Protocol_for_Network_Address_Translator_(NAT)_Traversal.md`
+
+Use this file first. It is the compact map for the section files in this RFC.
+
+## Data
+- `file`: section file name
+- `sec`: RFC section number
+- `intent`: short section purpose
+- `use`: one short cue or example
+- `ref`: parent RFC source file
+
+## Sections
+- `2.1_Gathering_Candidates.md` | sec `2.1` | intent `Gathering Candidates` | use `In order to execute ICE, an ICE agent identifies and gathers one or more address candidates. A…` | ref `2_Overview_of_ICE.md`
+- `2.2_Connectivity_Checks.md` | sec `2.2` | intent `Connectivity Checks` | use `Once L has gathered all of its candidates, it orders them by highest- to-lowest priority and…` | ref `2_Overview_of_ICE.md`
+- `2.3_Nominating_Candidate_Pairs_and_Concluding_ICE.md` | sec `2.3` | intent `Nominating Candidate Pairs and Concluding…` | use `ICE assigns one of the ICE agents in the role of the controlling agent, and the other in the…` | ref `2_Overview_of_ICE.md`
+- `2.4_ICE_Restart.md` | sec `2.4` | intent `ICE Restart` | use `Once ICE is concluded, it can be restarted at any time for one or all of the data streams by…` | ref `2_Overview_of_ICE.md`
+- `2.5_Lite_Implementations.md` | sec `2.5` | intent `Lite Implementations` | use `Certain ICE agents will always be connected to the public Internet and have a public IP address…` | ref `2_Overview_of_ICE.md`
+- `3_ICE_Usage.md` | sec `3` | intent `ICE Usage` | use `This document specifies generic use of ICE with protocols that provide means to exchange…` | ref `2_Overview_of_ICE.md`
+- `5.1_Full_Implementation.md` | sec `5.1` | intent `Full Implementation` | use `Full Implementation` | ref `5_ICE_Candidate_Gathering_and_Exchange.md`
+- `5.1.1_Gathering_Candidates.md` | sec `5.1.1` | intent `Gathering Candidates` | use `An ICE agent gathers candidates when it believes that communication is imminent. An initiating…` | ref `5_ICE_Candidate_Gathering_and_Exchange.md`
+- `5.1.2_Prioritizing_Candidates.md` | sec `5.1.2` | intent `Prioritizing Candidates` | use `The prioritization process results in the assignment of a priority to each candidate. Each…` | ref `5_ICE_Candidate_Gathering_and_Exchange.md`
+- `5.1.3_Eliminating_Redundant_Candidates.md` | sec `5.1.3` | intent `Eliminating Redundant Candidates` | use `Next, the ICE agents (initiating and responding) eliminate redundant candidates. Two candidates…` | ref `5_ICE_Candidate_Gathering_and_Exchange.md`
+- `5.2_Lite_Implementation_Procedures.md` | sec `5.2` | intent `Lite Implementation Procedures` | use `Lite implementations only utilize host candidates. For each IP address, independent of an IP…` | ref `5_ICE_Candidate_Gathering_and_Exchange.md`
+- `5.3_Exchanging_Candidate_Information.md` | sec `5.3` | intent `Exchanging Candidate Information` | use `ICE agents (initiating and responding) need the following information about candidates to be…` | ref `5_ICE_Candidate_Gathering_and_Exchange.md`
+- `5.4_ICE_Mismatch.md` | sec `5.4` | intent `ICE Mismatch` | use `Certain middleboxes, such as ALGs, can alter signaling information in ways that break ICE…` | ref `5_ICE_Candidate_Gathering_and_Exchange.md`
+- `6.1_Procedures_for_Full_Implementation.md` | sec `6.1` | intent `Procedures for Full Implementation` | use `Procedures for Full Implementation` | ref `6_ICE_Candidate_Processing.md`
+- `6.1.1_Determining_Role.md` | sec `6.1.1` | intent `Determining Role` | use `For each session, each ICE agent (initiating and responding) takes on a role. There are two…` | ref `6_ICE_Candidate_Processing.md`
+- `6.1.2_Forming_the_Checklists.md` | sec `6.1.2` | intent `Forming the Checklists` | use `There is one checklist for each data stream. To form a checklist, initiating and responding ICE…` | ref `6_ICE_Candidate_Processing.md`
+- `6.1.3_ICE_State.md` | sec `6.1.3` | intent `ICE State` | use `The ICE agent has a state determined by the state of the checklists. The state is Completed if…` | ref `6_ICE_Candidate_Processing.md`
+- `6.1.4_Scheduling_Checks.md` | sec `6.1.4` | intent `Scheduling Checks` | use `#### 6.1.4.1. Triggered-Check Queue` | ref `6_ICE_Candidate_Processing.md`
+- `6.2_Lite_Implementation_Procedures.md` | sec `6.2` | intent `Lite Implementation Procedures` | use `Lite implementations skip most of the steps in Section 6 except for verifying the peer's ICE…` | ref `6_ICE_Candidate_Processing.md`
+- `7.1_STUN_Extensions.md` | sec `7.1` | intent `STUN Extensions` | use `ICE extends STUN with the attributes: PRIORITY, USE-CANDIDATE, ICE- CONTROLLED, and ICE-…` | ref `7_Performing_Connectivity_Checks.md`
+- `7.1.1_PRIORITY.md` | sec `7.1.1` | intent `PRIORITY` | use `The PRIORITY attribute MUST be included in a Binding request and be set to the value computed…` | ref `7_Performing_Connectivity_Checks.md`
+- `7.1.2_USE_CANDIDATE.md` | sec `7.1.2` | intent `USE-CANDIDATE` | use `The controlling agent MUST include the USE-CANDIDATE attribute in order to nominate a candidate…` | ref `7_Performing_Connectivity_Checks.md`
+- `7.1.3_ICE_CONTROLLED_and_ICE_CONTROLLING.md` | sec `7.1.3` | intent `ICE-CONTROLLED and ICE-CONTROLLING` | use `The controlling agent MUST include the ICE-CONTROLLING attribute in a Binding request. The…` | ref `7_Performing_Connectivity_Checks.md`
+- `7.2_STUN_Client_Procedures.md` | sec `7.2` | intent `STUN Client Procedures` | use `STUN Client Procedures` | ref `7_Performing_Connectivity_Checks.md`
+- `7.2.1_Creating_Permissions_for_Relayed_Candidates.md` | sec `7.2.1` | intent `Creating Permissions for Relayed…` | use `If the connectivity check is being sent using a relayed local candidate, the client MUST create…` | ref `7_Performing_Connectivity_Checks.md`
+- `7.2.2_Forming_Credentials.md` | sec `7.2.2` | intent `Forming Credentials` | use `A connectivity-check Binding request MUST utilize the STUN short-term credential mechanism.` | ref `7_Performing_Connectivity_Checks.md`
+- `7.2.3_Diffserv_Treatment.md` | sec `7.2.3` | intent `Diffserv Treatment` | use `If the agent is using Differentiated Services Code Point (DSCP) markings [RFC2475] in data…` | ref `7_Performing_Connectivity_Checks.md`
+- `7.2.4_Sending_the_Request.md` | sec `7.2.4` | intent `Sending the Request` | use `A connectivity check is generated by sending a Binding request from the base associated with a…` | ref `7_Performing_Connectivity_Checks.md`
+- `7.2.5_Processing_the_Response.md` | sec `7.2.5` | intent `Processing the Response` | use `This section defines additional procedures for processing Binding responses specific to ICE…` | ref `7_Performing_Connectivity_Checks.md`
+- `7.3_STUN_Server_Procedures.md` | sec `7.3` | intent `STUN Server Procedures` | use `An ICE agent (lite or full) MUST be prepared to receive Binding requests on the base of each…` | ref `7_Performing_Connectivity_Checks.md`
+- `7.3.1_Additional_Procedures_for_Full_Implementations.md` | sec `7.3.1` | intent `Additional Procedures for Full…` | use `This subsection defines the additional server procedures applicable to full implementations,…` | ref `7_Performing_Connectivity_Checks.md`
+- `7.3.2_Additional_Procedures_for_Lite_Implementations.md` | sec `7.3.2` | intent `Additional Procedures for Lite…` | use `If the controlled agent receives a Binding request with the USE- CANDIDATE attribute set, and…` | ref `7_Performing_Connectivity_Checks.md`
+- `8.1_Procedures_for_Full_Implementations.md` | sec `8.1` | intent `Procedures for Full Implementations` | use `Concluding ICE involves nominating pairs by the controlling agent and updating state machinery.` | ref `8_Concluding_ICE_Processing.md`
+- `8.1.1_Nominating_Pairs.md` | sec `8.1.1` | intent `Nominating Pairs` | use `Prior to nominating, the controlling agent lets connectivity checks continue until some…` | ref `8_Concluding_ICE_Processing.md`
+- `8.1.2_Updating_Checklist_and_ICE_States.md` | sec `8.1.2` | intent `Updating Checklist and ICE States` | use `For both a controlling and a controlled agent, when a candidate pair for a component of a data…` | ref `8_Concluding_ICE_Processing.md`
+- `8.2_Procedures_for_Lite_Implementations.md` | sec `8.2` | intent `Procedures for Lite Implementations` | use `When ICE concludes, a lite ICE agent can free host candidates that were not used by ICE, as…` | ref `8_Concluding_ICE_Processing.md`
+- `8.3_Freeing_Candidates.md` | sec `8.3` | intent `Freeing Candidates` | use `Freeing Candidates` | ref `8_Concluding_ICE_Processing.md`
+- `8.3.1_Full_Implementation_Procedures.md` | sec `8.3.1` | intent `Full Implementation Procedures` | use `The rules in this section describe when it is safe for an agent to cease sending or receiving…` | ref `8_Concluding_ICE_Processing.md`
+- `8.3.2_Lite_Implementation_Procedures.md` | sec `8.3.2` | intent `Lite Implementation Procedures` | use `A lite implementation can free candidates that did not become selected candidates as soon as…` | ref `8_Concluding_ICE_Processing.md`
+- `12.1_Sending_Data.md` | sec `12.1` | intent `Sending Data` | use `An ICE agent MAY send data on any valid pair before selected pairs have been produced for the…` | ref `12_Data_Handling.md`
+- `12.1.1_Procedures_for_Lite_Implementations.md` | sec `12.1.1` | intent `Procedures for Lite Implementations` | use `A lite implementation MUST NOT send data until it has a valid list that contains a candidate…` | ref `12_Data_Handling.md`
+- `12.2_Receiving_Data.md` | sec `12.2` | intent `Receiving Data` | use `Even though ICE agents are only allowed to send data using valid candidate pairs (and, once…` | ref `12_Data_Handling.md`
+- `14.1_General.md` | sec `14.1` | intent `General` | use `During the ICE gathering phase (Section 5.1.1) and while ICE is performing connectivity checks…` | ref `14_Setting_Ta_and_RTO.md`
+- `14.2_Ta.md` | sec `14.2` | intent `Ta` | use `ICE agents SHOULD use a default Ta value, 50 ms, but MAY use another value based on the…` | ref `14_Setting_Ta_and_RTO.md`
+- `14.3_RTO.md` | sec `14.3` | intent `RTO` | use `During the ICE gathering phase, ICE agents SHOULD calculate the RTO value using the following…` | ref `14_Setting_Ta_and_RTO.md`
+- `15.1_Example_with_IPv4_Addresses.md` | sec `15.1` | intent `Example with IPv4 Addresses` | use `The example below is using the topology shown in Figure 7.` | ref `15_Examples.md`
+- `15.2_Example_with_IPv6_Addresses.md` | sec `15.2` | intent `Example with IPv6 Addresses` | use `The example below is using the topology shown in Figure 9.` | ref `15_Examples.md`
+- `16.1_Attributes.md` | sec `16.1` | intent `Attributes` | use `This specification defines four STUN attributes: PRIORITY, USE-CANDIDATE, ICE-CONTROLLED, and…` | ref `16_STUN_Extensions.md`
+- `16.2_New_Error_Response_Codes.md` | sec `16.2` | intent `New Error-Response Codes` | use `This specification defines a single error-response code:` | ref `16_STUN_Extensions.md`
+- `17.1_NAT_and_Firewall_Types.md` | sec `17.1` | intent `NAT and Firewall Types` | use `ICE was designed to work with existing NAT and firewall equipment. Consequently, it is not…` | ref `17_Operational_Considerations.md`
+- `17.2_Bandwidth_Requirements.md` | sec `17.2` | intent `Bandwidth Requirements` | use `Deployment of ICE can have several interactions with available network capacity that operators…` | ref `17_Operational_Considerations.md`
+- `17.2.1_STUN_and_TURN_Server_Capacity_Planning.md` | sec `17.2.1` | intent `STUN and TURN Server-Capacity Planning` | use `First and foremost, ICE makes use of TURN and STUN servers, which would typically be located in…` | ref `17_Operational_Considerations.md`
+- `17.2.2_Gathering_and_Connectivity_Checks.md` | sec `17.2.2` | intent `Gathering and Connectivity Checks` | use `The process of gathering candidates and performing connectivity checks can be bandwidth…` | ref `17_Operational_Considerations.md`
+- `17.2.3_Keepalives.md` | sec `17.2.3` | intent `Keepalives` | use `STUN keepalives (in the form of STUN Binding Indications) are sent in the middle of a data…` | ref `17_Operational_Considerations.md`
+- `17.3_ICE_and_ICE_Lite.md` | sec `17.3` | intent `ICE and ICE-Lite` | use `Deployments utilizing a mix of ICE and ICE-lite interoperate with each other. They have been…` | ref `17_Operational_Considerations.md`
+- `17.4_Troubleshooting_and_Performance_Management.md` | sec `17.4` | intent `Troubleshooting and Performance Management` | use `ICE utilizes end-to-end connectivity checks and places much of the processing in the endpoints.…` | ref `17_Operational_Considerations.md`
+- `17.5_Endpoint_Configuration.md` | sec `17.5` | intent `Endpoint Configuration` | use `ICE relies on several pieces of data being configured into the endpoints. This configuration…` | ref `17_Operational_Considerations.md`
+- `18.1_Problem_Definition.md` | sec `18.1` | intent `Problem Definition` | use `From RFC 3424, any UNSAF proposal needs to provide:` | ref `18_IAB_Considerations.md`
+- `18.2_Exit_Strategy.md` | sec `18.2` | intent `Exit Strategy` | use `From RFC 3424, any UNSAF proposal needs to provide:` | ref `18_IAB_Considerations.md`
+- `18.3_Brittleness_Introduced_by_ICE.md` | sec `18.3` | intent `Brittleness Introduced by ICE` | use `From RFC 3424, any UNSAF proposal needs to provide:` | ref `18_IAB_Considerations.md`
+- `18.4_Requirements_for_a_Long_Term_Solution.md` | sec `18.4` | intent `Requirements for a Long-Term Solution` | use `From RFC 3424, any UNSAF proposal needs to provide the following:` | ref `18_IAB_Considerations.md`
+- `18.5_Issues_with_Existing_NAPT_Boxes.md` | sec `18.5` | intent `Issues with Existing NAPT Boxes` | use `From RFC 3424, any UNSAF proposal needs to provide:` | ref `18_IAB_Considerations.md`
+- `19.1_IP_Address_Privacy.md` | sec `19.1` | intent `IP Address Privacy` | use `The process of probing for candidates reveals the source addresses of the client and its peer…` | ref `19_Security_Considerations.md`
+- `19.2_Attacks_on_Connectivity_Checks.md` | sec `19.2` | intent `Attacks on Connectivity Checks` | use `An attacker might attempt to disrupt the STUN connectivity checks. Ultimately, all of these…` | ref `19_Security_Considerations.md`
+- `19.3_Attacks_on_Server_Reflexive_Address_Gathering.md` | sec `19.3` | intent `Attacks on Server-Reflexive Address…` | use `ICE endpoints make use of STUN Binding requests for gathering server- reflexive candidates from…` | ref `19_Security_Considerations.md`
+- `19.4_Attacks_on_Relayed_Candidate_Gathering.md` | sec `19.4` | intent `Attacks on Relayed Candidate Gathering` | use `An attacker might attempt to disrupt the gathering of relayed candidates, forcing the client to…` | ref `19_Security_Considerations.md`
+- `19.5_Insider_Attacks.md` | sec `19.5` | intent `Insider Attacks` | use `In addition to attacks where the attacker is a third party trying to insert fake candidate…` | ref `19_Security_Considerations.md`
+- `19.5.1_STUN_Amplification_Attack.md` | sec `19.5.1` | intent `STUN Amplification Attack` | use `The STUN amplification attack is similar to a "voice hammer" attack, where the attacker causes…` | ref `19_Security_Considerations.md`
+- `20.1_STUN_Attributes.md` | sec `20.1` | intent `STUN Attributes` | use `IANA has registered four STUN attributes:` | ref `20_IANA_Considerations.md`
+- `20.2_STUN_Error_Responses.md` | sec `20.2` | intent `STUN Error Responses` | use `IANA has registered the following STUN error-response code:` | ref `20_IANA_Considerations.md`
+- `20.3_ICE_Options.md` | sec `20.3` | intent `ICE Options` | use `IANA has registered the following ICE option in the "ICE Options" subregistry of the…` | ref `20_IANA_Considerations.md`
+- `B.1_Pacing_of_STUN_Transactions.md` | sec `B.1` | intent `Pacing of STUN Transactions` | use `STUN transactions used to gather candidates and to verify connectivity are paced out at an…` | ref `Appendix_B_Design_Motivations.md`
+- `B.2_Candidates_with_Multiple_Bases.md` | sec `B.2` | intent `Candidates with Multiple Bases` | use `Section 5.1.3 talks about eliminating candidates that have the same transport address and base.…` | ref `Appendix_B_Design_Motivations.md`
+- `B.3_Purpose_of_the_Related_Address_and_Related_Port_Attributes.md` | sec `B.3` | intent `Purpose of the Related-Address and…` | use `The candidate attribute contains two values that are not used at all by ICE itself -- related…` | ref `Appendix_B_Design_Motivations.md`
+- `B.4_Importance_of_the_STUN_Username.md` | sec `B.4` | intent `Importance of the STUN Username` | use `ICE requires the usage of message integrity with STUN using its short-term credential…` | ref `Appendix_B_Design_Motivations.md`
+- `B.5_The_Candidate_Pair_Priority_Formula.md` | sec `B.5` | intent `The Candidate Pair Priority Formula` | use `The priority for a candidate pair has an odd form. It is:` | ref `Appendix_B_Design_Motivations.md`
+- `B.6_Why_Are_Keepalives_Needed.md` | sec `B.6` | intent `Why Are Keepalives Needed?` | use `Once data begins flowing on a candidate pair, it is still necessary to keep the bindings alive…` | ref `Appendix_B_Design_Motivations.md`
+- `B.7_Why_Prefer_Peer_Reflexive_Candidates.md` | sec `B.7` | intent `Why Prefer Peer-Reflexive Candidates?` | use `Section 5.1.2 describes procedures for computing the priority of a candidate based on its type…` | ref `Appendix_B_Design_Motivations.md`
+- `B.8_Why_Are_Binding_Indications_Used_for_Keepalives.md` | sec `B.8` | intent `Why Are Binding Indications Used for…` | use `Data keepalives are described in Section 11. These keepalives make use of STUN when both…` | ref `Appendix_B_Design_Motivations.md`
+- `B.9_Selecting_Candidate_Type_Preference.md` | sec `B.9` | intent `Selecting Candidate Type Preference` | use `One criterion for selecting type and local preference values is the use of a data intermediary,…` | ref `Appendix_B_Design_Motivations.md`
