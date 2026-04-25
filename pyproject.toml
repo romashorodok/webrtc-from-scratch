@@ -3,11 +3,10 @@ name = "webrtc"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = [
     "maturin>=1.8.3",
     "webrtc_rs",
-    "eventloop",
     "rav1e",
     "opus",
     "psutil>=7.0.0",
@@ -24,7 +23,6 @@ members = [
 
 [tool.uv.sources]
 webrtc_rs = { workspace = true }
-eventloop = { workspace = true }
 rav1e = { workspace = true }
 opus = { workspace = true }
 

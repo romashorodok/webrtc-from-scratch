@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "romashorodok", email = "108732029+romashorodok@users.noreply.github.com" }
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = [
     "fastapi>=0.115.12",
     "uvicorn[standard]>=0.34.2",

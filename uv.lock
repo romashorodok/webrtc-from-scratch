@@ -1,10 +1,9 @@
 version = 1
-revision = 2
-requires-python = ">=3.12"
+revision = 3
+requires-python = ">=3.14"
 
 [manifest]
 members = [
-    "eventloop",
     "opus",
     "rav1e",
     "webrtc",
@@ -19,11 +18,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/d8/53/6f443c9a4a8358a93
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6", size = 25335, upload-time = "2022-10-25T02:36:20.889Z" },
 ]
-
-[[package]]
-name = "eventloop"
-version = "0.1.0"
-source = { editable = "packages/eventloop" }
 
 [[package]]
 name = "iniconfig"
@@ -117,8 +111,8 @@ name = "webrtc"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "eventloop" },
     { name = "maturin" },
+    { name = "opus" },
     { name = "psutil" },
     { name = "pytest" },
     { name = "rav1e" },
@@ -127,8 +121,8 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "eventloop", editable = "packages/eventloop" },
     { name = "maturin", specifier = ">=1.8.3" },
+    { name = "opus", editable = "packages/opus" },
     { name = "psutil", specifier = ">=7.0.0" },
     { name = "pytest", specifier = ">=8.3.5" },
     { name = "rav1e", editable = "packages/rav1e" },
