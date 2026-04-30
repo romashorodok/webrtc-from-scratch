@@ -1,7 +1,19 @@
+import { TraceOverlay } from "./TraceOverlay";
 import { useServerSession } from "./useServerSession";
 
 export function ServerPage() {
-  const { createOffer, status, videoRef } = useServerSession();
+  const {
+    clearCompletedTraces,
+    clearFailedTraces,
+    createOffer,
+    deleteTrace,
+    setTraceRetentionSeconds,
+    status,
+    successRetentionSeconds,
+    summaries,
+    traces,
+    videoRef,
+  } = useServerSession();
 
   return (
     <section className="demo-card">
@@ -27,6 +39,16 @@ export function ServerPage() {
           Create Offer
         </button>
       </div>
+
+      <TraceOverlay
+        traces={traces}
+        onClearCompleted={clearCompletedTraces}
+        onClearFailed={clearFailedTraces}
+        onDeleteTrace={deleteTrace}
+        onRetentionChange={setTraceRetentionSeconds}
+        retentionSeconds={successRetentionSeconds}
+        summaries={summaries}
+      />
     </section>
   );
 }

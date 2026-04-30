@@ -1,7 +1,19 @@
+import { TraceOverlay } from "./TraceOverlay";
 import { useClientSession } from "./useClientSession";
 
 export function ClientPage() {
-  const { startNegotiation, status, videoRef } = useClientSession();
+  const {
+    clearCompletedTraces,
+    clearFailedTraces,
+    deleteTrace,
+    setTraceRetentionSeconds,
+    startNegotiation,
+    status,
+    successRetentionSeconds,
+    summaries,
+    traces,
+    videoRef,
+  } = useClientSession();
 
   return (
     <section className="demo-card">
@@ -27,6 +39,16 @@ export function ClientPage() {
           Start / Negotiate
         </button>
       </div>
+
+      <TraceOverlay
+        traces={traces}
+        onClearCompleted={clearCompletedTraces}
+        onClearFailed={clearFailedTraces}
+        onDeleteTrace={deleteTrace}
+        onRetentionChange={setTraceRetentionSeconds}
+        retentionSeconds={successRetentionSeconds}
+        summaries={summaries}
+      />
     </section>
   );
 }

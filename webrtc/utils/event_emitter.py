@@ -2,6 +2,8 @@ import asyncio
 from threading import Lock
 from typing import Any, Callable, OrderedDict, TypeVar
 
+from webrtc.runtime import get_default_runtime
+
 
 Handler_T = TypeVar("Handler_T", bound=Callable)
 
@@ -21,6 +23,7 @@ class EventEmitter:
 
     def _on_call_handler(
         self,
+        event: str,
         f: Callable,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
@@ -36,7 +39,7 @@ class EventEmitter:
             funcs = list(self._events.get(event, OrderedDict()).values())
 
         for f in funcs:
-            self._on_call_handler(f, args, kwargs)
+            self._on_call_handler(event, f, args, kwargs)
             handled = True
 
         return handled
@@ -99,7 +102,7 @@ class AsyncEventEmitter(EventEmitter):
         self._waiting = set[asyncio.Future]()
 
     def _on_call_handler(
-        self, f: Callable, args: tuple[Any, ...], kwargs: dict[str, Any]
+        self, event: str, f: Callable, args: tuple[Any, ...], kwargs: dict[str, Any]
     ):
         try:
             coro = f(*args, **kwargs)
@@ -107,17 +110,20 @@ class AsyncEventEmitter(EventEmitter):
             self.emit("error", e)
         else:
             if asyncio.iscoroutine(coro):
-                if self.__loop:
-                    future = asyncio.ensure_future(coro, loop=self.__loop)
-                else:
-                    future = asyncio.ensure_future(coro)
+                future = get_default_runtime().spawn_task(
+                    coro,
+                    name=f"event:{event}",
+                    kind="event",
+                    loop=self.__loop,
+                    metadata={"event": event},
+                )
             elif isinstance(coro, asyncio.Future):
                 future = coro
             else:
                 return
 
             def callback(f: asyncio.Future):
-                self._waiting.remove(f)
+                self._waiting.discard(f)
 
                 if f.cancelled():
                     return

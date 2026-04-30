@@ -4,6 +4,7 @@ from enum import IntEnum
 from typing import Protocol
 
 from webrtc.dtls.certificate import Certificate
+from webrtc.peer_context import spawn_peer_task
 
 # Structured logging for DTLS handshake
 logger = logging.getLogger("webrtc.dtls.fsm")
@@ -506,7 +507,12 @@ class DTLSConn:
     async def handle_inbound_record_layers(self):
         print("[FSM] handle_inbound_record_layers: STARTED")
         logger.info("handle_inbound_record_layers: starting inbound message handler")
-        fsm_runnable = asyncio.create_task(self.fsm.run())
+        fsm_runnable = spawn_peer_task(
+            self.fsm.run(),
+            name="dtls:fsm",
+            component="dtls",
+            kind="dtls",
+        )
 
         # Queue for encrypted messages that arrive before cipher suite is ready
         pending_encrypted: list[tuple[RecordLayer, bytes, EncryptedHandshakeMessage]] = []
