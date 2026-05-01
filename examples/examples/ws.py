@@ -402,17 +402,5 @@ async def ws_endpoint(ws: WebSocket):
                             statuses={"completed", "cancelled"},
                         )
 
-                case "trace:configure":
-                    data = msg.get("data")
-                    payload: dict[str, Any] = json.loads(data) if isinstance(data, str) else data or {}
-                    retention = payload.get("success_retention_seconds")
-                    if isinstance(retention, (int, float)):
-                        runtime.set_success_trace_retention(retention, peer_id=peer.peer_id)
-                        if retention <= 0:
-                            runtime.delete_traces(
-                                peer_id=peer.peer_id,
-                                statuses={"completed", "cancelled"},
-                            )
-
                 case _:
                     print("Unknown event")

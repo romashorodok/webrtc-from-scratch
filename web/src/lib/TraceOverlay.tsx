@@ -15,11 +15,9 @@ type TraceDatum = {
 type TraceOverlayProps = {
   traces: TraceRecord[];
   summaries?: TraceSummary[];
-  retentionSeconds?: number;
   onClearCompleted?: () => void;
   onClearFailed?: () => void;
   onDeleteTrace?: (traceId: string) => void;
-  onRetentionChange?: (seconds: number) => void;
 };
 
 const statusClass: Record<string, string> = {
@@ -29,14 +27,6 @@ const statusClass: Record<string, string> = {
   failed: "trace-node--failed",
   cancelled: "trace-node--cancelled",
 };
-
-const retentionOptions = [
-  { label: "0m", seconds: 0 },
-  { label: "1m", seconds: 60 },
-  { label: "5m", seconds: 300 },
-  { label: "15m", seconds: 900 },
-  { label: "60m", seconds: 3600 },
-];
 
 const MAX_RENDERED_TRACES = 650;
 const MAX_SIDE_ITEMS = 50;
@@ -238,17 +228,15 @@ function buildTree(traces: TraceRecord[]) {
 export function TraceOverlay({
   traces,
   summaries = [],
-  retentionSeconds = 60,
   onClearCompleted,
   onClearFailed,
   onDeleteTrace,
-  onRetentionChange,
 }: TraceOverlayProps) {
   const [open, setOpen] = useState(true);
   const [groupedView, setGroupedView] = useState(true);
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null);
   const [inspectedSummaryId, setInspectedSummaryId] = useState<string | null>(null);
-  const [preferLiveWhenEmpty, setPreferLiveWhenEmpty] = useState(false);
+  const [preferLiveWhenEmpty, setPreferLiveWhenEmpty] = useState(true);
   const [exportOpen, setExportOpen] = useState(false);
   const [copyStatus, setCopyStatus] = useState<"Copy" | "Copied" | "Selected">("Copy");
   const overlayRef = useRef<HTMLElement | null>(null);
@@ -260,7 +248,6 @@ export function TraceOverlay({
   const panelFrameRef = useRef<number | null>(null);
   const pendingArchiveTraceIdRef = useRef<string | null>(null);
   const pendingArchiveTraceIdsRef = useRef<Set<string>>(new Set());
-  const autoSelectedDeletedSummaryRef = useRef(false);
   const dragRef = useRef<{
     pointerId: number;
     startX: number;
@@ -321,6 +308,17 @@ export function TraceOverlay({
     [groupedTraces, inspectedSummary, selectedTraceId],
   );
   const visibleTraces = limitedTraces.records;
+  const visibleTraceById = useMemo(
+    () => new Map(visibleTraces.map((trace) => [trace.trace_id, trace])),
+    [visibleTraces],
+  );
+  const visibleTraceShapeKey = useMemo(
+    () =>
+      visibleTraces
+        .map((trace) => `${trace.trace_id}:${trace.parent_id ?? ""}:${trace.created_at}`)
+        .join("|"),
+    [visibleTraces],
+  );
   const selectedTrace = useMemo(
     () =>
       selectedTraceId
@@ -354,7 +352,6 @@ export function TraceOverlay({
 
   useEffect(() => {
     if (inspectedSummaryId && !inspectedSummary) {
-      autoSelectedDeletedSummaryRef.current = false;
       setInspectedSummaryId(null);
     }
   }, [inspectedSummary, inspectedSummaryId]);
@@ -402,7 +399,7 @@ export function TraceOverlay({
       nodes,
       viewBox: `${minX - 70} -34 ${maxY + 330} ${maxX - minX + 92}`,
     };
-  }, [visibleTraces]);
+  }, [visibleTraceShapeKey]);
 
   useEffect(() => {
     const svg = svgRef.current;
@@ -458,7 +455,6 @@ export function TraceOverlay({
     if (archivedTraces.length === 0) {
       return;
     }
-    autoSelectedDeletedSummaryRef.current = false;
     setPreferLiveWhenEmpty(false);
     setInspectedSummaryId(summary.summary_id);
     setSelectedTraceId(summary.deleted_trace_id);
@@ -466,34 +462,11 @@ export function TraceOverlay({
   }, [resetZoom]);
 
   const showLiveTraces = useCallback(() => {
-    autoSelectedDeletedSummaryRef.current = false;
     setPreferLiveWhenEmpty(true);
     setInspectedSummaryId(null);
     setSelectedTraceId(null);
     resetZoom();
   }, [resetZoom]);
-
-  useEffect(() => {
-    if (traces.length > 0) {
-      setPreferLiveWhenEmpty(false);
-      if (autoSelectedDeletedSummaryRef.current && inspectedSummaryId) {
-        autoSelectedDeletedSummaryRef.current = false;
-        setInspectedSummaryId(null);
-        setSelectedTraceId(null);
-      }
-      return;
-    }
-
-    if (preferLiveWhenEmpty || inspectedSummaryId || !restorableSummary) {
-      return;
-    }
-
-    setPreferLiveWhenEmpty(false);
-    autoSelectedDeletedSummaryRef.current = true;
-    setInspectedSummaryId(restorableSummary.summary_id);
-    setSelectedTraceId(restorableSummary.deleted_trace_id);
-    resetZoom();
-  }, [inspectedSummaryId, preferLiveWhenEmpty, resetZoom, restorableSummary, traces.length]);
 
   const copyExport = useCallback(async () => {
     setCopyStatus("Copy");
@@ -538,10 +511,6 @@ export function TraceOverlay({
       if (pendingArchiveTraceIdRef.current === traceId) {
         pendingArchiveTraceIdRef.current = null;
       }
-      if (autoSelectedDeletedSummaryRef.current && inspectedSummaryId) {
-        autoSelectedDeletedSummaryRef.current = false;
-        setInspectedSummaryId(null);
-      }
     }
 
     const unresolvedPendingTraceIds = pendingTraceIds.filter((traceId) => !liveTraceIds.has(traceId));
@@ -550,33 +519,12 @@ export function TraceOverlay({
     }
 
     for (const traceId of unresolvedPendingTraceIds) {
-      const summary =
-        summaries.find(
-          (item) =>
-            item.deleted_trace_id === traceId &&
-            archivedTracesForSummary(item).some((trace) => trace.trace_id === traceId),
-        ) ??
-        summaries.find((item) => item.deleted_trace_ids?.includes(traceId)) ??
-        summaries.find((item) =>
-          archivedTracesForSummary(item).some((trace) => trace.trace_id === traceId),
-        );
-
-      if (!summary || archivedTracesForSummary(summary).length === 0) {
-        continue;
-      }
-
       pendingArchiveTraceIdsRef.current.delete(traceId);
       if (pendingArchiveTraceIdRef.current === traceId) {
         pendingArchiveTraceIdRef.current = null;
       }
-      autoSelectedDeletedSummaryRef.current = true;
-      setPreferLiveWhenEmpty(false);
-      setInspectedSummaryId(summary.summary_id);
-      setSelectedTraceId(traceId);
-      resetZoom();
-      return;
     }
-  }, [inspectedSummaryId, resetZoom, summaries, traces]);
+  }, [inspectedSummaryId, traces]);
 
   const deleteTrace = useCallback(
     (traceId: string) => {
@@ -585,7 +533,8 @@ export function TraceOverlay({
       }
       pendingArchiveTraceIdsRef.current.add(traceId);
       pendingArchiveTraceIdRef.current = traceId;
-      setPreferLiveWhenEmpty(false);
+      setPreferLiveWhenEmpty(true);
+      setInspectedSummaryId(null);
       onDeleteTrace?.(traceId);
     },
     [onDeleteTrace],
@@ -722,18 +671,6 @@ export function TraceOverlay({
               <button type="button" onClick={onClearFailed} title="Clear failed traces">
                 Err
               </button>
-              <select
-                aria-label="Successful trace retention"
-                value={retentionSeconds}
-                onChange={(event) => onRetentionChange?.(Number(event.currentTarget.value))}
-                title="Keep successful traces"
-              >
-                {retentionOptions.map((option) => (
-                  <option key={option.seconds} value={option.seconds}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
               <span>{treeSourceTraces.length}</span>
             </div>
           </div>
@@ -753,7 +690,8 @@ export function TraceOverlay({
 
                   <g className="trace-nodes">
                     {layout.nodes.map((node) => {
-                      const trace = node.data.trace;
+                      const trace =
+                        visibleTraceById.get(node.data.trace.trace_id) ?? node.data.trace;
                       const label = durationLabel(trace);
                       const selected = trace.trace_id === selectedTraceId;
                       return (

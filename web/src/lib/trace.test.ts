@@ -154,7 +154,7 @@ test("keeps deleted summaries across duplicate summary and delete events", () =>
   expect(summaries[0]?.summary_id).toBe("trace-a");
 });
 
-test("deleting a parent removes known live descendants", () => {
+test("deleting a parent removes only explicitly deleted ids from live state", () => {
   const root = traceRecord("root");
   const parent = traceRecord("parent", "root");
   const child = traceRecord("child", "parent");
@@ -164,7 +164,7 @@ test("deleting a parent removes known live descendants", () => {
     { event: "trace:delete", data: { trace_ids: ["parent"] } },
   ]);
 
-  expect(traces.map((trace) => trace.trace_id)).toEqual(["root"]);
+  expect(traces.map((trace) => trace.trace_id)).toEqual(["root", "child", "grandchild"]);
 });
 
 test("late updates for deleted descendants do not reappear as roots", () => {
@@ -198,7 +198,7 @@ test("late updates for deleted descendants do not reappear as roots", () => {
   expect(afterLateUpdate.map((trace) => trace.trace_id)).toEqual(["root"]);
 });
 
-test("trace state reducer restores deleted subtree updates with a visible parent", () => {
+test("trace state reducer keeps archive frozen after delete despite late updates", () => {
   const peer = {
     ...traceRecord("peer"),
     name: "PeerContext-peer",
@@ -279,25 +279,13 @@ test("trace state reducer restores deleted subtree updates with a visible parent
     summary: afterLateUpdate.summaries[0],
   });
 
-  expect(afterLateUpdate.traces.map((trace) => trace.trace_id)).toEqual([
-    "peer",
-    "av1",
-    "srtp",
-    "ice",
-  ]);
-  expect(archived.map((trace) => trace.trace_id)).toEqual(["peer", "av1", "srtp", "ice"]);
-  expect(archived.find((trace) => trace.trace_id === "ice")?.metadata).toMatchObject({
-    archived_trace: true,
-    deleted_target: true,
-    call_count: 3154,
-    avg_duration_ms: 5.23,
-  });
-  expect(output).toContain("root_count=1");
-  expect(output).toContain("  - ws:av1-write-loop [running] media running");
-  expect(output).toContain("    - ice:send-rtp-packets [running] thread 3154 calls avg=5.23ms");
+  expect(afterLateUpdate.traces.map((trace) => trace.trace_id)).toEqual(["peer", "srtp"]);
+  expect(archived).toEqual([]);
+  expect(output).toContain("trace_count=0 root_count=0");
+  expect(output).toContain("- no traces");
 });
 
-test("trace state reducer archives the tree when every live trace is deleted", () => {
+test("trace state reducer does not backfill archived traces into pre-existing summaries", () => {
   const peer = {
     ...traceRecord("peer"),
     name: "PeerContext-peer",
@@ -365,11 +353,9 @@ test("trace state reducer archives the tree when every live trace is deleted", (
   });
 
   expect(state.traces).toEqual([]);
-  expect(archived.map((trace) => trace.trace_id)).toEqual(["peer", "av1", "srtp", "ice"]);
+  expect(archived).toEqual([]);
   expect(output).toContain("view=deleted");
-  expect(output).toContain("trace_count=4 root_count=1");
-  expect(output).toContain("- PeerContext-peer [running] peer running");
-  expect(output).toContain("  - ws:av1-write-loop [running] media running");
+  expect(output).toContain("trace_count=0 root_count=0");
 });
 
 test("trace state reducer synthesizes a deleted PeerContext summary without backend summary", () => {
@@ -389,7 +375,14 @@ test("trace state reducer synthesizes a deleted PeerContext summary without back
     summary,
   });
 
-  expect(state.traces).toEqual([]);
+  expect(state.traces.map((trace) => trace.trace_id)).toEqual([
+    "av1",
+    "rtcp",
+    "srtp",
+    "ice",
+    "rtcp-srtp",
+    "ice-check",
+  ]);
   expect(state.summaries).toHaveLength(1);
   expect(summary?.deleted_trace_id).toBe("peer");
   expect(new Set(summary?.deleted_trace_ids)).toEqual(
@@ -412,7 +405,7 @@ test("trace state reducer synthesizes a deleted PeerContext summary without back
   expect(output).toContain("    - ice:send-rtp-packets [running] thread 3154 calls avg=5.23ms");
 });
 
-test("trace state reducer merges a delayed backend summary with the local archive", () => {
+test("trace state reducer keeps synthesized archive when a delayed summary arrives", () => {
   const traces = peerContextTraceTree();
   const deleted = reduceTraceState(
     { ...createInitialTraceState(), traces },
@@ -437,7 +430,7 @@ test("trace state reducer merges a delayed backend summary with the local archiv
     deleted_trace_id: "peer",
     deleted_trace_ids: ["peer"],
     deleted_trace: {
-      ...traces[0],
+      ...traces[0]!,
       status: "completed",
       ended_at: 10,
       duration_ms: 9900,
@@ -452,7 +445,14 @@ test("trace state reducer merges a delayed backend summary with the local archiv
   const summary = merged.summaries[0];
   const archived = summary?.archived_traces ?? [];
 
-  expect(merged.traces).toEqual([]);
+  expect(merged.traces.map((trace) => trace.trace_id)).toEqual([
+    "av1",
+    "rtcp",
+    "srtp",
+    "ice",
+    "rtcp-srtp",
+    "ice-check",
+  ]);
   expect(merged.summaries).toHaveLength(1);
   expect(summary?.status).toBe("completed");
   expect(summary?.avg_duration_ms).toBe(42);
@@ -521,7 +521,7 @@ test("trace state reducer keeps deleted summaries after later trace init events"
   expect(output).toContain("trace_count=7 root_count=1");
 });
 
-test("trace state reducer restores deleted root when running heartbeat arrives", () => {
+test("trace state reducer does not restore deleted root when late heartbeat arrives", () => {
   const traces = peerContextTraceTree();
   const deleted = reduceTraceState(
     { ...createInitialTraceState(), traces },
@@ -543,30 +543,26 @@ test("trace state reducer restores deleted root when running heartbeat arrives",
   });
 
   expect(afterLateUpdate.traces.map((trace) => trace.trace_id)).toEqual([
-    "peer",
     "av1",
     "rtcp",
     "srtp",
-    "ice",
+    "rtcp-srtp",
+    "ice-check",
   ]);
-  expect(afterLateUpdate.traces.find((trace) => trace.trace_id === "ice")?.duration_ms).toBe(7000);
-  expect(afterLateUpdate.traces.find((trace) => trace.trace_id === "ice")?.metadata).not.toHaveProperty(
-    "archived_trace",
-  );
   expect(afterLateUpdate.summaries[0]?.archived_traces?.map((trace) => trace.trace_id)).toEqual(
     traces.map((trace) => trace.trace_id),
   );
   expect(
     afterLateUpdate.summaries[0]?.archived_traces?.find((trace) => trace.trace_id === "ice")
       ?.duration_ms,
-  ).toBe(7000);
+  ).toBeNull();
   expect(
     afterLateUpdate.summaries[0]?.archived_traces?.find((trace) => trace.trace_id === "ice")
       ?.metadata,
   ).toMatchObject({ archived_trace: true, deleted_target: true });
 });
 
-test("trace state reducer restores deleted heartbeat batch with latest durations", () => {
+test("trace state reducer keeps deleted archive snapshot frozen on heartbeat batch", () => {
   const traces = peerContextTraceTree().map((trace) =>
     trace.trace_id === "peer"
       ? { ...trace, duration_ms: 100 }
@@ -601,20 +597,15 @@ test("trace state reducer restores deleted heartbeat batch with latest durations
     ],
   });
 
-  expect(restored.traces.find((trace) => trace.trace_id === "peer")?.duration_ms).toBe(15000);
-  expect(restored.traces.find((trace) => trace.trace_id === "ice")?.duration_ms).toBe(7000);
-  expect(restored.traces.find((trace) => trace.trace_id === "ice")?.metadata).toMatchObject({
-    call_count: 400,
-    avg_duration_ms: 3.5,
-  });
+  expect(restored.traces.find((trace) => trace.trace_id === "peer")).toBeUndefined();
   expect(
     restored.summaries[0]?.archived_traces?.find((trace) => trace.trace_id === "peer")
       ?.duration_ms,
-  ).toBe(15000);
+  ).toBe(100);
   expect(
     restored.summaries[0]?.archived_traces?.find((trace) => trace.trace_id === "ice")
       ?.duration_ms,
-  ).toBe(7000);
+  ).toBe(100);
   expect(
     restored.summaries[0]?.archived_traces?.find((trace) => trace.trace_id === "ice")
       ?.metadata,
@@ -624,7 +615,7 @@ test("trace state reducer restores deleted heartbeat batch with latest durations
   });
 });
 
-test("trace state reducer does not regress archives to delete-time snapshots", () => {
+test("trace state reducer ignores stale delayed summaries", () => {
   const traces = peerContextTraceTree().map((trace) =>
     trace.trace_id === "peer" ? { ...trace, duration_ms: 100 } : trace,
   );
@@ -664,14 +655,12 @@ test("trace state reducer does not regress archives to delete-time snapshots", (
   expect(
     afterStaleSummary.summaries[0]?.archived_traces?.find((trace) => trace.trace_id === "peer")
       ?.duration_ms,
-  ).toBe(15000);
-  expect(afterStaleSummary.summaries[0]?.deleted_trace?.duration_ms).toBe(15000);
-  expect(afterStaleSummary.traces.find((trace) => trace.trace_id === "peer")?.duration_ms).toBe(
-    15000,
-  );
+  ).toBe(100);
+  expect(afterStaleSummary.summaries[0]?.deleted_trace?.duration_ms).toBe(100);
+  expect(afterStaleSummary.traces.find((trace) => trace.trace_id === "peer")).toBeUndefined();
 });
 
-test("trace state reducer lets terminal archived updates replace heartbeats", () => {
+test("trace state reducer ignores terminal updates for deleted traces", () => {
   const traces = peerContextTraceTree();
   const deleted = reduceTraceState(
     { ...createInitialTraceState(), traces },
@@ -699,19 +688,26 @@ test("trace state reducer lets terminal archived updates replace heartbeats", ()
     ],
   });
 
-  expect(afterTerminal.traces).toEqual([]);
+  expect(afterTerminal.traces.map((trace) => trace.trace_id)).toEqual([
+    "av1",
+    "rtcp",
+    "srtp",
+    "ice",
+    "rtcp-srtp",
+    "ice-check",
+  ]);
   expect(
     afterTerminal.summaries[0]?.archived_traces?.find((trace) => trace.trace_id === "peer")
       ?.status,
-  ).toBe("completed");
+  ).toBe("running");
   expect(
     afterTerminal.summaries[0]?.archived_traces?.find((trace) => trace.trace_id === "peer")
       ?.duration_ms,
-  ).toBe(16000);
-  expect(afterTerminal.summaries[0]?.deleted_trace?.status).toBe("completed");
+  ).toBeNull();
+  expect(afterTerminal.summaries[0]?.deleted_trace?.status).toBe("running");
 });
 
-test("trace state reducer does not restore completed late descendant updates", () => {
+test("trace state reducer keeps live unchanged for completed late descendant updates", () => {
   const traces = peerContextTraceTree();
   const deleted = reduceTraceState(
     { ...createInitialTraceState(), traces },
@@ -732,13 +728,19 @@ test("trace state reducer does not restore completed late descendant updates", (
     events: [{ event: "trace:update", data: { trace: completedIceUpdate } }],
   });
 
-  expect(afterLateUpdate.traces).toEqual([]);
+  expect(afterLateUpdate.traces.map((trace) => trace.trace_id)).toEqual([
+    "av1",
+    "rtcp",
+    "srtp",
+    "rtcp-srtp",
+    "ice-check",
+  ]);
   expect(afterLateUpdate.summaries[0]?.archived_traces?.map((trace) => trace.trace_id)).toEqual(
     traces.map((trace) => trace.trace_id),
   );
 });
 
-test("trace state reducer restores deleted root for late running children", () => {
+test("trace state reducer blocks resurrection from late running children", () => {
   const traces = peerContextTraceTree();
   const deleted = reduceTraceState(
     { ...createInitialTraceState(), traces },
@@ -769,24 +771,29 @@ test("trace state reducer restores deleted root for late running children", () =
     events: [{ event: "trace:update", data: { trace: runningChild } }],
   });
 
-  expect(afterCompletedParent.traces).toEqual([]);
-  expect(afterCompletedParent.summaries[0]?.archived_traces?.some(
-    (trace) => trace.trace_id === "late-parent",
-  )).toBe(true);
-  expect(afterRunningChild.traces.map((trace) => trace.trace_id)).toEqual([
-    "peer",
+  expect(afterCompletedParent.traces.map((trace) => trace.trace_id)).toEqual([
     "av1",
     "rtcp",
     "srtp",
     "ice",
-    "late-child",
+    "rtcp-srtp",
+    "ice-check",
   ]);
-  expect(afterRunningChild.traces.find((trace) => trace.trace_id === "late-child")?.parent_id).toBe(
-    "peer",
-  );
+  expect(afterCompletedParent.summaries[0]?.archived_traces?.some(
+    (trace) => trace.trace_id === "late-parent",
+  )).toBe(false);
+  expect(afterRunningChild.traces.map((trace) => trace.trace_id)).toEqual([
+    "av1",
+    "rtcp",
+    "srtp",
+    "ice",
+    "rtcp-srtp",
+    "ice-check",
+  ]);
+  expect(afterRunningChild.traces.find((trace) => trace.trace_id === "late-child")).toBeUndefined();
   expect(afterRunningChild.summaries[0]?.archived_traces?.some(
     (trace) => trace.trace_id === "late-child",
-  )).toBe(true);
+  )).toBe(false);
 });
 
 test("restores visible parent links through hidden completed ancestors", () => {
@@ -869,6 +876,57 @@ test("trace update replaces a running record with live duration", () => {
   expect(traces[0]?.trace_id).toBe("peer");
   expect(traces[0]?.status).toBe("running");
   expect(traces[0]?.duration_ms).toBe(125.5);
+});
+
+test("trace state reducer applies large batched heartbeat updates", () => {
+  const traces = Array.from({ length: 10000 }, (_, index) =>
+    liveTraceRecord(`trace-${index}`, null, {
+      created_at: index,
+      duration_ms: 1,
+      status: "running",
+    }),
+  );
+  const updates = traces.map((trace, index) => ({
+    ...trace,
+    duration_ms: 1000 + index,
+  }));
+
+  const initialized = reduceTraceState(createInitialTraceState(), {
+    type: "events",
+    events: [{ event: "trace:init", data: { traces } }],
+  });
+  const updated = reduceTraceState(initialized, {
+    type: "events",
+    events: [{ event: "trace:update", data: { traces: updates } }],
+  });
+
+  expect(updated.traces).toHaveLength(10000);
+  expect(updated.tracesById.size).toBe(10000);
+  expect(updated.traceOrder).toHaveLength(10000);
+  expect(updated.tracesById.get("trace-9999")?.duration_ms).toBe(10999);
+});
+
+test("trace state reducer ignores unchanged sparse heartbeat batches", () => {
+  const trace = liveTraceRecord("running", null, {
+    created_at: 1,
+    started_at: 1,
+    duration_ms: null,
+    status: "running",
+  });
+  const initialized = reduceTraceState(createInitialTraceState(), {
+    type: "events",
+    events: [{ event: "trace:init", data: { traces: [trace] } }],
+  });
+  const heartbeat = {
+    ...trace,
+    transitions: undefined,
+  };
+  const updated = reduceTraceState(initialized, {
+    type: "events",
+    events: [{ event: "trace:update", data: { traces: [heartbeat] } }],
+  });
+
+  expect(updated).toBe(initialized);
 });
 
 test("compact export shows elapsed duration for running peer context", () => {
@@ -996,6 +1054,20 @@ test("uses a snapshot transition when transition history is missing", () => {
   const output = formatTraceExport([trace]);
 
   expect(output).toContain("event=snapshot at=6 status=completed duration_ms=100");
+});
+
+test("formats live running duration from backend heartbeat snapshot", () => {
+  const trace: TraceRecord = {
+    ...traceRecord("running"),
+    created_at: 10,
+    started_at: 12,
+    duration_ms: 3000,
+    status: "running",
+  };
+
+  const output = formatTraceExport([trace], { compact: true });
+
+  expect(output).toContain("- running [running] task 3000ms");
 });
 
 test("formats compact export as grouped ui-style tree without details", () => {

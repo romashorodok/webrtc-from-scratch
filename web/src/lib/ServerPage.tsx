@@ -7,9 +7,9 @@ export function ServerPage() {
     clearFailedTraces,
     createOffer,
     deleteTrace,
-    setTraceRetentionSeconds,
     status,
-    successRetentionSeconds,
+    toasts,
+    dismissToast,
     summaries,
     traces,
     videoRef,
@@ -29,6 +29,18 @@ export function ServerPage() {
         <span className="status-label">Status</span>
         <span className="status-value">{status}</span>
       </div>
+      {toasts.length > 0 ? (
+        <div className="toast-stack" aria-live="polite">
+          {toasts.map((toast, index) => (
+            <div className="toast toast--error" key={`${toast}-${index}`}>
+              <span>{toast}</span>
+              <button type="button" onClick={() => dismissToast(index)} aria-label="Dismiss error">
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
 
       <div className="media-panel">
         <video ref={videoRef} controls autoPlay playsInline muted={false} />
@@ -45,8 +57,6 @@ export function ServerPage() {
         onClearCompleted={clearCompletedTraces}
         onClearFailed={clearFailedTraces}
         onDeleteTrace={deleteTrace}
-        onRetentionChange={setTraceRetentionSeconds}
-        retentionSeconds={successRetentionSeconds}
         summaries={summaries}
       />
     </section>

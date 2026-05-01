@@ -56,6 +56,7 @@ type TracePayload = {
   deleted_at?: number;
   peer_id?: string | null;
   success_retention_seconds?: number;
+  auto_prune?: boolean;
 };
 
 export type TraceEventInput = {
@@ -66,11 +67,11 @@ export type TraceEventInput = {
 export type TraceApplyOptions = {
   deletedTraceIds?: Set<string>;
   summaries?: TraceSummary[];
-  latestTraces?: Map<string, TraceRecord>;
 };
 
 export type TraceExportOptions = {
   compact?: boolean;
+  now?: number;
   summary?: TraceSummary | null;
   title?: string;
   view?: "live" | "deleted";
@@ -80,6 +81,8 @@ export type TraceState = {
   traces: TraceRecord[];
   summaries: TraceSummary[];
   deletedTraceIds: Set<string>;
+  tracesById: Map<string, TraceRecord>;
+  traceOrder: string[];
 };
 
 export type TraceStateAction = {
@@ -100,6 +103,8 @@ export function createInitialTraceState(): TraceState {
     traces: [],
     summaries: [],
     deletedTraceIds: new Set<string>(),
+    tracesById: new Map<string, TraceRecord>(),
+    traceOrder: [],
   };
 }
 
@@ -109,20 +114,12 @@ export function reduceTraceState(
 ): TraceState {
   const deletedTraceIds = new Set(state.deletedTraceIds);
   const archivedTrees = collectArchivedTreesForEvents(state.traces, action.events);
-  const latestTraces = latestTraceRecordsForEvents(action.events);
-  const summaries = updateArchivedSummariesWithTraceEvents(
-    synthesizeArchivedSummaries(
-      restoreArchivedSummaryTrees(
-        applyTraceSummaryEvents(state.summaries, action.events),
-        archivedTrees,
-      ),
-      archivedTrees,
-    ),
-    action.events,
+  const summaries = synthesizeArchivedSummaries(
+    applyTraceSummaryEvents(state.summaries, action.events),
+    archivedTrees,
   );
   const traces = applyTraceEvents(state.traces, action.events, {
     deletedTraceIds,
-    latestTraces,
     summaries,
   });
 
@@ -135,23 +132,13 @@ export function reduceTraceState(
     return state;
   }
 
-  return { deletedTraceIds, summaries, traces };
-}
-
-export function applyTraceEvent(
-  previous: TraceRecord[],
-  event: string,
-  data: unknown,
-): TraceRecord[] {
-  return applyTraceEvents(previous, [{ event, data }]);
-}
-
-export function applyTraceSummaryEvent(
-  previous: TraceSummary[],
-  event: string,
-  data: unknown,
-): TraceSummary[] {
-  return applyTraceSummaryEvents(previous, [{ event, data }]);
+  return {
+    deletedTraceIds,
+    summaries,
+    traces,
+    tracesById: new Map(traces.map((trace) => [trace.trace_id, trace])),
+    traceOrder: traces.map((trace) => trace.trace_id),
+  };
 }
 
 export function restoreVisibleTraceParents(
@@ -222,44 +209,13 @@ export function applyTraceEvents(
       changed = deleteLiveTraceIds(records, deletedIds, deletedTraceIds) || changed;
     }
 
-    if (payload.trace) {
-      if (traceBelongsToArchivedSummary(payload.trace, options.summaries)) {
-        if (
-          restoreDeletedTracePath(
-            payload.trace,
-            records,
-            deletedTraceIds,
-            options.summaries,
-            options.latestTraces,
-          )
-        ) {
-          changed = true;
-          continue;
-        }
+    for (const trace of traceRecordsFromPayload(payload)) {
+      if (isDeletedTrace(trace, records, deletedTraceIds)) {
         changed =
-          deleteLiveTraceIds(records, [payload.trace.trace_id], deletedTraceIds) || changed;
+          deleteLiveTraceIds(records, [trace.trace_id], deletedTraceIds) || changed;
         continue;
       }
-
-      if (isDeletedTrace(payload.trace, records, deletedTraceIds)) {
-        if (
-          restoreDeletedTracePath(
-            payload.trace,
-            records,
-            deletedTraceIds,
-            options.summaries,
-            options.latestTraces,
-          )
-        ) {
-          changed = true;
-          continue;
-        }
-        changed =
-          deleteLiveTraceIds(records, [payload.trace.trace_id], deletedTraceIds) || changed;
-        continue;
-      }
-      records.set(payload.trace.trace_id, payload.trace);
-      changed = true;
+      changed = upsertLiveTraceRecord(records, trace) || changed;
     }
   }
 
@@ -268,6 +224,23 @@ export function applyTraceEvents(
   }
 
   return [...records.values()].sort((a, b) => a.created_at - b.created_at);
+}
+
+function traceRecordsFromPayload(payload: TracePayload) {
+  return [
+    ...(payload.traces ?? []),
+    ...(payload.trace ? [payload.trace] : []),
+  ];
+}
+
+function upsertLiveTraceRecord(records: Map<string, TraceRecord>, incoming: TraceRecord) {
+  const previous = records.get(incoming.trace_id);
+  const next = previous ? latestTraceRecord(previous, incoming) : incoming;
+  if (previous && traceRecordsEquivalent(previous, next)) {
+    return false;
+  }
+  records.set(incoming.trace_id, next);
+  return true;
 }
 
 function deletedTraceIdsFromPayload(event: string, payload: TracePayload) {
@@ -286,8 +259,7 @@ function deleteLiveTraceIds(
   deletedTraceIds: Set<string> | undefined,
 ) {
   let changed = false;
-  const expandedTraceIds = collectTraceSubtreeIds(records, traceIds);
-  for (const traceId of expandedTraceIds) {
+  for (const traceId of traceIds) {
     deletedTraceIds?.add(traceId);
     changed = records.delete(traceId) || changed;
   }
@@ -322,6 +294,20 @@ function collectArchivedTreesForEvents(
     }
 
     if (item.event === "trace:delete") {
+      if (payload.auto_prune === true) {
+        const deletedIds = deletedTraceIdsFromPayload(item.event, payload);
+        const deletedRootIds = deletedRootTraceIdsFromPayload(records, payload);
+        for (const deletedId of deletedRootIds) {
+          addArchivedTraceTree(archives, records, deletedId, {
+            deletedAt: deletedAtForPayload(payload, records, deletedId),
+            synthesizeSummary: true,
+          });
+        }
+        for (const traceId of deletedIds) {
+          records.delete(traceId);
+        }
+        continue;
+      }
       const deletedIds = deletedTraceIdsFromPayload(item.event, payload);
       const deletedRootIds = deletedRootTraceIdsFromPayload(records, payload);
       const deletedSubtreeIds = collectTraceSubtreeIds(records, deletedIds);
@@ -353,8 +339,8 @@ function collectArchivedTreesForEvents(
       }
     }
 
-    if (payload.trace) {
-      records.set(payload.trace.trace_id, payload.trace);
+    for (const trace of traceRecordsFromPayload(payload)) {
+      records.set(trace.trace_id, trace);
     }
   }
 
@@ -393,30 +379,6 @@ function addArchivedTraceTree(
   });
 }
 
-function restoreArchivedSummaryTrees(
-  summaries: TraceSummary[],
-  archivedTrees: Map<string, ArchivedTraceTree>,
-) {
-  if (archivedTrees.size === 0) {
-    return summaries;
-  }
-
-  let changed = false;
-  const restored = summaries.map((summary) => {
-    const restoredArchive = deletedTraceIdsForSummary(summary).flatMap(
-      (traceId) => archivedTrees.get(traceId)?.archivedTraces ?? [],
-    );
-    if (restoredArchive.length === 0) {
-      return summary;
-    }
-
-    changed = true;
-    return mergeSummaryArchive(summary, restoredArchive);
-  });
-
-  return changed ? restored : summaries;
-}
-
 function synthesizeArchivedSummaries(
   summaries: TraceSummary[],
   archivedTrees: Map<string, ArchivedTraceTree>,
@@ -442,137 +404,14 @@ function synthesizeArchivedSummaries(
   return [...summaries, ...synthesized].sort((a, b) => b.deleted_at - a.deleted_at);
 }
 
-function updateArchivedSummariesWithTraceEvents(
-  summaries: TraceSummary[],
-  events: TraceEventInput[],
-) {
-  if (summaries.length === 0 || events.length === 0) {
-    return summaries;
-  }
-
-  let changed = false;
-  const nextSummaries = summaries.map((summary) => {
-    let nextSummary = summary;
-    for (const item of events) {
-      const payload = parseJson<TracePayload>(item.data);
-      if (!payload?.trace || item.event === "trace:init") {
-        continue;
-      }
-      const updated = mergeArchivedTraceIntoSummary(nextSummary, payload.trace);
-      if (updated !== nextSummary) {
-        changed = true;
-        nextSummary = updated;
-      }
-    }
-    return nextSummary;
-  });
-
-  return changed ? nextSummaries : summaries;
-}
-
-function latestTraceRecordsForEvents(events: TraceEventInput[]) {
-  const records = new Map<string, TraceRecord>();
-  for (const item of events) {
-    if (item.event === "trace:init") {
-      continue;
-    }
-    const payload = parseJson<TracePayload>(item.data);
-    if (payload?.trace) {
-      records.set(payload.trace.trace_id, payload.trace);
-    }
-  }
-  return records;
-}
-
-function mergeArchivedTraceIntoSummary(
-  summary: TraceSummary,
-  trace: TraceRecord,
-): TraceSummary {
-  const archived = archivedTracesForSummary(summary);
-  const hasArchivedTrace = archived.some((item) => item.trace_id === trace.trace_id);
-  const isDeletedTrace = summary.deleted_trace_id === trace.trace_id;
-  const hasArchivedParent = traceBelongsToArchivedSummary(trace, [summary]);
-  if (!hasArchivedTrace && !isDeletedTrace && !hasArchivedParent) {
-    return summary;
-  }
-
-  const archivedTraces = hasArchivedTrace
-    ? archived.map((item) =>
-        item.trace_id === trace.trace_id
-          ? mergeArchivedSnapshotRecord(item, trace)
-          : item,
-      )
-    : hasArchivedParent
-      ? mergeTraceRecords(archived, [archiveTraceRecord(trace, true)])
-    : archived;
-  const deletedTrace =
-    isDeletedTrace || summary.deleted_trace?.trace_id === trace.trace_id
-      ? mergeArchivedSnapshotRecord(summary.deleted_trace ?? trace, trace)
-      : summary.deleted_trace;
-
-  return {
-    ...summary,
-    status: isDeletedTrace ? trace.status : summary.status,
-    error: isDeletedTrace ? trace.error : summary.error,
-    avg_duration_ms: summary.avg_duration_ms,
-    delta_avg_duration_ms: summary.delta_avg_duration_ms,
-    deleted_trace: deletedTrace,
-    archived_traces: archivedTraces,
-  };
-}
-
-const ARCHIVE_FROZEN_METADATA_KEYS = [
-  "call_count",
-  "success_count",
-  "cancelled_count",
-  "error_count",
-  "total_duration_ms",
-  "avg_duration_ms",
-  "last_duration_ms",
-  "last_status",
-];
-
-function mergeArchivedSnapshotRecord(previous: TraceRecord, incoming: TraceRecord): TraceRecord {
-  const latest = latestTraceRecord(previous, incoming);
-  const archiveMetadata = previous.metadata ?? {};
-  const metadata = {
-    ...latest.metadata,
-    archived_trace: archiveMetadata.archived_trace ?? true,
-    deleted_target: archiveMetadata.deleted_target,
-    deleted_at: archiveMetadata.deleted_at,
-  };
-
-  for (const key of ARCHIVE_FROZEN_METADATA_KEYS) {
-    if (key in archiveMetadata) {
-      metadata[key] = archiveMetadata[key];
-    }
-  }
-
-  return {
-    ...latest,
-    metadata,
-  };
-}
-
-function mergeArchivedTraceRecord(previous: TraceRecord, incoming: TraceRecord): TraceRecord {
-  const latest = latestTraceRecord(previous, incoming);
-  const archiveMetadata = previous.metadata ?? {};
-  return {
-    ...latest,
-    metadata: {
-      ...latest.metadata,
-      archived_trace: archiveMetadata.archived_trace ?? true,
-      deleted_target: archiveMetadata.deleted_target,
-      deleted_at: archiveMetadata.deleted_at,
-    },
-  };
-}
-
 function createDeletedSummaryFromArchive(archive: ArchivedTraceTree): TraceSummary {
   const deletedTrace =
     archive.archivedTraces.find((trace) => trace.trace_id === archive.deletedTraceId) ??
     archive.archivedTraces.find((trace) => trace.metadata?.deleted_target === true) ??
     archive.archivedTraces[0];
+  if (!deletedTrace) {
+    throw new Error("cannot synthesize a deleted trace summary without archived traces");
+  }
   const metadata = deletedTrace.metadata ?? {};
   const groupKey = String(metadata.group_key ?? deletedTrace.name);
   const avgDuration = durationForDeletedTrace(deletedTrace, archive.deletedAt);
@@ -790,6 +629,70 @@ function latestTraceRecord(previous: TraceRecord, incoming: TraceRecord): TraceR
   return incoming;
 }
 
+function traceRecordsEquivalent(left: TraceRecord, right: TraceRecord) {
+  return (
+    left === right ||
+    (left.trace_id === right.trace_id &&
+      left.parent_id === right.parent_id &&
+      left.name === right.name &&
+      left.kind === right.kind &&
+      left.peer_id === right.peer_id &&
+      left.created_at === right.created_at &&
+      left.started_at === right.started_at &&
+      left.ended_at === right.ended_at &&
+      left.duration_ms === right.duration_ms &&
+      left.status === right.status &&
+      left.error === right.error &&
+      traceMetadataEquivalent(left.metadata, right.metadata) &&
+      traceTransitionsEquivalent(left.transitions, right.transitions))
+  );
+}
+
+function traceMetadataEquivalent(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+) {
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) {
+    return false;
+  }
+  for (const key of leftKeys) {
+    if (left[key] !== right[key]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function traceTransitionsEquivalent(
+  left: TraceTransition[] | undefined,
+  right: TraceTransition[] | undefined,
+) {
+  if (left === right) {
+    return true;
+  }
+  if (!left || !right || left.length !== right.length) {
+    return false;
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    const leftTransition = left[index];
+    const rightTransition = right[index];
+    if (
+      !leftTransition ||
+      !rightTransition ||
+      leftTransition.at !== rightTransition.at ||
+      leftTransition.event !== rightTransition.event ||
+      leftTransition.status !== rightTransition.status ||
+      leftTransition.duration_ms !== rightTransition.duration_ms ||
+      leftTransition.error !== rightTransition.error
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function isTerminalStatus(status: string) {
   return status === "completed" || status === "failed" || status === "cancelled";
 }
@@ -811,6 +714,13 @@ function setsEqual<T>(left: Set<T>, right: Set<T>) {
 }
 
 function collectTraceSubtreeIds(records: Map<string, TraceRecord>, traceIds: string[]) {
+  return collectTraceSubtreeIdsWithChildren(
+    buildTraceChildrenByParent(records),
+    traceIds,
+  );
+}
+
+function buildTraceChildrenByParent(records: Map<string, TraceRecord>) {
   const childrenByParent = new Map<string, string[]>();
   for (const trace of records.values()) {
     if (!trace.parent_id) {
@@ -820,11 +730,19 @@ function collectTraceSubtreeIds(records: Map<string, TraceRecord>, traceIds: str
     children.push(trace.trace_id);
     childrenByParent.set(trace.parent_id, children);
   }
+  return childrenByParent;
+}
 
+function collectTraceSubtreeIdsWithChildren(
+  childrenByParent: Map<string, string[]>,
+  traceIds: string[],
+) {
   const collected = new Set<string>();
   const pending = [...traceIds];
-  while (pending.length > 0) {
-    const traceId = pending.shift();
+  let index = 0;
+  while (index < pending.length) {
+    const traceId = pending[index];
+    index += 1;
     if (!traceId || collected.has(traceId)) {
       continue;
     }
@@ -859,82 +777,6 @@ function isDeletedTrace(
   return false;
 }
 
-function restoreDeletedTracePath(
-  trace: TraceRecord,
-  records: Map<string, TraceRecord>,
-  deletedTraceIds: Set<string> | undefined,
-  summaries: TraceSummary[] | undefined,
-  latestTraces: Map<string, TraceRecord> | undefined,
-) {
-  if (trace.status !== "running") {
-    return false;
-  }
-
-  const archived = archivedTracesForTrace(trace, summaries);
-  if (!archived) {
-    return false;
-  }
-
-  const byId = new Map(archived.map((item) => [item.trace_id, item]));
-  const restoreIds = new Set([
-    ...archived
-      .filter((item) => item.status === "running")
-      .map((item) => item.trace_id),
-    trace.trace_id,
-  ]);
-  const visibleIds = new Set([
-    ...records.keys(),
-    ...restoreIds,
-  ]);
-
-  for (const archivedTrace of archived) {
-    records.delete(archivedTrace.trace_id);
-  }
-
-  for (const archivedTrace of archived) {
-    if (archivedTrace.trace_id === trace.trace_id || !restoreIds.has(archivedTrace.trace_id)) {
-      continue;
-    }
-
-    const latestTrace = latestTraces?.get(archivedTrace.trace_id);
-    const sourceTrace = latestTrace
-      ? mergeArchivedTraceRecord(archivedTrace, latestTrace)
-      : archivedTrace;
-    const parentId = nearestVisibleAncestorId(archivedTrace.parent_id, byId, visibleIds);
-    const restored = restoreLiveTraceRecord(
-      sourceTrace,
-      parentId,
-    );
-    records.set(restored.trace_id, restored);
-    deletedTraceIds?.delete(restored.trace_id);
-  }
-  const parentId = nearestVisibleAncestorId(trace.parent_id, byId, visibleIds);
-  records.set(trace.trace_id, {
-    ...restoreLiveTraceRecord(trace, parentId),
-    parent_id: parentId,
-  });
-  deletedTraceIds?.delete(trace.trace_id);
-  return true;
-}
-
-function archivedTracesForTrace(
-  trace: TraceRecord,
-  summaries: TraceSummary[] | undefined,
-) {
-  if (!summaries || summaries.length === 0) {
-    return null;
-  }
-
-  for (const summary of summaries) {
-    const archived = archivedTracesForSummary(summary);
-    if (archivedTracePathForTrace(trace, [summary]).length > 0) {
-      return archived;
-    }
-  }
-
-  return null;
-}
-
 function nearestVisibleAncestorId(
   parentId: string | null,
   byId: Map<string, TraceRecord>,
@@ -950,60 +792,6 @@ function nearestVisibleAncestorId(
     currentId = byId.get(currentId)?.parent_id ?? null;
   }
   return null;
-}
-
-function traceBelongsToArchivedSummary(
-  trace: TraceRecord,
-  summaries: TraceSummary[] | undefined,
-) {
-  return archivedTracePathForTrace(trace, summaries).length > 0;
-}
-
-function archivedTracePathForTrace(
-  trace: TraceRecord,
-  summaries: TraceSummary[] | undefined,
-) {
-  if (!summaries || summaries.length === 0) {
-    return [];
-  }
-
-  for (const summary of summaries) {
-    const archived = archivedTracesForSummary(summary);
-    const byId = new Map(archived.map((item) => [item.trace_id, item]));
-    const path: TraceRecord[] = [];
-    let traceId = byId.has(trace.trace_id) ? trace.trace_id : trace.parent_id;
-    const seen = new Set<string>();
-
-    while (traceId && !seen.has(traceId)) {
-      seen.add(traceId);
-      const archivedTrace = byId.get(traceId);
-      if (!archivedTrace) {
-        break;
-      }
-      path.push(archivedTrace);
-      traceId = archivedTrace.parent_id;
-    }
-
-    if (path.length > 0) {
-      return path.reverse();
-    }
-  }
-
-  return [];
-}
-
-function restoreLiveTraceRecord(
-  trace: TraceRecord,
-  parentId: string | null,
-): TraceRecord {
-  const { archived_trace: _archivedTrace, deleted_target: _deletedTarget, ...metadata } =
-    trace.metadata;
-  return {
-    ...trace,
-    parent_id: parentId,
-    metadata,
-    transitions: trace.transitions ? [...trace.transitions] : undefined,
-  };
 }
 
 export function applyTraceSummaryEvents(
@@ -1027,10 +815,6 @@ export function applyTraceSummaryEvents(
     if (payload.summary) {
       upsertTraceSummary(summaries, payload.summary);
       changed = true;
-    }
-
-    if (payload.trace && payload.trace.status !== "running") {
-      changed = upsertHiddenArchivedTrace(summaries, payload.trace) || changed;
     }
   }
 
@@ -1056,24 +840,6 @@ function upsertTraceSummary(
     summaries.delete(existing.summary_id);
   }
   summaries.set(next.summary_id, next);
-}
-
-function upsertHiddenArchivedTrace(
-  summaries: Map<string, TraceSummary>,
-  trace: TraceRecord,
-) {
-  for (const summary of summaries.values()) {
-    if (!traceBelongsToArchivedSummary(trace, [summary])) {
-      continue;
-    }
-
-    summaries.set(summary.summary_id, mergeSummaryArchive(summary, [
-      archiveTraceRecord(trace, true),
-    ]));
-    return true;
-  }
-
-  return false;
 }
 
 export function formatTraceExport(
@@ -1190,7 +956,11 @@ function buildTraceForest(traces: OrderedTrace[]): TraceTreeNode[] {
   return roots;
 }
 
-function appendTraceTreeLines(lines: string[], node: TraceTreeNode, depth: number) {
+function appendTraceTreeLines(
+  lines: string[],
+  node: TraceTreeNode,
+  depth: number,
+) {
   const trace = node.trace;
   const indent = "  ".repeat(depth);
   const parts = [
@@ -1215,7 +985,11 @@ function appendTraceTreeLines(lines: string[], node: TraceTreeNode, depth: numbe
   }
 }
 
-function appendCompactTraceTreeLines(lines: string[], node: TraceTreeNode, depth: number) {
+function appendCompactTraceTreeLines(
+  lines: string[],
+  node: TraceTreeNode,
+  depth: number,
+) {
   const trace = node.trace;
   const indent = "  ".repeat(depth);
   const label = compactTraceLabel(trace);
