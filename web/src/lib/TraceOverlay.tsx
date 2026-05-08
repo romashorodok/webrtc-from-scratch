@@ -196,7 +196,6 @@ function buildTree(traces: TraceRecord[]) {
       parent_id: null,
       name: "Runtime",
       kind: "root",
-      peer_id: null,
       created_at: 0,
       started_at: null,
       ended_at: null,

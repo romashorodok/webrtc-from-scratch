@@ -9,10 +9,8 @@ from typing import Any
 class TaskContext:
     trace_id: str
     parent_id: str | None
-    root_trace_id: str
     name: str
     kind: str
-    peer_id: str | None = None
     created_at: float = field(default_factory=time.time)
     created_monotonic_ns: int = field(default_factory=time.monotonic_ns)
     started_at: float | None = None
@@ -29,10 +27,8 @@ class TaskContext:
         return {
             "trace_id": self.trace_id,
             "parent_id": self.parent_id,
-            "root_trace_id": self.root_trace_id,
             "name": self.name,
             "kind": self.kind,
-            "peer_id": self.peer_id,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "ended_at": self.ended_at,
@@ -47,7 +43,7 @@ class TaskContext:
 @dataclass(slots=True)
 class TraceNode:
     node_id: int
-    trace_id: str
+    context: TaskContext
     parent: int | None
     first_child: int | None = None
     last_child: int | None = None
@@ -55,5 +51,7 @@ class TraceNode:
     next_sibling: int | None = None
     prev_root: int | None = None
     next_root: int | None = None
-    hidden: bool = False
-    archived: bool = False
+
+    @property
+    def trace_id(self) -> str:
+        return self.context.trace_id

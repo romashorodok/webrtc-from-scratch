@@ -6,9 +6,10 @@ from webrtc.runtime import WebRTCRuntimeResources
 
 async def pump_trace_updates(
     runtime: WebRTCRuntimeResources,
-    peer_id: str,
     send_json: Callable[[dict[str, Any]], Awaitable[None]],
     *,
+    peer_id: str | None = None,
+    scope_trace_id: str | None = None,
     heartbeat_interval: float = 0.25,
     heartbeat_keepalive_interval: float = 2.5,
     update_flush_interval: float = 0.25,
@@ -33,10 +34,7 @@ async def pump_trace_updates(
         if not pending_updates:
             return None
 
-        data: dict[str, Any] = {
-            "peer_id": peer_id,
-            "traces": list(pending_updates.values()),
-        }
+        data: dict[str, Any] = {"traces": list(pending_updates.values())}
         if pending_sequence:
             data["sequence"] = pending_sequence
         pending_updates.clear()
@@ -57,9 +55,9 @@ async def pump_trace_updates(
             return
         next_batch_flush = None
         if events:
-            await send_trace_batch(send_json, events, peer_id=peer_id)
+            await send_trace_batch(send_json, events)
         if update is not None:
-            await send_trace_batch(send_json, [update], peer_id=peer_id)
+            await send_trace_batch(send_json, [update])
 
     def add_pending_update_event(event: dict[str, Any]) -> None:
         nonlocal pending_sequence
@@ -94,8 +92,8 @@ async def pump_trace_updates(
         {
             "event": "trace:init",
             "data": {
-                "peer_id": peer_id,
-                "traces": runtime.trace_live_tree(peer_id=peer_id),
+                "traces": runtime.trace_live_tree(scope_trace_id=scope_trace_id),
+                **({"peer_id": peer_id} if peer_id is not None else {}),
             },
         }
     )
@@ -117,22 +115,19 @@ async def pump_trace_updates(
                     continue
 
                 heartbeat_due = now - last_heartbeat_emit >= heartbeat_keepalive_interval
-                traces = runtime.trace_live_running(
-                    include_duration=heartbeat_due,
-                    peer_id=peer_id,
-                )
-                signature = tuple(
-                    (trace["trace_id"], trace["parent_id"], trace["status"])
-                    for trace in traces
-                )
+                signature = runtime.trace_running_signature(scope_trace_id=scope_trace_id)
                 should_emit = (
-                    bool(traces)
+                    bool(signature)
                     and (
                         signature != last_heartbeat_signature
                         or heartbeat_due
                     )
                 )
                 if should_emit:
+                    traces = runtime.trace_live_running(
+                        include_duration=heartbeat_due,
+                        scope_trace_id=scope_trace_id,
+                    )
                     for trace in traces:
                         add_pending_trace(trace)
                     last_heartbeat_emit = now
@@ -164,15 +159,12 @@ def trace_events_from_subscription_event(event: dict[str, Any]) -> list[dict[str
 async def send_trace_batch(
     send_json: Callable[[dict[str, Any]], Awaitable[None]],
     events: list[dict[str, Any]],
-    *,
-    peer_id: str,
 ) -> None:
     if not events:
         return
 
     if len(events) == 1 and events[0].get("event") == "trace:update":
         data = dict(events[0].get("data") or {})
-        data["peer_id"] = peer_id
         await send_json(
             {
                 "event": "trace:batch",
@@ -184,10 +176,7 @@ async def send_trace_batch(
     await send_json(
         {
             "event": "trace:batch",
-            "data": {
-                "peer_id": peer_id,
-                "events": events,
-            },
+            "data": {"events": events},
         }
     )
 

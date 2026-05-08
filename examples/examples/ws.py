@@ -297,7 +297,12 @@ async def ws_endpoint(ws: WebSocket):
 
     async with PeerContext(pc, runtime=runtime) as peer:
         trace_task = peer.spawn_app(
-            pump_trace_updates(runtime, peer.peer_id, send_json),
+            pump_trace_updates(
+                runtime,
+                send_json,
+                peer_id=peer.peer_id,
+                scope_trace_id=peer.root_trace_id,
+            ),
             name=f"ws:trace-pump-{peer.peer_id}",
             kind="trace",
         )
@@ -393,14 +398,11 @@ async def ws_endpoint(ws: WebSocket):
                     scope = payload.get("scope")
 
                     if isinstance(trace_id, str):
-                        runtime.delete_trace(trace_id)
+                        runtime.delete_trace(trace_id, peer_id=peer.peer_id)
                     elif scope == "failed":
-                        runtime.delete_traces(peer_id=peer.peer_id, statuses={"failed"})
+                        runtime.delete_traces(statuses={"failed"}, peer_id=peer.peer_id)
                     elif scope == "completed":
-                        runtime.delete_traces(
-                            peer_id=peer.peer_id,
-                            statuses={"completed", "cancelled"},
-                        )
+                        runtime.delete_traces(statuses={"completed", "cancelled"}, peer_id=peer.peer_id)
 
                 case _:
                     print("Unknown event")

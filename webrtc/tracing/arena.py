@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .models import TraceNode
+from .models import TaskContext, TraceNode
 
 
 @dataclass(slots=True)
@@ -14,6 +14,7 @@ class RootLinks:
 class TraceArena:
     def __init__(self) -> None:
         self.nodes: list[TraceNode | None] = []
+        self.free_node_ids: list[int] = []
         self.trace_to_node: dict[str, int] = {}
         self.roots = RootLinks()
 
@@ -25,26 +26,31 @@ class TraceArena:
             return None
         return self.nodes[node_id]
 
-    def add(self, trace_id: str, parent: int | None) -> TraceNode:
-        node_id = len(self.nodes)
-        node = TraceNode(node_id=node_id, trace_id=trace_id, parent=parent)
-        self.nodes.append(node)
-        self.trace_to_node[trace_id] = node_id
+    def add(self, context: TaskContext, parent: int | None) -> TraceNode:
+        node_id = self.free_node_ids.pop() if self.free_node_ids else len(self.nodes)
+        node = TraceNode(node_id=node_id, context=context, parent=parent)
+        if node_id == len(self.nodes):
+            self.nodes.append(node)
+        else:
+            self.nodes[node_id] = node
+        self.trace_to_node[context.trace_id] = node_id
         if parent is None:
             self._append_root(node)
         else:
             self._append_child(parent, node)
         return node
 
-    def remove(self, trace_id: str) -> None:
+    def remove(self, trace_id: str) -> TraceNode | None:
         node_id = self.trace_to_node.pop(trace_id, None)
         if node_id is None:
-            return
+            return None
         node = self.nodes[node_id]
         if node is None:
-            return
+            return None
         self._detach(node)
         self.nodes[node_id] = None
+        self.free_node_ids.append(node_id)
+        return node
 
     def remove_and_promote_children(self, trace_id: str) -> list[str]:
         node_id = self.trace_to_node.pop(trace_id, None)
@@ -68,6 +74,7 @@ class TraceArena:
         else:
             self._detach(node)
         self.nodes[node_id] = None
+        self.free_node_ids.append(node_id)
         return child_ids
 
     def _append_root(self, node: TraceNode) -> None:
@@ -150,10 +157,17 @@ class TraceArena:
             else:
                 self.roots.last = last_child.node_id
             last_child.next_root = node.next_root
-            child = first_child
+            child: TraceNode | None = first_child
+            previous: TraceNode | None = prev_root
             while child is not None:
+                next_child = self.get_node(child.next_sibling)
                 child.parent = None
-                child = self.get_node(child.next_sibling)
+                child.prev_root = previous.node_id if previous is not None else None
+                child.next_root = next_child.node_id if next_child is not None else node.next_root
+                child.prev_sibling = None
+                child.next_sibling = None
+                previous = child
+                child = next_child
             return
 
         parent = self.get_node(node.parent)

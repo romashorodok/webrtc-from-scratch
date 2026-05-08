@@ -49,12 +49,9 @@ class WebRTCRuntimeResources:
         owns_executor: bool | None = None,
         max_workers: int = 4,
         max_pending_offloads: int | None = None,
-        trace_history_limit: int = 2048,
         trace_context_limit: int = 4096,
-        trace_archive_limit: int = 8192,
         trace_group_update_interval: float = 0.5,
-        trace_subscriber_batch_interval: float = 0.25,
-        success_trace_retention_seconds: float = 60.0,
+        trace_subscriber_batch_interval: float = 0.5,
     ) -> None:
         if max_pending_offloads is not None:
             offload_capacity = max_pending_offloads
@@ -73,8 +70,9 @@ class WebRTCRuntimeResources:
             trace_subscriber_batch_interval=trace_subscriber_batch_interval,
             executor=self._executor,
         )
-        self._trace_groups: dict[tuple[str | None, str | None, str, str, str], TaskContext] = {}
+        self._trace_groups: dict[tuple[str | None, str, str, str], TaskContext] = {}
         self._trace_group_last_emit: dict[str, float] = {}
+        self._trace_group_emit_handles: dict[str, asyncio.TimerHandle] = {}
         self._task_registry_lock = RLock()
         self._task_registry: dict[str, RuntimeTaskEntry] = {}
 
@@ -97,7 +95,6 @@ class WebRTCRuntimeResources:
         *,
         name: str,
         kind: str = "task",
-        peer_id: str | None = None,
         parent: TaskContext | None | object = None,
         parent_id: str | None = None,
         metadata: Mapping[str, Any] | None = None,
@@ -112,7 +109,6 @@ class WebRTCRuntimeResources:
         return self._tracing.create_context(
             name=name,
             kind=kind,
-            peer_id=peer_id,
             parent=parent_context,
             parent_id=parent_id,
             metadata=metadata,
@@ -149,31 +145,30 @@ class WebRTCRuntimeResources:
         *,
         name: str,
         kind: str,
-        peer_id: str | None = None,
         parent: TaskContext | None = None,
         group_key: str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> TaskContext:
         parent_context = parent or get_current_task_context()
         key = (
-            peer_id or (parent_context.peer_id if parent_context else None),
             parent_context.trace_id if parent_context else None,
             group_key or name,
             name,
             kind,
         )
         existing = self._trace_groups.get(key)
-        if existing is not None and existing.status != "failed":
+        if existing is not None and existing.status in {"created", "running"}:
             return existing
+        if existing is not None:
+            self._forget_trace_group(key, existing.trace_id)
 
         group = self.create_task_context(
             name=name,
             kind=kind,
-            peer_id=key[0],
             parent=parent_context,
             metadata={
                 "trace_group": True,
-                "group_key": key[2],
+                "group_key": key[1],
                 "call_count": 0,
                 "success_count": 0,
                 "cancelled_count": 0,
@@ -215,20 +210,38 @@ class WebRTCRuntimeResources:
         else:
             metadata["error_count"] = int(metadata.get("error_count", 0)) + 1
             self.complete_task_context(group, status="failed", error=error)
+            self._forget_trace_group_by_id(group.trace_id)
             return
 
-        should_emit = force or (now - self._trace_group_last_emit.get(group.trace_id, 0.0) >= self._trace_group_update_interval)
+        should_emit = force or (
+            now - self._trace_group_last_emit.get(group.trace_id, 0.0) >= self._trace_group_update_interval
+        )
         if should_emit:
             self._trace_group_last_emit[group.trace_id] = now
+            self._cancel_trace_group_emit(group.trace_id)
             self._tracing.start_context(group)
+            return
 
-    def close_trace_groups(self, *, peer_id: str | None = None) -> None:
+        if group.trace_id not in self._trace_group_emit_handles:
+            remaining = max(
+                0.0,
+                self._trace_group_update_interval - (now - self._trace_group_last_emit.get(group.trace_id, 0.0)),
+            )
+            loop = asyncio.get_running_loop()
+            self._trace_group_emit_handles[group.trace_id] = loop.call_later(
+                remaining,
+                self._emit_trace_group_update,
+                group.trace_id,
+            )
+
+    def close_trace_groups(self, trace_ids: set[str] | None = None) -> None:
         for group in list(self._trace_groups.values()):
-            if peer_id is not None and group.peer_id != peer_id:
+            if trace_ids is not None and group.trace_id not in trace_ids:
                 continue
             if group.status == "failed":
                 continue
             self.complete_task_context(group, status="completed")
+            self._forget_trace_group_by_id(group.trace_id)
 
     async def trace_awaitable(
         self,
@@ -236,14 +249,12 @@ class WebRTCRuntimeResources:
         *,
         name: str | None = None,
         kind: str = "task",
-        peer_id: str | None = None,
         metadata: Mapping[str, Any] | None = None,
         context: TaskContext | None = None,
     ) -> T:
         task_context = context or self.create_task_context(
             name=name or self._awaitable_name(awaitable),
             kind=kind,
-            peer_id=peer_id,
             metadata=metadata,
         )
         self.start_task_context(task_context)
@@ -277,7 +288,6 @@ class WebRTCRuntimeResources:
         *,
         name: str | None = None,
         kind: str = "task",
-        peer_id: str | None = None,
         metadata: Mapping[str, Any] | None = None,
         loop: asyncio.AbstractEventLoop | None = None,
         context: TaskContext | None = None,
@@ -285,7 +295,6 @@ class WebRTCRuntimeResources:
         trace_context = context or self.create_task_context(
             name=name or self._awaitable_name(awaitable),
             kind=kind,
-            peer_id=peer_id,
             metadata=metadata,
         )
         return self.create_task(
@@ -294,7 +303,7 @@ class WebRTCRuntimeResources:
             loop=loop,
         )
 
-    async def offload_sync(self, *args: Any, name: str | None = None, kind: str = "thread", peer_id: str | None = None, metadata: Mapping[str, Any] | None = None, aggregate: bool = False, group_name: str | None = None, group_key: str | None = None, **kwargs: Any) -> T:
+    async def offload_sync(self, *args: Any, name: str | None = None, kind: str = "thread", metadata: Mapping[str, Any] | None = None, aggregate: bool = False, group_name: str | None = None, group_key: str | None = None, **kwargs: Any) -> T:
         if not args:
             raise TypeError("offload_sync requires a callable")
 
@@ -313,9 +322,9 @@ class WebRTCRuntimeResources:
             raise TypeError("offload_sync expected a callable")
 
         if aggregate:
-            return await self._offload_sync_aggregate(loop, fn, *fn_args, name=name, kind=kind, peer_id=peer_id, metadata=metadata, group_name=group_name, group_key=group_key, **kwargs)
+            return await self._offload_sync_aggregate(loop, fn, *fn_args, name=name, kind=kind, metadata=metadata, group_name=group_name, group_key=group_key, **kwargs)
 
-        trace_context = self.create_task_context(name=name or getattr(fn, "__qualname__", getattr(fn, "__name__", "offload")), kind=kind, peer_id=peer_id, metadata=metadata)
+        trace_context = self.create_task_context(name=name or getattr(fn, "__qualname__", getattr(fn, "__name__", "offload")), kind=kind, metadata=metadata)
         self.start_task_context(trace_context)
         self._register_task_entry(
             trace_id=trace_context.trace_id,
@@ -353,15 +362,15 @@ class WebRTCRuntimeResources:
             self._set_task_entry_active(trace_context.trace_id, False)
             reset_current_task_context(token)
 
-    async def to_thread(self, fn: Callable[..., T], *args: Any, name: str | None = None, peer_id: str | None = None, metadata: Mapping[str, Any] | None = None, aggregate: bool = False, group_name: str | None = None, group_key: str | None = None, **kwargs: Any) -> T:
-        return await self.offload_sync(fn, *args, name=name, kind="thread", peer_id=peer_id, metadata=metadata, aggregate=aggregate, group_name=group_name, group_key=group_key, **kwargs)
+    async def to_thread(self, fn: Callable[..., T], *args: Any, name: str | None = None, metadata: Mapping[str, Any] | None = None, aggregate: bool = False, group_name: str | None = None, group_key: str | None = None, **kwargs: Any) -> T:
+        return await self.offload_sync(fn, *args, name=name, kind="thread", metadata=metadata, aggregate=aggregate, group_name=group_name, group_key=group_key, **kwargs)
 
-    async def _offload_sync_aggregate(self, loop: asyncio.AbstractEventLoop, fn: Callable[..., T], *args: Any, name: str | None, kind: str, peer_id: str | None, metadata: Mapping[str, Any] | None, group_name: str | None, group_key: str | None, **kwargs: Any) -> T:
+    async def _offload_sync_aggregate(self, loop: asyncio.AbstractEventLoop, fn: Callable[..., T], *args: Any, name: str | None, kind: str, metadata: Mapping[str, Any] | None, group_name: str | None, group_key: str | None, **kwargs: Any) -> T:
         if self._shutdown:
             raise RuntimeError("WebRTC runtime is shutting down")
         parent = get_current_task_context()
         call_name = name or getattr(fn, "__qualname__", getattr(fn, "__name__", "offload"))
-        group = self.get_or_create_trace_group(name=group_name or call_name, kind=kind, peer_id=peer_id, parent=parent, group_key=group_key or call_name, metadata=metadata)
+        group = self.get_or_create_trace_group(name=group_name or call_name, kind=kind, parent=parent, group_key=group_key or call_name, metadata=metadata)
         token = set_current_task_context(group)
         started = asyncio.get_running_loop().time()
 
@@ -389,86 +398,64 @@ class WebRTCRuntimeResources:
         finally:
             reset_current_task_context(token)
 
-    def trace_live_tree(self, peer_id: str | None = None) -> list[dict[str, Any]]:
-        return self._tracing.trace_live_tree(peer_id=peer_id)
+    def trace_live_tree(self, *, scope_trace_id: str | None = None) -> list[dict[str, Any]]:
+        return self._tracing.store.live_tree(scope_trace_id=scope_trace_id)
 
-    def trace_live_running(self, peer_id: str | None = None, include_duration: bool = False) -> list[dict[str, Any]]:
-        return self._tracing.trace_live_running(peer_id=peer_id, include_duration=include_duration)
+    def trace_live_running(
+        self,
+        include_duration: bool = False,
+        *,
+        scope_trace_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self._tracing.trace_live_running(
+            include_duration=include_duration,
+            scope_trace_id=scope_trace_id,
+        )
 
-    def trace_subscribe(self, *, maxsize: int = 1024, peer_id: str | None = None) -> TraceSubscription:
+    def trace_running_signature(
+        self,
+        *,
+        scope_trace_id: str | None = None,
+    ) -> tuple[tuple[str, str | None, str], ...]:
+        return self._tracing.trace_running_signature(scope_trace_id=scope_trace_id)
+
+    def trace_subscribe(
+        self,
+        *,
+        maxsize: int = 1024,
+        peer_id: str | None = None,
+    ) -> TraceSubscription:
         return self._tracing.trace_subscribe(maxsize=maxsize, peer_id=peer_id)
 
-    # Compatibility APIs
-    def trace_snapshot(self, *, peer_id: str | None = None) -> list[dict[str, Any]]:
-        return self.trace_live_tree(peer_id=peer_id)
-
-    def running_trace_snapshot(self, *, peer_id: str | None = None) -> list[dict[str, Any]]:
-        return self.trace_live_running(peer_id=peer_id, include_duration=True)
-
-    def running_trace_heartbeat_snapshot(self, *, include_duration: bool = False, peer_id: str | None = None) -> list[dict[str, Any]]:
-        return self.trace_live_running(peer_id=peer_id, include_duration=include_duration)
-
-    def subscribe_traces(self, *, maxsize: int = 1024, peer_id: str | None = None) -> TraceSubscription:
-        return self.trace_subscribe(maxsize=maxsize, peer_id=peer_id)
-
-    def unsubscribe_traces(self, subscription: TraceSubscription) -> None:
-        subscription.close()
-
-    def delete_trace(self, trace_id: str) -> bool:
-        subtree_ids = self._tracing.store.subtree_ids(trace_id)
-        if not subtree_ids:
-            self._tracing.events.publish(
-                "trace:delete_result",
-                {"success": False, "trace_id": trace_id, "reason": "trace_not_found", "failed_trace_ids": []},
-            )
-            return False
-        running_ids: list[str] = []
-        failed_ids: list[str] = []
-        peer_id: str | None = None
-        for tid in subtree_ids:
-            ctx = self._tracing.store.context_by_id(tid)
-            if ctx is None:
-                continue
-            peer_id = peer_id or ctx.peer_id
-            if ctx.status in {"created", "running"}:
-                running_ids.append(tid)
-                if not self._is_running_trace_cancelable(ctx):
-                    failed_ids.append(tid)
-        if failed_ids:
-            self._tracing.events.publish(
-                "trace:delete_result",
-                {
-                    "success": False,
-                    "trace_id": trace_id,
-                    "trace_ids": subtree_ids,
-                    "peer_id": peer_id,
-                    "reason": "non_cancelable_path",
-                    "failed_trace_ids": failed_ids,
-                },
-            )
-            return False
-        for tid in running_ids:
-            entry = self._task_entry(tid)
-            if entry and entry.task and not entry.task.done():
-                entry.task.cancel()
-        ok, ids, event_peer = self._tracing.remove_trace_subtree(trace_id)
-        self._tracing.events.publish(
-            "trace:delete_result",
-            {
-                "success": bool(ok),
-                "trace_id": trace_id,
-                "trace_ids": ids if ok else subtree_ids,
-                "peer_id": event_peer or peer_id,
-                "reason": None if ok else "delete_failed",
-                "failed_trace_ids": [],
-            },
+    def delete_trace(self, trace_id: str, *, peer_id: str | None = None) -> bool:
+        deleted_contexts = self._tracing.store.subtree_contexts(trace_id)
+        ok = self._tracing.delete_trace(
+            trace_id,
+            is_cancelable=self._is_running_trace_cancelable,
+            cancel_trace=self._cancel_running_trace,
+            mark_inactive=lambda tid: self._set_task_entry_active(tid, False),
+            peer_id=peer_id,
         )
-        for tid in ids:
-            self._set_task_entry_active(tid, False)
+        if ok:
+            for context in deleted_contexts:
+                self._forget_trace_group_by_id(context.trace_id)
         return ok
 
-    def delete_traces(self, *, peer_id: str | None = None, statuses: set[str] | None = None, include_running: bool = False) -> int:
-        return self._tracing.delete_traces(peer_id=peer_id, statuses=statuses, include_running=include_running)
+    def delete_traces(
+        self,
+        *,
+        statuses: set[str] | None = None,
+        include_running: bool = False,
+        peer_id: str | None = None,
+    ) -> int:
+        count, ids = self._tracing.delete_traces(
+            statuses=statuses,
+            include_running=include_running,
+            peer_id=peer_id,
+        )
+        for trace_id in ids:
+            self._forget_trace_group_by_id(trace_id)
+        return count
 
     def shutdown(self, *, wait: bool = False, cancel_futures: bool = True) -> None:
         self._shutdown = True
@@ -526,6 +513,11 @@ class WebRTCRuntimeResources:
         with self._task_registry_lock:
             return self._task_registry.get(trace_id)
 
+    def _cancel_running_trace(self, trace_id: str) -> None:
+        entry = self._task_entry(trace_id)
+        if entry and entry.task and not entry.task.done():
+            entry.task.cancel()
+
     def _is_running_trace_cancelable(self, context: TaskContext) -> bool:
         entry = self._task_entry(context.trace_id)
         if entry is not None:
@@ -539,6 +531,36 @@ class WebRTCRuntimeResources:
         if context.metadata.get("trace_group") is True:
             return True
         return context.kind != "thread"
+
+    def _emit_trace_group_update(self, trace_id: str) -> None:
+        self._trace_group_emit_handles.pop(trace_id, None)
+        group = self._trace_group_by_id(trace_id)
+        if group is None or group.status not in {"created", "running"}:
+            return
+        self._trace_group_last_emit[trace_id] = asyncio.get_running_loop().time()
+        self._tracing.start_context(group)
+
+    def _trace_group_by_id(self, trace_id: str) -> TaskContext | None:
+        for group in self._trace_groups.values():
+            if group.trace_id == trace_id:
+                return group
+        return None
+
+    def _cancel_trace_group_emit(self, trace_id: str) -> None:
+        handle = self._trace_group_emit_handles.pop(trace_id, None)
+        if handle is not None:
+            handle.cancel()
+
+    def _forget_trace_group_by_id(self, trace_id: str) -> None:
+        self._cancel_trace_group_emit(trace_id)
+        self._trace_group_last_emit.pop(trace_id, None)
+        keys_to_remove = [key for key, group in self._trace_groups.items() if group.trace_id == trace_id]
+        for key in keys_to_remove:
+            self._trace_groups.pop(key, None)
+
+    def _forget_trace_group(self, key: tuple[str | None, str, str, str], trace_id: str) -> None:
+        self._trace_groups.pop(key, None)
+        self._forget_trace_group_by_id(trace_id)
 
 
 _default_runtime: WebRTCRuntimeResources | None = None

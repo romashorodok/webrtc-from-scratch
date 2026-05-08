@@ -1,5 +1,8 @@
 import { parseJson } from "./media";
 
+const TRACE_SUMMARY_LIMIT = 512;
+const ARCHIVED_TRACES_PER_SUMMARY_LIMIT = 512;
+
 export type TraceStatus = "created" | "running" | "completed" | "failed" | "cancelled";
 
 export type TraceTransition = {
@@ -15,7 +18,6 @@ export type TraceRecord = {
   parent_id: string | null;
   name: string;
   kind: string;
-  peer_id: string | null;
   created_at: number;
   started_at: number | null;
   ended_at: number | null;
@@ -28,7 +30,6 @@ export type TraceRecord = {
 
 export type TraceSummary = {
   summary_id: string;
-  peer_id: string | null;
   aggregate_key?: string;
   group_key: string;
   name: string;
@@ -54,7 +55,6 @@ type TracePayload = {
   summary?: TraceSummary;
   summaries?: TraceSummary[];
   deleted_at?: number;
-  peer_id?: string | null;
   success_retention_seconds?: number;
   auto_prune?: boolean;
 };
@@ -114,9 +114,11 @@ export function reduceTraceState(
 ): TraceState {
   const deletedTraceIds = new Set(state.deletedTraceIds);
   const archivedTrees = collectArchivedTreesForEvents(state.traces, action.events);
-  const summaries = synthesizeArchivedSummaries(
-    applyTraceSummaryEvents(state.summaries, action.events),
-    archivedTrees,
+  const summaries = trimTraceSummaries(
+    synthesizeArchivedSummaries(
+      applyTraceSummaryEvents(state.summaries, action.events),
+      archivedTrees,
+    ),
   );
   const traces = applyTraceEvents(state.traces, action.events, {
     deletedTraceIds,
@@ -363,9 +365,10 @@ function addArchivedTraceTree(
 
   const previous = archives.get(deletedTraceId);
   const archivedTraces = mergeTraceRecords(previous?.archivedTraces ?? [], archive);
+  const boundedArchivedTraces = limitArchivedTraces(archivedTraces);
   const deletedTraceIds = uniqueValues([
     ...(previous?.deletedTraceIds ?? []),
-    ...archivedTraces
+    ...boundedArchivedTraces
       .filter((trace) => trace.metadata?.deleted_target === true)
       .map((trace) => trace.trace_id),
   ]);
@@ -373,7 +376,7 @@ function addArchivedTraceTree(
   archives.set(deletedTraceId, {
     deletedTraceId,
     deletedTraceIds,
-    archivedTraces,
+    archivedTraces: boundedArchivedTraces,
     deletedAt: Math.max(previous?.deletedAt ?? 0, options.deletedAt),
     synthesizeSummary: (previous?.synthesizeSummary ?? false) || options.synthesizeSummary,
   });
@@ -418,13 +421,7 @@ function createDeletedSummaryFromArchive(archive: ArchivedTraceTree): TraceSumma
 
   return {
     summary_id: archive.deletedTraceId,
-    peer_id: deletedTrace.peer_id,
-    aggregate_key: [
-      deletedTrace.peer_id ?? "",
-      groupKey,
-      deletedTrace.name,
-      deletedTrace.kind,
-    ].join("|"),
+    aggregate_key: [archive.deletedTraceId, groupKey, deletedTrace.name, deletedTrace.kind].join("|"),
     group_key: groupKey,
     name: deletedTrace.name,
     kind: deletedTrace.kind,
@@ -495,23 +492,48 @@ function mergeSummaryArchive(
     archivedRecords,
     archivedTracesForSummary(summary),
   );
+  const boundedArchivedTraces = limitArchivedTraces(archivedTraces);
   const deletedTraceIds = uniqueValues([
     ...deletedTraceIdsForSummary(summary),
-    ...archivedTraces
+    ...boundedArchivedTraces
       .filter((trace) => trace.metadata?.deleted_target === true)
       .map((trace) => trace.trace_id),
   ]);
   const deletedTrace =
-    archivedTraces.find((trace) => trace.trace_id === summary.deleted_trace_id) ??
+    boundedArchivedTraces.find((trace) => trace.trace_id === summary.deleted_trace_id) ??
     summary.deleted_trace ??
-    archivedTraces.find((trace) => trace.metadata?.deleted_target === true);
+    boundedArchivedTraces.find((trace) => trace.metadata?.deleted_target === true);
 
   return {
     ...summary,
-    archived_traces: archivedTraces,
+    archived_traces: boundedArchivedTraces,
     deleted_trace: deletedTrace,
     deleted_trace_ids: deletedTraceIds,
   };
+}
+
+function trimTraceSummaries(summaries: TraceSummary[]) {
+  return summaries.length > TRACE_SUMMARY_LIMIT
+    ? summaries.slice(0, TRACE_SUMMARY_LIMIT)
+    : summaries;
+}
+
+function limitArchivedTraces(traces: TraceRecord[]) {
+  if (traces.length <= ARCHIVED_TRACES_PER_SUMMARY_LIMIT) {
+    return traces;
+  }
+  const targets = traces.filter((trace) => trace.metadata?.deleted_target === true);
+  const keep = new Map<string, TraceRecord>();
+  for (const trace of targets) {
+    keep.set(trace.trace_id, trace);
+  }
+  for (const trace of traces) {
+    if (keep.size >= ARCHIVED_TRACES_PER_SUMMARY_LIMIT) {
+      break;
+    }
+    keep.set(trace.trace_id, trace);
+  }
+  return [...keep.values()].sort((a, b) => a.created_at - b.created_at);
 }
 
 function summaryMatchesDeletedTraceId(summary: TraceSummary, traceId: string) {
@@ -636,7 +658,6 @@ function traceRecordsEquivalent(left: TraceRecord, right: TraceRecord) {
       left.parent_id === right.parent_id &&
       left.name === right.name &&
       left.kind === right.kind &&
-      left.peer_id === right.peer_id &&
       left.created_at === right.created_at &&
       left.started_at === right.started_at &&
       left.ended_at === right.ended_at &&
@@ -850,13 +871,11 @@ export function formatTraceExport(
   const view = options.view ?? (summary ? "deleted" : "live");
   const ordered = orderTraces(traces);
   const roots = buildTraceForest(ordered);
-  const peers = uniqueValues(ordered.map((trace) => trace.peer_id).filter(isString));
   const statuses = countStatuses(ordered);
   const lines = [
     options.title ?? "WEBRTC ASYNC RUNTIME TRACE",
     `view=${view}`,
     `trace_count=${ordered.length} root_count=${roots.length}`,
-    `peer_ids=${peers.length > 0 ? peers.join(",") : "-"}`,
     `statuses=${statuses || "-"}`,
   ];
 
@@ -970,7 +989,6 @@ function appendTraceTreeLines(
     `kind=${trace.kind}`,
     `status=${trace.status}`,
     `duration_ms=${formatMaybeNumber(trace.duration_ms)}`,
-    `peer_id=${trace.peer_id ?? "-"}`,
   ];
   if (trace.error) {
     parts.push(`error=${formatValue(trace.error)}`);

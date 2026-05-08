@@ -232,7 +232,7 @@ class PeerContext:
         self._root_task_context = self.runtime.create_task_context(
             name=f"PeerContext-{self.peer_id}",
             kind="peer",
-            peer_id=self.peer_id,
+            metadata={"peer_id": self.peer_id},
         )
         self.runtime.start_task_context(self._root_task_context)
         self._task_context_token = set_current_task_context(self._root_task_context)
@@ -332,12 +332,12 @@ class PeerContext:
         trace_context = self.runtime.create_task_context(
             name=task_name,
             kind=kind,
-            peer_id=self.peer_id,
             parent=parent_context,
             metadata={
                 "component": component,
                 "app_task": app_task,
                 "bounded": bounded,
+                "peer_id": self.peer_id,
                 **(metadata or {}),
             },
         )
@@ -442,7 +442,6 @@ class PeerContext:
             fn,
             *args,
             name=name,
-            peer_id=self.peer_id,
             metadata=metadata,
             aggregate=aggregate,
             group_name=group_name,
@@ -563,7 +562,7 @@ class PeerContext:
                     pass
 
         if self._root_task_context is not None:
-            self.runtime.close_trace_groups(peer_id=self.peer_id)
+            self.runtime.close_trace_groups()
             self.runtime.complete_task_context(
                 self._root_task_context,
                 status="failed" if error else "completed",
@@ -627,6 +626,10 @@ class PeerContext:
 
     async def send_rtcp_packet(self, packet: bytes | bytearray) -> int:
         return await self.pc.send_rtcp_packet(packet)
+
+    @property
+    def root_trace_id(self) -> str | None:
+        return self._root_task_context.trace_id if self._root_task_context is not None else None
 
     def _set_selected_transport(self, transport: Any) -> None:
         self._selected_transport = transport

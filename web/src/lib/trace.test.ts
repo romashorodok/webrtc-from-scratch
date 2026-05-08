@@ -16,7 +16,6 @@ function traceRecord(traceId: string, parentId: string | null = null): TraceReco
     parent_id: parentId,
     name: traceId,
     kind: "task",
-    peer_id: "peer",
     created_at: traceId === "parent" ? 0 : 1,
     started_at: null,
     ended_at: null,
@@ -32,7 +31,6 @@ function traceSummary(summaryId: string, deletedAt: number): TraceSummary {
   const child = traceRecord(summaryId, parent.trace_id);
   return {
     summary_id: summaryId,
-    peer_id: "peer",
     aggregate_key: "peer|group|name|task",
     group_key: "group",
     name: "name",
@@ -76,7 +74,6 @@ function peerContextTraceTree() {
     liveTraceRecord("peer", null, {
       name: "PeerContext-peer",
       kind: "peer",
-      peer_id: "peer",
       created_at: 0,
       started_at: 0.1,
       status: "running",
@@ -88,40 +85,34 @@ function peerContextTraceTree() {
     liveTraceRecord("av1", "peer", {
       name: "ws:av1-write-loop",
       kind: "media",
-      peer_id: "peer",
       created_at: 1,
     }),
     liveTraceRecord("rtcp", "av1", {
       name: "ws:rtcp-handler",
       kind: "media",
-      peer_id: "peer",
       created_at: 2,
     }),
     liveTraceRecord("srtp", "av1", {
       name: "srtp:encrypt-rtp-packets",
       kind: "thread",
-      peer_id: "peer",
       created_at: 3,
       metadata: { call_count: 2189, avg_duration_ms: 4.011 },
     }),
     liveTraceRecord("ice", "av1", {
       name: "ice:send-rtp-packets",
       kind: "thread",
-      peer_id: "peer",
       created_at: 4,
       metadata: { call_count: 3154, avg_duration_ms: 5.23 },
     }),
     liveTraceRecord("rtcp-srtp", "rtcp", {
       name: "srtp:decrypt-rtcp-packets",
       kind: "thread",
-      peer_id: "peer",
       created_at: 5,
       status: "created",
     }),
     liveTraceRecord("ice-check", "rtcp", {
       name: "ice:consent-check",
       kind: "thread",
-      peer_id: "peer",
       created_at: 6,
       status: "cancelled",
       duration_ms: 12,
@@ -233,7 +224,6 @@ test("trace state reducer keeps archive frozen after delete despite late updates
   };
   const summary: TraceSummary = {
     summary_id: "av1",
-    peer_id: "peer",
     group_key: "ws:av1-write-loop",
     name: "ws:av1-write-loop",
     kind: "media",
@@ -320,7 +310,6 @@ test("trace state reducer does not backfill archived traces into pre-existing su
   };
   const summary: TraceSummary = {
     summary_id: "peer",
-    peer_id: "peer",
     group_key: "PeerContext-peer",
     name: "PeerContext-peer",
     kind: "peer",
@@ -416,7 +405,6 @@ test("trace state reducer keeps synthesized archive when a delayed summary arriv
   );
   const backendSummary: TraceSummary = {
     summary_id: "peer",
-    peer_id: "peer",
     aggregate_key: "peer|PeerContext-peer|PeerContext-peer|peer",
     group_key: "PeerContext-peer",
     name: "PeerContext-peer",
@@ -476,7 +464,6 @@ test("trace state reducer keeps deleted summaries after later trace init events"
   );
   const backendSummary: TraceSummary = {
     summary_id: "peer",
-    peer_id: "peer",
     aggregate_key: "peer|PeerContext-peer|PeerContext-peer|peer",
     group_key: "PeerContext-peer",
     name: "PeerContext-peer",
@@ -496,7 +483,6 @@ test("trace state reducer keeps deleted summaries after later trace init events"
   const lateTrace = liveTraceRecord("late", null, {
     name: "post-delete-trace",
     kind: "task",
-    peer_id: "peer",
   });
 
   const afterLateInit = reduceTraceState(deleted, {
@@ -811,7 +797,6 @@ test("restores visible parent links through hidden completed ancestors", () => {
   });
   const summary: TraceSummary = {
     summary_id: "peer",
-    peer_id: "peer",
     group_key: "PeerContext-peer",
     name: "PeerContext-peer",
     kind: "peer",
@@ -1096,4 +1081,29 @@ test("formats compact export as grouped ui-style tree without details", () => {
   expect(output).not.toContain("TRANSITIONS");
   expect(output).not.toContain("metadata=");
   expect(output).not.toContain("id=ui-group");
+});
+
+test("trace state reducer caps deleted summary retention", () => {
+  let state = createInitialTraceState();
+  const summaries = Array.from({ length: 520 }, (_, index): TraceSummary => ({
+    summary_id: `summary-${index}`,
+    group_key: `group-${index}`,
+    name: `deleted-${index}`,
+    kind: "task",
+    avg_duration_ms: 1,
+    previous_avg_duration_ms: null,
+    delta_avg_duration_ms: null,
+    sample_count: 1,
+    deleted_trace_id: `trace-${index}`,
+    deleted_at: index,
+  }));
+
+  state = reduceTraceState(state, {
+    type: "events",
+    events: [{ event: "trace:summary", data: { summaries } }],
+  });
+
+  expect(state.summaries).toHaveLength(512);
+  expect(state.summaries[0].summary_id).toBe("summary-519");
+  expect(state.summaries.at(-1)?.summary_id).toBe("summary-8");
 });

@@ -12,7 +12,6 @@ type QueuedTraceEvent = {
 };
 
 type TraceUpdatePayload = {
-  peer_id?: string | null;
   trace?: TraceRecord;
   traces?: TraceRecord[];
 };
