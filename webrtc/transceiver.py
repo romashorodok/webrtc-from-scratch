@@ -10,6 +10,7 @@ import webrtc_rs
 from webrtc.media.av1_payloader import AV1_PAYLOAD_TYPE, Av1Packetizer
 from webrtc.media.opus_payloader import OPUS_PAYLOAD_TYPE, OpusPacketizer
 from webrtc.media.vp8_payloader import VP8Payloader
+from webrtc.peer_context import spawn_peer_task
 from webrtc.srtp import Stream as SrtpStream
 
 from . import media
@@ -584,9 +585,11 @@ class RTPReceiver:
         self._track = TrackRemote(self._kind, params.ssrc, params.rtx.ssrc, params.rid)
 
         # Create async task to read from SRTP stream
-        self._receive_task = asyncio.create_task(
+        self._receive_task = spawn_peer_task(
             _receive_task(self.__rtp_reader(), self._track),
-            name=f"RTPReceiver-{self._track.ssrc}"
+            name=f"RTPReceiver-{self._track.ssrc}",
+            component="rtp",
+            kind="rtp",
         )
         print(f"[RTPReceiver.receive] Started _receive_task for SSRC={params.ssrc}")
 

@@ -1,8 +1,8 @@
 import asyncio
 import json
-import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -20,13 +20,17 @@ from webrtc.media.rtp_extensions import DEFAULT_EXT_MAP
 from webrtc.peer_connection import (
     PeerConnection,
 )
+from webrtc.peer_context import PeerContext
+from webrtc.runtime import WebRTCRuntimeResources, get_default_runtime
 from webrtc.session_description import (
     SessionDescription,
     SessionDescriptionType,
 )
+from .trace_pump import pump_trace_updates
 from webrtc.transceiver import RTPCodecKind, RTPTransceiverDirection
 
 app = FastAPI()
+VIDEO_FILE = Path(__file__).resolve().parents[1] / "output_av1.ivf"
 
 
 async def on_recv(ws: WebSocket, on_close: Callable | None = None):
@@ -38,7 +42,7 @@ async def on_recv(ws: WebSocket, on_close: Callable | None = None):
             _on_close()
 
 
-async def pre_read_frames(file_path: str):
+def read_frames(file_path: str):
     frames: list[tuple[bytes, media.IVFFrameHeader]] = []
     with open(file_path, "rb") as file:
         reader = media.IVFReader(file)
@@ -82,9 +86,7 @@ TARGET_FPS = 30
 FRAME_PERIOD = 1 / TARGET_FPS
 
 
-def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
-    rw_loop = asyncio.new_event_loop()
-
+async def start_write_loop(pc: PeerConnection, peer: PeerContext):
     sender = pc._transceivers[0].sender
     if not sender:
         raise ValueError("Not found the sender")
@@ -95,7 +97,11 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
 
     encoding = sender._track_encodings[0]
 
-    frames = rw_loop.run_until_complete(pre_read_frames("output_av1.ivf"))
+    frames = await peer.to_thread(
+        read_frames,
+        str(VIDEO_FILE),
+        name="ws:read-ivf-frames",
+    )
 
     ptime = encoding.codec.refresh_rate
     ms = 1000
@@ -201,8 +207,23 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
 
                 # Read decrypted RTCP from stream
                 rtcp = await stream.read()
-                pkts = await asyncio.to_thread(RtcpPacket.parse, rtcp)
-                await asyncio.to_thread(print_rtcp, pkts, smoothed_gradient)
+                pkts = await peer.to_thread(
+                    RtcpPacket.parse,
+                    rtcp,
+                    name="rtcp:parse",
+                    aggregate=True,
+                    group_name="rtcp:parse-feedback",
+                    group_key="rtcp:parse-feedback",
+                )
+                await peer.to_thread(
+                    print_rtcp,
+                    pkts,
+                    smoothed_gradient,
+                    name="rtcp:print-feedback",
+                    aggregate=True,
+                    group_name="rtcp:feedback-processing",
+                    group_key="rtcp:feedback-processing",
+                )
 
             except Exception as e:
                 print("rtcp error", e)
@@ -238,103 +259,150 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
                 )
                 serialized = pkt.serialize(DEFAULT_EXT_MAP)
                 # Offload encrypt to thread pool to avoid blocking event loop
-                encoded = await asyncio.to_thread(srtp.encrypt, serialized)
+                encoded = await peer.to_thread(
+                    srtp.encrypt,
+                    serialized,
+                    name="srtp:encrypt-rtp",
+                    aggregate=True,
+                    group_name="srtp:encrypt-rtp-packets",
+                    group_key="srtp:encrypt-rtp-packets",
+                )
                 if not pc._transport:
                     print(f"[WS] ERROR: pc._transport is None!")
                     continue
                 send_time_cache.add(pkt.extensions.transport_sequence_number)
-                await asyncio.to_thread(pc._transport.sendto, encoded)
+                await peer.to_thread(
+                    pc._transport.sendto,
+                    encoded,
+                    name="ice:sendto-rtp",
+                    aggregate=True,
+                    group_name="ice:send-rtp-packets",
+                    group_key="ice:send-rtp-packets",
+                )
 
-    asyncio.run_coroutine_threadsafe(rtcp_handler(), loop)
-    rw_loop.run_until_complete(encode())
+    peer.spawn_app(rtcp_handler(), name="ws:rtcp-handler", kind="rtcp")
+    await encode()
 
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
+    runtime = get_default_runtime()
     pc = PeerConnection()
-    pc.start()
-    await pc.gatherer.dial()
+    send_lock = asyncio.Lock()
 
-    await pc.add_transceiver_from_kind(
-        RTPCodecKind.Video, RTPTransceiverDirection.Sendonly
-    )
+    async def send_json(message: dict[str, Any]) -> None:
+        async with send_lock:
+            await ws.send_json(message)
 
-    def start():
-        "send only example"
-        rw_thread = threading.Thread(
-            target=start_write_loop, args=(pc, asyncio.get_running_loop())
+    async with PeerContext(pc, runtime=runtime) as peer:
+        trace_task = peer.spawn_app(
+            pump_trace_updates(
+                runtime,
+                send_json,
+                peer_id=peer.peer_id,
+                scope_trace_id=peer.root_trace_id,
+            ),
+            name=f"ws:trace-pump-{peer.peer_id}",
+            kind="trace",
         )
-        rw_thread.start()
+        write_task: asyncio.Task[Any] | None = None
 
-    def on_close():
-        print("Done thread")
+        peer.start()
+        await pc.gatherer.dial()
 
-    async for data in on_recv(ws, on_close):
-        msg: dict[str, Any] = json.loads(data)
+        await pc.add_transceiver_from_kind(
+            RTPCodecKind.Video, RTPTransceiverDirection.Sendonly
+        )
 
-        match msg.get("event"):
-            case "negotiate":
-                print("Start all webrtc")
-                await pc.gatherer.dial()
+        def on_close():
+            trace_task.cancel()
+            print("WebSocket disconnected")
 
-                try:
-                    start()
-                except RuntimeError:
-                    pass
+        async def start_media() -> None:
+            nonlocal write_task
+            if write_task and not write_task.done():
+                return
+            write_task = peer.spawn_app(
+                start_write_loop(pc, peer),
+                name="ws:av1-write-loop",
+                kind="media",
+            )
 
-            case "offer":
-                print("recv offer")
-                if offer := await pc.create_offer():
-                    print("offer offer")
-                    await pc.set_local_description(SessionDescriptionType.Offer, offer)
-                    print("set offer")
-                    await ws.send_json(
-                        {"event": "offer", "data": offer.marshal().decode()}
-                    )
+        async for data in on_recv(ws, on_close):
+            msg: dict[str, Any] = json.loads(data)
 
-            case "answer":
-                data = msg.get("data")
-                if not data:
-                    continue
+            match msg.get("event"):
+                case "negotiate":
+                    print("Start all webrtc")
+                    await pc.gatherer.dial()
+                    await start_media()
 
-                payload: dict[str, Any] = json.loads(data)
-                sdp = payload.get("sdp")
-                sdp_type = payload.get("type")
+                case "offer":
+                    print("recv offer")
+                    if offer := await pc.create_offer():
+                        print("offer offer")
+                        await pc.set_local_description(SessionDescriptionType.Offer, offer)
+                        print("set offer")
+                        await send_json(
+                            {"event": "offer", "data": offer.marshal().decode()}
+                        )
 
-                if not sdp or not sdp_type:
-                    continue
+                case "answer":
+                    data = msg.get("data")
+                    if not data:
+                        continue
 
-                if not isinstance(sdp, str):
-                    continue
+                    payload: dict[str, Any] = json.loads(data)
+                    sdp = payload.get("sdp")
+                    sdp_type = payload.get("type")
 
-                desc_type = SessionDescriptionType(sdp_type)
-                if not (
-                    desc_type is SessionDescriptionType.Offer
-                    or desc_type is SessionDescriptionType.Answer
-                ):
-                    continue
+                    if not sdp or not sdp_type:
+                        continue
 
-                desc = SessionDescription.parse(sdp)
-                print(f"Set remote description desc:{desc}")
+                    if not isinstance(sdp, str):
+                        continue
 
-                for ufrag, pwd in desc.get_media_credentials():
-                    await pc.gatherer.set_remote_credentials(ufrag, pwd)
+                    desc_type = SessionDescriptionType(sdp_type)
+                    if not (
+                        desc_type is SessionDescriptionType.Offer
+                        or desc_type is SessionDescriptionType.Answer
+                    ):
+                        continue
 
-                await pc.set_remote_description(desc_type, desc)
+                    desc = SessionDescription.parse(sdp)
+                    print(f"Set remote description desc:{desc}")
 
-            case "trickle-ice":
-                # NOTE: In my current state I need know ufrag, pwd before adding the candidate, because all pair credentials is immutable
-                data = msg.get("data")
-                if not data:
-                    continue
-                payload: dict[str, Any] = json.loads(data)
+                    for ufrag, pwd in desc.get_media_credentials():
+                        await peer.set_remote_credentials(ufrag, pwd)
 
-                candidate_str = payload.get("candidate")
-                if not candidate_str:
-                    continue
+                    await peer.set_remote_description(desc_type, desc)
 
-                await pc.gatherer.add_remote_candidate(candidate_str)
+                case "trickle-ice":
+                    # NOTE: In my current state I need know ufrag, pwd before adding the candidate, because all pair credentials is immutable
+                    data = msg.get("data")
+                    if not data:
+                        continue
+                    payload: dict[str, Any] = json.loads(data)
 
-            case _:
-                print("Unknown event")
+                    candidate_str = payload.get("candidate")
+                    if not candidate_str:
+                        continue
+
+                    await peer.add_remote_candidate(candidate_str)
+
+                case "trace:delete":
+                    data = msg.get("data")
+                    payload: dict[str, Any] = json.loads(data) if isinstance(data, str) else data or {}
+                    trace_id = payload.get("trace_id")
+                    scope = payload.get("scope")
+
+                    if isinstance(trace_id, str):
+                        runtime.delete_trace(trace_id, peer_id=peer.peer_id)
+                    elif scope == "failed":
+                        runtime.delete_traces(statuses={"failed"}, peer_id=peer.peer_id)
+                    elif scope == "completed":
+                        runtime.delete_traces(statuses={"completed", "cancelled"}, peer_id=peer.peer_id)
+
+                case _:
+                    print("Unknown event")

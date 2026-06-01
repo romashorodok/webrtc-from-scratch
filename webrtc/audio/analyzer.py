@@ -5,7 +5,6 @@ Provides real-time PCM audio analysis for spectrogram visualization and ML segme
 Includes FFT spectrum computation, audio feature extraction, and threshold-based detection.
 """
 
-import asyncio
 import time
 from collections import deque
 from typing import Any, Dict, Optional
@@ -13,6 +12,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from webrtc.logger import Component, get_logger
+from webrtc.runtime import get_default_runtime
 
 logger = get_logger()
 
@@ -172,8 +172,19 @@ class AudioAnalyzer:
         self.frame_count += 1
 
         # Run CPU-intensive computation in thread pool
-        spectrum, vad_features = await asyncio.to_thread(self._compute_spectrum, pcm_bytes)
-        features = await asyncio.to_thread(self._compute_features, pcm_bytes)
+        runtime = get_default_runtime()
+        spectrum, vad_features = await runtime.to_thread(
+            self._compute_spectrum,
+            pcm_bytes,
+            name="audio:compute-spectrum",
+            metadata={"timestamp": timestamp},
+        )
+        features = await runtime.to_thread(
+            self._compute_features,
+            pcm_bytes,
+            name="audio:compute-features",
+            metadata={"timestamp": timestamp},
+        )
 
         # Merge VAD features into main features dict
         if vad_features:
