@@ -1,10 +1,24 @@
+from dataclasses import replace
+
 from webrtc.dtls.dtls_record import (
     ContentType,
     Handshake,
+    HandshakeFragment,
     HandshakeMessageType,
     HandshakeMultipleMessages,
+    RecordHeader,
     RecordLayer,
 )
+
+
+class _RawHandshakeContent:
+    content_type = ContentType.HANDSHAKE
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+    def marshal(self) -> bytes:
+        return self.data
 
 
 class HandshakeReconstructor:
@@ -17,7 +31,7 @@ class HandshakeReconstructor:
 
     def __init__(self) -> None:
         self._fragments: dict[
-            tuple[ContentType, int, HandshakeMessageType, int, int],
+            tuple[HandshakeMessageType, int, int],
             dict[int, bytes],
         ] = {}
 
@@ -65,8 +79,6 @@ class HandshakeReconstructor:
     def _complete_single(
         self, record: RecordLayer, raw: bytes
     ) -> list[tuple[RecordLayer, bytes]]:
-        if not isinstance(record.content, Handshake):
-            return [(record, raw)]
         if self._is_complete(record.content):
             return [(record, raw)]
 
@@ -76,34 +88,57 @@ class HandshakeReconstructor:
     def _complete_fragmented(
         self, record: RecordLayer, handshake: Handshake
     ) -> tuple[RecordLayer, bytes] | None:
-        fragments = self._fragments.setdefault(self._key(record, handshake), {})
+        fragments = self._fragments.setdefault(self._key(handshake), {})
         fragments[handshake.header.fragment_offset] = handshake.message.marshal()
 
         payload = self._assemble(handshake, fragments)
         if payload is None:
             return None
 
-        del self._fragments[self._key(record, handshake)]
-        raw = self._record_bytes(record, handshake, payload)
-        return RecordLayer.unmarshal(raw), raw
+        del self._fragments[self._key(handshake)]
+        return self._record_from_handshake(
+            record,
+            Handshake(
+                replace(
+                    handshake.header,
+                    fragment_offset=0,
+                    fragment_length=handshake.header.length,
+                ),
+                HandshakeFragment(payload),
+            ),
+        )
+
+    def _record_from_handshake(
+        self, record: RecordLayer, handshake: Handshake
+    ) -> tuple[RecordLayer, bytes]:
+        return self._record_from_content(record, handshake)
 
     def _record_from_handshake_bytes(
         self, record: RecordLayer, handshake_bytes: bytes
     ) -> tuple[RecordLayer, bytes]:
-        raw = self._record_header_bytes(record, len(handshake_bytes)) + handshake_bytes
+        return self._record_from_content(record, _RawHandshakeContent(handshake_bytes))
+
+    def _record_from_content(
+        self, record: RecordLayer, content: Handshake | _RawHandshakeContent
+    ) -> tuple[RecordLayer, bytes]:
+        raw = RecordLayer(
+            RecordHeader(
+                content_type=record.header.content_type,
+                version=record.header.version,
+                epoch=record.header.epoch,
+                sequence_number=record.header.sequence_number,
+            ),
+            content,
+        ).marshal()
         return RecordLayer.unmarshal(raw), raw
 
     def _is_complete(self, handshake: Handshake) -> bool:
         header = handshake.header
         return header.fragment_offset == 0 and header.fragment_length == header.length
 
-    def _key(
-        self, record: RecordLayer, handshake: Handshake
-    ) -> tuple[ContentType, int, HandshakeMessageType, int, int]:
+    def _key(self, handshake: Handshake) -> tuple[HandshakeMessageType, int, int]:
         header = handshake.header
         return (
-            record.header.content_type,
-            record.header.epoch,
             header.handshake_type,
             header.message_sequence,
             header.length,
@@ -124,29 +159,3 @@ class HandshakeReconstructor:
                 break
 
         return bytes(payload) if len(payload) == handshake.header.length else None
-
-    def _record_bytes(
-        self, record: RecordLayer, handshake: Handshake, payload: bytes
-    ) -> bytes:
-        handshake_bytes = self._handshake_bytes(handshake, payload)
-        return self._record_header_bytes(record, len(handshake_bytes)) + handshake_bytes
-
-    def _record_header_bytes(self, record: RecordLayer, length: int) -> bytes:
-        return (
-            bytes([record.header.content_type])
-            + int(record.header.version).to_bytes(2, "big")
-            + record.header.epoch.to_bytes(2, "big")
-            + record.header.sequence_number.to_bytes(6, "big")
-            + length.to_bytes(2, "big")
-        )
-
-    def _handshake_bytes(self, handshake: Handshake, payload: bytes) -> bytes:
-        header = handshake.header
-        return (
-            bytes([header.handshake_type])
-            + header.length.to_bytes(3, "big")
-            + header.message_sequence.to_bytes(2, "big")
-            + (0).to_bytes(3, "big")
-            + header.length.to_bytes(3, "big")
-            + payload
-        )

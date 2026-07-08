@@ -37,6 +37,33 @@ def _handshake_fragment(
     )
 
 
+def _client_hello_payload_with_unknown_extension(payload: bytes) -> bytes:
+    offset = 2 + 32
+
+    session_id_length = payload[offset]
+    offset += 1 + session_id_length
+
+    cookie_length = payload[offset]
+    offset += 1 + cookie_length
+
+    cipher_suites_length = int.from_bytes(payload[offset : offset + 2], "big")
+    offset += 2 + cipher_suites_length
+
+    compression_methods_length = payload[offset]
+    offset += 1 + compression_methods_length
+
+    extensions_length = int.from_bytes(payload[offset : offset + 2], "big")
+    extensions = payload[offset + 2 : offset + 2 + extensions_length]
+    unknown_extension = b"\xfa\xfa\x00\x03abc"
+
+    return (
+        payload[:offset]
+        + (extensions_length + len(unknown_extension)).to_bytes(2, "big")
+        + extensions
+        + unknown_extension
+    )
+
+
 def test_fragmented_client_hello_is_reassembled_before_parsing():
     client_hello = DEFAULT_FACTORY.client_hello(
         random=b"\x11" * 32,
@@ -94,3 +121,47 @@ def test_unfragmented_client_hello_passes_through_unchanged():
     completed = HandshakeReconstructor().complete(record, raw)
 
     assert completed == [(record, raw)]
+
+
+def test_complete_message_in_mixed_batch_preserves_original_bytes():
+    complete_client_hello = DEFAULT_FACTORY.client_hello(
+        random=b"\x33" * 32,
+        cookie=None,
+        cipher_suites=[CipherSuiteID.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256],
+        elliptic_curves=[EllipticCurveGroup.X25519, EllipticCurveGroup.SECP256R1],
+        signature_hash_algorithms=[SignatureHashAlgorithm.ECDSA_SECP256R1_SHA256],
+    )
+    complete_payload = _client_hello_payload_with_unknown_extension(
+        complete_client_hello.content.message.marshal()
+    )
+    complete_handshake = _handshake_fragment(
+        complete_payload,
+        offset=0,
+        length=len(complete_payload),
+        message_sequence=1,
+    )
+
+    fragmented_client_hello = DEFAULT_FACTORY.client_hello(
+        random=b"\x44" * 32,
+        cookie=None,
+        cipher_suites=[CipherSuiteID.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256],
+        elliptic_curves=[EllipticCurveGroup.X25519, EllipticCurveGroup.SECP256R1],
+        signature_hash_algorithms=[SignatureHashAlgorithm.ECDSA_SECP256R1_SHA256],
+    )
+    fragmented_payload = fragmented_client_hello.content.message.marshal()
+    first_fragment = _handshake_fragment(
+        fragmented_payload[:10],
+        offset=0,
+        length=len(fragmented_payload),
+        message_sequence=2,
+    )
+
+    raw = _record(complete_handshake + first_fragment, 0)
+    record = next(iter(RecordLayerBatch(raw)))[0]
+
+    completed = HandshakeReconstructor().complete(record, raw)
+
+    assert len(completed) == 1
+    complete_record, complete_raw = completed[0]
+    assert complete_raw[13:] == complete_handshake
+    assert complete_record.content.marshal() != complete_handshake
