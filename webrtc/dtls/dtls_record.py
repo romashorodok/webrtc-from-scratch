@@ -561,6 +561,16 @@ class Message:
     def unmarshal(cls, data: bytes) -> Self: ...
 
 
+class HandshakeFragment(Message):
+    """Raw DTLS handshake fragment awaiting reassembly."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+    def marshal(self) -> bytes:
+        return self.data
+
+
 class ClientHello(Message):
     message_type = HandshakeMessageType.ClientHello
 
@@ -940,13 +950,15 @@ class Handshake(RecordContentType):
         payload = self.message.marshal()
         # print("handshake payload", len(payload))
 
-        length = byteops.pack_unsigned_24(len(payload))
+        length = byteops.pack_unsigned_24(self.header.length or len(payload))
         message_sequence = byteops.pack_unsigned_short(self.header.message_sequence)
         fragment_offset = byteops.pack_unsigned_24(self.header.fragment_offset)
-        fragment_length = byteops.pack_unsigned_24(len(payload))
+        fragment_length = byteops.pack_unsigned_24(
+            self.header.fragment_length or len(payload)
+        )
 
         return bytes(
-            byteops.pack_byte_int(self.message.message_type)
+            byteops.pack_byte_int(self.header.handshake_type)
             + length
             + message_sequence
             + fragment_offset
@@ -956,6 +968,9 @@ class Handshake(RecordContentType):
 
     @classmethod
     def unmarshal(cls, data: bytes) -> Self:
+        if len(data) < 12:
+            raise ValueError("DTLS handshake message is too small")
+
         header = HandshakeHeader(
             handshake_type=HandshakeMessageType(data[0]),
             length=byteops.unpack_unsigned_24(data[1:4]),
@@ -963,13 +978,18 @@ class Handshake(RecordContentType):
             fragment_offset=byteops.unpack_unsigned_24(data[6:9]),
             fragment_length=byteops.unpack_unsigned_24(data[9:12]),
         )
-        data = data[12:]
+        fragment = data[12 : 12 + header.fragment_length]
+        if len(fragment) != header.fragment_length:
+            raise ValueError("insufficient data for handshake fragment")
+
+        if header.fragment_offset != 0 or header.fragment_length != header.length:
+            return cls(header, HandshakeFragment(fragment))
 
         message_cls = MESSAGE_CLASSES.get(header.handshake_type)
         if not message_cls:
             raise ValueError("Not found message class")
 
-        message = message_cls.unmarshal(data)
+        message = message_cls.unmarshal(fragment)
 
         return cls(header, message)
 
@@ -997,6 +1017,9 @@ class HandshakeMultipleMessages(RecordContentType):
         handshake_messages = list[tuple[Handshake, bytes]]()
 
         while data:
+            if len(data) < Handshake.HEADER_LENGHT:
+                raise ValueError("DTLS handshake message is too small")
+
             header = HandshakeHeader(
                 handshake_type=HandshakeMessageType(data[0]),
                 length=byteops.unpack_unsigned_24(data[1:4]),
@@ -1004,18 +1027,29 @@ class HandshakeMultipleMessages(RecordContentType):
                 fragment_offset=byteops.unpack_unsigned_24(data[6:9]),
                 fragment_length=byteops.unpack_unsigned_24(data[9:12]),
             )
-            # data = data[12:]
+            message_end = Handshake.HEADER_LENGHT + header.fragment_length
+            fragment = data[Handshake.HEADER_LENGHT : message_end]
+            if len(fragment) != header.fragment_length:
+                raise ValueError("insufficient data for handshake fragment")
+
+            raw = data[:message_end]
+            if header.fragment_offset != 0 or header.fragment_length != header.length:
+                handshake_messages.append(
+                    (Handshake(header, HandshakeFragment(fragment)), raw)
+                )
+                data = data[message_end:]
+                continue
 
             message_cls = MESSAGE_CLASSES.get(header.handshake_type)
             if not message_cls:
                 raise ValueError("Not found message class")
 
-            message = message_cls.unmarshal(data[12:])
+            message = message_cls.unmarshal(fragment)
 
             handshake_messages.append(
-                (Handshake(header, message), data[: 12 + header.length])
+                (Handshake(header, message), raw)
             )
-            data = data[12 + header.length :]
+            data = data[message_end:]
 
         return cls(handshake_messages)
 
@@ -1222,19 +1256,13 @@ class RecordLayer:
             case ContentType.HANDSHAKE if epoch > 0:  # it's encrypted message
                 layer = cls.unmarshal(data)
             case ContentType.HANDSHAKE if epoch == 0:  # Record with Single | Multiple messages
-                # print("pkt length", length)
+                if len(data) < cls.FIXED_HEADER_SIZE + length:
+                    raise ValueError("DTLS record payload is truncated")
+                if length < Handshake.HEADER_LENGHT:
+                    raise ValueError("DTLS handshake record payload is too small")
 
-                message_length = byteops.unpack_unsigned_24(data[14:17]) - 1
-                # print(
-                #     "message length",
-                #     message_length,
-                #     "record langth - header",
-                #     length - cls.FIXED_HEADER_SIZE,
-                #     "record len",
-                #     len(data[26:]),
-                # )
-
-                if message_length == length - cls.FIXED_HEADER_SIZE:
+                fragment_length = byteops.unpack_unsigned_24(data[22:25])
+                if Handshake.HEADER_LENGHT + fragment_length == length:
                     layer = cls.unmarshal(data)
                 else:
                     layer = cls.unmarshal_multiple(

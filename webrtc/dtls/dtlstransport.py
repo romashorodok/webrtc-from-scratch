@@ -8,9 +8,13 @@ import webrtc_rs
 from webrtc import ice
 from webrtc.dtls.certificate import Certificate
 from webrtc.dtls.dtls_cipher_suite import Keypair
-from webrtc.dtls.dtls_record import RecordLayer, is_dtls_record_layer
+from webrtc.dtls.dtls_record import (
+    RecordLayer,
+    is_dtls_record_layer,
+)
 from webrtc.dtls.flight_state import Flight
 from webrtc.dtls.fsm import DTLSConn
+from webrtc.dtls.handshake_reconstructor import HandshakeReconstructor
 from webrtc.dtls.prf import SRTPKeyingMaterial
 from webrtc.srtp import Session as SrtpSession, Stream as SrtpStream
 from webrtc.logger import get_logger, Component
@@ -69,6 +73,7 @@ class DTLSTransport:
 
         # Record layer channel for incoming DTLS packets
         self.record_layer_chan: asyncio.Queue[tuple[RecordLayer, bytes]] = asyncio.Queue()
+        self.__handshake_reconstructor = HandshakeReconstructor()
 
         # SRTP state - Python Session with Rust SrtpContext for crypto
         self.__srtp_rtp_lock = asyncio.Event()
@@ -298,7 +303,10 @@ class DTLSTransport:
                                 content_type=record.header.content_type,
                                 epoch=record.header.epoch,
                                 seq=record.header.sequence_number)
-                await self.record_layer_chan.put((record, raw))
+                for complete_record, complete_raw in (
+                    self.__handshake_reconstructor.complete(record, raw)
+                ):
+                    await self.record_layer_chan.put((complete_record, complete_raw))
 
             wlogger.log_queue_size(Component.DTLS, "record_layer",
                                   self.record_layer_chan.qsize(),
