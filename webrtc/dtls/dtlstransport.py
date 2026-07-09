@@ -10,6 +10,7 @@ from webrtc.dtls.certificate import Certificate
 from webrtc.dtls.dtls_cipher_suite import Keypair
 from webrtc.dtls.dtls_record import (
     RecordLayer,
+    RecordLayerBatch,
     is_dtls_record_layer,
 )
 from webrtc.dtls.flight_state import Flight
@@ -20,6 +21,14 @@ from webrtc.srtp import Session as SrtpSession, Stream as SrtpStream
 from webrtc.logger import get_logger, Component
 from webrtc.config import get_config
 from webrtc.peer_context import spawn_peer_task
+from webrtc.lifecycle import (
+    TransportCondition,
+    require_timeout,
+    wait_for_all,
+    wait_for_event,
+    wait_until,
+)
+from webrtc.tracing import perf_mark, perf_measured_async
 
 logger = logging.getLogger("webrtc.dtls.transport")
 
@@ -45,7 +54,38 @@ class DTLSLocal:
         self._t = transport
 
     async def sendto(self, data: bytes):
+        _mark_dtls_records("tx", data)
         self._t.sendto(data)
+
+
+def _mark_dtls_records(direction: str, data: bytes) -> None:
+    try:
+        records = list(RecordLayerBatch(data))
+    except Exception:
+        perf_mark(
+            "dtls",
+            "record",
+            direction,
+            metadata={
+                "size_bytes": len(data),
+                f"counter.dtls.records_{direction}": 1,
+            },
+        )
+        return
+
+    for record, raw in records:
+        perf_mark(
+            "dtls",
+            "record",
+            direction,
+            metadata={
+                "content_type": getattr(record.header.content_type, "name", str(record.header.content_type)),
+                "epoch": record.header.epoch,
+                "sequence_number": record.header.sequence_number,
+                "size_bytes": len(raw),
+                f"counter.dtls.records_{direction}": 1,
+            },
+        )
 
 
 class DTLSTransport:
@@ -83,6 +123,7 @@ class DTLSTransport:
 
         # Handshake completion
         self.__handshake_complete = asyncio.Event()
+        self.__handshake_failed: BaseException | None = None
         self._srtp_keying_material: SRTPKeyingMaterial | None = None
 
     @property
@@ -109,19 +150,28 @@ class DTLSTransport:
         wlogger = get_logger()
         wlogger.debug(Component.DTLS, "Starting DTLS handshake",
                      role=role.value, transport_provided=transport is not None)
+        perf_mark(
+            "dtls",
+            "start",
+            "started",
+            metadata={"role": role.value, "transport_provided": transport is not None},
+        )
 
         # If handshake already completed, skip
         if self.__handshake_complete.is_set():
             wlogger.info(Component.DTLS, "Handshake already complete, skipping")
+            perf_mark("dtls", "start", "completed", metadata={"already_complete": True})
             return
 
         # If there's already a DTLS connection in progress, skip (don't restart mid-handshake)
         if self.__dtls_conn is not None:
             wlogger.info(Component.DTLS, "DTLS connection already in progress, skipping duplicate start")
+            perf_mark("dtls", "start", "completed", metadata={"already_started": True})
             return
 
         self.__role = role
         is_client = role == DTLSRole.Client
+        perf_mark("dtls", "role", "selected", metadata={"role": role.value})
 
         # Bind transport if provided
         if transport:
@@ -129,7 +179,13 @@ class DTLSTransport:
 
         if not self.__transport:
             wlogger.error(Component.DTLS, "No transport bound - cannot start DTLS handshake")
-            return
+            perf_mark(
+                "dtls",
+                "start",
+                "failed",
+                metadata={"role": role.value, "exception_class": "RuntimeError"},
+            )
+            raise RuntimeError("No transport bound - cannot start DTLS handshake")
 
         # Determine initial flight based on role
         if is_client:
@@ -156,7 +212,9 @@ class DTLSTransport:
             kind="dtls",
         )
         wlogger.debug(Component.DTLS, "Handshake task created")
+        perf_mark("dtls", "start", "completed", metadata={"role": role.value})
 
+    @perf_measured_async("dtls", "handshake")
     async def _run_handshake(self, is_client: bool):
         """Run the DTLS handshake using Python FSM."""
         wlogger = get_logger()
@@ -164,7 +222,10 @@ class DTLSTransport:
 
         if not self.__dtls_conn:
             wlogger.error(Component.DTLS, "DTLS connection not initialized")
-            return
+            exc = RuntimeError("DTLS connection not initialized")
+            self.__handshake_failed = exc
+            self.__handshake_complete.set()
+            raise exc
 
         try:
             # Start FSM processing
@@ -174,6 +235,7 @@ class DTLSTransport:
                 name="dtls:handle-inbound-record-layers",
                 component="dtls",
                 kind="dtls",
+                metadata={"expected_long_running": True, "loop_role": "receive"},
             )
 
             # Dispatch initial state
@@ -191,16 +253,22 @@ class DTLSTransport:
                 self._srtp_keying_material = self.__dtls_conn.get_srtp_keying_material()
 
                 if self._srtp_keying_material:
+                    perf_mark("srtp", "keys", "derived")
                     # Initialize Rust SRTP with Python-derived keys
                     await self._init_srtp(is_client)
 
                 self.__handshake_complete.set()
             else:
                 wlogger.error(Component.DTLS, "Handshake timed out")
+                raise TimeoutError("DTLS handshake timed out")
 
         except Exception as e:
             wlogger.error(Component.DTLS, "Handshake error", error=str(e))
+            self.__handshake_failed = e
+            self.__handshake_complete.set()
+            raise
 
+    @perf_measured_async("srtp", "ready")
     async def _init_srtp(self, is_client: bool):
         """
         Initialize Python SRTP sessions with Rust cipher backend.
@@ -213,7 +281,7 @@ class DTLSTransport:
 
         if not self._srtp_keying_material:
             wlogger.error(Component.DTLS, "No SRTP keying material available")
-            return
+            raise RuntimeError("No SRTP keying material available")
 
         keys = self._srtp_keying_material
 
@@ -241,6 +309,7 @@ class DTLSTransport:
                 is_rtp=True,
             )
             self.__srtp_rtp_lock.set()
+            perf_mark("srtp", "rtp_session", "ready")
             wlogger.debug(Component.DTLS, "RTP SRTP session created")
 
             self._srtp_rtcp = SrtpSession.from_keying_material(
@@ -249,6 +318,7 @@ class DTLSTransport:
                 is_rtp=False,
             )
             self.__srtp_rtcp_lock.set()
+            perf_mark("srtp", "rtcp_session", "ready")
             wlogger.debug(Component.DTLS, "RTCP SRTP session created")
 
             wlogger.info(Component.DTLS, "SRTP sessions initialized")
@@ -259,21 +329,19 @@ class DTLSTransport:
                 name="dtls:rtp-receive-loop",
                 component="dtls",
                 kind="dtls",
+                metadata={"expected_long_running": True, "loop_role": "receive"},
             )
             spawn_peer_task(
                 self._rtcp_receive_loop(),
                 name="dtls:rtcp-receive-loop",
                 component="dtls",
                 kind="dtls",
+                metadata={"expected_long_running": True, "loop_role": "receive"},
             )
 
         except Exception as e:
             wlogger.error(Component.DTLS, "Failed to initialize SRTP", error=str(e))
-            import traceback
-            traceback.print_exc()
-            # Signal completion so callers know handshake succeeded even if SRTP fails
-            self.__srtp_rtp_lock.set()
-            self.__srtp_rtcp_lock.set()
+            raise
 
     async def enqueue_record(self, record_layer_bytes: bytes):
         """
@@ -298,6 +366,18 @@ class DTLSTransport:
             record_count = 0
             for record, raw in RecordLayerBatch(record_layer_bytes):
                 record_count += 1
+                perf_mark(
+                    "dtls",
+                    "record",
+                    "rx",
+                    metadata={
+                        "content_type": getattr(record.header.content_type, "name", str(record.header.content_type)),
+                        "epoch": record.header.epoch,
+                        "sequence_number": record.header.sequence_number,
+                        "size_bytes": len(raw),
+                        "counter.dtls.records_rx": 1,
+                    },
+                )
                 if config.log_packet_details and record_count <= 10:
                     wlogger.debug(Component.DTLS, f"Parsed DTLS record #{record_count}",
                                 content_type=record.header.content_type,
@@ -327,7 +407,34 @@ class DTLSTransport:
         await asyncio.Event().wait()  # Never returns
         return bytes()
 
-    async def wait_handshake(self, timeout: float | None = None) -> bool:
+    def _srtp_ready(self) -> bool:
+        return (
+            self.__srtp_rtp_lock.is_set()
+            and self.__srtp_rtcp_lock.is_set()
+            and self._srtp_rtp is not None
+            and self._srtp_rtcp is not None
+        )
+
+    async def wait(self, condition: TransportCondition, timeout: float) -> None:
+        timeout = require_timeout(timeout)
+        match condition:
+            case TransportCondition.HANDSHAKE_COMPLETE:
+                await wait_for_event(self.__handshake_complete, timeout=timeout)
+                if self.__handshake_failed is not None:
+                    raise self.__handshake_failed
+            case TransportCondition.SRTP_READY:
+                await wait_for_all(
+                    [
+                        self.__srtp_rtp_lock.wait(),
+                        self.__srtp_rtcp_lock.wait(),
+                    ],
+                    timeout=timeout,
+                )
+                await wait_until(self._srtp_ready, timeout=timeout)
+            case _:
+                raise ValueError(f"unsupported transport condition: {condition}")
+
+    async def wait_handshake(self, timeout: float) -> bool:
         """
         Wait for DTLS handshake to complete.
 
@@ -338,7 +445,14 @@ class DTLSTransport:
             True if handshake completed, False on timeout
         """
         try:
-            await asyncio.wait_for(self.__handshake_complete.wait(), timeout)
+            await self.wait(TransportCondition.HANDSHAKE_COMPLETE, timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def wait_srtp_ready(self, timeout: float) -> bool:
+        try:
+            await self.wait(TransportCondition.SRTP_READY, timeout)
             return True
         except asyncio.TimeoutError:
             return False
@@ -367,7 +481,7 @@ class DTLSTransport:
             self.__transport.sendto(encrypted)
             return len(encrypted)
         except Exception as e:
-            logger.error(f"Failed to send RTCP: {e}")
+            get_logger().error(Component.DTLS, "Failed to send RTCP", error=str(e))
             return 0
 
     async def write_rtp_bytes(self, data: bytes) -> int:
@@ -388,8 +502,6 @@ class DTLSTransport:
         except Exception as e:
             wlogger = get_logger()
             wlogger.error(Component.DTLS, "Failed to send RTP", error=str(e))
-            import traceback
-            traceback.print_exc()
             return 0
 
     async def srtp_rtp_stream(self, ssrc: int) -> SrtpStream:
@@ -470,18 +582,17 @@ class DTLSTransport:
 
     async def _rtcp_receive_loop(self):
         """Internal loop that reads RTCP from ICE and routes to SRTP streams."""
+        wlogger = get_logger()
         if not self.__transport:
-            logger.error("No transport for RTCP receive loop")
+            wlogger.error(Component.DTLS, "No transport for RTCP receive loop")
             return
 
-        logger.info("RTCP receive loop started")
+        wlogger.info(Component.DTLS, "RTCP receive loop started")
         while True:
             try:
                 packet = await self.__transport.recv_rtcp()
                 if self._srtp_rtcp:
                     await self._srtp_rtcp.write_incoming(packet.data)
             except Exception as e:
-                logger.error(f"RTCP receive loop error: {e}")
-                import traceback
-                traceback.print_exc()
+                wlogger.error(Component.DTLS, "RTCP receive loop error", error=str(e))
                 await asyncio.sleep(0.1)

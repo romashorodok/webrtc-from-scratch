@@ -1,0 +1,74 @@
+{
+  "scenario": "pc_e2e_loopback_ice_dtls_srtp",
+  "required_events": [
+    "sdp.create_offer.started",
+    "sdp.create_offer.completed",
+    "sdp.set_local_offer.completed",
+    "sdp.set_remote_offer.completed",
+    "sdp.create_answer.completed",
+    "sdp.set_local_answer.completed",
+    "sdp.set_remote_answer.completed",
+    "ice.gather.completed",
+    "ice.remote_credentials.set",
+    "ice.candidate.remote_added",
+    "ice.candidate_pair.created",
+    "ice.candidate_pair.succeeded",
+    "ice.transport.nominated",
+    "dtls.start.completed",
+    "dtls.handshake.completed",
+    "dtls.record.tx",
+    "dtls.record.rx",
+    "srtp.keys.derived",
+    "srtp.ready.completed"
+  ],
+  "forbidden_events": [
+    "sdp.create_offer.failed",
+    "sdp.create_answer.failed",
+    "sdp.set_local_offer.failed",
+    "sdp.set_remote_offer.failed",
+    "sdp.set_local_answer.failed",
+    "sdp.set_remote_answer.failed",
+    "dtls.start.failed",
+    "dtls.handshake.failed",
+    "srtp.ready.failed"
+  ],
+  "ordering": [
+    [
+      "sdp.create_offer.started",
+      "sdp.create_offer.completed",
+      "sdp.set_local_offer.completed",
+      "sdp.set_remote_offer.completed",
+      "sdp.create_answer.completed",
+      "sdp.set_local_answer.completed",
+      "sdp.set_remote_answer.completed"
+    ],
+    [
+      "ice.remote_credentials.set",
+      "ice.candidate.remote_added",
+      "ice.candidate_pair.created",
+      "ice.candidate_pair.succeeded",
+      "ice.transport.nominated",
+      "dtls.start.completed",
+      "srtp.ready.completed",
+      "dtls.handshake.completed"
+    ]
+  ],
+  "counters": {
+    "events.total": {"min": 80},
+    "ice.candidates": {"min": 2},
+    "ice.stun_tx": {"min": 2},
+    "ice.stun_rx": {"min": 2},
+    "ice.stun_success": {"min": 2},
+    "dtls.records_tx": {"min": 8},
+    "dtls.records_rx": {"min": 8},
+    "events.srtp.ready.completed": {"min": 2}
+  },
+  "smoke_thresholds": {
+    "total_ms": {"max": 10000},
+    "phase_ms.sdp.create_offer": {"max": 1000},
+    "phase_ms.sdp.create_answer": {"max": 1000},
+    "phase_ms.ice.gather": {"max": 3000},
+    "phase_ms.dtls.handshake": {"max": 10000},
+    "phase_ms.srtp.ready": {"max": 3000}
+  }
+}

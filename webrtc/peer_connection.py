@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import wraps
 import secrets
 import string
 
@@ -15,6 +16,8 @@ from . import dtls
 import socket
 from .utils import AsyncEventEmitter, impl_protocol, current_ntp_time
 from .peer_context import get_active_peer_context, spawn_peer_task
+from .logger import Component, get_logger
+from .tracing import measure_perf_async, perf_mark, perf_measured_async
 
 from .session_description import (
     Origin,
@@ -52,6 +55,13 @@ from .peer_connection_types import (
     ICEParameters,
     ConnectionRole,
 )
+from .lifecycle import (
+    ICECondition,
+    PeerCondition,
+    TransportCondition,
+    require_timeout,
+    wait_for_event,
+)
 
 nic_interfaces = net.interface_factory(
     net.InterfaceProvider.PSUTIL, [socket.AF_INET], False
@@ -67,6 +77,26 @@ def random_string(length: int) -> str:
     return "".join(secrets.choice(allchar) for _ in range(length))
 
 
+def _sdp_description_measured(operation: str):
+    def decorate(fn):
+        @wraps(fn)
+        async def wrapper(
+            self,
+            desc_type: SessionDescriptionType,
+            desc: SessionDescription,
+        ):
+            async with measure_perf_async(
+                "sdp",
+                f"{operation}_{desc_type.value}",
+                metadata={"description_type": desc_type.value},
+            ):
+                return await fn(self, desc_type, desc)
+
+        return wrapper
+
+    return decorate
+
+
 class ICEGathererEvent(StrEnum):
     CANDIDATE_PAIR_CONTROLLER = "candidate-pair-controller"
 
@@ -77,6 +107,7 @@ class ICEGatherer(AsyncEventEmitter):
 
         self._loop = asyncio.get_running_loop()
         self.__agent: ice.Agent | None = None
+        self.__gather_lock = asyncio.Lock()
 
         # self._policy: ICEGatherPolicy = ICEGatherPolicy.All
         # self._state: ICEGatherState = ICEGatherState.NEW
@@ -130,7 +161,7 @@ class ICEGatherer(AsyncEventEmitter):
             await self.gather()
 
         if not self.__agent:
-            return
+            raise RuntimeError("ICE agent is not available")
 
         self.__agent.set_remote_credentials(ufrag, pwd)
 
@@ -139,7 +170,7 @@ class ICEGatherer(AsyncEventEmitter):
             await self.gather()
 
         if not self.__agent:
-            return
+            raise RuntimeError("ICE agent is not available")
 
         self.__agent.add_remote_candidate(candidate_str)
 
@@ -152,14 +183,12 @@ class ICEGatherer(AsyncEventEmitter):
         options = ice.AgentOptions([ice.CandidateType.Host], udp_mux, interfaces)
         return ice.Agent(options)
 
-    # def _on_candidate(self, candidate: ice.CandidateBase):
-    #     print("ICEGatherer on candidate", candidate)
     async def dial(self):
         if not self.__agent:
             await self.gather()
 
         if not self.__agent:
-            return
+            raise RuntimeError("ICE agent is not available")
 
         self.__agent.dial()
 
@@ -169,28 +198,39 @@ class ICEGatherer(AsyncEventEmitter):
             await self.gather()
 
         if not self.__agent:
-            return
+            raise RuntimeError("ICE agent is not available")
 
         self.__agent.accept()
 
     async def gather(self):
-        try:
+        async with self.__gather_lock:
             if not self.__agent:
                 self.__agent = await self.__create_agent()
 
             await self.__agent.gather_candidates()
 
-            # agent = self.__agent
-            # if agent is None:
-            #     self.__agent = await self.__create_agent()
-            #     agent = self.__agent
+        # agent = self.__agent
+        # if agent is None:
+        #     self.__agent = await self.__create_agent()
+        #     agent = self.__agent
 
-            # self._set_state(ICEGatherState.Gathering)
+        # self._set_state(ICEGatherState.Gathering)
 
-            # agent.set_on_candidate(self._on_candidate)
-            # await agent.gather_candidates()
-        except RuntimeError as e:
-            print("ICE gather error. Err:", e)
+        # agent.set_on_candidate(self._on_candidate)
+        # await agent.gather_candidates()
+
+    async def wait(self, condition: ICECondition, timeout: float) -> None:
+        timeout = require_timeout(timeout)
+        if not self.__agent:
+            if condition is ICECondition.GATHERING_COMPLETE:
+                await self.gather()
+            else:
+                raise RuntimeError("ICE agent is not started")
+
+        if not self.__agent:
+            raise RuntimeError("ICE agent is not available")
+
+        await self.__agent.wait(condition, timeout)
 
     # def _set_state(self, state: ICEGatherState):
     #     # TODO: Make it reactive
@@ -309,27 +349,16 @@ class PeerConnectionEvent(StrEnum):
 async def dtls_ice_pair_queue_handshake_routine(
     pair_transport: ice.CandidatePairTransport, dtls_transport: dtls.DTLSTransport
 ):
-    print("dtls_ice_pair_queue_handshake_routine: STARTED - listening for DTLS packets")
+    logger = get_logger()
+    logger.debug(Component.DTLS, "DTLS ICE queue routine started")
     while True:
         try:
             pkt = await pair_transport.recv_dtls()
-            print(
-                f"dtls_ice_pair_queue_handshake_routine: received DTLS packet, {len(pkt.data)} bytes"
-            )
+            logger.trace(Component.DTLS, "Received DTLS packet from ICE", size=len(pkt.data))
             await dtls_transport.enqueue_record(pkt.data)
         except Exception as e:
-            print("dtls_ice_pair_queue_routine error:", e)
-
-
-async def dtls_ice_pair_dequeue_handshake_routine(
-    pair_transport: ice.CandidatePairTransport, dtls_transport: dtls.DTLSTransport
-):
-    while True:
-        try:
-            layer = await dtls_transport.dequeue_record()
-            pair_transport.sendto(layer)
-        except Exception as e:
-            print("dtls_ice_pair_queue_routine error:", e)
+            logger.error(Component.DTLS, "DTLS ICE queue routine failed", error=str(e))
+            raise
 
 
 # TODO: Watch into ORTC API
@@ -370,16 +399,11 @@ class PeerConnection(AsyncEventEmitter):
         self._closed: bool = False
         self._peer_connection_lock = asyncio.Lock()
         self._transport: ice.CandidatePairTransport | None = None
+        self._transport_ready = asyncio.Event()
 
     async def __on_ice_pair_controller(self, pair_ctrl: ice.CandidatePairController):
         # TODO: check if this already started
         pair_ctrl.remove_all_listeners()
-
-        ice_transport = ICETransport(self.gatherer)
-        if ice_transport.get_ice_role() == ice.AgentRole.Controlled:
-            dtls_role = dtls.DTLSRole.Client
-        else:
-            dtls_role = dtls.DTLSRole.Server
 
         @pair_ctrl.on(ice.CandidatePairControllerEvent.NOMINATE_TRANSPORT)
         async def _bind_transport_on_nominated_to_transceivers(
@@ -387,28 +411,32 @@ class PeerConnection(AsyncEventEmitter):
         ):
             # Guard against duplicate NOMINATE_TRANSPORT events
             if self._transport is not None:
-                print(
-                    f"[PC] on NOMINATE_TRANSPORT: already have transport, ignoring duplicate"
+                get_logger().debug(
+                    Component.PEER_CONNECTION,
+                    "Ignoring duplicate nominated transport",
                 )
                 return
 
-            print(f"[PC] on NOMINATE_TRANSPORT: starting DTLS as {dtls_role}")
+            dtls_role = self.__get_dtls_role()
+            get_logger().info(
+                Component.PEER_CONNECTION,
+                "Starting DTLS on nominated transport",
+                role=dtls_role.value,
+            )
             self._transport = transport
+            self._transport_ready.set()
+            perf_mark("ice", "transport", "nominated")
             if peer_context := get_active_peer_context():
                 peer_context._set_selected_transport(transport)
 
             # Start DTLS with the nominated transport
             self._dtls_transport.start(dtls_role, transport)
-            print(f"[PC] DTLS transport started, creating handshake routines")
+            get_logger().debug(Component.DTLS, "Starting DTLS ICE queue routine")
             spawn_peer_task(
                 dtls_ice_pair_queue_handshake_routine(transport, self._dtls_transport),
                 name="dtls:ice-pair-queue-handshake",
                 component="dtls",
-            )
-            spawn_peer_task(
-                dtls_ice_pair_dequeue_handshake_routine(transport, self._dtls_transport),
-                name="dtls:ice-pair-dequeue-handshake",
-                component="dtls",
+                metadata={"expected_long_running": True, "loop_role": "receive"},
             )
 
             # OBSOLETE: This loop was stealing 50% of packets from DTLSTransport._rtp_receive_loop()
@@ -421,14 +449,16 @@ class PeerConnection(AsyncEventEmitter):
             #         pkt = await transport.recv_rtp()
             #         await self._dtls_transport.write_rtp_bytes(pkt.data)
             #
-            print(
-                "[PeerConnection] Skipping obsolete run_rtp_recv_loop - DTLSTransport._rtp_receive_loop handles this"
+            get_logger().debug(
+                Component.PEER_CONNECTION,
+                "Skipping obsolete RTP receive bridge",
             )
 
         spawn_peer_task(
             pair_ctrl.start(),
             name="ice:candidate-pair-controller",
             component="ice",
+            metadata={"expected_long_running": True, "loop_role": "controller"},
         )
 
         # self.dtls_transports.append(dtls_transport)
@@ -443,6 +473,45 @@ class PeerConnection(AsyncEventEmitter):
             component="ice",
             kind="lifecycle",
         )
+
+    async def wait(self, condition: PeerCondition, timeout: float) -> None:
+        timeout = require_timeout(timeout)
+        match condition:
+            case PeerCondition.ICE_GATHERING_COMPLETE:
+                await self.gatherer.wait(ICECondition.GATHERING_COMPLETE, timeout)
+            case PeerCondition.ICE_CANDIDATE_PAIR_SUCCEEDED:
+                await self.gatherer.wait(
+                    ICECondition.CANDIDATE_PAIR_SUCCEEDED,
+                    timeout,
+                )
+            case PeerCondition.ICE_NOMINATED:
+                await self.gatherer.wait(ICECondition.NOMINATED, timeout)
+            case PeerCondition.NOMINATED_TRANSPORT_READY:
+                await wait_for_event(self._transport_ready, timeout=timeout)
+            case PeerCondition.DTLS_HANDSHAKE_COMPLETE:
+                await self._dtls_transport.wait(
+                    TransportCondition.HANDSHAKE_COMPLETE,
+                    timeout,
+                )
+            case PeerCondition.SRTP_READY:
+                await self._dtls_transport.wait(TransportCondition.SRTP_READY, timeout)
+            case _:
+                raise ValueError(f"unsupported peer condition: {condition}")
+
+    async def wait_nominated_transport(self, timeout: float) -> ice.CandidatePairTransport:
+        await self.wait(PeerCondition.NOMINATED_TRANSPORT_READY, timeout)
+        if self._transport is None:
+            raise RuntimeError("nominated transport is not available")
+        return self._transport
+
+    async def wait_transport_ready(self, timeout: float) -> ice.CandidatePairTransport:
+        return await self.wait_nominated_transport(timeout)
+
+    async def wait_dtls_handshake(self, timeout: float) -> None:
+        await self.wait(PeerCondition.DTLS_HANDSHAKE_COMPLETE, timeout)
+
+    async def wait_srtp_ready(self, timeout: float) -> None:
+        await self.wait(PeerCondition.SRTP_READY, timeout)
 
     async def add_transceiver_from_track(
         self, track: TrackLocal, direction: RTPTransceiverDirection
@@ -495,22 +564,22 @@ class PeerConnection(AsyncEventEmitter):
             await transceiver.set_sender(sender)
 
             encoding = sender._track_encodings[0]
-            print(
-                "add_transceiver_from_track | Local Sender open stream for SSRC:",
-                encoding.ssrc,
-                "STREAM_ID",
-                track.stream_id,
+            get_logger().debug(
+                Component.PEER_CONNECTION,
+                "Configured local sender stream",
+                ssrc=encoding.ssrc,
+                stream_id=track.stream_id,
             )
         if receiver:
             if not receiver._track:
                 raise ValueError("Receiver stream must bedefined")
 
             # NOTE: It may have different SSRC after negotiation
-            print(
-                "add_transceiver_from_track | Remote receiver open stream for SSRC:",
-                receiver._track.ssrc,
-                "STREAM_ID",
-                track.stream_id,
+            get_logger().debug(
+                Component.PEER_CONNECTION,
+                "Configured remote receiver stream",
+                ssrc=receiver._track.ssrc,
+                stream_id=track.stream_id,
             )
 
             transceiver.set_receiver(receiver)
@@ -561,6 +630,7 @@ class PeerConnection(AsyncEventEmitter):
         else:
             raise ValueError("Unknown direction")
 
+    @_sdp_description_measured("set_local")
     async def set_local_description(
         self, desc_type: SessionDescriptionType, desc: SessionDescription
     ):
@@ -608,8 +678,12 @@ class PeerConnection(AsyncEventEmitter):
                 case SessionDescriptionType.Rollback:
                     raise ValueError("unsupported rollback desc type")
         except SignalingStateTransitionError as e:
-            print("Invalid local state transition", e)
-            return
+            get_logger().error(
+                Component.SDP,
+                "Invalid local description state transition",
+                error=str(e),
+            )
+            raise
 
     async def _match_transceivers_with_offer(self, offer: SessionDescription):
         """
@@ -635,7 +709,12 @@ class PeerConnection(AsyncEventEmitter):
                 if transceiver.kind == kind:
                     # Assign the MID from the offer
                     transceiver.set_mid(int(mid) if mid.isdigit() else 0)
-                    print(f"[PC] Assigned MID {mid} to transceiver with kind {kind}")
+                    get_logger().debug(
+                        Component.SDP,
+                        "Assigned MID from remote offer",
+                        mid=mid,
+                        kind=kind.value,
+                    )
 
                     # Track greater mid for future use
                     if mid.isdigit() and int(mid) > self._greater_mid:
@@ -645,10 +724,16 @@ class PeerConnection(AsyncEventEmitter):
                     unassigned_transceivers.pop(i)
                     break
 
+    @_sdp_description_measured("set_remote")
     async def set_remote_description(
         self, desc_type: SessionDescriptionType, desc: SessionDescription
     ):
-        print("Old state", self._transceivers)
+        get_logger().debug(
+            Component.SDP,
+            "Setting remote description",
+            desc_type=desc_type.value,
+            transceiver_count=len(self._transceivers),
+        )
         try:
             match desc_type:
                 case SessionDescriptionType.Answer:
@@ -697,22 +782,30 @@ class PeerConnection(AsyncEventEmitter):
                     raise ValueError("unsupported rollback desc type")
 
         except SignalingStateTransitionError as e:
-            print("Invalid remote state transition", e)
-            return
+            get_logger().error(
+                Component.SDP,
+                "Invalid remote description state transition",
+                error=str(e),
+            )
+            raise
 
         transceivers = self._transceivers.copy()
 
         if desc_type == SessionDescriptionType.Answer:
-            print("Generate state by answer")
+            get_logger().debug(Component.SDP, "Applying remote answer state")
             for media in desc.media_descriptions:
                 mid = media.get_attribute_value(SessionDescriptionAttrKey.MID.value)
                 if not mid:
-                    print("Not found mid")
+                    get_logger().debug(Component.SDP, "Skipping media without MID")
                     continue
 
                 kind = RTPCodecKind(media.kind)
                 if kind != RTPCodecKind.Audio and kind != RTPCodecKind.Video:
-                    print("Not found kind")
+                    get_logger().debug(
+                        Component.SDP,
+                        "Skipping unsupported media kind",
+                        kind=media.kind,
+                    )
                     continue
 
                 transceiver = find_transceiver_by_mid(mid, transceivers)
@@ -732,9 +825,18 @@ class PeerConnection(AsyncEventEmitter):
                             media.codecs[0],
                         )
                         await self.add_transceiver_from_track(track, media.direction)
-                        print("Create transciver from track", kind, media.codecs[0])
+                        get_logger().debug(
+                            Component.SDP,
+                            "Created transceiver from track",
+                            kind=kind.value,
+                        )
                     else:
-                        print("Create transciver from kind", kind, media.direction)
+                        get_logger().debug(
+                            Component.SDP,
+                            "Created transceiver from kind",
+                            kind=kind.value,
+                            direction=media.direction.value,
+                        )
                         await self.add_transceiver_from_kind(kind, media.direction)
                 elif transceiver:
                     # TODO: It may change direction too
@@ -747,7 +849,11 @@ class PeerConnection(AsyncEventEmitter):
                             if track := recv.track:
                                 track.ssrc = int(ssrc.split(" ")[0])
 
-        print("New state", self._transceivers)
+        get_logger().debug(
+            Component.SDP,
+            "Remote description applied",
+            transceiver_count=len(self._transceivers),
+        )
         # NOTE: Here may be also restart and updating candidates
         # TODO: May also start transports
         # TODO: This also may remote all unmatched transceivers
@@ -764,12 +870,43 @@ class PeerConnection(AsyncEventEmitter):
     def __get_sdp_role(self) -> ConnectionRole:
         role = self.gatherer.get_role()
 
-        print(f"Set SDP from agent {role}")
-        # The ICE controlling role acts as the server.
-        if role == ice.AgentRole.Controlling or not role:
+        get_logger().debug(
+            Component.SDP,
+            "Selecting SDP setup role",
+            ice_role=role.value if role else None,
+        )
+        if self._pending_remote_description is not None:
             return ConnectionRole.Passive
 
-        return ConnectionRole.Active
+        return ConnectionRole.Actpass
+
+    def __get_dtls_role(self) -> dtls.DTLSRole:
+        remote_description = (
+            self._current_remote_description or self._pending_remote_description
+        )
+        remote_setup: str | None = None
+        if remote_description is not None:
+            for media in remote_description.media_descriptions:
+                remote_setup = media.get_attribute_value(
+                    SessionDescriptionAttrKey.ConnectionSetup.value
+                )
+                if remote_setup:
+                    break
+
+        match remote_setup:
+            case ConnectionRole.Active.value:
+                return dtls.DTLSRole.Server
+            case ConnectionRole.Passive.value:
+                return dtls.DTLSRole.Client
+            case ConnectionRole.Actpass.value:
+                return dtls.DTLSRole.Server
+            case ConnectionRole.Holdconn.value:
+                raise RuntimeError("remote SDP requested DTLS holdconn")
+
+        ice_transport = ICETransport(self.gatherer)
+        if ice_transport.get_ice_role() == ice.AgentRole.Controlled:
+            return dtls.DTLSRole.Server
+        return dtls.DTLSRole.Client
 
     # Generates an SDP that doesn't take remote state into account
     # This is used for the initial call for create_offer
@@ -783,11 +920,10 @@ class PeerConnection(AsyncEventEmitter):
 
         ice_params = await self.gatherer.get_local_parameters()
         if ice_params is None:
-            print("_generate_unmatched_sdp not found ice params")
-            return
+            raise RuntimeError("ICE local parameters are not available")
 
         if not self._transceivers:
-            print("Empty transceivers")
+            get_logger().debug(Component.SDP, "Generating SDP with no transceivers")
 
         ice_candidates = await self.gatherer.get_local_candidates()
 
@@ -804,7 +940,11 @@ class PeerConnection(AsyncEventEmitter):
                     )
                 )
             else:
-                print("Not found transceiver mid. Must be already defined")
+                get_logger().debug(
+                    Component.SDP,
+                    "Skipping transceiver without MID",
+                    kind=t.kind.value,
+                )
 
         fingerprints = [
             dtls.Fingerprint(
@@ -813,7 +953,11 @@ class PeerConnection(AsyncEventEmitter):
             ),
         ]
 
-        print("media sections", media_sections)
+        get_logger().debug(
+            Component.SDP,
+            "Generated unmatched SDP media sections",
+            media_section_count=len(media_sections),
+        )
 
         return populate_session_descriptor(
             desc=desc,
@@ -860,10 +1004,10 @@ class PeerConnection(AsyncEventEmitter):
 
         ice_params = await self.gatherer.get_local_parameters()
         if ice_params is None:
-            return
+            raise RuntimeError("ICE local parameters are not available")
 
         if not self._transceivers:
-            print("Empty transceivers")
+            get_logger().debug(Component.SDP, "Generating SDP with no transceivers")
 
         ice_candidates = await self.gatherer.get_local_candidates()
 
@@ -876,12 +1020,16 @@ class PeerConnection(AsyncEventEmitter):
         for media in remote_desc.media_descriptions:
             mid = media.get_attribute_value(SessionDescriptionAttrKey.MID.value)
             if not mid:
-                print("Not found mid")
+                get_logger().debug(Component.SDP, "Skipping media without MID")
                 continue
 
             kind = RTPCodecKind(media.kind)
             if kind != RTPCodecKind.Audio and kind != RTPCodecKind.Video:
-                print("Not found kind")
+                get_logger().debug(
+                    Component.SDP,
+                    "Skipping unsupported media kind",
+                    kind=media.kind,
+                )
                 continue
 
             transceiver = find_transceiver_by_mid(mid, transceivers)
@@ -903,7 +1051,11 @@ class PeerConnection(AsyncEventEmitter):
                 "Unable generate stateful desc. Not found correct media_section"
             )
 
-        print(media_sections)
+        get_logger().debug(
+            Component.SDP,
+            "Generated matched SDP media sections",
+            media_section_count=len(media_sections),
+        )
 
         # That approach will add flexability to decide client to assign it by own.
         matched_transiceivers = flatten_media_section_transceivers(media_sections)
@@ -934,6 +1086,7 @@ class PeerConnection(AsyncEventEmitter):
             remote_description=remote_desc,  # Pass remote for codec negotiation
         )
 
+    @perf_measured_async("sdp", "create_offer")
     async def create_offer(self, options: OfferOption | None = None):
         # if self._closed:
         #     raise ValueError("connection closed")
@@ -966,8 +1119,10 @@ class PeerConnection(AsyncEventEmitter):
             return desc
 
         except RuntimeError as e:
-            print("Create offer error", e)
+            get_logger().error(Component.SDP, "Create offer failed", error=str(e))
+            raise
 
+    @perf_measured_async("sdp", "create_answer")
     async def create_answer(self):
         """
         Create an SDP answer in response to an offer from a remote peer.
@@ -1001,4 +1156,5 @@ class PeerConnection(AsyncEventEmitter):
             return desc
 
         except RuntimeError as e:
-            print("Create answer error", e)
+            get_logger().error(Component.SDP, "Create answer failed", error=str(e))
+            raise

@@ -450,7 +450,6 @@ async def ws_endpoint(ws: WebSocket):
     # Create PeerConnection
     pc = PeerConnection()
     pc.start()
-    await pc.gatherer.dial()
 
     # Add SINGLE sendrecv transceiver for bidirectional audio
     await pc.add_transceiver_from_kind(
@@ -514,7 +513,6 @@ async def ws_endpoint(ws: WebSocket):
         match msg.get("event"):
             case "negotiate":
                 print("[Opus] Negotiate event received")
-                await pc.gatherer.dial()
                 try:
                     start()
                 except RuntimeError as e:
@@ -558,6 +556,7 @@ async def ws_endpoint(ws: WebSocket):
 
                 # Start audio processing automatically after answer
                 if desc_type is SessionDescriptionType.Answer:
+                    await pc.gatherer.dial()
                     print("[Opus] Answer received, starting audio processing...")
                     try:
                         start()

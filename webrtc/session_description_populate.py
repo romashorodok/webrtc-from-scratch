@@ -16,6 +16,7 @@ from .peer_connection_types import (
     ICEParameters,
     RTPComponent,
 )
+from .logger import Component, get_logger
 
 
 class ExtMap:
@@ -112,7 +113,11 @@ def add_sender_sdp(desc: MediaDescription, media_section: MediaSection):
 
         send_params = sender.get_parameters()
         if not send_params:
-            print("empty sender encodings. Possible empty track")
+            get_logger().debug(
+                Component.SDP,
+                "Skipping sender SDP with no encodings",
+                track_id=track.id,
+            )
             continue
 
         for encoding in send_params.encodings:
@@ -266,7 +271,7 @@ def add_transceiver_media_description(
 
     add_sender_sdp(media, media_section)
 
-    print("Current direction ", t.direction.value)
+    get_logger().debug(Component.SDP, "Adding media direction", direction=t.direction.value)
     media.add_attribute(SessionDescriptionAttr(t.direction.value))
 
     for fingerprint in fingerprints:
@@ -328,7 +333,7 @@ def populate_session_descriptor(
         should_add_candidates = False
 
         if media.data:
-            print("media session desc contain SCTP. Not supported")
+            get_logger().debug(Component.SDP, "Skipping unsupported SCTP media section")
             continue
 
         # Get the corresponding remote media for this MID (for codec negotiation)

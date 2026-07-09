@@ -111,6 +111,13 @@ async def start_write_loop(pc: PeerConnection, peer: PeerContext):
 
     send_time_cache = SendTimeCache()
 
+    async def wait_sender_rtcp_stream(timeout: float) -> None:
+        async def poll() -> None:
+            while sender._rtcp_stream is None:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(poll(), timeout)
+
     def print_rtcp(pkts: list[AnyRtcpPacket], smoothed_gradient: float):
         for feedback in pkts:
             if isinstance(feedback, TransportLayerCC):
@@ -280,6 +287,9 @@ async def start_write_loop(pc: PeerConnection, peer: PeerContext):
                     group_key="ice:send-rtp-packets",
                 )
 
+    await pc.wait_transport_ready(timeout=10)
+    await pc.wait_srtp_ready(timeout=10)
+    await wait_sender_rtcp_stream(timeout=10)
     peer.spawn_app(rtcp_handler(), name="ws:rtcp-handler", kind="rtcp")
     await encode()
 
@@ -309,7 +319,6 @@ async def ws_endpoint(ws: WebSocket):
         write_task: asyncio.Task[Any] | None = None
 
         peer.start()
-        await pc.gatherer.dial()
 
         await pc.add_transceiver_from_kind(
             RTPCodecKind.Video, RTPTransceiverDirection.Sendonly
@@ -335,7 +344,6 @@ async def ws_endpoint(ws: WebSocket):
             match msg.get("event"):
                 case "negotiate":
                     print("Start all webrtc")
-                    await pc.gatherer.dial()
                     await start_media()
 
                 case "offer":
@@ -377,6 +385,8 @@ async def ws_endpoint(ws: WebSocket):
                         await peer.set_remote_credentials(ufrag, pwd)
 
                     await peer.set_remote_description(desc_type, desc)
+                    if desc_type is SessionDescriptionType.Answer:
+                        await pc.gatherer.dial()
 
                 case "trickle-ice":
                     # NOTE: In my current state I need know ufrag, pwd before adding the candidate, because all pair credentials is immutable

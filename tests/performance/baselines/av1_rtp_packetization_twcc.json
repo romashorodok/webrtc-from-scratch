@@ -1,0 +1,51 @@
+{
+  "scenario": "av1_rtp_packetization_twcc",
+  "required_events": [
+    "scenario.run.started",
+    "media.frame.generated",
+    "rtp.packetize.started",
+    "rtp.packetize.completed",
+    "rtp.packet.serialized",
+    "rtp.packet.depacketized",
+    "media.frame.verified",
+    "rtcp.twcc.generated",
+    "rtcp.twcc.confirmed",
+    "scenario.run.completed"
+  ],
+  "forbidden_events": [
+    "scenario.run.failed",
+    "rtp.packetize.failed",
+    "rtp.packet.failed",
+    "rtcp.twcc.failed",
+    "media.frame.failed"
+  ],
+  "ordering": [
+    [
+      "scenario.run.started",
+      "media.frame.generated",
+      "rtp.packetize.started",
+      "rtp.packetize.completed",
+      "rtp.packet.serialized",
+      "rtp.packet.depacketized",
+      "media.frame.verified",
+      "rtcp.twcc.generated",
+      "rtcp.twcc.confirmed",
+      "scenario.run.completed"
+    ]
+  ],
+  "counters": {
+    "events.total": {"min": 20},
+    "rtp.frames": {"equals": 1},
+    "rtp.packets": {"min": 2},
+    "rtp.serialized": {"min": 2},
+    "rtp.depacketized": {"min": 2},
+    "rtcp.feedback_packets": {"equals": 1},
+    "rtcp.confirmed_packets": {"min": 2},
+    "media.frames": {"equals": 1},
+    "media.frames_verified": {"equals": 1}
+  },
+  "smoke_thresholds": {
+    "total_ms": 1000,
+    "phase_ms.rtp.packetize": 250
+  }
+}

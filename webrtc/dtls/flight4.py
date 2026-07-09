@@ -19,6 +19,7 @@ from webrtc.dtls.dtls_record import (
 from webrtc.dtls.dtls_record_factory import DEFAULT_FACTORY
 from webrtc.dtls.dtls_typing import EllipticCurveGroup
 from webrtc.dtls.flight_state import Flight, FlightTransition, HandshakeCacheKey, State
+from webrtc.dtls.dtls_cipher_suite import generate_server_signature
 from webrtc.dtls.prf import prf_master_secret, prf_extended_master_secret
 
 
@@ -61,11 +62,14 @@ class Flight4(FlightTransition):
         #     state.local_random.marshal_fixed(),
         # )
 
-        signature = state.local_certificate._keypair.generate_server_signature(
+        signature_input = generate_server_signature(
             state.remote_random,
             state.local_random.marshal_fixed(),
+            state.local_keypair.public_key_bytes(),
+            state.local_keypair.curve,
         )
-        curve = EllipticCurveGroup(state.local_certificate._keypair.curve_id())
+        signature = state.local_certificate.sign(signature_input)
+        curve = state.local_keypair.curve
 
         return [
             self.__msg.server_hello(
@@ -78,8 +82,7 @@ class Flight4(FlightTransition):
                 signature,
                 curve,
                 state.local_keypair.signature_hash_algorithm,
-                state.local_certificate.pubkey_der,
-                # keypair.publicKey.to_der(),
+                state.local_keypair.public_key_bytes(),
             ),
             self.__msg.certificate_request(
                 [CertificateType.ECDSA], [state.local_keypair.signature_hash_algorithm]
@@ -99,8 +102,7 @@ class Flight4(FlightTransition):
         logger.debug(f"__setup_cipher_suite: client pubkey length={len(client_key_exchange.pubkey)}")
 
         # Compute pre-master secret using ECDH
-        # The state.local_certificate._keypair is a Rust Keypair that provides compute_shared_secret()
-        pre_master_secret = state.local_certificate._keypair.compute_shared_secret(
+        pre_master_secret = state.local_keypair.compute_shared_secret(
             client_key_exchange.pubkey
         )
 

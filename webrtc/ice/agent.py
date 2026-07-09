@@ -13,6 +13,7 @@ from . import net
 
 from .net.types import (
     Address,
+    CandidateProtocol,
     MuxConnProtocol,
     MuxProtocol,
     NetworkType,
@@ -26,6 +27,8 @@ from webrtc.utils import impl_protocol, AsyncEventEmitter, Handler_T
 from webrtc.logger import get_logger, Component
 from webrtc.config import get_config
 from webrtc.peer_context import spawn_peer_task
+from webrtc.lifecycle import ICECondition, require_timeout, wait_for_event, wait_until
+from webrtc.tracing import perf_mark, perf_measured_async
 
 from .candidate_base import (
     CandidateBase,
@@ -134,6 +137,28 @@ class CandidatePair:
         return self._remote_pwd.encode()
 
 
+def _candidate_metadata(candidate: CandidateProtocol) -> dict[str, object]:
+    return {
+        "address": candidate.address,
+        "port": candidate.port,
+        "network_type": candidate.get_network_type().value,
+        "candidate_type": getattr(candidate, "candidate_type", None),
+        "priority": candidate.priority,
+    }
+
+
+def _pair_metadata(pair: CandidatePair) -> dict[str, object]:
+    return {
+        "pair_id": pair.get_pair_id(),
+        "local_address": pair.local_candidate.unwrap.address,
+        "local_port": pair.local_candidate.unwrap.port,
+        "remote_address": pair.remote_candidate.unwrap.address,
+        "remote_port": pair.remote_candidate.unwrap.port,
+        "local_ufrag": pair.local_ufrag,
+        "remote_ufrag": pair.remote_ufrag,
+    }
+
+
 class CandidatePairRegistry:
     def __init__(self) -> None:
         self._check_list = dict[str, CandidatePair]()
@@ -190,8 +215,10 @@ class BindingRequestCacheRegistry:
 
         bind_requests_removed = initial_size - len(self._registry)
         if bind_requests_removed > 0:
-            print(
-                f"Discarded {bind_requests_removed} binding requests, because they expired"
+            get_logger().debug(
+                Component.ICE,
+                "Discarded expired binding requests",
+                count=bind_requests_removed,
             )
 
     async def cache_message(self, msg: stun.Message, dst: tuple[str, int]):
@@ -270,10 +297,15 @@ class ControllingSelector(AsyncEventEmitter):
     def start(self):
         self._start_time = datetime.now()
         self._nominated_pair = None
-        print("Start ControllingSelector agent selector")
+        get_logger().debug(Component.ICE, "Started controlling ICE selector")
 
     def _set_nominate_pair(self, pair: CandidatePair):
-        print(f"[ICE] _set_nominate_pair: nominating pair {pair.get_pair_id()}")
+        get_logger().debug(
+            Component.ICE,
+            "Nominating candidate pair",
+            pair_id=pair.get_pair_id(),
+        )
+        perf_mark("ice", "candidate_pair", "nominated", metadata=_pair_metadata(pair))
         self._nominated_pair = pair
         self.emit(SelectorEvent.NOMINATE, pair)
 
@@ -294,10 +326,19 @@ class ControllingSelector(AsyncEventEmitter):
             ),
         )
 
-        print(
-            f"Ping STUN (nominate candidate pair) from {pair.local_ufrag} to {pair.remote_ufrag}"
+        get_logger().trace(
+            Component.ICE,
+            "Sending STUN nomination request",
+            local_ufrag=pair.local_ufrag,
+            remote_ufrag=pair.remote_ufrag,
         )
 
+        perf_mark(
+            "ice",
+            "stun",
+            "tx",
+            metadata={**_pair_metadata(pair), "use_candidate": True, "counter.ice.stun_tx": 1},
+        )
         conn.sendto(msg.encode(pair.remote_pwd))
 
     async def on_binding_success(
@@ -317,6 +358,12 @@ class ControllingSelector(AsyncEventEmitter):
             )
         )
         conn.sendto(msg.encode(pair.local_pwd))
+        perf_mark(
+            "ice",
+            "stun",
+            "tx",
+            metadata={**_pair_metadata(pair), "message_class": "success_response", "counter.ice.stun_tx": 1},
+        )
 
         # TODO: check also selected pair like this s.agent.getSelectedPair() == nil
         # But what is diff between nominated_pair
@@ -335,8 +382,11 @@ class ControllingSelector(AsyncEventEmitter):
             bytes(msg.transaction_id)
         )
         if binding_request is None:
-            print(
-                f"Discard message from ({pair.remote_ufrag}), unknown transaction_id: {msg.transaction_id}"
+            get_logger().warn(
+                Component.ICE,
+                "Discarding STUN success response with unknown transaction ID",
+                remote_ufrag=pair.remote_ufrag,
+                transaction_id=msg.transaction_id,
             )
             raise ValueError(
                 f"Discard message from ({pair.remote_ufrag}), unknown transaction_id: {msg.transaction_id}"
@@ -349,14 +399,20 @@ class ControllingSelector(AsyncEventEmitter):
         # NOTE: Each connection from an internal host to an external host is given a unique mapping in the NAT device. Different connections to different external hosts will have different mappings. Is it like NAT:NAT ???
         # https://github.com/pion/ice/blob/2a9fdb5c0dde845df6a5cb4709e619dbb6164786/selection.go#L133
         if transaction_addr != source_addr or transaction_port != source_port:
-            print(
-                f"Discard message from ({pair.remote_ufrag}), source and transaction does not match expected({transaction_addr}:{transaction_port}), actual({source_addr}:{source_port})"
+            get_logger().warn(
+                Component.ICE,
+                "Discarding STUN success response from unexpected source",
+                remote_ufrag=pair.remote_ufrag,
+                expected=f"{transaction_addr}:{transaction_port}",
+                actual=f"{source_addr}:{source_port}",
             )
             raise ValueError(
                 f"Discard message from ({pair.remote_ufrag}), source and transaction does not match expected({transaction_addr}:{transaction_port}), actual({source_addr}:{source_port})"
             )
 
         pair.state = CandidatePairState.SUCCEEDED
+        perf_mark("ice", "candidate_pair", "succeeded", metadata=_pair_metadata(pair))
+        perf_mark("ice", "stun", "success", metadata={**_pair_metadata(pair), "counter.ice.stun_success": 1})
 
         if binding_request.use_candidate_attr and self._nominated_pair is None:
             self._set_nominate_pair(pair)
@@ -377,6 +433,12 @@ class ControllingSelector(AsyncEventEmitter):
             ),
         )
 
+        perf_mark(
+            "ice",
+            "stun",
+            "tx",
+            metadata={**_pair_metadata(pair), "use_candidate": False, "counter.ice.stun_tx": 1},
+        )
         conn.sendto(msg.encode(pair.remote_pwd))
 
 
@@ -391,7 +453,7 @@ class ControlledSelector(AsyncEventEmitter):
         self._local_binding_cache = BindingRequestCacheRegistry()
 
     def start(self):
-        print("Start ControlledSelector agent selector")
+        get_logger().debug(Component.ICE, "Started controlled ICE selector")
 
     async def on_binding_success(
         self, pair: CandidatePair, conn: MuxConnProtocol, msg: stun.Message
@@ -399,19 +461,32 @@ class ControlledSelector(AsyncEventEmitter):
         useCandidate = msg.get_attribute(stun.UseCandidate)
 
         if useCandidate:
-            print("[ICE] ControlledSelector.on_binding_success: UseCandidate attribute found")
+            get_logger().debug(Component.ICE, "Received STUN UseCandidate")
             # When the controlling agent sends UseCandidate, we should nominate the pair
             # The controlling agent has already verified connectivity, so we can trust this
             if self._selected_pair is None or self._selected_pair.get_pair_priority(
                 False
             ) < pair.get_pair_priority(False):
-                print(f"[ICE] ControlledSelector: nominating pair via UseCandidate {pair.get_pair_id()}")
+                get_logger().debug(
+                    Component.ICE,
+                    "Nominating candidate pair via UseCandidate",
+                    pair_id=pair.get_pair_id(),
+                )
+                perf_mark(
+                    "ice",
+                    "candidate_pair",
+                    "nominated",
+                    metadata=_pair_metadata(pair),
+                )
                 self._selected_pair = pair
                 # Emit NOMINATE event to trigger DTLS transport setup
                 self.emit(SelectorEvent.NOMINATE, pair)
             elif self._selected_pair != pair:
-                print(
-                    f"Ignore nominated new pair {pair}, already selected {self._selected_pair}"
+                get_logger().debug(
+                    Component.ICE,
+                    "Ignoring lower-priority nominated candidate pair",
+                    pair_id=pair.get_pair_id(),
+                    selected_pair_id=self._selected_pair.get_pair_id(),
                 )
         else:
             # If the received Binding request triggered a new check to be
@@ -438,6 +513,12 @@ class ControlledSelector(AsyncEventEmitter):
             )
         )
         conn.sendto(msg.encode(pair.local_pwd))
+        perf_mark(
+            "ice",
+            "stun",
+            "tx",
+            metadata={**_pair_metadata(pair), "message_class": "success_response", "counter.ice.stun_tx": 1},
+        )
 
         await self.send_ping_stun_message(pair, conn)
 
@@ -449,18 +530,33 @@ class ControlledSelector(AsyncEventEmitter):
         source: Address,
     ):
         pair.state = CandidatePairState.SUCCEEDED
+        perf_mark("ice", "candidate_pair", "succeeded", metadata=_pair_metadata(pair))
+        perf_mark("ice", "stun", "success", metadata={**_pair_metadata(pair), "counter.ice.stun_success": 1})
 
         if pair._nominate_on_binding:
             if self._selected_pair is None or self._selected_pair.get_pair_priority(
                 False
             ) < pair.get_pair_priority(False):
-                print(f"[ICE] ControlledSelector: nominating pair {pair.get_pair_id()}")
+                get_logger().debug(
+                    Component.ICE,
+                    "Nominating candidate pair",
+                    pair_id=pair.get_pair_id(),
+                )
+                perf_mark(
+                    "ice",
+                    "candidate_pair",
+                    "nominated",
+                    metadata=_pair_metadata(pair),
+                )
                 self._selected_pair = pair
                 # Emit NOMINATE event to trigger DTLS transport setup
                 self.emit(SelectorEvent.NOMINATE, pair)
             elif self._selected_pair != pair:
-                print(
-                    f"Ignore nominated new pair {pair}, already selected {self._selected_pair}"
+                get_logger().debug(
+                    Component.ICE,
+                    "Ignoring lower-priority nominated candidate pair",
+                    pair_id=pair.get_pair_id(),
+                    selected_pair_id=self._selected_pair.get_pair_id(),
                 )
 
     async def send_ping_stun_message(self, pair: CandidatePair, conn: MuxConnProtocol):
@@ -479,6 +575,12 @@ class ControlledSelector(AsyncEventEmitter):
             ),
         )
 
+        perf_mark(
+            "ice",
+            "stun",
+            "tx",
+            metadata={**_pair_metadata(pair), "use_candidate": False, "counter.ice.stun_tx": 1},
+        )
         conn.sendto(msg.encode(pair.remote_pwd))
 
 
@@ -592,9 +694,16 @@ class CandidatePairController(AsyncEventEmitter):
             self._pair.remote_candidate.unwrap
         )
         self.__transport = CandidatePairTransport(self.__conn)
+        self.__nominated = asyncio.Event()
 
     def __pair_nominate(self, _: CandidatePair):
-        print(f"[ICE] __pair_nominate: emitting NOMINATE_TRANSPORT event")
+        get_logger().debug(
+            Component.ICE,
+            "Emitting nominated transport",
+            pair_id=self._pair.get_pair_id(),
+        )
+        self.__nominated.set()
+        perf_mark("ice", "transport", "nominated", metadata=_pair_metadata(self._pair))
         self.emit(CandidatePairControllerEvent.NOMINATE_TRANSPORT, self.__transport)
 
     async def start(self):
@@ -602,7 +711,11 @@ class CandidatePairController(AsyncEventEmitter):
         self.__selector.on(SelectorEvent.NOMINATE, self.__pair_nominate)
         await self.ping_remote_candidate()
 
-        print("Start candidate pair selector", self._pair)
+        get_logger().debug(
+            Component.ICE,
+            "Started candidate pair selector",
+            pair_id=self._pair.get_pair_id(),
+        )
         while True:
             pkt = await self.__conn.recvfrom()
 
@@ -615,15 +728,14 @@ class CandidatePairController(AsyncEventEmitter):
         self.__transport.pipe(pkt)
 
     async def _on_stun_binding_request(self, pkt: Packet, msg: stun.Message):
-        # print("On stun binding request", msg)
+        perf_mark("ice", "stun", "rx", metadata={**_pair_metadata(self._pair), "message_class": "request", "counter.ice.stun_rx": 1})
         await self.__selector.on_binding_success(self._pair, self.__conn, msg)
-        # print("On stun binding request", self._pair.state)
 
     async def _on_stun_success_response(self, pkt: Packet, msg: stun.Message):
+        perf_mark("ice", "stun", "rx", metadata={**_pair_metadata(self._pair), "message_class": "success_response", "counter.ice.stun_rx": 1})
         await self.__selector.on_success_response(
             self._pair, self.__conn, msg, pkt.source
         )
-        # print("On stun binding success response", self._pair.state)
 
     async def _on_inbound_stun(self, pkt: Packet):
         try:
@@ -644,14 +756,20 @@ class CandidatePairController(AsyncEventEmitter):
                             await self._on_stun_success_response(pkt, msg)
 
                         case _:
-                            print(
-                                f"Unhandled STUN message class for method {msg.message_type.method}"
+                            get_logger().debug(
+                                Component.ICE,
+                                "Unhandled STUN message class",
+                                method=msg.message_type.method,
+                                message_class=msg.message_type.message_class,
                             )
                 case _:
-                    print("Unhandled STUN message type")
+                    get_logger().debug(
+                        Component.ICE,
+                        "Unhandled STUN message type",
+                        method=msg.message_type.method,
+                    )
         except ValueError as e:
             raise e
-            # print("Invalid stun message or creds", e)
 
     async def ping_remote_candidate(self):
         """
@@ -664,6 +782,10 @@ class CandidatePairController(AsyncEventEmitter):
     def get_transport(self) -> CandidatePairTransport:
         return self.__transport
 
+    @property
+    def nominated(self) -> bool:
+        return self.__nominated.is_set()
+
 
 class CandidatePairControllerRegistry:
     def __init__(self) -> None:
@@ -675,6 +797,9 @@ class CandidatePairControllerRegistry:
 
     def get(self, pair_id: str) -> CandidatePairController | None:
         return self._check_list.get(pair_id)
+
+    def controllers(self) -> list[CandidatePairController]:
+        return list(self._check_list.values())
 
 
 # Role Determination: The peers determine their roles (controlling or controlled) based on the ICE tie-breaking algorithm. The peer with the higher tie-breaker value becomes the controlling agent
@@ -717,6 +842,7 @@ class Agent(AsyncEventEmitter):
         self._controller_registry = CandidatePairControllerRegistry()
 
         self._candidate_pair_transports = list[CandidatePairTransport]()
+        self._gathering_complete = asyncio.Event()
 
     def set_on_candidate(self, on_candidate: Callable[[CandidateBase], None]):
         self._on_candidate = on_candidate
@@ -731,6 +857,7 @@ class Agent(AsyncEventEmitter):
             if self._on_candidate:
                 self._on_candidate(candidate)
 
+    @perf_measured_async("ice", "gather")
     async def gather_candidates(self):
         coros = []
         for candidate_type in self._options.candidate_types:
@@ -748,9 +875,14 @@ class Agent(AsyncEventEmitter):
                 case _:
                     pass
         await asyncio.gather(*coros)
+        self._gathering_complete.set()
 
     def _on_nominate_pair(self, pair: CandidatePair):
-        print("TODO: _on_nominate_pair", pair)
+        get_logger().debug(
+            Component.ICE,
+            "Candidate pair nominated",
+            pair_id=pair.get_pair_id(),
+        )
 
     def _start_controller(self, pair: CandidatePair):
         if self._role == AgentRole.Controlling:
@@ -762,7 +894,11 @@ class Agent(AsyncEventEmitter):
         pair_controller = CandidatePairController(pair, selector, self._tie_breaker)
         self._controller_registry.append(pair_controller)
 
-        print("Emit controller??")
+        get_logger().debug(
+            Component.ICE,
+            "Emitting candidate pair controller",
+            pair_id=pair.get_pair_id(),
+        )
         self.emit(
             AgentEvent.CANDIDATE_PAIR_CONTROLLER,
             pair_controller,
@@ -770,23 +906,30 @@ class Agent(AsyncEventEmitter):
 
     # Look at func (s *controllingSelector) ContactCandidates() to know more
     def connect(self, controlling: bool):
-        print("start connection", controlling, self._remote_ufrag, self._remote_pwd)
-
-        print(self._pair_registry.get_pair_list())
-        print("Pair registry", self._pair_registry)
+        if self._remote_ufrag is None or self._remote_pwd is None:
+            raise RuntimeError("ICE remote credentials are not set")
 
         if controlling:
             self._role = AgentRole.Controlling
         else:
             self._role = AgentRole.Controlled
 
-        print("pair list", self._pair_registry.get_pair_list().items())
+        get_logger().debug(
+            Component.ICE,
+            "Starting ICE connectivity checks",
+            controlling=controlling,
+            candidate_pair_count=len(self._pair_registry.get_pair_list()),
+        )
 
         for id, pair in self._pair_registry.get_pair_list().items():
             controller = self._controller_registry.get(id)
 
             if controller:
-                print("Found already negotiated controller")
+                get_logger().debug(
+                    Component.ICE,
+                    "Candidate pair controller already exists",
+                    pair_id=id,
+                )
                 continue
 
             self._start_controller(pair)
@@ -821,11 +964,21 @@ class Agent(AsyncEventEmitter):
         if mdns_pattern.search(remote.address):
             try:
                 ip = socket.gethostbyname(remote.address)
-                print("Resolved mDNS IP:", ip)
+                get_logger().debug(
+                    Component.ICE,
+                    "Resolved mDNS candidate address",
+                    hostname=remote.address,
+                    address=ip,
+                )
                 remote.set_address(ip)
-            except socket.gaierror:
-                print("Could not resolve mDNS address")
-                exit(1)
+            except socket.gaierror as exc:
+                get_logger().error(
+                    Component.ICE,
+                    "Could not resolve mDNS candidate address",
+                    hostname=remote.address,
+                    error=str(exc),
+                )
+                raise
 
         # TODO: may be better provide some object ref that hold ufrag, pwd to make dynamic replacement of credentials
         pair = CandidatePair(
@@ -837,15 +990,24 @@ class Agent(AsyncEventEmitter):
             RemoteCandidate(remote, remote_conn),
         )
 
-        print("Added candidate pair", pair.get_pair_id())
+        get_logger().debug(
+            Component.ICE,
+            "Added candidate pair",
+            pair_id=pair.get_pair_id(),
+        )
 
         self._pair_registry.append(pair)
+        perf_mark("ice", "candidate_pair", "created", metadata=_pair_metadata(pair))
 
         # If role is already set (connect() was called), start controller for this new pair
         if self._role != AgentRole.Unknown:
             controller = self._controller_registry.get(pair.get_pair_id())
             if not controller:
-                print(f"Starting controller for late-added pair {pair.get_pair_id()}")
+                get_logger().debug(
+                    Component.ICE,
+                    "Starting controller for late-added candidate pair",
+                    pair_id=pair.get_pair_id(),
+                )
                 self._start_controller(pair)
 
     async def _add_local_candidate(self, local: LocalCandidate):
@@ -867,6 +1029,13 @@ class Agent(AsyncEventEmitter):
         else:
             return
 
+        perf_mark(
+            "ice",
+            "candidate",
+            "gathered",
+            metadata={**_candidate_metadata(local.unwrap), "counter.ice.candidates": 1},
+        )
+
         remotes = self._remote_candidates.get(net_type)
         if remotes:
             for remote in remotes:
@@ -879,9 +1048,13 @@ class Agent(AsyncEventEmitter):
                 )
 
     async def _add_remote_candidate(self, remote: CandidateBase):
-        # print("add remote candidate befre lock")
         # async with self._candidate_lock:
-        print("add remote candidate after lock")
+        get_logger().debug(
+            Component.ICE,
+            "Adding remote candidate",
+            address=remote.address,
+            port=remote.port,
+        )
         net_type = remote.get_network_type()
         pool = self._remote_candidates.get(net_type)
         if pool is None:
@@ -898,6 +1071,8 @@ class Agent(AsyncEventEmitter):
             pool.append(remote)
         else:
             return
+
+        perf_mark("ice", "candidate", "remote_added", metadata=_candidate_metadata(remote))
 
         locals = self._local_candidates.get(net_type)
         if locals:
@@ -929,6 +1104,47 @@ class Agent(AsyncEventEmitter):
     def set_remote_credentials(self, ufrag: str, pwd: str):
         self._remote_ufrag = ufrag
         self._remote_pwd = pwd
+        perf_mark(
+            "ice",
+            "remote_credentials",
+            "set",
+            metadata={"remote_ufrag": ufrag, "password_length": len(pwd)},
+        )
 
     def get_role(self) -> AgentRole:
         return self._role
+
+    def _has_succeeded_candidate_pair(self) -> bool:
+        return any(
+            pair.state == CandidatePairState.SUCCEEDED
+            for pair in self._pair_registry.get_pair_list().values()
+        )
+
+    def _has_nominated_pair(self) -> bool:
+        return any(
+            controller.nominated
+            for controller in self._controller_registry.controllers()
+        )
+
+    def _has_nominated_transport_ready(self) -> bool:
+        return self._has_nominated_pair()
+
+    async def wait(self, condition: ICECondition, timeout: float) -> None:
+        timeout = require_timeout(timeout)
+        match condition:
+            case ICECondition.GATHERING_COMPLETE:
+                await wait_for_event(self._gathering_complete, timeout=timeout)
+            case ICECondition.CANDIDATE_PAIR_SUCCEEDED:
+                await wait_until(
+                    self._has_succeeded_candidate_pair,
+                    timeout=timeout,
+                )
+            case ICECondition.NOMINATED:
+                await wait_until(self._has_nominated_pair, timeout=timeout)
+            case ICECondition.NOMINATED_TRANSPORT_READY:
+                await wait_until(
+                    self._has_nominated_transport_ready,
+                    timeout=timeout,
+                )
+            case _:
+                raise ValueError(f"unsupported ICE condition: {condition}")

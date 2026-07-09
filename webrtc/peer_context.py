@@ -17,6 +17,7 @@ from webrtc.runtime import (
     reset_current_task_context,
     set_current_task_context,
 )
+from webrtc.lifecycle import PeerCondition, require_timeout
 
 if TYPE_CHECKING:
     from webrtc.peer_connection import PeerConnection
@@ -41,6 +42,7 @@ def spawn_peer_task(
     component: str,
     kind: str = "protocol",
     bounded: bool = False,
+    metadata: dict[str, Any] | None = None,
     runtime: WebRTCRuntimeResources | None = None,
     loop: asyncio.AbstractEventLoop | None = None,
 ) -> asyncio.Task[Any]:
@@ -52,6 +54,7 @@ def spawn_peer_task(
             name=name,
             kind=kind,
             bounded=bounded,
+            metadata=metadata,
         )
 
     return (runtime or get_default_runtime()).spawn_task(
@@ -59,7 +62,7 @@ def spawn_peer_task(
         name=name,
         kind=kind,
         loop=loop,
-        metadata={"component": component, "bounded": bounded},
+        metadata={"component": component, "bounded": bounded, **(metadata or {})},
     )
 
 
@@ -610,13 +613,24 @@ class PeerContext:
             )
             last_flush = time.monotonic()
 
-    async def wait_nominated_transport(self, timeout: float | None = None) -> Any:
+    async def wait(self, condition: PeerCondition, timeout: float) -> None:
+        timeout = require_timeout(timeout)
+        await self.pc.wait(condition, timeout)
+
+    async def wait_nominated_transport(self, timeout: float) -> Any:
+        await self.wait(PeerCondition.NOMINATED_TRANSPORT_READY, timeout)
         if self._selected_transport is None:
-            await asyncio.wait_for(self._transport_ready.wait(), timeout)
+            self._selected_transport = await self.pc.wait_nominated_transport(timeout)
         return self._selected_transport
 
-    async def wait_transport_ready(self, timeout: float | None = None) -> Any:
+    async def wait_transport_ready(self, timeout: float) -> Any:
         return await self.wait_nominated_transport(timeout)
+
+    async def wait_dtls_handshake(self, timeout: float) -> None:
+        await self.wait(PeerCondition.DTLS_HANDSHAKE_COMPLETE, timeout)
+
+    async def wait_srtp_ready(self, timeout: float) -> None:
+        await self.wait(PeerCondition.SRTP_READY, timeout)
 
     async def send_rtp_packet(self, packet: bytes | bytearray) -> int:
         return await self.pc.send_rtp_packet(packet)

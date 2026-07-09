@@ -3,6 +3,7 @@ import binascii
 
 from webrtc.dtls.dtls_record import (
     Certificate,
+    ExtendedMasterSecret,
     HandshakeMessageType,
     KeyServerExchange,
     Message,
@@ -95,6 +96,16 @@ class Flight3(FlightTransition):
                         raise ValueError("Flight 3 different cipher suite")
 
                     print("Cipher suite", state.pending_cipher_suite)
+
+                    # Check for Extended Master Secret extension (RFC 7627).
+                    # Flight1 handles the no-cookie path; this covers the normal
+                    # HelloVerifyRequest retry path used by the loopback E2E test.
+                    if message.extensions:
+                        for ext in message.extensions:
+                            if isinstance(ext, ExtendedMasterSecret):
+                                state.use_extended_master_secret = True
+                                print("Flight 3: Extended Master Secret negotiated")
+                                break
 
                     # cipher_suite_cls = CIPHER_SUITES_CLASSES.get(message.cipher_suite)
                     # if not cipher_suite_cls:

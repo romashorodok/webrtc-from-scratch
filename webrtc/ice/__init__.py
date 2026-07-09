@@ -10,6 +10,7 @@ from .agent import (
     CandidatePairController,
     CandidatePairControllerEvent,
 )
+from webrtc.lifecycle import ICECondition
 from .candidate_base import parse_candidate_str
 from .net.types import CandidateProtocol
 from .net.udp_mux import MuxConnProtocol, Interceptor

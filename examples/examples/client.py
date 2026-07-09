@@ -1,10 +1,10 @@
 """
-WebRTC Client Example (Python as DTLS Client)
+WebRTC Client Example (Python as DTLS Server)
 
-This example demonstrates Python WebRTC acting as the DTLS client:
+This example demonstrates Python WebRTC acting as the DTLS server:
 - Browser sends offer, Python sends answer
 - Python acts as ICE Controlled (accepts connection)
-- Python acts as DTLS Client (sends ClientHello)
+- Python acts as DTLS Server (waits for ClientHello)
 - Sends video stream to browser
 
 The browser acts as the WebRTC server (creates offer, receives answer).
@@ -304,13 +304,13 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     """
-    WebSocket endpoint where Python acts as WebRTC client (DTLS Client).
+    WebSocket endpoint where Python acts as WebRTC client (DTLS Server).
 
     Flow:
     1. Browser sends offer
     2. Python creates answer and sends it back
     3. Python uses ICE Controlled role (accept)
-    4. Python uses DTLS Client role
+    4. Python uses DTLS Server role
     5. Video is streamed to browser
     """
     await ws.accept()
@@ -369,9 +369,9 @@ async def ws_endpoint(ws: WebSocket):
                 await pc.set_remote_description(SessionDescriptionType.Offer, remote_desc)
                 print("[CLIENT] Remote description set")
 
-                # Start ICE as Controlled (answerer) - this makes Python DTLS Client
+                # Start ICE as Controlled (answerer) - this makes Python DTLS Server
                 await pc.gatherer.accept()
-                print("[CLIENT] ICE accept() called - acting as Controlled/DTLS Client")
+                print("[CLIENT] ICE accept() called - acting as Controlled/DTLS Server")
 
                 # Create and send answer
                 answer = await pc.create_answer()

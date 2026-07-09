@@ -17,6 +17,7 @@ from .transceiver import (
     RTCPFeedback,
     RTPCodecKind,
 )
+from .logger import Component, get_logger
 
 
 class SessionDescriptionType(Enum):
@@ -247,7 +248,7 @@ class MediaDescription:
                 attr, value = parse_attr(line)
 
                 if attr in RTPTransceiverDirectionList:
-                    print("Parse direction", attr)
+                    get_logger().debug(Component.SDP, "Parsed media direction", direction=attr)
                     media.direction = RTPTransceiverDirection(attr)
                 elif attr == SessionDescriptionAttrKey.Candidate.value and value:
                     candidate = ice.parse_candidate_str(value)
@@ -407,8 +408,12 @@ class SessionDescription:
 
         session_lines, media_groups = grouplines(sdp)
 
-        print("media_groups", media_groups)
-        print("session_lines", session_lines)
+        get_logger().debug(
+            Component.SDP,
+            "Parsed SDP line groups",
+            media_group_count=len(media_groups),
+            session_line_count=len(session_lines),
+        )
 
         sdp_attrs = []
 

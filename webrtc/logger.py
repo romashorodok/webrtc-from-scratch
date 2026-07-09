@@ -37,6 +37,7 @@ class Component(StrEnum):
     """WebRTC component identifiers."""
     ICE = "ICE"
     DTLS = "DTLS"
+    SDP = "SDP"
     SRTP = "SRTP"
     RTP = "RTP"
     RTCP = "RTCP"
@@ -69,6 +70,7 @@ class WebRTCLogger:
         level_map = {
             Component.ICE: self.config.ice_log_level,
             Component.DTLS: self.config.dtls_log_level,
+            Component.SDP: self.config.peer_connection_log_level,
             Component.SRTP: self.config.srtp_log_level,
             Component.RTP: self.config.rtp_log_level,
             Component.RTCP: self.config.rtcp_log_level,
@@ -100,6 +102,7 @@ class WebRTCLogger:
         component_colors = {
             Component.ICE: Color.CYAN,
             Component.DTLS: Color.GREEN,
+            Component.SDP: Color.WHITE,
             Component.SRTP: Color.MAGENTA,
             Component.RTP: Color.BLUE,
             Component.RTCP: Color.BLUE,

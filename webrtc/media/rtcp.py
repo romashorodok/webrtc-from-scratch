@@ -209,19 +209,18 @@ class TransportLayerCC:
     def marshal(self) -> bytes:
         header = bytearray(20)
         struct.pack_into(
-            ">BBHII",
+            ">BBH",
             header,
             0,
             (2 << 6) | 15,  # V=2, PT=15
             205,  # FMT=15
             0,  # Length (placeholder)
-            self.sender_ssrc,
-            self.media_ssrc,
         )
-        struct.pack_into(">H", header, 8, self.base_sequence_number)
-        struct.pack_into(">H", header, 10, self.packet_status_count)
+        struct.pack_into(">II", header, 4, self.sender_ssrc, self.media_ssrc)
+        struct.pack_into(">H", header, 12, self.base_sequence_number)
+        struct.pack_into(">H", header, 14, self.packet_status_count)
         struct.pack_into(
-            ">I", header, 12, (self.reference_time << 8) | self.fb_pkt_count
+            ">I", header, 16, (self.reference_time << 8) | self.fb_pkt_count
         )
 
         chunks_bytes = b"".join(chunk.marshal() for chunk in self.packet_chunks)
@@ -234,11 +233,10 @@ class TransportLayerCC:
 
     @classmethod
     def unmarshal(cls, raw: bytes) -> Self:
-        if len(raw) < 20:
+        if len(raw) < 16:
             raise ValueError("packet too short")
 
-        # TODO: media_ssrc has different numbers
-        sender_ssrc, media_ssrc = struct.unpack_from(">II", raw, 4)
+        sender_ssrc, media_ssrc = struct.unpack_from(">II", raw, 0)
         base_sequence_number, packet_status_count = struct.unpack_from(">HH", raw, 8)
         ref_time_and_count = struct.unpack_from(">I", raw, 12)[0]
 
@@ -263,14 +261,26 @@ class TransportLayerCC:
                 processed_packets += len(chunk.symbol_list)
 
         recv_deltas = []
-        while offset < len(raw):
-            remaining = len(raw) - offset
-            if remaining >= 2 and raw[offset] & 0x80:
+        packet_statuses: list[int] = []
+        for chunk in packet_chunks:
+            if isinstance(chunk, RunLengthChunk):
+                packet_statuses.extend([chunk.packet_status_symbol] * chunk.run_length)
+            elif isinstance(chunk, StatusVectorChunk):
+                packet_statuses.extend(chunk.symbol_list)
+
+        for status in packet_statuses[:packet_status_count]:
+            if status == TypeTCCPacketReceivedSmallDelta:
+                if offset + 1 > len(raw):
+                    raise ValueError("RTCP transport-cc small delta is truncated")
+                delta = RecvDelta.unmarshal(raw[offset : offset + 1])
+                offset += 1
+            elif status == TypeTCCPacketReceivedLargeDelta:
+                if offset + 2 > len(raw):
+                    raise ValueError("RTCP transport-cc large delta is truncated")
                 delta = RecvDelta.unmarshal(raw[offset : offset + 2])
                 offset += 2
             else:
-                delta = RecvDelta.unmarshal(raw[offset : offset + 1])
-                offset += 1
+                continue
             recv_deltas.append(delta)
 
         return cls(

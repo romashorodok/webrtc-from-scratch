@@ -1,5 +1,6 @@
 from . import stun
 from . import net
+from webrtc.logger import Component, get_logger
 
 
 def stun_message_parse_header(pkt: net.types.Packet) -> stun.Message:
@@ -33,8 +34,11 @@ def stun_message_parse_attrs(
         attr_length = int.from_bytes(data[2:4], "big")
 
         if attr_type not in stun.attr.ATTRIBUTE_REGISTRY:
-            print(
-                f"STUN type not in registry or invalid deserialization: attr_type={attr_type}, attr_length={attr_length}",
+            get_logger().debug(
+                Component.STUN,
+                "Skipping unknown STUN attribute",
+                attr_type=attr_type,
+                attr_length=attr_length,
             )
             total_length = stun.utils.ATTRIBUTE_HEADER_SIZE + attr_length
             padding_bytes_to_skip = stun.utils.nearest_padded_value_length(total_length)
