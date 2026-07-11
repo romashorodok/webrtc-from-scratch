@@ -6,6 +6,7 @@ from webrtc.utils.types import impl_protocol
 from webrtc.logger import get_logger, Component
 from webrtc.config import get_config
 from webrtc.runtime import get_default_runtime
+from webrtc.tracing import perf_mark
 
 from .interface import Interface
 from .types import (
@@ -103,17 +104,54 @@ class InterfaceMuxUDPHandler(asyncio.DatagramProtocol):
 
         interceptors_ports = self._interceptors.get(address_str)
         if interceptors_ports is None:
+            perf_mark(
+                "udp", "datagram", "unbound_dropped",
+                metadata={
+                    "flow_direction": "rx", "remote_address": address_str,
+                    "remote_port": port, "size_bytes": len(data),
+                    "drop_reason": "unbound", "counter.udp.datagrams_dropped": 1,
+                },
+            )
             logger.warn(Component.UDP, "Unbound datagram received - address not found",
                        address=address_str)
             return
 
         interceptor = interceptors_ports.get(port)
         if interceptor is None:
+            perf_mark(
+                "udp", "datagram", "unbound_dropped",
+                metadata={
+                    "flow_direction": "rx", "remote_address": address_str,
+                    "remote_port": port, "size_bytes": len(data),
+                    "drop_reason": "unbound", "counter.udp.datagrams_dropped": 1,
+                },
+            )
             logger.warn(Component.UDP, "Unbound datagram received - port not found",
                        address=address_str, port=port)
             return
 
-        interceptor.put_nowait(Packet(Address(address, port), data))
+        local_address, local_port = self.transport.get_extra_info("sockname")[:2]
+        perf_mark(
+            "udp", "datagram", "rx",
+            metadata={
+                "flow_direction": "rx", "local_address": str(local_address),
+                "local_port": local_port, "remote_address": address_str,
+                "remote_port": port, "size_bytes": len(data),
+                "counter.udp.datagrams_rx": 1,
+            },
+        )
+        interceptor.put_nowait(Packet(Address(address_str, port), data))
+
+    @override
+    def error_received(self, exc: Exception) -> None:
+        perf_mark(
+            "udp", "datagram", "failed",
+            metadata={
+                "failure_source": "error_received", "error_stage": "udp_transport",
+                "exception_class": exc.__class__.__name__,
+                "counter.udp.datagrams_failed": 1,
+            },
+        )
 
 
 @impl_protocol(MuxConnProtocol)
@@ -127,12 +165,57 @@ class UDPMuxConn:
         self._transport = transport
         self._address = address
         self._interceptor = interceptor
+        self._pair_id: str | None = None
+
+    def set_trace_pair_id(self, pair_id: str) -> None:
+        self._pair_id = pair_id
 
     def sendto(self, data: bytes | bytearray | bytes):
-        return self._transport.sendto(data, self._address)
+        local_address, local_port = self._transport.get_extra_info("sockname")[:2]
+        metadata: dict[str, object] = {
+            "flow_direction": "tx", "local_address": str(local_address),
+            "local_port": local_port, "remote_address": self._address[0],
+            "remote_port": self._address[1], "packet_kind": _packet_kind(data),
+            "size_bytes": len(data),
+        }
+        if self._pair_id is not None:
+            metadata["pair_id"] = self._pair_id
+        try:
+            result = self._transport.sendto(data, self._address)
+        except Exception as exc:
+            perf_mark(
+                "udp", "datagram", "failed",
+                metadata={
+                    **metadata, "failure_source": "sendto", "error_stage": "sendto",
+                    "exception_class": exc.__class__.__name__,
+                    "counter.udp.datagrams_failed": 1,
+                },
+            )
+            raise
+        perf_mark(
+            "udp", "datagram", "tx",
+            metadata={**metadata, "counter.udp.datagrams_tx": 1},
+        )
+        return result
 
     async def recvfrom(self) -> Packet:
         return await self._interceptor.get()
+
+
+def _packet_kind(data: bytes | bytearray) -> str:
+    """Classify only from headers; UDP callbacks must never parse payloads."""
+    if not data:
+        return "unknown"
+    first_byte = data[0]
+    if 20 <= first_byte < 64:
+        return "dtls"
+    if len(data) >= 8 and first_byte & 0xC0 == 0 and data[4:8] == b"\x21\x12\xA4\x42":
+        return "stun"
+    if 128 <= first_byte < 192:
+        if len(data) >= 2 and 192 <= data[1] <= 208:
+            return "rtcp"
+        return "rtp"
+    return "unknown"
 
 
 @impl_protocol(MuxProtocol)

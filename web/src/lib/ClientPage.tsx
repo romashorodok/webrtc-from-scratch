@@ -10,6 +10,7 @@ export function ClientPage() {
     status,
     toasts,
     dismissToast,
+    performanceEvents,
     summaries,
     traces,
     videoRef,
@@ -53,6 +54,7 @@ export function ClientPage() {
       </div>
 
       <TraceOverlay
+        performanceEvents={performanceEvents}
         traces={traces}
         onClearCompleted={clearCompletedTraces}
         onClearFailed={clearFailedTraces}

@@ -2,6 +2,7 @@ import { parseJson } from "./media";
 
 const TRACE_SUMMARY_LIMIT = 512;
 const ARCHIVED_TRACES_PER_SUMMARY_LIMIT = 512;
+const PERFORMANCE_EVENT_LIMIT = 160;
 
 export type TraceStatus = "created" | "running" | "completed" | "failed" | "cancelled";
 
@@ -47,6 +48,13 @@ export type TraceSummary = {
   deleted_at: number;
 };
 
+export type PerformanceEvent = {
+  name: string;
+  timestamp: number;
+  duration_ms: number | null;
+  metadata: Record<string, unknown>;
+};
+
 type TracePayload = {
   trace?: TraceRecord;
   traces?: TraceRecord[];
@@ -80,6 +88,7 @@ export type TraceExportOptions = {
 export type TraceState = {
   traces: TraceRecord[];
   summaries: TraceSummary[];
+  performanceEvents: PerformanceEvent[];
   deletedTraceIds: Set<string>;
   tracesById: Map<string, TraceRecord>;
   traceOrder: string[];
@@ -102,6 +111,7 @@ export function createInitialTraceState(): TraceState {
   return {
     traces: [],
     summaries: [],
+    performanceEvents: [],
     deletedTraceIds: new Set<string>(),
     tracesById: new Map<string, TraceRecord>(),
     traceOrder: [],
@@ -124,10 +134,12 @@ export function reduceTraceState(
     deletedTraceIds,
     summaries,
   });
+  const performanceEvents = applyPerformanceEvents(state.performanceEvents, action.events);
 
   const unchanged =
     traces === state.traces &&
     summaries === state.summaries &&
+    performanceEvents === state.performanceEvents &&
     setsEqual(deletedTraceIds, state.deletedTraceIds);
 
   if (unchanged) {
@@ -137,10 +149,34 @@ export function reduceTraceState(
   return {
     deletedTraceIds,
     summaries,
+    performanceEvents,
     traces,
     tracesById: new Map(traces.map((trace) => [trace.trace_id, trace])),
     traceOrder: traces.map((trace) => trace.trace_id),
   };
+}
+
+function applyPerformanceEvents(
+  previous: PerformanceEvent[],
+  events: TraceEventInput[],
+): PerformanceEvent[] {
+  let next = previous;
+  for (const item of events) {
+    const payload = parseJson<{ performance?: PerformanceEvent }>(item.data);
+    if (item.event === "trace:init") {
+      next = [];
+      continue;
+    }
+    if (item.event !== "trace:performance" || !payload?.performance) {
+      continue;
+    }
+    const event = payload.performance;
+    if (!event.name || !Number.isFinite(event.timestamp)) {
+      continue;
+    }
+    next = [...next, event].slice(-PERFORMANCE_EVENT_LIMIT);
+  }
+  return next;
 }
 
 export function restoreVisibleTraceParents(

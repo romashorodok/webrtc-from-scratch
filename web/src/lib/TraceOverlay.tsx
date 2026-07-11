@@ -3,6 +3,7 @@ import * as d3 from "d3";
 import {
   formatTraceExport,
   restoreVisibleTraceParents,
+  type PerformanceEvent,
   type TraceRecord,
   type TraceSummary,
 } from "./trace";
@@ -14,6 +15,7 @@ type TraceDatum = {
 
 type TraceOverlayProps = {
   traces: TraceRecord[];
+  performanceEvents?: PerformanceEvent[];
   summaries?: TraceSummary[];
   onClearCompleted?: () => void;
   onClearFailed?: () => void;
@@ -226,6 +228,7 @@ function buildTree(traces: TraceRecord[]) {
 
 export function TraceOverlay({
   traces,
+  performanceEvents: _performanceEvents = [],
   summaries = [],
   onClearCompleted,
   onClearFailed,
@@ -327,6 +330,10 @@ export function TraceOverlay({
           null
         : null,
     [inspectedTraces, selectedTraceId, traces, visibleTraces],
+  );
+  const selectedPerformanceMetrics = useMemo(
+    () => performanceMetricsForTrace(selectedTrace),
+    [selectedTrace],
   );
   const visibleSummaries = useMemo(
     () => summaries.slice(0, MAX_SIDE_ITEMS),
@@ -768,6 +775,34 @@ export function TraceOverlay({
                   {selectedTrace.error ? (
                     <p title={selectedTrace.error}>{selectedTrace.error}</p>
                   ) : null}
+                  <div className="trace-selection__performance">
+                    <div>
+                      <strong>Attached metrics</strong>
+                      <span>{selectedPerformanceMetrics.length}</span>
+                    </div>
+                    {selectedPerformanceMetrics.length === 0 ? (
+                      <p>No metrics attached to this trace</p>
+                    ) : (
+                      <ul>
+                        {selectedPerformanceMetrics.map((metric) => (
+                          <li key={metric.name}>
+                            <span className="trace-failures__name" title={metric.name}>{metric.name}</span>
+                            <span className="trace-performance__duration">
+                              {metric.duration_count === 0 ? `${metric.count} marks` : `${metric.count} calls avg ${compactDuration(metric.avg_ms)}`}
+                            </span>
+                            <span className="trace-failures__error">
+                              {metric.duration_count === 0 ? "no duration" : `min ${compactDuration(metric.min_ms)} | max ${compactDuration(metric.max_ms)}`}
+                            </span>
+                            {metric.metadataLabel ? (
+                              <span className="trace-performance__metadata" title={metric.metadataLabel}>
+                                {metric.metadataLabel}
+                              </span>
+                            ) : null}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
                   {!isVirtualTrace(selectedTrace) && !isArchivedTrace(selectedTrace) ? (
                     <button
                       type="button"
@@ -873,6 +908,7 @@ export function TraceOverlay({
                 </ul>
               )}
             </section>
+
           </div>
 
           {exportOpen ? (
@@ -895,4 +931,55 @@ export function TraceOverlay({
       ) : null}
     </aside>
   );
+}
+
+function performanceMetadataLabel(event: PerformanceEvent) {
+  const metadata = event.metadata;
+  const details = [
+    typeof metadata.packet_kind === "string" ? metadata.packet_kind : null,
+    typeof metadata.ssrc === "number" ? `ssrc ${metadata.ssrc}` : null,
+    typeof metadata.sequence_number === "number" ? `seq ${metadata.sequence_number}` : null,
+    typeof metadata.size_bytes === "number" ? `${metadata.size_bytes} B` : null,
+    typeof metadata.error_stage === "string" ? metadata.error_stage : null,
+  ].filter((value): value is string => value != null);
+  return details.join(" · ") || "-";
+}
+
+type TracePerformanceMetric = {
+  name: string;
+  count: number;
+  duration_count: number;
+  avg_ms: number | null;
+  min_ms: number | null;
+  max_ms: number | null;
+  metadataLabel: string;
+};
+
+function aggregateMetadataLabel(value: unknown): string {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "";
+  return Object.entries(value as Record<string, unknown>)
+    .map(([key, item]) => `${key.replaceAll("_", " ")}=${String(item)}`)
+    .join(" · ");
+}
+
+function performanceMetricsForTrace(trace: TraceRecord | null): TracePerformanceMetric[] {
+  const raw = trace?.metadata.performance_metrics;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return [];
+  }
+  return Object.entries(raw as Record<string, unknown>).flatMap(([name, value]) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return [];
+    }
+    const metric = value as Record<string, unknown>;
+    return [{
+      name,
+      count: typeof metric.count === "number" ? metric.count : 0,
+      duration_count: typeof metric.duration_count === "number" ? metric.duration_count : 0,
+      avg_ms: typeof metric.avg_ms === "number" ? metric.avg_ms : null,
+      min_ms: typeof metric.min_ms === "number" ? metric.min_ms : null,
+      max_ms: typeof metric.max_ms === "number" ? metric.max_ms : null,
+      metadataLabel: aggregateMetadataLabel(metric.metadata),
+    }];
+  });
 }

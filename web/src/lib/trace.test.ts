@@ -132,6 +132,33 @@ test("appends deleted summaries with distinct archive ids", () => {
   expect(summaries.map((summary) => summary.summary_id)).toEqual(["trace-b", "trace-a"]);
 });
 
+test("keeps a bounded live performance feed and resets it with a trace snapshot", () => {
+  let state = createInitialTraceState();
+  state = reduceTraceState(state, {
+    type: "events",
+    events: Array.from({ length: 162 }, (_, index) => ({
+      event: "trace:performance",
+      data: {
+        performance: {
+          name: "srtp.rtp_decrypt.completed",
+          timestamp: index,
+          duration_ms: 0.2,
+          metadata: { sequence_number: index },
+        },
+      },
+    })),
+  });
+
+  expect(state.performanceEvents).toHaveLength(160);
+  expect(state.performanceEvents[0]?.metadata.sequence_number).toBe(2);
+
+  state = reduceTraceState(state, {
+    type: "events",
+    events: [{ event: "trace:init", data: { traces: [] } }],
+  });
+  expect(state.performanceEvents).toEqual([]);
+});
+
 test("keeps deleted summaries across duplicate summary and delete events", () => {
   const summary = traceSummary("trace-a", 1);
 

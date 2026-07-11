@@ -23,7 +23,7 @@ from webrtc.dtls.flight0 import Flight0
 from webrtc.dtls.flight2 import Flight2
 from webrtc.dtls.flight4 import Flight4
 from webrtc.dtls.flight6 import Flight6
-from webrtc.dtls.dtls_record import RecordLayer, unmarshal_record_layers
+from webrtc.dtls.dtls_record import RecordLayer, RecordLayerBatch
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -64,8 +64,7 @@ class DTLSServerProtocol(asyncio.DatagramProtocol):
 
         try:
             # Parse incoming DTLS records
-            records = unmarshal_record_layers(data)
-            for record in records:
+            for record, _raw in RecordLayerBatch(data):
                 asyncio.create_task(self._process_record(record))
         except Exception as e:
             logger.error(f"Error parsing DTLS record: {e}")

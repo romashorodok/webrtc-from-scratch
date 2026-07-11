@@ -641,6 +641,12 @@ class PeerContext:
     async def send_rtcp_packet(self, packet: bytes | bytearray) -> int:
         return await self.pc.send_rtcp_packet(packet)
 
+    async def recv_rtcp_feedback(self, ssrc: int):
+        return await self.pc.recv_rtcp_feedback(ssrc)
+
+    def build_twcc_feedback(self, media_ssrc: int, transport_sequences: Iterable[int]) -> bytes:
+        return self.pc.build_twcc_feedback(media_ssrc, transport_sequences)
+
     @property
     def root_trace_id(self) -> str | None:
         return self._root_task_context.trace_id if self._root_task_context is not None else None

@@ -7,7 +7,13 @@ from dataclasses import dataclass
 from threading import RLock
 from typing import Any, TypeVar
 
-from .tracing import TaskContext, TraceService, TraceSubscription
+from .tracing import (
+    TaskContext,
+    TraceService,
+    TraceSubscription,
+    get_current_performance_recorder,
+    use_performance_recorder,
+)
 
 T = TypeVar("T")
 
@@ -268,7 +274,12 @@ class WebRTCRuntimeResources:
         )
         token = set_current_task_context(task_context)
         try:
-            result = await awaitable
+            # Preserve an explicitly installed recorder (tests and callers use
+            # this for isolated captures); otherwise stream through runtime.
+            with use_performance_recorder(
+                get_current_performance_recorder() or self._tracing.performance_recorder
+            ):
+                result = await awaitable
         except asyncio.CancelledError:
             self.complete_task_context(task_context, status="cancelled")
             raise
@@ -338,7 +349,10 @@ class WebRTCRuntimeResources:
         def call_in_thread() -> T:
             thread_token = set_current_task_context(trace_context)
             try:
-                return fn(*fn_args, **kwargs)
+                with use_performance_recorder(
+                    get_current_performance_recorder() or self._tracing.performance_recorder
+                ):
+                    return fn(*fn_args, **kwargs)
             finally:
                 reset_current_task_context(thread_token)
 
@@ -377,7 +391,10 @@ class WebRTCRuntimeResources:
         def call_in_thread() -> T:
             thread_token = set_current_task_context(group)
             try:
-                return fn(*args, **kwargs)
+                with use_performance_recorder(
+                    get_current_performance_recorder() or self._tracing.performance_recorder
+                ):
+                    return fn(*args, **kwargs)
             finally:
                 reset_current_task_context(thread_token)
 

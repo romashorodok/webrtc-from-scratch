@@ -127,6 +127,44 @@ class TraceStore:
                 return []
             return [node.context for node in self._walk_subtree_locked(self._node_by_trace_id_locked(trace_id))]
 
+    def aggregate_performance_event(
+        self,
+        trace_id: str,
+        name: str,
+        duration_ms: float | None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Fold a performance sample into its live trace without emitting per-sample events."""
+        with self.lock:
+            context = self._context_by_id_locked(trace_id)
+            if context is None:
+                return False
+            metrics = context.metadata.setdefault("performance_metrics", {})
+            if not isinstance(metrics, dict):
+                metrics = {}
+                context.metadata["performance_metrics"] = metrics
+            metric = metrics.setdefault(
+                name,
+                {"count": 0, "duration_count": 0, "total_ms": 0.0, "min_ms": None, "max_ms": None},
+            )
+            metric["count"] += 1
+            if metadata:
+                excluded = {"trace_id", "parent_trace_id", "peer_id", "task_name", "task_kind", "operation_id"}
+                metric["metadata"] = {
+                    key: value
+                    for key, value in metadata.items()
+                    if key not in excluded
+                    and isinstance(key, str)
+                    and (value is None or isinstance(value, (bool, int, float, str)))
+                }
+            if duration_ms is not None:
+                metric["duration_count"] += 1
+                metric["total_ms"] += duration_ms
+                metric["avg_ms"] = metric["total_ms"] / metric["duration_count"]
+                metric["min_ms"] = duration_ms if metric["min_ms"] is None else min(metric["min_ms"], duration_ms)
+                metric["max_ms"] = duration_ms if metric["max_ms"] is None else max(metric["max_ms"], duration_ms)
+            return True
+
     def root_trace_id(self, trace_id: str) -> str | None:
         with self.lock:
             node = self._node_by_trace_id_locked(trace_id)

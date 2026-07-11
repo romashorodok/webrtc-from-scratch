@@ -17,11 +17,29 @@ from webrtc_rs import SrtpContext
 # Import logger
 from webrtc.logger import get_logger, Component
 from webrtc.config import get_config
+from webrtc.tracing import measure_perf, perf_mark
 
 
 # Buffer limits
 SRTP_BUFFER_SIZE = 1_000_000  # 1MB for RTP
 SRTCP_BUFFER_SIZE = 100_000  # 100KB for RTCP
+
+
+def _packet_metadata(data: bytes, is_rtp: bool, *, size_key: str) -> dict[str, int | str]:
+    """Return cheap, header-only tracing metadata for an SRTP operation."""
+    metadata: dict[str, int | str] = {
+        "packet_kind": "rtp" if is_rtp else "rtcp",
+        size_key: len(data),
+    }
+    if is_rtp:
+        if len(data) >= 4:
+            metadata["sequence_number"] = int.from_bytes(data[2:4], "big")
+        if len(data) >= 12:
+            metadata["ssrc"] = int.from_bytes(data[8:12], "big")
+    elif len(data) >= 8:
+        # The sender SSRC is unencrypted in the RTCP common packet header.
+        metadata["ssrc"] = int.from_bytes(data[4:8], "big")
+    return metadata
 
 
 def parse_rtp_ssrc(data: bytes) -> int:
@@ -229,10 +247,26 @@ class Session:
         Returns:
             Encrypted SRTP or SRTCP packet
         """
-        if self.is_rtp:
-            return self._context.encrypt_rtp(plaintext)
-        else:
-            return self._context.encrypt_rtcp(plaintext)
+        packet_type = "rtp" if self.is_rtp else "rtcp"
+        phase = f"{packet_type}_encrypt"
+        metadata = _packet_metadata(plaintext, self.is_rtp, size_key="plaintext_size_bytes")
+        metadata["flow_direction"] = "tx"
+        with measure_perf("srtp", phase, metadata=metadata):
+            try:
+                encrypted = (
+                    self._context.encrypt_rtp(plaintext)
+                    if self.is_rtp
+                    else self._context.encrypt_rtcp(plaintext)
+                )
+            except BaseException:
+                metadata[f"counter.srtp.{packet_type}_encrypt_failed"] = 1
+                metadata["error_stage"] = "srtp_encrypt"
+                raise
+            # ``measure_perf`` retains this mapping until it emits completion,
+            # letting the completed event describe both sides of the boundary.
+            metadata["ciphertext_size_bytes"] = len(encrypted)
+            metadata[f"counter.srtp.{packet_type}_encrypted"] = 1
+            return encrypted
 
     def decrypt(self, ciphertext: bytes) -> bytes:
         """
@@ -244,10 +278,24 @@ class Session:
         Returns:
             Decrypted RTP or RTCP packet
         """
-        if self.is_rtp:
-            return self._context.decrypt_rtp(ciphertext)
-        else:
-            return self._context.decrypt_rtcp(ciphertext)
+        packet_type = "rtp" if self.is_rtp else "rtcp"
+        phase = f"{packet_type}_decrypt"
+        metadata = _packet_metadata(ciphertext, self.is_rtp, size_key="ciphertext_size_bytes")
+        metadata["flow_direction"] = "rx"
+        with measure_perf("srtp", phase, metadata=metadata):
+            try:
+                decrypted = (
+                    self._context.decrypt_rtp(ciphertext)
+                    if self.is_rtp
+                    else self._context.decrypt_rtcp(ciphertext)
+                )
+            except BaseException:
+                metadata[f"counter.srtp.{packet_type}_decrypt_failed"] = 1
+                metadata["error_stage"] = "srtp_decrypt"
+                raise
+            metadata["plaintext_size_bytes"] = len(decrypted)
+            metadata[f"counter.srtp.{packet_type}_decrypted"] = 1
+            return decrypted
 
     async def encrypt_async(self, plaintext: bytes) -> bytes:
         """
@@ -290,6 +338,18 @@ class Session:
 
             stream = Stream(ssrc, self.is_rtp, on_close)
             self._streams[ssrc] = stream
+            perf_mark(
+                "srtp",
+                "stream",
+                "created",
+                metadata={
+                    "flow_direction": "rx",
+                    "packet_kind": "rtp" if self.is_rtp else "rtcp",
+                    "ssrc": ssrc,
+                    "is_new": True,
+                    "counter.srtp.streams_created": 1,
+                },
+            )
             return stream, True
 
     async def write_incoming(self, ciphertext: bytes) -> None:
@@ -346,11 +406,34 @@ class Session:
             await self._new_stream_queue.put((stream, ssrc))
             logger.info(Component.SRTP, f"New stream created", ssrc=ssrc)
 
-        # Check if write succeeded (could fail if stream queue is full)
+        # Check if write succeeded (could fail if stream queue is full).
         write_success = await stream.write(decrypted)
+        packet_metadata = _packet_metadata(decrypted, self.is_rtp, size_key="plaintext_size_bytes")
+        packet_metadata["flow_direction"] = "rx"
+        packet_metadata["ssrc"] = ssrc
         if not write_success:
             seq = int.from_bytes(decrypted[2:4], 'big') if len(decrypted) >= 4 else -1
+            perf_mark(
+                "srtp",
+                "stream",
+                "dropped",
+                metadata={
+                    **packet_metadata,
+                    "drop_reason": "stream_queue_full_or_closed",
+                    "counter.srtp.stream_packets_dropped": 1,
+                },
+            )
             logger.warn(Component.SRTP, f"Stream write FAILED - queue full", ssrc=ssrc, seq=seq)
+        else:
+            perf_mark(
+                "srtp",
+                "stream",
+                "delivered",
+                metadata={
+                    **packet_metadata,
+                    "counter.srtp.stream_packets_delivered": 1,
+                },
+            )
 
     async def accept_stream(self) -> tuple[Stream, int]:
         """
@@ -391,6 +474,10 @@ class Session:
     async def close(self) -> None:
         """Close all streams and the session."""
         async with self._streams_lock:
-            for stream in list(self._streams.values()):
-                await stream.close()
+            streams = list(self._streams.values())
             self._streams.clear()
+
+        # Stream.close invokes the session's on_close callback, which also
+        # acquires _streams_lock.  Close outside that lock to avoid deadlock.
+        for stream in streams:
+            await stream.close()

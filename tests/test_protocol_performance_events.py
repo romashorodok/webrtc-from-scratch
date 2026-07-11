@@ -142,3 +142,96 @@ def test_srtp_ready_events_are_decorated(monkeypatch):
         ]
 
     asyncio.run(scenario())
+
+
+def test_peer_connection_public_media_send_helpers_wait_trace_and_preserve_order(monkeypatch):
+    async def scenario():
+        pc = PeerConnection()
+        sent: list[tuple[str, bytes]] = []
+        readiness_waits = 0
+
+        async def wait_for_srtp(*_args, **_kwargs):
+            nonlocal readiness_waits
+            readiness_waits += 1
+
+        async def write_rtp(data):
+            sent.append(("rtp", data))
+            return len(data)
+
+        async def write_rtcp(data):
+            sent.append(("rtcp", data))
+            return len(data)
+
+        pc._transport_ready.set()
+        monkeypatch.setattr(pc._dtls_transport, "wait", wait_for_srtp)
+        monkeypatch.setattr(pc._dtls_transport, "write_rtp_bytes", write_rtp)
+        monkeypatch.setattr(pc._dtls_transport, "write_rtcp_bytes", write_rtcp)
+        recorder = PerformanceRecorder()
+        first = bytearray(b"first")
+
+        with use_performance_recorder(recorder):
+            assert await pc.send_rtp_packet(first) == 5
+            first[:] = b"xxxxx"
+            assert await pc.send_rtp_packets([b"second", b"third"]) == 11
+            assert await pc.send_rtcp_packet(bytearray(b"rtcp")) == 4
+
+        assert sent == [
+            ("rtp", b"first"),
+            ("rtp", b"second"),
+            ("rtp", b"third"),
+            ("rtcp", b"rtcp"),
+        ]
+        # A burst waits once, then keeps its lock for the ordered send sequence.
+        assert readiness_waits == 3
+        assert _event_names(recorder) == [
+            "rtp.packet.send.started",
+            "rtp.packet.send.completed",
+            "rtp.packet.send.started",
+            "rtp.packet.send.completed",
+            "rtp.packet.send.started",
+            "rtp.packet.send.completed",
+            "rtcp.feedback.send.started",
+            "rtcp.feedback.send.completed",
+        ]
+        completed = [event for event in recorder.events() if event.name.endswith(".completed")]
+        assert completed[0].metadata["counter.rtp.packets_sent"] == 1
+        assert dict(completed[-1].metadata) == {
+            "flow_direction": "tx",
+            "packet_kind": "rtcp",
+            "plaintext_size_bytes": 4,
+            "packet_count": 1,
+            "feedback_type": "18/116",
+            "counter.rtcp.feedback_sent": 1,
+            "operation_id": completed[-1].metadata["operation_id"],
+        }
+
+    asyncio.run(scenario())
+
+
+def test_peer_connection_public_media_send_reports_failures(monkeypatch):
+    async def scenario():
+        pc = PeerConnection()
+
+        async def ready(*_args, **_kwargs):
+            return None
+
+        async def failed_send(_data):
+            return 0
+
+        pc._transport_ready.set()
+        monkeypatch.setattr(pc._dtls_transport, "wait", ready)
+        monkeypatch.setattr(pc._dtls_transport, "write_rtp_bytes", failed_send)
+        recorder = PerformanceRecorder()
+
+        with use_performance_recorder(recorder), pytest.raises(RuntimeError):
+            await pc.send_rtp_packet(b"rtp")
+
+        assert _event_names(recorder) == [
+            "rtp.packet.send.started",
+            "rtp.packet.send.failed",
+        ]
+        failure = recorder.events()[-1]
+        assert failure.metadata["counter.rtp.packets_send_failed"] == 1
+        assert failure.metadata["exception_class"] == "RuntimeError"
+
+    asyncio.run(scenario())

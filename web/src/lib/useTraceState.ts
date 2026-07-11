@@ -96,7 +96,13 @@ export function useTraceState() {
     [],
   );
 
-  return { enqueueTraceEvent, enqueueTraceEvents, summaries: state.summaries, traces: state.traces };
+  return {
+    enqueueTraceEvent,
+    enqueueTraceEvents,
+    performanceEvents: state.performanceEvents,
+    summaries: state.summaries,
+    traces: state.traces,
+  };
 }
 
 function mergeTraceUpdatePayloads(previousData: unknown, nextData: unknown) {

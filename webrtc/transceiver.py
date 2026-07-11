@@ -12,6 +12,7 @@ from webrtc.media.opus_payloader import OPUS_PAYLOAD_TYPE, OpusPacketizer
 from webrtc.media.vp8_payloader import VP8Payloader
 from webrtc.peer_context import spawn_peer_task
 from webrtc.srtp import Stream as SrtpStream
+from webrtc.tracing import measure_perf_async, perf_mark
 
 from . import media
 from .utils import impl_protocol
@@ -187,10 +188,24 @@ class TrackEncoding:
             return 0
 
         pts, time_base = await self._packetizer.next_timestamp()
-
-        pkts = self._packetizer.packetize(
-            frame, self.convert_timebase(pts, time_base, time_base)
-        )
+        timestamp = self.convert_timebase(pts, time_base, time_base)
+        metadata: dict[str, int | str] = {
+            "flow_direction": "tx",
+            "codec": self.codec.mime_type,
+            "frame_bytes": len(frame),
+            "mtu": self._packetizer.mtu,
+        }
+        async with measure_perf_async("rtp", "frame.packetize", metadata=metadata):
+            pkts = self._packetizer.packetize(frame, timestamp)
+            metadata.update(
+                {
+                    "packet_count": len(pkts),
+                    "ssrc": self.ssrc,
+                    "timestamp": timestamp,
+                    "counter.rtp.frames_packetized": 1,
+                    "counter.rtp.packets_packetized": len(pkts),
+                }
+            )
 
         n = 0
         for pkt in pkts:
@@ -494,13 +509,37 @@ class TrackRemote:
     def stream(self, value: SrtpStream):
         self.__stream = value
 
-    async def write_rtp_bytes(self, data: bytes):
-        """Write RTP bytes to queue (async)."""
+    async def write_rtp_bytes(self, data: bytes) -> bool:
+        """Make a decrypted RTP packet visible to the application queue."""
         try:
-            await self.__queue.put(data)
+            self.__queue.put_nowait(data)
+            metadata: dict[str, int | str] = {
+                "flow_direction": "rx",
+                "packet_kind": "rtp",
+                "ssrc": self.ssrc,
+                "plaintext_size_bytes": len(data),
+                "counter.rtp.packets_received": 1,
+            }
+            if len(data) >= 4:
+                metadata["sequence_number"] = int.from_bytes(data[2:4], "big")
+            perf_mark("rtp", "packet.receive", "completed", metadata=metadata)
+            return True
         except asyncio.QueueFull:
-            # Drop packet if queue is full (backpressure)
-            pass
+            perf_mark(
+                "rtp",
+                "packet.receive",
+                "failed",
+                metadata={
+                    "flow_direction": "rx",
+                    "packet_kind": "rtp",
+                    "ssrc": self.ssrc,
+                    "plaintext_size_bytes": len(data),
+                    "error_stage": "track_queue_delivery",
+                    "drop_reason": "track_queue_full",
+                    "counter.rtp.packets_receive_failed": 1,
+                },
+            )
+            return False
 
     async def recv_rtp_pkt_sync(self):
         """Read RTP bytes from queue (async)."""
@@ -590,6 +629,7 @@ class RTPReceiver:
             name=f"RTPReceiver-{self._track.ssrc}",
             component="rtp",
             kind="rtp",
+            metadata={"expected_long_running": True, "loop_role": "receive"},
         )
         print(f"[RTPReceiver.receive] Started _receive_task for SSRC={params.ssrc}")
 

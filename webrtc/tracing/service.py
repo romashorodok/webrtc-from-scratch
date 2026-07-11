@@ -9,6 +9,7 @@ from typing import Any
 from .events import TraceEventBus, TraceSubscriber
 from .metrics import MetricDelta, TraceMetricsAggregator
 from .models import TaskContext
+from .performance import PerfEvent, PerformanceRecorder
 from .store import TraceStore
 
 
@@ -52,6 +53,15 @@ class TraceService:
         self.store = TraceStore(context_limit=trace_context_limit)
         self.events = TraceEventBus(batch_interval=trace_subscriber_batch_interval)
         self.metrics = TraceMetricsAggregator(executor=executor)
+        self.performance_recorder = PerformanceRecorder(event_sink=self.record_performance_event)
+
+    def record_performance_event(self, event: PerfEvent) -> None:
+        """Aggregate a packet-path measurement onto its owning live trace."""
+        trace_id = event.metadata.get("trace_id")
+        if isinstance(trace_id, str):
+            self.store.aggregate_performance_event(
+                trace_id, event.name, event.duration_ms, event.metadata
+            )
 
     def create_context(
         self,

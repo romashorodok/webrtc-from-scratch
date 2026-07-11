@@ -594,8 +594,13 @@ async def ping_routine(
 
 
 class CandidatePairTransport:
-    def __init__(self, conn: MuxConnProtocol) -> None:
+    def __init__(self, conn: MuxConnProtocol, *, pair_id: str | None = None) -> None:
         self._conn: MuxConnProtocol = conn
+        self._pair_id = pair_id
+        if pair_id is not None:
+            set_trace_pair_id = getattr(conn, "set_trace_pair_id", None)
+            if set_trace_pair_id is not None:
+                set_trace_pair_id(pair_id)
 
         # self._rtp = queue.Queue[Packet]()
         # self._rtcp = queue.Queue[Packet]()
@@ -609,12 +614,26 @@ class CandidatePairTransport:
         self._rtcp_count = 0
         self._rtp_count = 0
 
+    def _demux_metadata(self, packet_kind: str, pkt: Packet) -> dict[str, object]:
+        metadata: dict[str, object] = {
+            "flow_direction": "rx", "packet_kind": packet_kind,
+            "size_bytes": len(pkt.data),
+        }
+        if self._pair_id is not None:
+            metadata["pair_id"] = self._pair_id
+        return metadata
+
     def pipe(self, pkt: Packet):
         logger = get_logger()
         config = get_config()
 
-        self._total_packets += 1
+        if not pkt.data:
+            self._demux_failed(pkt, "empty")
         first_byte = pkt.data[0]
+        if not (20 <= first_byte < 64 or 128 <= first_byte < 192):
+            self._demux_failed(pkt, "unsupported")
+
+        self._total_packets += 1
 
         # Extract RTP info if it looks like RTP (starts with 0x80-0x9f typically)
         pkt_type = "UNKNOWN"
@@ -626,21 +645,38 @@ class CandidatePairTransport:
             if self._dtls_count <= config.log_first_n_packets or self._dtls_count % config.log_every_n_packets == 0:
                 logger.trace(Component.ICE, f"DTLS packet -> dtls queue",
                            count=self._dtls_count, size=len(pkt.data))
-            self._dtls.put_nowait(pkt)
+            self._queue_demuxed_packet(self._dtls, pkt, "dtls")
+            perf_mark(
+                "ice", "packet_demux", "dtls",
+                metadata={**self._demux_metadata("dtls", pkt), "counter.ice.demux_dtls": 1},
+            )
         elif net.is_rtcp(pkt.data):
+            if len(pkt.data) < 4:
+                self._demux_failed(pkt, "malformed_rtcp")
             # RTCP packet
             self._rtcp_count += 1
             pkt_type = "RTCP"
-            self._rtcp.put_nowait(pkt)
+            self._queue_demuxed_packet(self._rtcp, pkt, "rtcp")
+            rtcp_metadata = self._demux_metadata("rtcp", pkt)
+            if len(pkt.data) >= 8:
+                rtcp_metadata["ssrc"] = int.from_bytes(pkt.data[4:8], "big")
+            perf_mark(
+                "ice", "packet_demux", "rtcp",
+                metadata={**rtcp_metadata, "counter.ice.demux_rtcp": 1},
+            )
         else:
+            if len(pkt.data) < 12:
+                self._demux_failed(pkt, "malformed_rtp")
             # RTP packet
             self._rtp_count += 1
             pkt_type = "RTP"
 
-            # Parse RTP header for debugging (first 12 bytes minimum)
-            if len(pkt.data) >= 12 and config.log_packet_details:
-                seq = int.from_bytes(pkt.data[2:4], 'big')
-                ssrc = int.from_bytes(pkt.data[8:12], 'big')
+            # Header-only extraction is deliberately outside the UDP callback.
+            seq = int.from_bytes(pkt.data[2:4], "big")
+            ssrc = int.from_bytes(pkt.data[8:12], "big")
+            rtp_metadata = self._demux_metadata("rtp", pkt)
+            rtp_metadata.update({"ssrc": ssrc, "sequence_number": seq})
+            if config.log_packet_details:
                 payload_type = pkt.data[1] & 0x7F
 
                 # Log using packet logger
@@ -648,7 +684,11 @@ class CandidatePairTransport:
                     logger.log_packet(Component.ICE, "RX", self._rtp_count,
                                     seq=seq, ssrc=ssrc, size=len(pkt.data), pt=payload_type)
 
-            self._rtp.put_nowait(pkt)
+            self._queue_demuxed_packet(self._rtp, pkt, "rtp")
+            perf_mark(
+                "ice", "packet_demux", "rtp",
+                metadata={**rtp_metadata, "counter.ice.demux_rtp": 1},
+            )
 
         # Log demux statistics periodically
         if config.log_packet_counts and (self._total_packets <= 50 or self._total_packets % 100 == 0):
@@ -661,6 +701,28 @@ class CandidatePairTransport:
                            RTP=f"{self._rtp_count} ({rtp_pct:.1f}%)",
                            RTCP=f"{self._rtcp_count} ({rtcp_pct:.1f}%)",
                            DTLS=f"{self._dtls_count} ({dtls_pct:.1f}%)")
+
+    def _queue_demuxed_packet(self, queue: Interceptor, pkt: Packet, packet_kind: str) -> None:
+        try:
+            queue.put_nowait(pkt)
+        except Exception as exc:
+            self._demux_failed(pkt, "queue_rejected", exc)
+
+    def _demux_failed(
+        self, pkt: Packet, demux_reason: str, exc: Exception | None = None
+    ) -> None:
+        failure = exc or ValueError(f"Unable to demux {demux_reason} ICE transport datagram")
+        perf_mark(
+            "ice", "packet_demux", "failed",
+            metadata={
+                **self._demux_metadata("unknown", pkt), "demux_reason": demux_reason,
+                "error_stage": "packet_demux", "exception_class": failure.__class__.__name__,
+                "counter.ice.demux_failed": 1,
+            },
+        )
+        if exc is not None:
+            raise ValueError(f"Unable to demux {demux_reason} ICE transport datagram") from exc
+        raise failure
 
     async def recv_dtls(self) -> Packet:
         return await self._dtls.get()
@@ -693,7 +755,7 @@ class CandidatePairController(AsyncEventEmitter):
         self.__conn = pair.local_candidate.mux.intercept(
             self._pair.remote_candidate.unwrap
         )
-        self.__transport = CandidatePairTransport(self.__conn)
+        self.__transport = CandidatePairTransport(self.__conn, pair_id=pair.get_pair_id())
         self.__nominated = asyncio.Event()
 
     def __pair_nominate(self, _: CandidatePair):
@@ -709,6 +771,13 @@ class CandidatePairController(AsyncEventEmitter):
     async def start(self):
         self.__selector.start()
         self.__selector.on(SelectorEvent.NOMINATE, self.__pair_nominate)
+        controller_metadata = {
+            "pair_id": self._pair.get_pair_id(), "flow_direction": "rx",
+        }
+        perf_mark(
+            "ice", "controller", "loop_started",
+            metadata={**controller_metadata, "expected_long_running": True},
+        )
         await self.ping_remote_candidate()
 
         get_logger().debug(
@@ -717,12 +786,43 @@ class CandidatePairController(AsyncEventEmitter):
             pair_id=self._pair.get_pair_id(),
         )
         while True:
-            pkt = await self.__conn.recvfrom()
+            pkt: Packet | None = None
+            try:
+                pkt = await self.__conn.recvfrom()
+                is_stun = stun.is_stun(pkt.data)
+                packet_kind = "stun" if is_stun else "unknown"
+                packet_metadata = {
+                    **controller_metadata, "size_bytes": len(pkt.data),
+                    "packet_kind": packet_kind,
+                }
+                perf_mark(
+                    "ice", "controller", "packet_received",
+                    metadata={**packet_metadata, "counter.ice.controller_packets_received": 1},
+                )
 
-            if stun.is_stun(pkt.data):
-                await self._on_inbound_stun(pkt)
-            else:
-                await self._on_inbound_pkt(pkt)
+                if is_stun:
+                    await self._on_inbound_stun(pkt)
+                    route = "stun"
+                else:
+                    await self._on_inbound_pkt(pkt)
+                    route = "transport"
+                perf_mark(
+                    "ice", "controller", "packet_routed",
+                    metadata={**packet_metadata, "route": route, "counter.ice.controller_packets_routed": 1},
+                )
+            except Exception as exc:
+                metadata = dict(controller_metadata)
+                if pkt is not None:
+                    metadata["size_bytes"] = len(pkt.data)
+                perf_mark(
+                    "ice", "controller", "packet_failed",
+                    metadata={
+                        **metadata, "error_stage": "dequeue_branch_or_route",
+                        "exception_class": exc.__class__.__name__,
+                        "counter.ice.controller_packets_failed": 1,
+                    },
+                )
+                raise
 
     async def _on_inbound_pkt(self, pkt: Packet):
         self.__transport.pipe(pkt)

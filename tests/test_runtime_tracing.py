@@ -4,6 +4,7 @@ import pytest
 
 from webrtc.peer_context import PeerContext
 from webrtc.runtime import WebRTCRuntimeResources, get_current_task_context
+from webrtc.tracing import perf_mark
 
 
 def trace_batch_events(messages, event_name=None):
@@ -73,6 +74,35 @@ def test_subscriber_sees_complete_then_auto_prune_delete():
             events = [e["event"] for e in batch["data"]["events"]]
             assert events == ["trace:init", "trace:update", "trace:complete", "trace:delete"]
             sub.close()
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_runtime_aggregates_performance_events_onto_owning_trace():
+    async def scenario():
+        runtime = WebRTCRuntimeResources(max_workers=1, trace_subscriber_batch_interval=0.01)
+        try:
+            context = runtime.create_task_context(
+                name="rtp-receive-loop", metadata={"peer_id": "peer-performance"}
+            )
+            runtime.start_task_context(context)
+            runtime._tracing.performance_recorder.mark(
+                "udp", "datagram", "rx",
+                metadata={
+                    "trace_id": context.trace_id,
+                    "peer_id": "peer-performance",
+                    "packet_kind": "rtp",
+                    "size_bytes": 128,
+                },
+            )
+            traces = runtime.trace_live_tree()
+            metric_trace = next(trace for trace in traces if trace["trace_id"] == context.trace_id)
+            metric = metric_trace["metadata"]["performance_metrics"]["udp.datagram.rx"]
+            assert metric["count"] == 1
+            assert metric["duration_count"] == 0
+            assert metric["metadata"] == {"packet_kind": "rtp", "size_bytes": 128}
         finally:
             await runtime.aclose()
 

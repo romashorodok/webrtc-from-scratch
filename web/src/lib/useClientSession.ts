@@ -19,7 +19,7 @@ export function useClientSession() {
   const signalRef = useRef<Signal | null>(null);
   const [status, setStatus] = useState("Disconnected");
   const [toasts, setToasts] = useState<string[]>([]);
-  const { enqueueTraceEvent, enqueueTraceEvents, summaries, traces } = useTraceState();
+  const { enqueueTraceEvent, enqueueTraceEvents, performanceEvents, summaries, traces } = useTraceState();
 
   useEffect(() => {
     const signal = new Signal();
@@ -165,6 +165,7 @@ export function useClientSession() {
     status,
     toasts,
     dismissToast,
+    performanceEvents,
     summaries,
     traces,
     videoRef,

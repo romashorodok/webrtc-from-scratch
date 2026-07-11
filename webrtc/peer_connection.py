@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import wraps
@@ -8,6 +9,13 @@ import string
 import webrtc_rs
 
 from webrtc.media.av1_payloader import AV1_PAYLOAD_TYPE
+from webrtc.media.rtcp import (
+    RecvDelta,
+    RtcpPacket,
+    RunLengthChunk,
+    TransportLayerCC,
+    TypeTCCPacketReceivedSmallDelta,
+)
 
 from . import ice
 from .ice import net
@@ -400,6 +408,184 @@ class PeerConnection(AsyncEventEmitter):
         self._peer_connection_lock = asyncio.Lock()
         self._transport: ice.CandidatePairTransport | None = None
         self._transport_ready = asyncio.Event()
+
+        # Keep public raw-media sends ordered.  In particular, a burst must not
+        # interleave with another caller halfway through its RTP sequence.
+        self._media_send_lock = asyncio.Lock()
+
+    async def _wait_for_media_send_ready(self) -> None:
+        """Wait until the selected ICE transport and both SRTP sessions exist."""
+        # Lifecycle waits are deliberately bounded so a failed negotiation cannot
+        # leave a public send call (and its send lock) blocked forever.
+        await wait_for_event(self._transport_ready, timeout=30.0)
+        # DTLSTransport owns the SRTP readiness state.  Its write methods also
+        # wait on the individual RTP/RTCP session, while this wait makes the
+        # public PeerConnection contract explicit before a send begins.
+        await self._dtls_transport.wait(TransportCondition.SRTP_READY, timeout=30.0)
+
+    @staticmethod
+    def _media_packet_bytes(packet: bytes | bytearray) -> bytes:
+        if not isinstance(packet, (bytes, bytearray)):
+            raise TypeError("media packet must be bytes or bytearray")
+        # Public helpers must not retain caller-owned mutable packet buffers.
+        return bytes(packet)
+
+    async def _send_media_packet(
+        self, packet: bytes, *, rtcp: bool, wait_ready: bool = True
+    ) -> int:
+        component = "rtcp" if rtcp else "rtp"
+        phase = "packet.send" if not rtcp else "feedback.send"
+        metadata: dict[str, object] = {
+            "flow_direction": "tx",
+            "packet_kind": "rtcp" if rtcp else "rtp",
+            "plaintext_size_bytes": len(packet),
+        }
+        if self._transport is not None and self._transport._pair_id is not None:
+            metadata["pair_id"] = self._transport._pair_id
+        if rtcp:
+            metadata["packet_count"] = 1
+            if len(packet) >= 2:
+                metadata["feedback_type"] = f"{packet[0] & 0x1f}/{packet[1]}"
+            completed_metadata = {"counter.rtcp.feedback_sent": 1}
+            failed_metadata = {"counter.rtcp.feedback_send_failed": 1}
+        else:
+            if len(packet) >= 12:
+                metadata["sequence_number"] = int.from_bytes(packet[2:4], "big")
+                metadata["ssrc"] = int.from_bytes(packet[8:12], "big")
+            completed_metadata = {"counter.rtp.packets_sent": 1}
+            failed_metadata = {"counter.rtp.packets_send_failed": 1}
+        async with measure_perf_async(
+            component,
+            phase,
+            metadata=metadata,
+            completed_metadata=completed_metadata,
+            failed_metadata=failed_metadata,
+        ):
+            if wait_ready:
+                await self._wait_for_media_send_ready()
+            sent = (
+                await self._dtls_transport.write_rtcp_bytes(packet)
+                if rtcp
+                else await self._dtls_transport.write_rtp_bytes(packet)
+            )
+            if sent <= 0:
+                raise RuntimeError(f"failed to send {'RTCP' if rtcp else 'RTP'} packet")
+            return sent
+
+    async def send_rtp_packet(self, packet: bytes | bytearray) -> int:
+        """Encrypt and send one serialized RTP packet through the selected peer transport."""
+        packet_bytes = self._media_packet_bytes(packet)
+        async with self._media_send_lock:
+            return await self._send_media_packet(packet_bytes, rtcp=False)
+
+    async def send_rtp_packets(self, packets: Iterable[bytes | bytearray]) -> int:
+        """Encrypt and send an ordered RTP burst without spawning per-packet tasks."""
+        packet_batch = tuple(self._media_packet_bytes(packet) for packet in packets)
+        if not packet_batch:
+            return 0
+
+        async with self._media_send_lock:
+            total = 0
+            for index, packet in enumerate(packet_batch):
+                total += await self._send_media_packet(
+                    packet, rtcp=False, wait_ready=index == 0
+                )
+            return total
+
+    async def send_rtcp_packet(self, packet: bytes | bytearray) -> int:
+        """Encrypt and send one serialized RTCP packet through the selected peer transport."""
+        packet_bytes = self._media_packet_bytes(packet)
+        async with self._media_send_lock:
+            return await self._send_media_packet(packet_bytes, rtcp=True)
+
+    async def recv_rtcp_feedback(self, ssrc: int) -> list[RtcpPacket]:
+        """Read and accept one SRTP-delivered RTCP feedback packet by SSRC.
+
+        The DTLS/SRTP transport owns secure delivery; this public peer boundary
+        owns parsing the feedback that is visible to the sending application.
+        """
+        stream = await self._dtls_transport.srtp_rtcp_stream(ssrc)
+        packet = await stream.read()
+        metadata: dict[str, object] = {
+            "flow_direction": "rx",
+            "packet_kind": "rtcp",
+            "plaintext_size_bytes": len(packet),
+            "packet_count": 1,
+        }
+        try:
+            feedback = RtcpPacket.parse(packet)
+            if len(feedback) != 1:
+                raise ValueError("expected exactly one RTCP feedback packet")
+            parsed = feedback[0]
+            metadata["feedback_type"] = "twcc" if isinstance(parsed, TransportLayerCC) else type(parsed).__name__
+        except BaseException as exc:
+            perf_mark(
+                "rtcp", "feedback.receive", "failed",
+                metadata={
+                    **metadata,
+                    "error_stage": "rtcp_feedback_parse",
+                    "exception_class": exc.__class__.__name__,
+                    "counter.rtcp.feedback_receive_failed": 1,
+                },
+            )
+            raise
+
+        perf_mark(
+            "rtcp", "feedback.receive", "completed",
+            metadata={**metadata, "counter.rtcp.feedback_received": 1},
+        )
+        if isinstance(parsed, TransportLayerCC):
+            perf_mark(
+                "rtcp", "twcc", "confirmed",
+                metadata={
+                    "flow_direction": "rx",
+                    "feedback_type": "twcc",
+                    "base_sequence_number": parsed.base_sequence_number,
+                    "confirmed_packet_count": parsed.packet_status_count,
+                    "packet_count": 1,
+                    "counter.rtcp.confirmed_packets": parsed.packet_status_count,
+                },
+            )
+        return feedback
+
+    def build_twcc_feedback(self, media_ssrc: int, transport_sequences: Iterable[int]) -> bytes:
+        """Build receiver-owned TWCC feedback for received transport sequences."""
+        sequences = tuple(transport_sequences)
+        if not sequences:
+            raise ValueError("TWCC feedback requires at least one transport sequence")
+        if any(not 0 <= sequence <= 0xFFFF for sequence in sequences):
+            raise ValueError("TWCC transport sequences must be unsigned 16-bit values")
+        if any(sequence != ((sequences[0] + index) & 0xFFFF) for index, sequence in enumerate(sequences)):
+            raise ValueError("TWCC feedback currently requires contiguous transport sequences")
+
+        feedback = TransportLayerCC(
+            sender_ssrc=media_ssrc,
+            media_ssrc=media_ssrc,
+            base_sequence_number=sequences[0],
+            packet_status_count=len(sequences),
+            reference_time=12345,
+            fb_pkt_count=1,
+            packet_chunks=[RunLengthChunk(TypeTCCPacketReceivedSmallDelta, len(sequences))],
+            recv_deltas=[
+                RecvDelta(delta=250 * (index + 1), delta_type=TypeTCCPacketReceivedSmallDelta)
+                for index in range(len(sequences))
+            ],
+        ).marshal()
+        perf_mark(
+            "rtcp",
+            "twcc",
+            "generated",
+            metadata={
+                "flow_direction": "tx",
+                "packet_kind": "rtcp",
+                "feedback_type": "twcc",
+                "base_sequence_number": sequences[0],
+                "packet_count": 1,
+                "confirmed_packet_count": len(sequences),
+                "counter.rtcp.feedback_generated": 1,
+            },
+        )
+        return feedback
 
     async def __on_ice_pair_controller(self, pair_ctrl: ice.CandidatePairController):
         # TODO: check if this already started

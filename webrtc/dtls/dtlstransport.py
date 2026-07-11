@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import uuid
 from enum import Enum
 from typing import Protocol
 
@@ -28,7 +29,7 @@ from webrtc.lifecycle import (
     wait_for_event,
     wait_until,
 )
-from webrtc.tracing import perf_mark, perf_measured_async
+from webrtc.tracing import measure_perf, perf_mark, perf_measured_async
 
 logger = logging.getLogger("webrtc.dtls.transport")
 
@@ -210,6 +211,7 @@ class DTLSTransport:
             name="dtls:handshake",
             component="dtls",
             kind="dtls",
+            bounded=True,
         )
         wlogger.debug(Component.DTLS, "Handshake task created")
         perf_mark("dtls", "start", "completed", metadata={"role": role.value})
@@ -355,44 +357,90 @@ class DTLSTransport:
 
         wlogger.trace(Component.DTLS, "Received DTLS record", size=len(record_layer_bytes))
 
-        if not is_dtls_record_layer(record_layer_bytes):
-            first_byte = record_layer_bytes[0] if record_layer_bytes else None
-            wlogger.warn(Component.DTLS, "Non-DTLS packet received", first_byte=f"0x{first_byte:02x}" if first_byte else "empty")
+        parse_metadata = {
+            "flow_direction": "rx",
+            "packet_kind": "dtls",
+            "input_size_bytes": len(record_layer_bytes),
+            "operation_id": uuid.uuid4().hex,
+        }
+        try:
+            with measure_perf("dtls", "record.parse", metadata=parse_metadata):
+                try:
+                    if not is_dtls_record_layer(record_layer_bytes):
+                        raise ValueError("received non-DTLS record")
+                    records = list(RecordLayerBatch(record_layer_bytes))
+                except Exception:
+                    parse_metadata.update(
+                        error_stage="record_batch_parse",
+                        **{"counter.dtls.record_parse_failed": 1},
+                    )
+                    raise
+                parse_metadata["record_count"] = len(records)
+        except Exception as e:
+            wlogger.error(Component.DTLS, "Failed to parse DTLS record", error=str(e))
             return
 
         try:
-            from webrtc.dtls.dtls_record import RecordLayerBatch
-            # Use RecordLayerBatch to iterate over all records in the packet
-            record_count = 0
-            for record, raw in RecordLayerBatch(record_layer_bytes):
-                record_count += 1
-                perf_mark(
-                    "dtls",
-                    "record",
-                    "rx",
-                    metadata={
-                        "content_type": getattr(record.header.content_type, "name", str(record.header.content_type)),
-                        "epoch": record.header.epoch,
-                        "sequence_number": record.header.sequence_number,
-                        "size_bytes": len(raw),
-                        "counter.dtls.records_rx": 1,
-                    },
-                )
+            for record_count, (record, raw) in enumerate(records, start=1):
+                record_metadata = {
+                    "flow_direction": "rx",
+                    "packet_kind": "dtls",
+                    "content_type": getattr(record.header.content_type, "name", str(record.header.content_type)),
+                    "record_type": getattr(record.header.content_type, "name", str(record.header.content_type)),
+                    "epoch": record.header.epoch,
+                    "sequence_number": record.header.sequence_number,
+                    "size_bytes": len(raw),
+                    "counter.dtls.records_rx": 1,
+                }
+                perf_mark("dtls", "record", "rx", metadata=record_metadata)
                 if config.log_packet_details and record_count <= 10:
                     wlogger.debug(Component.DTLS, f"Parsed DTLS record #{record_count}",
                                 content_type=record.header.content_type,
                                 epoch=record.header.epoch,
                                 seq=record.header.sequence_number)
-                for complete_record, complete_raw in (
-                    self.__handshake_reconstructor.complete(record, raw)
+                reconstruct_metadata = {
+                    key: value for key, value in record_metadata.items()
+                    if not key.startswith("counter.")
+                }
+                reconstruct_metadata.update(operation_id=uuid.uuid4().hex)
+                with measure_perf(
+                    "dtls", "record.reconstruct", metadata=reconstruct_metadata
                 ):
-                    await self.record_layer_chan.put((complete_record, complete_raw))
+                    try:
+                        complete_records = self.__handshake_reconstructor.complete(record, raw)
+                    except Exception:
+                        reconstruct_metadata.update(
+                            error_stage="handshake_reconstruction",
+                            **{"counter.dtls.record_reconstruct_failed": 1},
+                        )
+                        raise
+                    reconstruct_metadata["reconstructed_size_bytes"] = sum(
+                        len(complete_raw) for _, complete_raw in complete_records
+                    )
+                    reconstruct_metadata["counter.dtls.records_reconstructed"] = 1
+                for complete_record, complete_raw in complete_records:
+                    enqueue_metadata = {
+                        key: value for key, value in reconstruct_metadata.items()
+                        if not key.startswith("counter.")
+                    }
+                    enqueue_metadata.update(
+                        operation_id=uuid.uuid4().hex,
+                        reconstructed_size_bytes=len(complete_raw),
+                    )
+                    with measure_perf(
+                        "dtls", "record.enqueue", metadata=enqueue_metadata
+                    ):
+                        try:
+                            await self.record_layer_chan.put((complete_record, complete_raw))
+                        except Exception:
+                            enqueue_metadata["error_stage"] = "record_queue_enqueue"
+                            raise
 
             wlogger.log_queue_size(Component.DTLS, "record_layer",
                                   self.record_layer_chan.qsize(),
                                   getattr(self.record_layer_chan, 'maxsize', 'unlimited'))
         except Exception as e:
-            wlogger.error(Component.DTLS, "Failed to parse DTLS record", error=str(e))
+            wlogger.error(Component.DTLS, "Failed to reconstruct or enqueue DTLS record", error=str(e))
 
     async def dequeue_record(self) -> bytes:
         """

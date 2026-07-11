@@ -1,10 +1,12 @@
 import asyncio
 import logging
+import uuid
 from enum import IntEnum
 from typing import Protocol
 
 from webrtc.dtls.certificate import Certificate
 from webrtc.peer_context import spawn_peer_task
+from webrtc.tracing import measure_perf_async
 
 # Structured logging for DTLS handshake
 logger = logging.getLogger("webrtc.dtls.fsm")
@@ -169,8 +171,26 @@ class FSM:
         return self._last_received_flight == flight
 
     async def dispatch(self):
-        async with self.handshake_state_transition_lock:
-            await self.handshake_state_transition.put(self.handshake_state)
+        metadata = {
+            "flow_direction": "rx",
+            "operation_id": uuid.uuid4().hex,
+            "flight": self.flight.name,
+            "fsm_state": self.handshake_state.name,
+        }
+        async with measure_perf_async(
+            "dtls",
+            "fsm.dispatch",
+            metadata=metadata,
+        ):
+            try:
+                async with self.handshake_state_transition_lock:
+                    await self.handshake_state_transition.put(self.handshake_state)
+            except Exception:
+                metadata.update(
+                    error_stage="state_transition_enqueue",
+                    **{"counter.dtls.fsm_dispatch_failed": 1},
+                )
+                raise
 
     async def prepare(self) -> FSMState:
         # print("Prepare state", self.flight)
@@ -512,6 +532,7 @@ class DTLSConn:
             name="dtls:fsm",
             component="dtls",
             kind="dtls",
+            metadata={"expected_long_running": True, "loop_role": "fsm"},
         )
 
         # Queue for encrypted messages that arrive before cipher suite is ready

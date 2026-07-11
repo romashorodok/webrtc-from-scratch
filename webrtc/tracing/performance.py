@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextvars
 import functools
 import time
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
@@ -79,10 +80,11 @@ def _thaw_value(value: Any) -> Any:
 
 
 class PerformanceRecorder:
-    def __init__(self) -> None:
+    def __init__(self, *, event_sink: Callable[[PerfEvent], None] | None = None) -> None:
         self._lock = RLock()
         self._sequence = 0
         self._events: list[PerfEvent] = []
+        self._event_sink = event_sink
 
     def mark(
         self,
@@ -106,7 +108,14 @@ class PerformanceRecorder:
                 metadata=event_metadata,
             )
             self._events.append(event)
-            return event
+        # Streaming must never affect a media/protocol path.  In particular,
+        # sinks may publish to a bounded UI subscriber queue.
+        if self._event_sink is not None:
+            try:
+                self._event_sink(event)
+            except Exception:
+                pass
+        return event
 
     def events(self) -> tuple[PerfEvent, ...]:
         with self._lock:
@@ -160,7 +169,11 @@ def measure_perf(
         return
 
     started_ns = time.monotonic_ns()
-    recorder.mark(component, phase, "started", metadata=metadata)
+    # Callers intentionally enrich a mutable mapping inside the measured block
+    # (for example with output sizes). Preserve that completion-time contract.
+    operation_metadata = metadata if isinstance(metadata, dict) else dict(metadata or {})
+    operation_metadata.setdefault("operation_id", uuid.uuid4().hex)
+    recorder.mark(component, phase, "started", metadata=operation_metadata)
     try:
         yield
     except BaseException as exc:
@@ -169,7 +182,7 @@ def measure_perf(
             phase,
             "failed",
             duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
-            metadata={**(metadata or {}), "exception_class": exc.__class__.__name__},
+            metadata={**operation_metadata, "exception_class": exc.__class__.__name__},
         )
         raise
     else:
@@ -178,7 +191,7 @@ def measure_perf(
             phase,
             "completed",
             duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
-            metadata=metadata,
+            metadata=operation_metadata,
         )
 
 
@@ -188,6 +201,8 @@ async def measure_perf_async(
     phase: str,
     *,
     metadata: Mapping[str, Any] | None = None,
+    completed_metadata: Mapping[str, Any] | None = None,
+    failed_metadata: Mapping[str, Any] | None = None,
 ) -> AsyncIterator[None]:
     recorder = get_current_performance_recorder()
     if recorder is None:
@@ -195,7 +210,10 @@ async def measure_perf_async(
         return
 
     started_ns = time.monotonic_ns()
-    recorder.mark(component, phase, "started", metadata=metadata)
+    # See the synchronous helper: completion metadata may be added in-block.
+    operation_metadata = metadata if isinstance(metadata, dict) else dict(metadata or {})
+    operation_metadata.setdefault("operation_id", uuid.uuid4().hex)
+    recorder.mark(component, phase, "started", metadata=operation_metadata)
     try:
         yield
     except BaseException as exc:
@@ -204,7 +222,11 @@ async def measure_perf_async(
             phase,
             "failed",
             duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
-            metadata={**(metadata or {}), "exception_class": exc.__class__.__name__},
+            metadata={
+                **operation_metadata,
+                **(failed_metadata or {}),
+                "exception_class": exc.__class__.__name__,
+            },
         )
         raise
     else:
@@ -213,7 +235,7 @@ async def measure_perf_async(
             phase,
             "completed",
             duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
-            metadata=metadata,
+            metadata={**operation_metadata, **(completed_metadata or {})},
         )
 
 
