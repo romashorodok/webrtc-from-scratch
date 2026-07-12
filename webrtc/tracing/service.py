@@ -53,7 +53,13 @@ class TraceService:
         self.store = TraceStore(context_limit=trace_context_limit)
         self.events = TraceEventBus(batch_interval=trace_subscriber_batch_interval)
         self.metrics = TraceMetricsAggregator(executor=executor)
-        self.performance_recorder = PerformanceRecorder(event_sink=self.record_performance_event)
+        # Runtime events are immediately folded into their owning trace. Keeping
+        # individual packet-path samples would grow memory without adding data
+        # to the replacement snapshots consumed by trace subscribers.
+        self.performance_recorder = PerformanceRecorder(
+            event_sink=self.record_performance_event,
+            retain_events=False,
+        )
 
     def record_performance_event(self, event: PerfEvent) -> None:
         """Aggregate a packet-path measurement onto its owning live trace."""

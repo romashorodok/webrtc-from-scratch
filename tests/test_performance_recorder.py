@@ -40,6 +40,18 @@ def test_events_are_sequenced_deterministically():
     assert [event.sequence for event in recorder.events()] == [1, 2]
 
 
+def test_recorder_can_stream_without_retaining_events():
+    streamed = []
+    recorder = PerformanceRecorder(event_sink=streamed.append, retain_events=False)
+
+    first = recorder.mark("udp", "datagram", "rx")
+    second = recorder.mark("udp", "datagram", "rx")
+
+    assert streamed == [first, second]
+    assert recorder.events() == ()
+    assert second.sequence == 2
+
+
 def test_perf_mark_is_noop_without_current_recorder():
     assert get_current_performance_recorder() is None
     assert perf_mark("sdp", "offer", "started") is None

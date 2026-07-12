@@ -80,11 +80,17 @@ def _thaw_value(value: Any) -> Any:
 
 
 class PerformanceRecorder:
-    def __init__(self, *, event_sink: Callable[[PerfEvent], None] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        event_sink: Callable[[PerfEvent], None] | None = None,
+        retain_events: bool = True,
+    ) -> None:
         self._lock = RLock()
         self._sequence = 0
         self._events: list[PerfEvent] = []
         self._event_sink = event_sink
+        self._retain_events = retain_events
 
     def mark(
         self,
@@ -107,7 +113,8 @@ class PerformanceRecorder:
                 duration_ms=duration_ms,
                 metadata=event_metadata,
             )
-            self._events.append(event)
+            if self._retain_events:
+                self._events.append(event)
         # Streaming must never affect a media/protocol path.  In particular,
         # sinks may publish to a bounded UI subscriber queue.
         if self._event_sink is not None:

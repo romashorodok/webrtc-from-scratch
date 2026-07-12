@@ -344,6 +344,7 @@ async def ws_endpoint(ws: WebSocket):
             match msg.get("event"):
                 case "negotiate":
                     print("Start all webrtc")
+                    await pc.gatherer.dial()
                     await start_media()
 
                 case "offer":
