@@ -5,6 +5,7 @@ import pytest
 from webrtc.peer_context import PeerContext
 from webrtc.runtime import WebRTCRuntimeResources, get_current_task_context
 from webrtc.tracing import perf_mark
+from webrtc.tracing.metrics import MetricDelta, TraceMetricsAggregator
 
 
 def trace_batch_events(messages, event_name=None):
@@ -107,6 +108,41 @@ def test_runtime_aggregates_performance_events_onto_owning_trace():
             await runtime.aclose()
 
     asyncio.run(scenario())
+
+
+def test_completed_trace_metrics_are_coalesced_until_flush():
+    async def scenario():
+        runtime = WebRTCRuntimeResources(max_workers=1)
+        try:
+            parent = runtime.create_task_context(name="stream", kind="media")
+            runtime.start_task_context(parent)
+            for _ in range(10_000):
+                context = runtime.create_task_context(
+                    name="packet", kind="media", parent_id=parent.trace_id
+                )
+                runtime.start_task_context(context)
+                runtime.complete_task_context(context, status="completed", error=None)
+
+            assert len(runtime._tracing.metrics._totals) == 1
+            metrics = await runtime._tracing.flush_metrics()
+            metric = next(iter(metrics.values()))
+            assert metric["call_count"] == 10_000
+            assert metric["success_count"] == 10_000
+            assert runtime._tracing.metrics._totals == {}
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_trace_metrics_evict_oldest_keys_at_cardinality_limit():
+    aggregator = TraceMetricsAggregator(max_keys=2)
+    for root in ("old", "kept", "new"):
+        aggregator.enqueue(
+            MetricDelta((root, "packet", "packet", "media"), 1.0, "completed")
+        )
+
+    assert [key[0] for key in aggregator._totals] == ["kept", "new"]
 
 
 def test_trace_live_running_includes_transitions():
