@@ -5,9 +5,6 @@ import { TraceOverlay } from "./TraceOverlay";
 test("closed normalized overlay does not mount list, SVG, export, or animation work", () => {
   const html = renderToString(
     <TraceOverlay
-      tasks={[]}
-      groups={[]}
-      summaries={[]}
       machinesById={new Map([["peer", {
         entity_id: "peer",
         machine_type: "peer",

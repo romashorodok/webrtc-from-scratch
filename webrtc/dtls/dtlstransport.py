@@ -308,7 +308,10 @@ class DTLSTransport(ObservedComponent):
                 is_rtp=True,
             )
             self.__srtp_rtp_lock.set()
-            emit_domain_event(SrtpSessionReady, protocol="rtp")
+            emit_domain_event(
+                SrtpSessionReady, protocol="rtp",
+                session_id=getattr(self._srtp_rtp, "observability_id", None),
+            )
             wlogger.debug(Component.DTLS, "RTP SRTP session created")
 
             self._srtp_rtcp = SrtpSession.from_keying_material(
@@ -317,7 +320,10 @@ class DTLSTransport(ObservedComponent):
                 is_rtp=False,
             )
             self.__srtp_rtcp_lock.set()
-            emit_domain_event(SrtpSessionReady, protocol="rtcp")
+            emit_domain_event(
+                SrtpSessionReady, protocol="rtcp",
+                session_id=getattr(self._srtp_rtcp, "observability_id", None),
+            )
             wlogger.debug(Component.DTLS, "RTCP SRTP session created")
 
             wlogger.info(Component.DTLS, "SRTP sessions initialized")

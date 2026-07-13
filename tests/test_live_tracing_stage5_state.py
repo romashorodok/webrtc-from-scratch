@@ -1,6 +1,7 @@
 import asyncio
 
 from webrtc import Runtime
+from webrtc.domain_events import SrtpPacketDelivery, emit_domain_event
 from webrtc.dtls.fsm import FSM, FSMState, StartHandshake
 from webrtc.observability import FacetOp, FacetStore, ProducerDot
 from webrtc.runtime_services import Borrowed
@@ -91,6 +92,90 @@ def test_srtp_readiness_boolean_is_not_mistaken_for_key_material():
     ))
     assert store.snapshots()[0].value is True
     assert diagnostics["facet_redactions"] == 0
+
+
+def test_srtp_delivery_facets_aggregate_and_publish_health_transitions():
+    async def scenario():
+        async with Runtime(
+            scope_id="scope", trace_patch_cadence=60,
+            srtp_delivery_facet_cadence=60,
+        ) as runtime:
+            for ssrc in range(100):
+                assert emit_domain_event(
+                    SrtpPacketDelivery, ssrc=ssrc, protocol="rtp", delivered=True
+                )
+
+            # Packet-rate success does not revise projection state per packet.
+            assert not any(
+                item.owner_entity_id == "queue:scope:rtp"
+                for item in runtime.projection.facets.snapshots()
+            )
+            runtime.trace_patch_flush()
+            facets = {
+                item.facet_id.rsplit(":", 1)[-1]: item
+                for item in runtime.projection.facets.snapshots()
+                if item.owner_entity_id == "queue:scope:rtp"
+            }
+            assert facets["delivered_packets"].value == 100
+            assert facets["dropped_packets"].value == 0
+            assert facets["delivery_health"].value == "healthy"
+            assert {item.revision for item in facets.values()} == {1}
+
+            # A failure changes health immediately and retains a stable reason.
+            assert emit_domain_event(
+                SrtpPacketDelivery, ssrc=7, protocol="rtp", delivered=False,
+                failure_reason="stream_queue_full",
+            )
+            facets = {
+                item.facet_id.rsplit(":", 1)[-1]: item
+                for item in runtime.projection.facets.snapshots()
+                if item.owner_entity_id == "queue:scope:rtp"
+            }
+            assert facets["delivered_packets"].value == 100
+            assert facets["dropped_packets"].value == 1
+            assert facets["delivery_health"].value == "degraded"
+            assert facets["last_failure"].value == "stream_queue_full"
+
+            # One successful packet is not treated as instant recovery.  A
+            # drop-free reporting interval is the recovery boundary.
+            assert emit_domain_event(
+                SrtpPacketDelivery, ssrc=7, protocol="rtp", delivered=True
+            )
+            health_revision = facets["delivery_health"].revision
+            assert next(
+                item for item in runtime.projection.facets.snapshots()
+                if item.facet_id.endswith(":delivery_health")
+            ).value == "degraded"
+            runtime.trace_patch_flush()
+            facets = {
+                item.facet_id.rsplit(":", 1)[-1]: item
+                for item in runtime.projection.facets.snapshots()
+                if item.owner_entity_id == "queue:scope:rtp"
+            }
+            assert facets["delivered_packets"].value == 101
+            assert facets["delivery_health"].value == "healthy"
+            assert facets["delivery_health"].revision == health_revision + 1
+            assert facets["last_failure"].value == "stream_queue_full"
+
+    asyncio.run(scenario())
+
+
+def test_srtp_delivery_facets_publish_on_their_cadence():
+    async def scenario():
+        async with Runtime(
+            scope_id="scope", srtp_delivery_facet_cadence=0.001
+        ) as runtime:
+            emit_domain_event(SrtpPacketDelivery, delivered=True)
+            emit_domain_event(SrtpPacketDelivery, delivered=True)
+            await asyncio.sleep(0.01)
+            delivered = next(
+                item for item in runtime.projection.facets.snapshots()
+                if item.facet_id == "queue:scope:rtp:delivered_packets"
+            )
+            assert delivered.value == 2
+            assert delivered.revision == 1
+
+    asyncio.run(scenario())
 
 
 def test_runtime_shutdown_releases_transition_checkpoint():

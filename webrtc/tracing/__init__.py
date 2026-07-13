@@ -6,7 +6,8 @@ from webrtc.activity import (
 )
 from webrtc.observability import (
     ControlHandle, ControlHandleStore, FacetOp, FacetSnapshot, FacetStore,
-    MachineSnapshot, MachineStore, MachineTransitionOp, ObservabilityService,
+    MachineSnapshot, MachineStore, MachineTransitionOp, MachineTransitionRecord,
+    ObservabilityService,
     ProducerClock, ProducerDot,
 )
 from .performance import (
@@ -50,6 +51,7 @@ __all__ = [
     "ProducerDot",
     "ProducerClock",
     "MachineTransitionOp",
+    "MachineTransitionRecord",
     "MachineSnapshot",
     "MachineStore",
     "FacetOp",

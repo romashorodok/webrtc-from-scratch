@@ -5,6 +5,8 @@ const ARCHIVED_TRACES_PER_SUMMARY_LIMIT = 512;
 const PERFORMANCE_EVENT_LIMIT = 160;
 export const NORMALIZED_ARCHIVE_LIMIT = 512;
 export const NORMALIZED_TOMBSTONE_LIMIT = 1024;
+export const DEFAULT_TRANSITION_JOURNAL_LIMIT = 512;
+export const MAX_TRANSITION_JOURNAL_LIMIT = 4096;
 
 export type TraceStatus = "created" | "running" | "completed" | "failed" | "cancelled";
 
@@ -45,13 +47,15 @@ export type GroupSnapshot = {
   operation: string;
   calls: number;
   in_flight?: number;
-  successes: number;
-  cancellations: number;
-  errors: number;
-  total_duration_ms: number;
-  average_duration_ms: number;
-  min_duration_ms: number;
-  max_duration_ms: number;
+  successes?: number;
+  cancellations?: number;
+  errors?: number;
+  total_duration_ms?: number;
+  average_duration_ms?: number;
+  min_duration_ms?: number;
+  max_duration_ms?: number;
+  total_queue_ms?: number;
+  total_worker_ms?: number;
   latest_failure_class: string | null;
   revision?: number;
   overflow?: boolean;
@@ -61,6 +65,19 @@ export type GroupSnapshot = {
 export type TraceMachine = {
   entity_id: string;
   machine_type: string;
+  state: string;
+  machine_epoch: number;
+  revision: number;
+  cause_id: number | string | null;
+  monotonic_ns: number;
+};
+
+export type TraceMachineTransition = {
+  order: number;
+  entity_id: string;
+  machine_type: string;
+  from_state: string;
+  to_state: string;
   state: string;
   machine_epoch: number;
   revision: number;
@@ -182,6 +199,8 @@ export type TraceState = {
   sequence: number | null;
   serverMonotonicMs: number | null;
   machinesById: Map<string, TraceMachine>;
+  transitions: TraceMachineTransition[];
+  transitionJournalLimit: number;
   controlsById: Map<string, TraceControl>;
   groupsById: Map<number, GroupSnapshot>;
   facetsById: Map<string, TraceFacet>;
@@ -235,6 +254,8 @@ export function createInitialTraceState(): TraceState {
     sequence: null,
     serverMonotonicMs: null,
     machinesById: new Map(),
+    transitions: [],
+    transitionJournalLimit: DEFAULT_TRANSITION_JOURNAL_LIMIT,
     controlsById: new Map(),
     groupsById: new Map(),
     facetsById: new Map(),
@@ -275,6 +296,8 @@ type Schema2Snapshot = {
   snapshot_sequence: number;
   server_monotonic_ms?: number;
   machines?: TraceMachine[];
+  transitions?: TraceMachineTransition[];
+  transition_journal_limit?: number;
   controls?: TraceControl[];
   groups?: GroupSnapshot[];
   facets?: TraceFacet[];
@@ -294,6 +317,7 @@ type Schema2Patch = {
     records?: unknown[];
     ids?: Array<string | number>;
     values?: Record<string, number>;
+    reset?: boolean;
   }>;
 };
 
@@ -343,6 +367,7 @@ function reduceNormalizedTraceState(
   }
 
   let machinesById = state.machinesById;
+  let transitions = state.transitions;
   let controlsById = state.controlsById;
   let groupsById = state.groupsById;
   let facetsById = state.facetsById;
@@ -361,7 +386,7 @@ function reduceNormalizedTraceState(
 
   for (const operation of patch.events ?? []) {
     switch (operation.type) {
-      case "machine:transition": {
+      case "machine:upsert": {
         for (const record of validRecords<TraceMachine>(operation.records, "entity_id")) {
           const previous = machinesById.get(record.entity_id);
           if (!acceptEpochRevision(previous, record, "machine_epoch", removedMachineRevisions.get(record.entity_id))) continue;
@@ -373,6 +398,32 @@ function reduceNormalizedTraceState(
           }
           topologyChanged ||= !previous || previous.machine_epoch !== record.machine_epoch || previous.machine_type !== record.machine_type;
           valueChanged = true;
+        }
+        break;
+      }
+      case "machine:transition": {
+        if (operation.reset === true) transitions = [];
+        for (const record of validRecords<TraceMachine>(operation.records, "entity_id")) {
+          const previous = machinesById.get(record.entity_id);
+          if (!acceptEpochRevision(previous, record, "machine_epoch", removedMachineRevisions.get(record.entity_id))) continue;
+          if (machinesById === state.machinesById) machinesById = new Map(machinesById);
+          machinesById.set(record.entity_id, record);
+          if (removedMachineRevisions.has(record.entity_id)) {
+            if (removedMachineRevisions === state.removedMachineRevisions) removedMachineRevisions = new Map(removedMachineRevisions);
+            removedMachineRevisions.delete(record.entity_id);
+          }
+          topologyChanged ||= !previous || previous.machine_epoch !== record.machine_epoch || previous.machine_type !== record.machine_type;
+          valueChanged = true;
+        }
+        const committed = validRecords<TraceMachineTransition>(operation.records, "order")
+          .filter(validMachineTransition);
+        if (committed.length) {
+          transitions = appendTransitions(
+            transitions, committed, state.transitionJournalLimit,
+          );
+          topologyChanged = valueChanged = true;
+        } else if (operation.reset === true) {
+          topologyChanged = valueChanged = true;
         }
         break;
       }
@@ -504,7 +555,7 @@ function reduceNormalizedTraceState(
     schema: 2,
     sequence: patch.sequence,
     serverMonotonicMs: finiteNumber(patch.server_monotonic_ms),
-    machinesById, controlsById, groupsById, facetsById, capturesById, operationNamesById,
+    machinesById, transitions, controlsById, groupsById, facetsById, capturesById, operationNamesById,
     ...indexes,
     groups: groupsById === state.groupsById ? state.groups : [...groupsById.values()],
     groupArchive, machineArchive, controlArchive, facetArchive,
@@ -527,13 +578,19 @@ function replaceNormalizedSnapshot(state: TraceState, snapshot: Schema2Snapshot)
   );
   const facetsById = new Map((snapshot.facets ?? []).map((item) => [item.facet_id, item]));
   const capturesById = new Map((snapshot.captures ?? []).map((item) => [item.record_id, item]));
+  const transitionJournalLimit = transitionLimit(snapshot.transition_journal_limit);
+  const transitions = appendTransitions(
+    [], (snapshot.transitions ?? []).filter(validMachineTransition),
+    transitionJournalLimit,
+  );
   return {
     ...state,
     schema: 2,
     traceId: snapshot.trace_id,
     sequence: snapshot.snapshot_sequence,
     serverMonotonicMs: finiteNumber(snapshot.server_monotonic_ms),
-    machinesById, controlsById, groupsById, facetsById, capturesById,
+    machinesById, transitions, transitionJournalLimit,
+    controlsById, groupsById, facetsById, capturesById,
     operationNamesById: mergeOperationNames(new Map(), snapshot.operation_strings),
     ...buildNormalizedIndexes(controlsById, groupsById, facetsById),
     groups: [...groupsById.values()],
@@ -548,6 +605,30 @@ function replaceNormalizedSnapshot(state: TraceState, snapshot: Schema2Snapshot)
     valueVersion: state.valueVersion + 1,
     commitVersion: state.commitVersion + 1,
   };
+}
+
+function transitionLimit(value: number | undefined) {
+  if (!Number.isSafeInteger(value) || (value ?? 0) < 1) {
+    return DEFAULT_TRANSITION_JOURNAL_LIMIT;
+  }
+  return Math.min(value!, MAX_TRANSITION_JOURNAL_LIMIT);
+}
+
+function validMachineTransition(record: TraceMachineTransition) {
+  return Number.isSafeInteger(record.order) && record.order > 0 &&
+    typeof record.entity_id === "string" && typeof record.machine_type === "string" &&
+    typeof record.from_state === "string" && typeof record.to_state === "string" &&
+    Number.isSafeInteger(record.machine_epoch) && Number.isSafeInteger(record.revision);
+}
+
+function appendTransitions(
+  previous: TraceMachineTransition[], incoming: TraceMachineTransition[], limit: number,
+) {
+  const byOrder = new Map(previous.map((item) => [item.order, item]));
+  for (const item of incoming) byOrder.set(item.order, item);
+  return [...byOrder.values()]
+    .sort((left, right) => left.order - right.order)
+    .slice(-limit);
 }
 
 function requestTraceResync(state: TraceState, reason: string): TraceState {

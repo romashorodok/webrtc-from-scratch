@@ -87,6 +87,10 @@ from .lifecycle import (
     require_timeout,
     wait_for_event,
 )
+from .domain_events import (
+    IceStateChanged, MediaStateChanged, PeerStateChanged,
+    TransceiverStateChanged, TransportStateChanged, emit_domain_event,
+)
 
 nic_interfaces = net.interface_factory(
     net.InterfaceProvider.PSUTIL, [socket.AF_INET], False
@@ -100,6 +104,12 @@ if len(nic_interfaces) <= 0:
 def random_string(length: int) -> str:
     allchar = string.ascii_letters + string.digits
     return "".join(secrets.choice(allchar) for _ in range(length))
+
+
+def _pair_observability_id(transport: ice.CandidatePairTransport) -> str | None:
+    # The transport owns the process-local, keyed identity. Candidate pair
+    # strings contain addresses and must never be copied into live state.
+    return getattr(transport, "observability_id", None)
 
 
 def _sdp_description_measured(operation: str):
@@ -133,11 +143,19 @@ class ICEGatherer(AsyncEventEmitter):
         self._loop = asyncio.get_running_loop()
         self.__agent: ice.Agent | None = None
         self.__gather_lock = asyncio.Lock()
+        self._gathering_state = "new"
+        self._connection_state = "new"
 
         # self._policy: ICEGatherPolicy = ICEGatherPolicy.All
         # self._state: ICEGatherState = ICEGatherState.NEW
         # TODO: Add support for dedicated stun server
         # self._stun_servers = []
+
+    def _emit_state(self) -> None:
+        emit_domain_event(
+            IceStateChanged, gathering=self._gathering_state,
+            connection=self._connection_state,
+        )
 
     # @property
     # def agent(self) -> ice.Agent:
@@ -215,6 +233,8 @@ class ICEGatherer(AsyncEventEmitter):
         if not self.__agent:
             raise RuntimeError("ICE agent is not available")
 
+        self._connection_state = "checking"
+        self._emit_state()
         self.__agent.dial()
 
     async def accept(self):
@@ -225,14 +245,20 @@ class ICEGatherer(AsyncEventEmitter):
         if not self.__agent:
             raise RuntimeError("ICE agent is not available")
 
+        self._connection_state = "checking"
+        self._emit_state()
         self.__agent.accept()
 
     async def gather(self):
+        self._gathering_state = "gathering"
+        self._emit_state()
         async with self.__gather_lock:
             if not self.__agent:
                 self.__agent = await self.__create_agent()
 
             await self.__agent.gather_candidates()
+        self._gathering_state = "complete"
+        self._emit_state()
 
         # agent = self.__agent
         # if agent is None:
@@ -262,6 +288,9 @@ class ICEGatherer(AsyncEventEmitter):
         self.__agent = None
         if agent is not None:
             await agent.aclose()
+        self._gathering_state = "closed"
+        self._connection_state = "closed"
+        self._emit_state()
         await super().aclose()
 
     async def aclose_controllers(self) -> None:
@@ -412,6 +441,7 @@ class PeerConnection(AsyncEventEmitter, ObservedComponent):
 
         self.__loop = asyncio.get_running_loop()
         self.id = uuid.uuid4().hex
+        self._observability_id = f"peer-{self.id[:12]}"
         self.gatherer = ICEGatherer()
 
         self.__certificate = webrtc_rs.Certificate()
@@ -440,6 +470,7 @@ class PeerConnection(AsyncEventEmitter, ObservedComponent):
         # self._sdp_semantic: SDPSemantic = SDPSemantic.UnifiedPlan
 
         self._transceivers = list[RTPTransceiver]()
+        self._transceiver_observability_sequence = 0
 
         self.state = "new"
         self.generation = 0
@@ -464,6 +495,46 @@ class PeerConnection(AsyncEventEmitter, ObservedComponent):
         # Keep public raw-media sends ordered.  In particular, a burst must not
         # interleave with another caller halfway through its RTP sequence.
         self._media_send_lock = asyncio.Lock()
+        self._emit_peer_state()
+
+    @event_loop
+    def _emit_peer_state(self) -> None:
+        lifecycle = getattr(self, "state", "new")
+        signaling = getattr(self, "_signaling_state", SignalingState.Stable)
+        connection = (
+            "failed" if lifecycle == "error" else
+            "closed" if lifecycle == "closed" else
+            "closing" if lifecycle == "closing" else
+            "connected" if getattr(self, "_transport", None) is not None else "new"
+        )
+        emit_domain_event(
+            PeerStateChanged, lifecycle=lifecycle,
+            signaling=signaling.value, connection=connection,
+        )
+
+    @event_loop
+    def _emit_transceiver_state(
+        self, transceiver: RTPTransceiver, *, lifecycle: str = "active",
+        active: bool = True,
+    ) -> None:
+        transceiver_id = transceiver.observability_id
+        direction = transceiver.direction.value
+        emit_domain_event(
+            TransceiverStateChanged, transceiver_id=transceiver_id,
+            direction=direction, active=active, lifecycle=lifecycle,
+        )
+        emit_domain_event(
+            MediaStateChanged, media_id=transceiver_id,
+            direction=direction, active=active, lifecycle=lifecycle,
+        )
+
+    @event_loop
+    def _next_transceiver_observability_id(self) -> str:
+        self._transceiver_observability_sequence += 1
+        return (
+            f"{self._observability_id}:transceiver-"
+            f"{self._transceiver_observability_sequence}"
+        )
 
     @property
     def closed(self) -> bool:
@@ -533,6 +604,7 @@ class PeerConnection(AsyncEventEmitter, ObservedComponent):
         if self._closing or self._closed:
             return
         self.state = "error"
+        self._emit_peer_state()
         component = str(event.spec.metadata.get("component", event.spec.kind))
         self._offer_event(PeerConnectionTaskFailed(
             component, event.spec.name, event.exception, self.generation
@@ -576,6 +648,7 @@ class PeerConnection(AsyncEventEmitter, ObservedComponent):
             self.state = "error"
         elif self.state != "error":
             self.state = "closing"
+        self._emit_peer_state()
 
         async with self._close_lock:
             if self._closed:
@@ -618,7 +691,15 @@ class PeerConnection(AsyncEventEmitter, ObservedComponent):
             await attempt("dtls", lambda: self._close_resource(self._dtls_transport))
             await attempt("gatherer", lambda: self._close_resource(self.gatherer))
             if self._transport is not None:
+                emit_domain_event(
+                    TransportStateChanged, lifecycle="draining", selected=True,
+                    pair_id=_pair_observability_id(self._transport),
+                )
                 await attempt("selected-transport", lambda: self._close_resource(self._transport))
+                emit_domain_event(
+                    TransportStateChanged, lifecycle="closed", selected=False,
+                    pair_id=_pair_observability_id(self._transport),
+                )
 
             # No domain producer can enqueue after this point. The worker lane
             # is still active, so the last batch is observed and offloaded.
@@ -633,6 +714,7 @@ class PeerConnection(AsyncEventEmitter, ObservedComponent):
             self._closing = False
             if self.state != "error":
                 self.state = "closed"
+            self._emit_peer_state()
             self._offer_event({
                 "type": "closed",
                 "reason": reason,
@@ -861,6 +943,20 @@ class PeerConnection(AsyncEventEmitter, ObservedComponent):
             )
             self._transport = transport
             self._transport_ready.set()
+            pair_id = _pair_observability_id(transport)
+            self.gatherer._connection_state = "connected"
+            emit_ice_state = getattr(self.gatherer, "_emit_state", None)
+            if emit_ice_state is not None:
+                emit_ice_state()
+            else:
+                emit_domain_event(
+                    IceStateChanged, gathering="complete", connection="connected"
+                )
+            emit_domain_event(
+                TransportStateChanged, lifecycle="ready", selected=True,
+                pair_id=pair_id,
+            )
+            self._emit_peer_state()
             perf_mark("ice", "transport", "nominated")
 
             # Start DTLS with the nominated transport
@@ -895,6 +991,7 @@ class PeerConnection(AsyncEventEmitter, ObservedComponent):
         self._started = True
         self.generation += 1
         self.state = "starting"
+        self._emit_peer_state()
         self.gatherer.on(
             ICEGathererEvent.CANDIDATE_PAIR_CONTROLLER, self.__on_ice_pair_controller
         )
@@ -904,6 +1001,7 @@ class PeerConnection(AsyncEventEmitter, ObservedComponent):
         elif self._role == "accept":
             await self.gatherer.accept()
         self.state = "active"
+        self._emit_peer_state()
 
     @task(
         name="dtls:ice-pair-queue-handshake",
@@ -997,7 +1095,8 @@ class PeerConnection(AsyncEventEmitter, ObservedComponent):
                 )
 
         transceiver = RTPTransceiver(
-            self._dtls_transport, caps=self._caps, kind=kind, direction=direction
+            self._dtls_transport, caps=self._caps, kind=kind, direction=direction,
+            observability_id=self._next_transceiver_observability_id(),
         )
         transceiver.set_prefered_codec(codec)
 
@@ -1027,6 +1126,7 @@ class PeerConnection(AsyncEventEmitter, ObservedComponent):
             transceiver.set_receiver(receiver)
 
         self._transceivers.append(transceiver)
+        self._emit_transceiver_state(transceiver)
 
         return transceiver
 
@@ -1063,11 +1163,14 @@ class PeerConnection(AsyncEventEmitter, ObservedComponent):
             )
 
             transceiver = RTPTransceiver(
-                self._dtls_transport, caps=self._caps, kind=kind, direction=direction
+                self._dtls_transport, caps=self._caps, kind=kind,
+                direction=direction,
+                observability_id=self._next_transceiver_observability_id(),
             )
             transceiver.set_receiver(receiver)
             transceiver.set_prefered_codec(codecs[0])
             self._transceivers.append(transceiver)
+            self._emit_transceiver_state(transceiver)
             return transceiver
         else:
             raise ValueError("Unknown direction")
@@ -1126,6 +1229,7 @@ class PeerConnection(AsyncEventEmitter, ObservedComponent):
                 error=str(e),
             )
             raise
+        self._emit_peer_state()
 
     async def _match_transceivers_with_offer(self, offer: SessionDescription):
         """
@@ -1230,6 +1334,8 @@ class PeerConnection(AsyncEventEmitter, ObservedComponent):
                 error=str(e),
             )
             raise
+
+        self._emit_peer_state()
 
         transceivers = self._transceivers.copy()
 

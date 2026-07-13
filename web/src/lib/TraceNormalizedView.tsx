@@ -1,6 +1,9 @@
 import { memo, useCallback, useMemo, useRef, useState } from "react";
 import * as d3 from "d3";
-import type { GroupSnapshot, TraceCapture, TraceControl, TraceFacet, TraceMachine } from "./trace";
+import type {
+  GroupSnapshot, TraceCapture, TraceControl, TraceFacet, TraceMachine,
+  TraceMachineTransition,
+} from "./trace";
 
 export const TRACE_GRAPH_NODE_LIMIT = 300;
 export const TRACE_LIST_ROW_HEIGHT = 34;
@@ -28,6 +31,7 @@ export type TraceTopologyNode = {
 
 type NormalizedTraceViewProps = {
   machinesById: Map<string, TraceMachine>;
+  transitions: TraceMachineTransition[];
   controlsById: Map<string, TraceControl>;
   groupsById: Map<number, GroupSnapshot>;
   facetsById: Map<string, TraceFacet>;
@@ -49,6 +53,51 @@ function compactValue(value: unknown) {
   }
 }
 
+function finiteMetric(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function formatMilliseconds(value: number) {
+  if (value === 0) return "0ms";
+  if (value >= 100) return `${Math.round(value)}ms`;
+  if (value >= 10) return `${value.toFixed(1)}ms`;
+  return `${value.toFixed(2)}ms`;
+}
+
+export function formatOperationSummary(group: GroupSnapshot) {
+  const active = finiteMetric(group.in_flight);
+  const calls = finiteMetric(group.calls);
+  const parts = [
+    active == null ? null : `${active} active`,
+    calls == null ? null : `${calls} calls`,
+  ];
+
+  const outcomes: string[] = [];
+  const successes = finiteMetric(group.successes);
+  const errors = finiteMetric(group.errors);
+  const cancellations = finiteMetric(group.cancellations);
+  if (successes != null) outcomes.push(`${successes} ok`);
+  if (errors != null) outcomes.push(`${errors} errors`);
+  if (cancellations != null) outcomes.push(`${cancellations} cancelled`);
+  if (outcomes.length) parts.push(outcomes.join(" / "));
+
+  const average = finiteMetric(group.average_duration_ms);
+  const minimum = finiteMetric(group.min_duration_ms);
+  const maximum = finiteMetric(group.max_duration_ms);
+  if (average != null) {
+    const range = minimum != null && maximum != null
+      ? ` (${formatMilliseconds(minimum)}–${formatMilliseconds(maximum)})`
+      : "";
+    parts.push(`avg ${formatMilliseconds(average)}${range}`);
+  }
+
+  const worker = finiteMetric(group.total_worker_ms);
+  const queue = finiteMetric(group.total_queue_ms);
+  if (worker != null) parts.push(`worker total ${formatMilliseconds(worker)}`);
+  if (queue != null) parts.push(`queue total ${formatMilliseconds(queue)}`);
+  return parts.filter((part): part is string => part != null).join(" · ");
+}
+
 export function buildTraceDataRows(props: Omit<NormalizedTraceViewProps, "topologyVersion" | "valueVersion">) {
   const rows: TraceDataRow[] = [];
   for (const machine of props.machinesById.values()) {
@@ -64,14 +113,17 @@ export function buildTraceDataRows(props: Omit<NormalizedTraceViewProps, "topolo
       value: machine.state,
       revision: machine.revision,
     });
+  }
+  for (const transition of props.transitions) {
+    const cause = transition.cause_id == null ? "" : ` · cause ${transition.cause_id}`;
     rows.push({
-      id: `transition:${machine.entity_id}:${machine.revision}`,
-      ownerId: machine.entity_id,
-      parentId: `machine:${machine.entity_id}`,
+      id: `transition:${transition.order}`,
+      ownerId: transition.entity_id,
+      parentId: `machine:${transition.entity_id}`,
       kind: "transition",
-      name: `${machine.machine_type} transition`,
-      value: machine.state,
-      revision: machine.revision,
+      name: `${transition.machine_type} transition #${transition.order}`,
+      value: `${transition.from_state} → ${transition.to_state}${cause}`,
+      revision: transition.revision,
     });
   }
   for (const control of props.controlsById.values()) {
@@ -100,7 +152,7 @@ export function buildTraceDataRows(props: Omit<NormalizedTraceViewProps, "topolo
       parentId: parent,
       kind: "group",
       name: operation || group.group,
-      value: `${group.in_flight ?? 0} active · ${group.calls} calls`,
+      value: formatOperationSummary(group),
       revision: group.revision ?? 0,
     });
     for (const [index, exemplar] of (group.exemplars ?? []).entries()) {
@@ -183,12 +235,9 @@ export function formatNormalizedTraceExport(rows: TraceDataRow[]) {
     }).join(", ")}`,
   ];
 
-  if (ownerAliases.size) {
-    lines.push("", "Entities:");
-    for (const [id, alias] of ownerAliases) lines.push(`- ${alias}: ${id}`);
-  }
   const sections: Array<[TraceDataKind, string]> = [
     ["machine", "Machine state"],
+    ["transition", "Machine transitions"],
     ["control", "Controls"],
     ["group", "Operations"],
     ["facet", "State facets"],
@@ -200,17 +249,103 @@ export function formatNormalizedTraceExport(rows: TraceDataRow[]) {
     const matching = rows.filter((row) => row.kind === kind);
     if (!matching.length) continue;
     lines.push("", `${title}:`);
-    for (const row of matching) {
-      const name = kind === "machine" && row.ownerId
-        ? row.name.replace(` · ${row.ownerId}`, "")
-        : row.name;
-      const marker = kind === "capture" ? " [diagnostic capture]" : kind === "failure" ? " [failure exemplar]" : "";
-      lines.push(`- ${name}${owner(row)}: ${row.value}${marker}`);
+    if (kind === "group") {
+      appendOperationHierarchy(lines, matching, owner);
+    } else if (kind === "transition") {
+      appendGroupedExportRows(lines, matching, owner, (row) =>
+        sanitizeExportText(row.value.replace(/ · cause .*$/, "")),
+      );
+    } else if (kind === "facet" || kind === "diagnostic") {
+      appendGroupedExportRows(lines, matching, owner, (row) =>
+        `${sanitizeExportText(row.name)}=${sanitizeExportText(row.value)}`,
+      );
+    } else {
+      for (const row of matching) {
+        const name = kind === "machine" && row.ownerId
+          ? row.name.replace(` · ${row.ownerId}`, "")
+          : kind === "capture"
+            ? row.name.replace(/^\[CAPTURE #[^\]]+\] /, "")
+            : row.name;
+        const marker = kind === "capture" ? " [diagnostic capture]" : kind === "failure" ? " [failure exemplar]" : "";
+        lines.push(`- ${sanitizeExportText(name)}${owner(row)}: ${sanitizeExportText(row.value)}${marker}`);
+      }
     }
   }
-  // Transition rows duplicate the current state already shown under Machine
-  // state, so their count is retained above without repeating their payload.
   return lines.join("\n");
+}
+
+function appendGroupedExportRows(
+  lines: string[],
+  rows: TraceDataRow[],
+  owner: (row: TraceDataRow) => string,
+  format: (row: TraceDataRow) => string,
+) {
+  const groups = new Map<string, TraceDataRow[]>();
+  for (const row of rows) {
+    const key = row.ownerId ?? "";
+    const group = groups.get(key) ?? [];
+    group.push(row);
+    groups.set(key, group);
+  }
+  for (const group of groups.values()) {
+    const label = owner(group[0]).trim();
+    lines.push(`- ${label ? `${label}: ` : ""}${group.map(format).join("; ")}`);
+  }
+}
+
+function appendOperationHierarchy(
+  lines: string[],
+  rows: TraceDataRow[],
+  owner: (row: TraceDataRow) => string,
+) {
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  const children = new Map<string, TraceDataRow[]>();
+  const roots: TraceDataRow[] = [];
+  for (const row of rows) {
+    if (row.parentId && byId.has(row.parentId) && row.parentId !== row.id) {
+      const bucket = children.get(row.parentId) ?? [];
+      bucket.push(row);
+      children.set(row.parentId, bucket);
+    } else {
+      roots.push(row);
+    }
+  }
+
+  const emitted = new Set<string>();
+  const append = (row: TraceDataRow, depth: number) => {
+    if (emitted.has(row.id)) return;
+    emitted.add(row.id);
+    lines.push(
+      `${"  ".repeat(depth)}- ${sanitizeExportText(row.name)}${depth === 0 ? owner(row) : ""}: ` +
+      sanitizeExportText(compactOperationExportValue(row.value)),
+    );
+    for (const child of children.get(row.id) ?? []) append(child, depth + 1);
+  };
+  for (const root of roots) append(root, 0);
+  // Malformed legacy parent cycles still remain exportable exactly once.
+  for (const row of rows) append(row, 0);
+}
+
+function sanitizeExportText(value: string) {
+  return value
+    .replace(/\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/gi, "<id>")
+    .replace(/\b[0-9a-f]{24,64}\b/gi, "<id>");
+}
+
+function compactOperationExportValue(value: string) {
+  const parts = value.split(" · ");
+  const compact: string[] = [];
+  for (const part of parts) {
+    if (/^\d+ calls$/.test(part)) compact.push(part);
+    else if (/^[1-9]\d* active$/.test(part)) compact.push(part);
+    else if (part.includes(" errors") || part.includes(" cancelled")) {
+      const failures = part.split(" / ").filter((outcome) =>
+        !outcome.endsWith(" ok") && !outcome.startsWith("0 "),
+      );
+      if (failures.length) compact.push(failures.join(" / "));
+    }
+  }
+  return compact.join(" · ") || value;
 }
 
 async function writeClipboardText(text: string) {
@@ -346,7 +481,7 @@ export function NormalizedTraceView(props: NormalizedTraceViewProps) {
 
   const rows = useMemo(
     () => stabilizeTraceDataRows(buildTraceDataRows(props), stableRowsRef.current),
-    [props.machinesById, props.controlsById, props.groupsById, props.facetsById,
+    [props.machinesById, props.transitions, props.controlsById, props.groupsById, props.facetsById,
       props.capturesById, props.operationNamesById, props.diagnostics, props.valueVersion],
   );
   const filtered = useMemo(() => filterTraceDataRows(rows, query, kind), [rows, query, kind]);

@@ -17,6 +17,7 @@ from typing import Any
 from .state_machine import MachineSpec
 
 _REJECTED = object()
+MAX_TRANSITION_JOURNAL_LIMIT = 4096
 
 
 @dataclass(frozen=True, order=True, slots=True)
@@ -88,6 +89,21 @@ class MachineSnapshot:
     monotonic_ns: int
 
 
+@dataclass(frozen=True, slots=True)
+class MachineTransitionRecord:
+    """One committed machine edge in the runtime-wide observed order."""
+
+    order: int
+    entity_id: str
+    machine_type: str
+    from_state: str
+    to_state: str
+    machine_epoch: int
+    revision: int
+    cause_id: int | str | None
+    monotonic_ns: int
+
+
 @dataclass(slots=True)
 class _MachineRecord:
     spec: MachineSpec
@@ -102,18 +118,26 @@ class _MachineRecord:
 class MachineStore(_LoopOwned):
     def __init__(self, *, runtime_epoch: int | None = None,
                  diagnostics: Counter[str] | None = None,
-                 seen_limit: int = 4096, pending_limit: int = 256) -> None:
+                 seen_limit: int = 4096, pending_limit: int = 256,
+                 transition_limit: int = 512) -> None:
         diagnostics = diagnostics if diagnostics is not None else Counter()
         super().__init__(diagnostics, "machine_wrong_thread")
         self.diagnostics = diagnostics
         self.runtime_epoch = runtime_epoch
         self.seen_limit = max(1, seen_limit)
         self.pending_limit = max(1, pending_limit)
+        self.transition_limit = min(
+            max(1, transition_limit), MAX_TRANSITION_JOURNAL_LIMIT
+        )
         self._records: dict[str, _MachineRecord] = {}
         self._seen: set[ProducerDot] = set()
         self._seen_order: deque[ProducerDot] = deque()
         self._pending: dict[str, dict[int, MachineTransitionOp]] = defaultdict(dict)
         self._invalid_exemplar: MachineTransitionOp | None = None
+        self._transitions: deque[MachineTransitionRecord] = deque(
+            maxlen=self.transition_limit
+        )
+        self._transition_order = 0
 
     def register(self, entity_id: str, spec: MachineSpec, *, epoch: int = 1) -> MachineSnapshot:
         self._assert_owner()
@@ -209,13 +233,18 @@ class MachineStore(_LoopOwned):
         while len(self._seen_order) > self.seen_limit:
             self._seen.discard(self._seen_order.popleft())
 
-    @staticmethod
-    def _commit(record: _MachineRecord, op: MachineTransitionOp) -> None:
+    def _commit(self, record: _MachineRecord, op: MachineTransitionOp) -> None:
         record.state = op.to_state
         record.revision = op.revision
         record.dot = op.dot
         record.cause_id = op.cause_id
         record.monotonic_ns = op.monotonic_ns
+        self._transition_order += 1
+        self._transitions.append(MachineTransitionRecord(
+            self._transition_order, op.entity_id, op.machine_type,
+            op.from_state, op.to_state, op.machine_epoch, op.revision,
+            op.cause_id, op.monotonic_ns,
+        ))
 
     @property
     def invalid_exemplar(self) -> MachineTransitionOp | None:
@@ -227,6 +256,23 @@ class MachineStore(_LoopOwned):
 
     def snapshots(self) -> tuple[MachineSnapshot, ...]:
         return tuple(self._snapshot(key, value) for key, value in self._records.items())
+
+    @property
+    def transition_order(self) -> int:
+        return self._transition_order
+
+    def transition_snapshots(self) -> tuple[MachineTransitionRecord, ...]:
+        return tuple(self._transitions)
+
+    def transitions_after(
+        self, order: int
+    ) -> tuple[tuple[MachineTransitionRecord, ...], bool]:
+        """Return retained edges after ``order`` and whether the cursor wrapped."""
+        if not self._transitions:
+            return (), False
+        first = self._transitions[0].order
+        reset = order < first - 1
+        return tuple(item for item in self._transitions if item.order > order), reset
 
     @staticmethod
     def _snapshot(entity_id: str, record: _MachineRecord) -> MachineSnapshot:
@@ -432,12 +478,16 @@ class ObservabilityService:
     """One runtime's single-writer projection and direct cleanup indexes."""
 
     def __init__(self, *, runtime_epoch: int, trace_id: str = "", scope_id: str | None = None,
-                 diagnostics: Counter[str] | None = None, activity_groups: Any = None) -> None:
+                 diagnostics: Counter[str] | None = None, activity_groups: Any = None,
+                 transition_limit: int = 512) -> None:
         self.runtime_epoch = runtime_epoch
         self.trace_id = trace_id
         self.scope_id = scope_id
         self.diagnostics = diagnostics if diagnostics is not None else Counter()
-        self.machines = MachineStore(runtime_epoch=runtime_epoch, diagnostics=self.diagnostics)
+        self.machines = MachineStore(
+            runtime_epoch=runtime_epoch, diagnostics=self.diagnostics,
+            transition_limit=transition_limit,
+        )
         self.facets = FacetStore(runtime_epoch=runtime_epoch, diagnostics=self.diagnostics)
         self.controls = ControlHandleStore(diagnostics=self.diagnostics)
         self.activity_groups = activity_groups

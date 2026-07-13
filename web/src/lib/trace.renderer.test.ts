@@ -10,12 +10,15 @@ import {
   stabilizeTraceDataRows,
   virtualTraceWindow,
 } from "./TraceNormalizedView";
-import type { GroupSnapshot, TraceFacet, TraceMachine } from "./trace";
+import type {
+  GroupSnapshot, TraceFacet, TraceMachine, TraceMachineTransition,
+} from "./trace";
 
 function fixtures(machineCount = 2, groupsPerMachine = 4) {
   const machinesById = new Map<string, TraceMachine>();
   const groupsById = new Map<number, GroupSnapshot>();
   const facetsById = new Map<string, TraceFacet>();
+  const transitions: TraceMachineTransition[] = [];
   for (let machine = 0; machine < machineCount; machine += 1) {
     const entity = `peer-${machine}`;
     machinesById.set(entity, {
@@ -26,6 +29,11 @@ function fixtures(machineCount = 2, groupsPerMachine = 4) {
       revision: 1,
       cause_id: null,
       monotonic_ns: 1,
+    });
+    transitions.push({
+      order: machine + 1, entity_id: entity, machine_type: "peer",
+      from_state: "new", to_state: "connected", state: "connected",
+      machine_epoch: 1, revision: 1, cause_id: null, monotonic_ns: machine + 1,
     });
     facetsById.set(`queue-${machine}`, {
       facet_id: `queue-${machine}`,
@@ -58,6 +66,7 @@ function fixtures(machineCount = 2, groupsPerMachine = 4) {
   }
   return {
     machinesById,
+    transitions,
     controlsById: new Map(),
     groupsById,
     facetsById,
@@ -83,8 +92,137 @@ test("diagnostic state can be copied through the export action", async () => {
   expect(copied).toBe(exportText);
   expect(copied).toContain("WebRTC runtime trace (schema 2, compact LLM summary)");
   expect(copied).toContain("Operations:");
+  expect(copied).toContain("Machine transitions:");
+  expect(copied).toContain("new → connected");
+  expect(copied).toContain("subscriber_lag");
+  expect(copied).not.toContain("transition #");
+  expect(copied).not.toContain("Entities:");
+  expect(copied).not.toContain("peer-0");
   expect(copied).not.toContain("revision");
   expect(copied).not.toContain("parentId");
+});
+
+test("operation rows expose outcomes, latency distribution, and worker queue totals", () => {
+  const data = fixtures(1, 1);
+  const group = data.groupsById.get(0)!;
+  Object.assign(group, {
+    in_flight: 2,
+    calls: 12,
+    successes: 7,
+    errors: 2,
+    cancellations: 1,
+    average_duration_ms: 3.25,
+    min_duration_ms: 0.5,
+    max_duration_ms: 19.75,
+    total_worker_ms: 31.2,
+    total_queue_ms: 4.125,
+  });
+
+  const rows = buildTraceDataRows(data);
+  const value = rows.find((row) => row.id === "group:0")?.value;
+  expect(value).toBe(
+    "2 active · 12 calls · 7 ok / 2 errors / 1 cancelled · " +
+    "avg 3.25ms (0.50ms–19.8ms) · worker total 31.2ms · queue total 4.13ms",
+  );
+  const exported = formatNormalizedTraceExport(rows);
+  expect(exported).toContain(
+    "2 active · 12 calls · 2 errors / 1 cancelled",
+  );
+  expect(exported).not.toContain("avg 3.25ms");
+  expect(exported).not.toContain("worker total");
+  expect(exported).not.toContain("0.50ms–19.8ms");
+});
+
+test("operation rows remain readable when older aggregate fields are absent", () => {
+  const data = fixtures(1, 1);
+  const group = data.groupsById.get(0)!;
+  delete group.in_flight;
+  delete group.successes;
+  delete group.errors;
+  delete group.cancellations;
+  delete group.average_duration_ms;
+  delete group.min_duration_ms;
+  delete group.max_duration_ms;
+
+  const value = buildTraceDataRows(data).find((row) => row.id === "group:0")?.value;
+  expect(value).toBe("10 calls");
+  expect(value).not.toContain("undefined");
+  expect(value).not.toContain("NaN");
+});
+
+test("compact export retains nested duplicate operations without exposing group identities", () => {
+  const data = fixtures(1, 0);
+  const makeGroup = (id: number, operation: string, parent: number | null): GroupSnapshot => ({
+    group_id: id,
+    trace_id: "trace",
+    task_id: `activity:${id}`,
+    owner_entity_id: "peer-0",
+    parent_ref_type: parent == null ? "machine" : "group",
+    parent_ref_id: parent ?? "peer-0",
+    group: "activity",
+    operation,
+    calls: 1,
+    in_flight: 0,
+    successes: 1,
+    cancellations: 0,
+    errors: 0,
+    average_duration_ms: 1,
+    min_duration_ms: 1,
+    max_duration_ms: 1,
+    latest_failure_class: null,
+    revision: 1,
+  });
+  data.groupsById.set(10, makeGroup(10, "branch.left", null));
+  data.groupsById.set(11, makeGroup(11, "shared.work", 10));
+  data.groupsById.set(20, makeGroup(20, "branch.right", null));
+  data.groupsById.set(21, makeGroup(21, "shared.work", 20));
+
+  const rows = buildTraceDataRows(data);
+  expect(new Set(rows.filter((row) => row.kind === "group").map((row) => row.id)).size).toBe(4);
+  const exported = formatNormalizedTraceExport(rows);
+  expect(exported).toContain("- branch.left [@1]");
+  expect(exported).toContain("  - shared.work: 1 calls");
+  expect(exported).toContain("- branch.right [@1]");
+  expect(exported).not.toContain("group #");
+  expect(exported).not.toContain("1 ok / 0 errors / 0 cancelled");
+  expect(exported).toContain("1 calls");
+  expect(exported).not.toContain("avg 1.00ms");
+});
+
+test("LLM export retains all records while reducing per-record detail", () => {
+  const rows = buildTraceDataRows(fixtures(1, 40));
+  const exported = formatNormalizedTraceExport(rows);
+  expect(exported).toContain("operation-23 [@1]");
+  expect(exported).toContain("operation-39 [@1]");
+  expect(exported).not.toContain("records omitted");
+});
+
+test("LLM export removes UUIDs and long hexadecimal identifiers from all record text", () => {
+  const data = fixtures(1, 1);
+  const uuid = "0ab91234-1234-4abc-8def-0123456789ab";
+  const digest = "0123456789abcdef0123456789abcdef";
+  data.facetsById.set(`queue:${uuid}`, {
+    facet_id: `queue:${uuid}`,
+    owner_entity_id: "peer-0",
+    owner_epoch: 1,
+    value: { session_id: uuid, stream_key: digest },
+    revision: 1,
+  });
+
+  const exported = formatNormalizedTraceExport(buildTraceDataRows(data));
+  expect(exported).not.toContain(uuid);
+  expect(exported).not.toContain(digest);
+  expect(exported).toContain("queue:<id>");
+  expect(exported).toContain('"session_id":"<id>"');
+});
+
+test("LLM export groups repetitive records without dropping their values", () => {
+  const exported = formatNormalizedTraceExport(buildTraceDataRows(fixtures(2, 1)));
+  const transitionLines = exported.split("\n").filter((line) => line.includes("new → connected"));
+  const facetLines = exported.split("\n").filter((line) => line.includes("queue-"));
+  expect(transitionLines).toHaveLength(2);
+  expect(facetLines).toHaveLength(2);
+  expect(exported).toContain("subscriber_lag=0");
 });
 
 test("virtual list renders only viewport plus bounded overscan", () => {

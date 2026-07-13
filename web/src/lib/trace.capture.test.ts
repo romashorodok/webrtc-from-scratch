@@ -23,12 +23,15 @@ test("bounded captures are marked in normalized UI rows and exports", () => {
     }}],
   });
   const rows = buildTraceDataRows({
-    machinesById: snapshot.machinesById, controlsById: snapshot.controlsById,
+    machinesById: snapshot.machinesById, transitions: snapshot.transitions,
+    controlsById: snapshot.controlsById,
     groupsById: snapshot.groupsById, facetsById: snapshot.facetsById,
     capturesById: snapshot.capturesById,
     operationNamesById: snapshot.operationNamesById, diagnostics: snapshot.diagnostics,
   });
   expect(rows[0]?.kind).toBe("capture");
   expect(rows[0]?.name).toContain("CAPTURE #7");
-  expect(formatNormalizedTraceExport(rows)).toContain("[diagnostic capture]");
+  const exported = formatNormalizedTraceExport(rows);
+  expect(exported).toContain("[diagnostic capture]");
+  expect(exported).not.toContain("CAPTURE #7");
 });

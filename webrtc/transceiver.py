@@ -14,6 +14,9 @@ from webrtc.performance import ObservedComponent, event_loop, task
 from webrtc.runtime_services import FailurePolicy
 from webrtc.srtp import Stream as SrtpStream
 from webrtc.tracing import measure_perf_async, perf_mark
+from webrtc.domain_events import (
+    MediaStateChanged, TransceiverStateChanged, emit_domain_event,
+)
 
 from . import media
 from .utils import impl_protocol
@@ -737,6 +740,7 @@ class RTPTransceiver(ObservedComponent):
         caps: MediaCaps,
         kind: RTPCodecKind,
         direction: RTPTransceiverDirection,
+        *, observability_id: str | None = None,
     ):
         self._mid: MID | None = None
         self._sender: RTPSender | None = None
@@ -746,6 +750,10 @@ class RTPTransceiver(ObservedComponent):
         self._prefered_codecs = list[RTPCodecParameters]()
         self._direction = direction
         self.__dtls = dtls
+        self._observability_id = (
+            observability_id or f"transceiver-{secrets.token_hex(6)}"
+        )
+        self._stopped = False
 
     @task(
         name="srtp:start-streams",
@@ -798,7 +806,19 @@ class RTPTransceiver(ObservedComponent):
 
     @event_loop
     def stop(self):
-        print("TODO: stop transceiver")
+        if self._stopped:
+            return
+        self._stopped = True
+        if self._receiver is not None:
+            self._receiver.stop()
+        emit_domain_event(
+            TransceiverStateChanged, transceiver_id=self._observability_id,
+            direction=self._direction.value, active=False, lifecycle="stopped",
+        )
+        emit_domain_event(
+            MediaStateChanged, media_id=self._observability_id,
+            direction=self._direction.value, active=False, lifecycle="ended",
+        )
 
     @event_loop
     def track_local(self) -> TrackLocal | None:
@@ -829,6 +849,10 @@ class RTPTransceiver(ObservedComponent):
     @property
     def direction(self) -> RTPTransceiverDirection:
         return self._direction
+
+    @property
+    def observability_id(self) -> str:
+        return self._observability_id
 
     @property
     def kind(self) -> RTPCodecKind:

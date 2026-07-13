@@ -283,9 +283,17 @@ _worker_observation_delta: contextvars.ContextVar[WorkerObservationDelta | None]
 def _aggregate_identity(scope):
     context = current_execution_context()
     root = getattr(scope, "root_context", None)
-    owner = getattr(scope, "scope_id", None) or (
-        root.task_id if root is not None else (context.task_id if context is not None else "")
+    projection = getattr(scope, "_state_task_projection", None)
+    owner = (
+        projection.owner_entity_id(context.task_id)
+        if projection is not None and context is not None
+        else None
     )
+    if owner is None:
+        identity = getattr(scope, "scope_id", None) or (
+            root.trace_id if root is not None else (context.trace_id if context is not None else "")
+        )
+        owner = f"peer:{identity}" if identity else ""
     if context is not None:
         return context.trace_id, owner
     if root is not None:
@@ -781,8 +789,10 @@ def _begin_capture(scope, policy):
     _, owner_id = _aggregate_identity(scope)
     try:
         projection = getattr(scope, "_state_task_projection", None)
+        context = current_execution_context()
         entity_alias = (
-            projection.owner_entity_id(owner_id) if projection is not None else None
+            projection.owner_entity_id(context.task_id)
+            if projection is not None and context is not None else None
         )
         return manager.begin(
             policy, owner_id, getattr(scope, "scope_id", None), entity_alias

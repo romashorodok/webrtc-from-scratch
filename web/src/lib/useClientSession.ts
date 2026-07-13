@@ -12,7 +12,7 @@ export function useClientSession() {
   const {
     enqueueTraceBatch,
     enqueueTraceSnapshot, enqueueTraceResyncRequired,
-    machinesById, controlsById, groupsById, facetsById, capturesById,
+    machinesById, transitions, controlsById, groupsById, facetsById, capturesById,
     operationNamesById, diagnostics, topologyVersion, valueVersion,
   } = useTraceState((request) => signalRef.current?.send("trace:resync_request", request));
 
@@ -127,6 +127,7 @@ export function useClientSession() {
     dismissToast,
     requestTraceCapture,
     machinesById,
+    transitions,
     controlsById,
     groupsById,
     facetsById,

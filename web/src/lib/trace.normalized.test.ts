@@ -57,6 +57,17 @@ function batch(sequence: number, events: unknown[]): TraceEventInput {
   };
 }
 
+function transition(order: number, revision = order) {
+  const states = ["new", "starting", "active", "closed"];
+  return {
+    order, entity_id: "peer", machine_type: "peer",
+    from_state: states[revision - 1] ?? `state-${revision - 1}`,
+    to_state: states[revision] ?? `state-${revision}`,
+    state: states[revision] ?? `state-${revision}`,
+    machine_epoch: 1, revision, cause_id: null, monotonic_ns: order * 10,
+  };
+}
+
 function apply(state: ReturnType<typeof createInitialTraceState>, event: TraceEventInput) {
   return reduceTraceState(state, { type: "events", events: [event] });
 }
@@ -85,6 +96,51 @@ test("one canonical batch applies all records in one atomic reducer commit", () 
   expect(next.groupsById.get(1)?.calls).toBe(1);
   expect(next.facetsById.get("peer.ready")?.value).toBe(true);
   expect(next.groupIdsByOwner.get("peer")).toEqual([1]);
+});
+
+test("committed transitions survive one coalesced patch in truthful order", () => {
+  const initial = apply(createInitialTraceState(), snapshot());
+  const next = apply(initial, batch(1, [{
+    type: "machine:transition",
+    records: [transition(1), transition(2), transition(3)],
+  }]));
+
+  expect(next.transitions.map((item) => item.order)).toEqual([1, 2, 3]);
+  expect(next.transitions.map((item) => `${item.from_state}->${item.to_state}`)).toEqual([
+    "new->starting", "starting->active", "active->closed",
+  ]);
+  expect(next.machinesById.get("peer")?.revision).toBe(3);
+});
+
+test("transition reset and replacement snapshot enforce the advertised bound", () => {
+  let state = apply(createInitialTraceState(), {
+    event: "trace:snapshot",
+    data: {
+      ...(snapshot().data as Record<string, unknown>),
+      transition_journal_limit: 2,
+      transitions: [transition(1), transition(2)],
+    },
+  });
+  state = apply(state, batch(1, [{
+    type: "machine:transition", records: [transition(3)],
+  }]));
+  expect(state.transitions.map((item) => item.order)).toEqual([2, 3]);
+
+  state = apply(state, batch(2, [{
+    type: "machine:transition", reset: true,
+    records: [transition(8, 2), transition(9, 3)],
+  }]));
+  expect(state.transitions.map((item) => item.order)).toEqual([8, 9]);
+
+  state = apply(state, {
+    event: "trace:snapshot",
+    data: {
+      ...(snapshot().data as Record<string, unknown>), snapshot_sequence: 20,
+      transition_journal_limit: 2, transitions: [transition(20, 1)],
+    },
+  });
+  expect(state.transitions.map((item) => item.order)).toEqual([20]);
+  expect(state.resyncRequired).toBe(false);
 });
 
 test("schema-2 snapshot replaces every live normalized collection", () => {
@@ -138,6 +194,35 @@ test("a group counter patch changes values without changing topology", () => {
   expect(next.topologyVersion).toBe(initial.topologyVersion);
   expect(next.valueVersion).toBe(initial.valueVersion + 1);
   expect(next.groupIdsByOwner).toBe(initial.groupIdsByOwner);
+});
+
+test("operation timing and outcome aggregates survive snapshot and patch reduction", () => {
+  const timed = {
+    ...group(1, 1, 4),
+    in_flight: 1,
+    successes: 2,
+    errors: 1,
+    cancellations: 0,
+    average_duration_ms: 2.5,
+    min_duration_ms: 1,
+    max_duration_ms: 6,
+    total_worker_ms: 8,
+    total_queue_ms: 2,
+  };
+  let state = apply(createInitialTraceState(), snapshot([timed]));
+  expect(state.groupsById.get(1)).toMatchObject({
+    successes: 2, errors: 1, cancellations: 0,
+    average_duration_ms: 2.5, min_duration_ms: 1, max_duration_ms: 6,
+    total_worker_ms: 8, total_queue_ms: 2,
+  });
+
+  state = apply(state, batch(1, [{ type: "group:upsert", records: [{
+    ...timed, revision: 2, calls: 5, successes: 3,
+    total_worker_ms: 10, total_queue_ms: 3,
+  }] }]));
+  expect(state.groupsById.get(1)).toMatchObject({
+    calls: 5, successes: 3, total_worker_ms: 10, total_queue_ms: 3,
+  });
 });
 
 test("removals retain bounded normalized records and reject stale resurrection", () => {

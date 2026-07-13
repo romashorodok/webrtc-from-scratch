@@ -20,6 +20,7 @@ class DomainEvent:
 class IcePairNominated(DomainEvent):
     local_address: str | None = None
     remote_address: str | None = None
+    pair_id: str | None = None
 
 @dataclass(frozen=True, slots=True)
 class SrtpKeysReady(DomainEvent):
@@ -31,17 +32,25 @@ class SrtpKeysReady(DomainEvent):
 @dataclass(frozen=True, slots=True)
 class SrtpSessionReady(DomainEvent):
     protocol: str = "rtp"
+    session_id: str | None = None
 
 @dataclass(frozen=True, slots=True)
 class SrtpStreamCreated(DomainEvent):
     ssrc: int = 0
     protocol: str = "rtp"
+    session_id: str | None = None
+    stream_id: str | None = None
+    ssrc_id: str | None = None
+    stream_count: int = 1
 
 @dataclass(frozen=True, slots=True)
 class SrtpPacketDelivery(DomainEvent):
     ssrc: int = 0
     protocol: str = "rtp"
     delivered: bool = True
+    failure_reason: str | None = None
+    session_id: str | None = None
+    stream_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +67,13 @@ class IceStateChanged(DomainEvent):
 
 
 @dataclass(frozen=True, slots=True)
+class TransportStateChanged(DomainEvent):
+    lifecycle: str = "new"
+    selected: bool = False
+    pair_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class DtlsStateChanged(DomainEvent):
     state: str = "new"
     revision: int = 0
@@ -68,6 +84,7 @@ class TransceiverStateChanged(DomainEvent):
     transceiver_id: str = "default"
     direction: str = "inactive"
     active: bool = False
+    lifecycle: str = "inactive"
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,11 +92,13 @@ class MediaStateChanged(DomainEvent):
     media_id: str = "default"
     direction: str = "recv"
     active: bool = False
+    lifecycle: str = "inactive"
 
 
 @dataclass(frozen=True, slots=True)
 class QueueStateChanged(DomainEvent):
     queue_id: str = "default"
+    queue_instance_id: str | None = None
     depth: int = 0
     high_water: int = 0
 
@@ -87,6 +106,7 @@ class QueueStateChanged(DomainEvent):
 @dataclass(frozen=True, slots=True)
 class WorkerLaneStateChanged(DomainEvent):
     lane_id: str = "default"
+    lane_instance_id: str | None = None
     queued: int = 0
     running: bool = False
 
@@ -96,6 +116,8 @@ class TraceHealthChanged(DomainEvent):
     admitted: bool = True
     subscriber_count: int = 0
     journal_depth: int = 0
+    dispatcher_drops: int = 0
+    dispatcher_observer_failures: int = 0
 
 class DomainEventObserver(Protocol):
     def on_domain_event(self, event: DomainEvent) -> None: ...
@@ -107,6 +129,7 @@ class DomainEventDispatcher:
         self.observers = list(observers)
         self.capacity = max(1, capacity)
         self.diagnostics = Counter()
+        self._diagnostic_sinks: list[Counter[str]] = []
         self._owner_thread: int | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ingress: Queue[DomainEvent] = Queue(maxsize=self.capacity)
@@ -123,7 +146,7 @@ class DomainEventDispatcher:
             self._owner_thread = current
         if current == self._owner_thread:
             if self._delivery_depth >= self.capacity:
-                self.diagnostics["dropped"] += 1
+                self._diagnostic("dropped")
                 return False
             self._delivery_depth += 1
             try:
@@ -134,12 +157,12 @@ class DomainEventDispatcher:
         # Exceptional external-thread producers enqueue only immutable events.
         # Queue/wakeup internals may lock; projection records never do.
         if self._loop is None or self._loop.is_closed():
-            self.diagnostics["external_without_loop"] += 1
+            self._diagnostic("external_without_loop")
             return False
         try:
             self._ingress.put_nowait(event)
         except Full:
-            self.diagnostics["dropped"] += 1
+            self._diagnostic("dropped")
             return False
         if not self._drain_scheduled:
             self._drain_scheduled = True
@@ -151,7 +174,23 @@ class DomainEventDispatcher:
             try:
                 observer.on_domain_event(event)
             except Exception:
-                self.diagnostics["observer_failures"] += 1
+                self._diagnostic("observer_failures")
+
+    def _diagnostic(self, name: str) -> None:
+        self.diagnostics[name] += 1
+        exported_name = f"domain_dispatcher_{name}"
+        for sink in tuple(self._diagnostic_sinks):
+            sink[exported_name] += 1
+
+    def add_diagnostic_sink(self, diagnostics: Counter[str]) -> None:
+        if not any(sink is diagnostics for sink in self._diagnostic_sinks):
+            self._diagnostic_sinks.append(diagnostics)
+
+    def remove_diagnostic_sink(self, diagnostics: Counter[str]) -> None:
+        for index, sink in enumerate(self._diagnostic_sinks):
+            if sink is diagnostics:
+                del self._diagnostic_sinks[index]
+                break
 
     def add_observer(self, observer: DomainEventObserver) -> None:
         if observer not in self.observers:

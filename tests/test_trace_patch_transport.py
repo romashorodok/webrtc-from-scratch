@@ -3,6 +3,7 @@ import time
 from types import SimpleNamespace
 
 from webrtc import Runtime
+from webrtc.domain_events import PeerStateChanged, get_domain_event_dispatcher
 from webrtc.performance import _intern_operation
 from webrtc.observability import ControlHandle, FacetOp, MachineTransitionOp, ProducerDot
 from webrtc.state_machine import MachineSpec
@@ -59,6 +60,151 @@ def test_one_group_patch_is_absolute_and_source_coalesced():
     asyncio.run(scenario())
 
 
+def test_diagnostic_only_changes_coalesce_and_do_not_emit_noop_patches():
+    async def scenario():
+        async with Runtime(trace_patch_cadence=60) as runtime:
+            subscription = runtime.trace_patch_subscribe()
+            await subscription.get()
+
+            runtime.diagnostics["diagnostic_only"] += 1
+            runtime.diagnostics["diagnostic_only"] += 2
+            assert runtime.trace_transport._flush_handle is not None
+
+            batches = runtime.trace_patch_flush()
+            assert len(batches) == 1
+            events = batches[0]["data"]["events"]
+            assert [event["type"] for event in events] == ["diagnostics:patch"]
+            assert events[0]["values"]["diagnostic_only"] == 3
+            assert await subscription.get() is batches[0]
+            assert runtime.trace_patch_flush() == ()
+
+            del runtime.diagnostics["diagnostic_only"]
+            reset = runtime.trace_patch_flush()[0]
+            reset_event = next(
+                event for event in reset["data"]["events"]
+                if event["type"] == "diagnostics:patch"
+            )
+            assert reset_event["values"]["diagnostic_only"] == 0
+            assert runtime.trace_patch_flush() == ()
+            subscription.close()
+
+    asyncio.run(scenario())
+
+
+def test_domain_dispatcher_observer_failures_reach_patch_snapshot_and_health_facet():
+    class BrokenObserver:
+        def on_domain_event(self, event):
+            raise RuntimeError("observer failed")
+
+    async def scenario():
+        dispatcher = get_domain_event_dispatcher()
+        broken = BrokenObserver()
+        async with Runtime(scope_id="diagnostic-peer", trace_patch_cadence=60) as runtime:
+            subscription = runtime.trace_patch_subscribe()
+            await subscription.get()
+            dispatcher.add_observer(broken)
+            try:
+                assert dispatcher.publish(PeerStateChanged(
+                    context=runtime.root_context,
+                ))
+            finally:
+                dispatcher.remove_observer(broken)
+
+            batch = runtime.trace_patch_flush()[0]
+            diagnostic_event = next(
+                event for event in batch["data"]["events"]
+                if event["type"] == "diagnostics:patch"
+            )
+            assert diagnostic_event["values"]["domain_dispatcher_observer_failures"] == 1
+            health = {
+                item.facet_id.rsplit(":", 1)[-1]: item.value
+                for item in runtime.projection.facets.snapshots()
+                if item.owner_entity_id == "tracing:diagnostic-peer"
+            }
+            assert health["dispatcher_observer_failures"] == 1
+            snapshot = runtime.trace_snapshot()
+            assert snapshot["data"]["diagnostics"][
+                "domain_dispatcher_observer_failures"
+            ] == 1
+            assert runtime.trace_patch_flush() == ()
+            subscription.close()
+
+    asyncio.run(scenario())
+
+
+def test_trace_health_delivery_failure_is_reconciled_without_feedback_loop():
+    class BrokenObserver:
+        def on_domain_event(self, event):
+            raise RuntimeError("observer failed")
+
+    async def scenario():
+        dispatcher = get_domain_event_dispatcher()
+        broken = BrokenObserver()
+        async with Runtime(scope_id="diagnostic-peer", trace_patch_cadence=60) as runtime:
+            dispatcher.add_observer(broken)
+            try:
+                subscription = runtime.trace_patch_subscribe()
+                snapshot = await subscription.get()
+                failures = runtime.diagnostics[
+                    "domain_dispatcher_observer_failures"
+                ]
+                # The health event fails once at the broken observer; updating
+                # its health facet must not recursively emit another event.
+                assert failures == 1
+                facets = {
+                    item.facet_id.rsplit(":", 1)[-1]: item.value
+                    for item in runtime.projection.facets.snapshots()
+                    if item.owner_entity_id == "tracing:diagnostic-peer"
+                }
+                assert facets["dispatcher_observer_failures"] == failures
+                assert snapshot["data"]["diagnostics"][
+                    "domain_dispatcher_observer_failures"
+                ] == failures
+                assert runtime.trace_patch_flush() == ()
+            finally:
+                dispatcher.remove_observer(broken)
+                subscription.close()
+
+    asyncio.run(scenario())
+
+
+def test_domain_dispatcher_drop_is_exported_without_recursive_flush_churn():
+    class RecursiveObserver:
+        def __init__(self, dispatcher):
+            self.dispatcher = dispatcher
+
+        def on_domain_event(self, event):
+            self.dispatcher.publish(event)
+
+    async def scenario():
+        dispatcher = get_domain_event_dispatcher()
+        recursive = RecursiveObserver(dispatcher)
+        old_capacity = dispatcher.capacity
+        async with Runtime(trace_patch_cadence=60) as runtime:
+            subscription = runtime.trace_patch_subscribe()
+            await subscription.get()
+            dispatcher.capacity = 2
+            dispatcher.add_observer(recursive)
+            try:
+                assert dispatcher.publish(PeerStateChanged(
+                    context=runtime.root_context,
+                ))
+            finally:
+                dispatcher.remove_observer(recursive)
+                dispatcher.capacity = old_capacity
+
+            batch = runtime.trace_patch_flush()[0]
+            diagnostic_event = next(
+                event for event in batch["data"]["events"]
+                if event["type"] == "diagnostics:patch"
+            )
+            assert diagnostic_event["values"]["domain_dispatcher_dropped"] == 1
+            assert runtime.trace_patch_flush() == ()
+            subscription.close()
+
+    asyncio.run(scenario())
+
+
 def test_serialized_batch_object_is_reused_for_all_subscribers():
     async def scenario():
         async with Runtime(trace_patch_cadence=60) as runtime:
@@ -98,6 +244,14 @@ def test_slow_subscriber_overflow_resyncs_then_snapshot_converges():
             assert current["in_flight"] == 0
             assert current["successes"] == 1
             assert runtime.diagnostics["trace_resync_required"] == 1
+            diagnostic_batch = runtime.trace_patch_flush()
+            assert len(diagnostic_batch) == 1
+            diagnostic_events = diagnostic_batch[0]["data"]["events"]
+            assert [event["type"] for event in diagnostic_events] == [
+                "diagnostics:patch"
+            ]
+            assert diagnostic_events[0]["values"]["trace_resync_required"] == 1
+            assert runtime.trace_patch_flush() == ()
             subscription.close()
 
     asyncio.run(scenario())
@@ -169,6 +323,94 @@ def test_machine_control_and_state_records_share_the_schema2_drain():
             assert events["control:upsert"]["records"][0]["revision"] == 1
             assert events["state:upsert"]["records"][0]["revision"] == 1
             assert "diagnostics:patch" in events
+            subscription.close()
+
+    asyncio.run(scenario())
+
+
+def test_all_machine_transitions_survive_source_coalescing_in_commit_order():
+    async def scenario():
+        async with Runtime(trace_patch_cadence=60) as runtime:
+            subscription = runtime.trace_patch_subscribe()
+            await subscription.get()
+            spec = MachineSpec(
+                "journal", "new", {
+                    "new": frozenset({"starting"}),
+                    "starting": frozenset({"active"}),
+                    "active": frozenset({"closed"}),
+                    "closed": frozenset(),
+                }, frozenset(),
+            )
+            runtime.projection.machines.register("journal", spec)
+            states = (("new", "starting"), ("starting", "active"), ("active", "closed"))
+            for revision, (previous, current) in enumerate(states, 1):
+                runtime.projection.machines.apply(MachineTransitionOp(
+                    "journal", "journal", previous, current, 1, revision,
+                    ProducerDot(runtime.runtime_epoch, 77, revision),
+                    cause_id=f"cause-{revision}", monotonic_ns=100 + revision,
+                ))
+
+            batch = runtime.trace_patch_flush()[0]
+            event = next(
+                item for item in batch["data"]["events"]
+                if item["type"] == "machine:transition"
+            )
+            assert [item["revision"] for item in event["records"]] == [1, 2, 3]
+            assert [item["from_state"] for item in event["records"]] == [
+                "new", "starting", "active"
+            ]
+            assert [item["to_state"] for item in event["records"]] == [
+                "starting", "active", "closed"
+            ]
+            assert [item["order"] for item in event["records"]] == sorted(
+                item["order"] for item in event["records"]
+            )
+            assert event["records"][1]["cause_id"] == "cause-2"
+            subscription.close()
+
+    asyncio.run(scenario())
+
+
+def test_machine_transition_journal_is_bounded_and_patch_reset_is_truthful():
+    async def scenario():
+        async with Runtime(
+            trace_patch_cadence=60, trace_transition_journal_limit=2,
+        ) as runtime:
+            subscription = runtime.trace_patch_subscribe(maxsize=4)
+            initial = await subscription.get()
+            assert initial["data"]["transition_journal_limit"] == 2
+            spec = MachineSpec(
+                "journal", "new", {
+                    "new": frozenset({"one"}), "one": frozenset({"two"}),
+                    "two": frozenset({"three"}), "three": frozenset(),
+                }, frozenset(),
+            )
+            runtime.projection.machines.register("bounded", spec)
+            for revision, (previous, current) in enumerate(
+                (("new", "one"), ("one", "two"), ("two", "three")), 1,
+            ):
+                runtime.projection.machines.apply(MachineTransitionOp(
+                    "bounded", "journal", previous, current, 1, revision,
+                    ProducerDot(runtime.runtime_epoch, 88, revision),
+                    monotonic_ns=revision,
+                ))
+
+            assert len(runtime.projection.machines.transition_snapshots()) == 2
+            batch = runtime.trace_patch_flush()[0]
+            machine = next(
+                item for item in batch["data"]["events"]
+                if item["type"] == "machine:upsert"
+            )
+            assert machine["records"][0]["state"] == "three"
+            event = next(
+                item for item in batch["data"]["events"]
+                if item["type"] == "machine:transition"
+            )
+            assert event["reset"] is True
+            assert [item["revision"] for item in event["records"]] == [2, 3]
+            snapshot = runtime.trace_snapshot()["data"]
+            assert [item["revision"] for item in snapshot["transitions"]] == [2, 3]
+            assert runtime.diagnostics["machine_transition_journal_resets"] == 1
             subscription.close()
 
     asyncio.run(scenario())

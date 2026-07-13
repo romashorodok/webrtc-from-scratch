@@ -2,6 +2,8 @@ import socket
 import re
 import asyncio
 import inspect
+import hashlib
+import secrets
 import queue
 from datetime import datetime, timedelta
 
@@ -39,6 +41,21 @@ from .candidate_base import (
     parse_candidate_str,
 )
 from .utils import generate_pwd, generate_tie_breaker, generate_ufrag, cmp
+
+
+_PAIR_OBSERVABILITY_KEY = secrets.token_bytes(16)
+
+
+def _observable_pair_id_value(pair_id: str) -> str:
+    """Return a process-local identity without a reversible address digest."""
+    return hashlib.blake2s(
+        pair_id.encode(), key=_PAIR_OBSERVABILITY_KEY, digest_size=8,
+    ).hexdigest()
+
+
+def _observable_pair_id(pair: "CandidatePair") -> str:
+    """Return stable nomination identity without exposing candidate addresses."""
+    return _observable_pair_id_value(pair.get_pair_id())
 
 
 @dataclass
@@ -308,7 +325,7 @@ class ControllingSelector(AsyncEventEmitter):
             "Nominating candidate pair",
             pair_id=pair.get_pair_id(),
         )
-        emit_domain_event(IcePairNominated)
+        emit_domain_event(IcePairNominated, pair_id=_observable_pair_id(pair))
         self._nominated_pair = pair
         self.emit(SelectorEvent.NOMINATE, pair)
 
@@ -600,6 +617,9 @@ class CandidatePairTransport:
     def __init__(self, conn: MuxConnProtocol, *, pair_id: str | None = None) -> None:
         self._conn: MuxConnProtocol = conn
         self._pair_id = pair_id
+        self._observability_id = (
+            _observable_pair_id_value(pair_id) if pair_id is not None else None
+        )
         if pair_id is not None:
             set_trace_pair_id = getattr(conn, "set_trace_pair_id", None)
             if set_trace_pair_id is not None:
@@ -607,15 +627,19 @@ class CandidatePairTransport:
 
         # self._rtp = queue.Queue[Packet]()
         # self._rtcp = queue.Queue[Packet]()
-        self._rtp = Interceptor(maxsize=2048, drop_oldest=True)
-        self._rtcp = Interceptor()
-        self._dtls = Interceptor()
+        self._rtp = Interceptor(maxsize=2048, drop_oldest=True, queue_id="ice-rtp")
+        self._rtcp = Interceptor(queue_id="ice-rtcp")
+        self._dtls = Interceptor(queue_id="ice-dtls")
 
         # Packet classification stats
         self._total_packets = 0
         self._dtls_count = 0
         self._rtcp_count = 0
         self._rtp_count = 0
+
+    @property
+    def observability_id(self) -> str | None:
+        return self._observability_id
 
     def _demux_metadata(self, packet_kind: str, pkt: Packet) -> dict[str, object]:
         metadata: dict[str, object] = {
@@ -773,7 +797,9 @@ class CandidatePairController(AsyncEventEmitter, ObservedComponent):
             pair_id=self._pair.get_pair_id(),
         )
         self.__nominated.set()
-        emit_domain_event(IcePairNominated)
+        emit_domain_event(
+            IcePairNominated, pair_id=_observable_pair_id(self._pair)
+        )
         self.emit(CandidatePairControllerEvent.NOMINATE_TRANSPORT, self.__transport)
 
     @task(

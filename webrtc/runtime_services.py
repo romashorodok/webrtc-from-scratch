@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import secrets
 import inspect
 import time
 import uuid
@@ -572,9 +573,27 @@ class SerializedWorkerLane:
     def __init__(self, offloader: SyncOffloader) -> None:
         self.offloader = offloader
         self._identity = object()
+        self._observability_id = f"serialized:{secrets.token_hex(6)}"
         self._semaphore = asyncio.Semaphore(1)
         self._queued: set[asyncio.Task[Any]] = set()
+        self._running = False
+        self._high_water = 0
         self.state = ScopeState.ACTIVE
+
+    def _publish_state(self) -> None:
+        # Imported lazily because domain_events defines its immutable context
+        # contract in terms of this module.
+        from .domain_events import WorkerLaneStateChanged, emit_domain_event
+
+        emit_domain_event(
+            WorkerLaneStateChanged, lane_id="serialized",
+            lane_instance_id=self._observability_id,
+            queued=len(self._queued), running=self._running,
+        )
+
+    @property
+    def observability_id(self) -> str:
+        return self._observability_id
 
     def is_current_worker_context(self) -> bool:
         return _worker_lane_context.get() is self._identity
@@ -601,13 +620,20 @@ class SerializedWorkerLane:
         owner = asyncio.current_task()
         if owner is not None:
             self._queued.add(owner)
+            self._high_water = max(self._high_water, len(self._queued))
+            self._publish_state()
         try:
             await self._semaphore.acquire()
         finally:
             if owner is not None:
                 self._queued.discard(owner)
+            self._publish_state()
+        self._running = True
+        self._publish_state()
 
         if self.state is not ScopeState.ACTIVE:
+            self._running = False
+            self._publish_state()
             self._semaphore.release()
             raise ScopeNotActive(f"worker lane is {self.state.value}")
 
@@ -631,11 +657,15 @@ class SerializedWorkerLane:
                 except BaseException:
                     pass
                 finally:
+                    self._running = False
+                    self._publish_state()
                     self._semaphore.release()
 
             asyncio.create_task(release_when_finished())
             raise
         else:
+            self._running = False
+            self._publish_state()
             self._semaphore.release()
             return result
 
@@ -647,6 +677,8 @@ class SerializedWorkerLane:
             task.cancel()
         await self.offloader.wait_for_dispatched(timeout)
         self.state = ScopeState.CLOSED
+        self._running = False
+        self._publish_state()
 
 
 CoroutineFactory = Callable[[], Awaitable[T]]
@@ -665,12 +697,13 @@ class TaskScheduler:
         registry: TaskRegistry | None = None,
         observers=(),
         failure_observers=(),
+        diagnostics: Counter[str] | None = None,
     ) -> None:
         self.registry = registry or TaskRegistry()
         self.observers = list(observers)
         self.failure_observers = list(failure_observers)
         self.closed = False
-        self.diagnostics: Counter[str] = Counter()
+        self.diagnostics = diagnostics if diagnostics is not None else Counter()
 
     def _notify(self, method: str, event: Any) -> None:
         for observer in tuple(self.observers):

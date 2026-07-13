@@ -8,7 +8,9 @@ This module provides the high-level Session interface that:
 """
 
 import asyncio
+import hashlib
 import inspect
+import secrets
 from dataclasses import dataclass
 from typing import Optional, Callable, Awaitable
 
@@ -76,7 +78,11 @@ class Stream:
     that can be read by consumers.
     """
 
-    def __init__(self, ssrc: int, is_rtp: bool, on_close: Optional[Callable[[int], Awaitable[None]]] = None):
+    def __init__(
+        self, ssrc: int, is_rtp: bool,
+        on_close: Optional[Callable[[int], Awaitable[None]]] = None,
+        *, observability_id: str | None = None,
+    ):
         """
         Create a new Stream.
 
@@ -89,6 +95,7 @@ class Stream:
         self.is_rtp = is_rtp
         self._on_close = on_close
         self._closed = False
+        self.observability_id = observability_id or f"stream-{secrets.token_hex(6)}"
 
         # Async queue for buffered packets
         # Use packet count limit rather than byte limit for simplicity
@@ -181,7 +188,10 @@ class Session(ObservedComponent):
     This is the main interface for SRTP in the WebRTC stack.
     """
 
-    def __init__(self, keys: SessionKeys, is_rtp: bool = True):
+    def __init__(
+        self, keys: SessionKeys, is_rtp: bool = True,
+        *, observability_id: str | None = None,
+    ):
         """
         Create a new SRTP session.
 
@@ -190,6 +200,12 @@ class Session(ObservedComponent):
             is_rtp: True for RTP session, False for RTCP session
         """
         self.is_rtp = is_rtp
+        protocol = "rtp" if is_rtp else "rtcp"
+        self.observability_id = (
+            observability_id or f"srtp-{protocol}-{secrets.token_hex(6)}"
+        )
+        self._observability_key = secrets.token_bytes(16)
+        self._stream_sequence = 0
         # Create Rust SRTP context
         # tx_key = local key + salt (for encryption)
         # rx_key = remote key + salt (for decryption)
@@ -318,10 +334,22 @@ class Session(ObservedComponent):
                 async with self._streams_lock:
                     self._streams.pop(closed_ssrc, None)
 
-            stream = Stream(ssrc, self.is_rtp, on_close)
+            self._stream_sequence += 1
+            stream_id = f"{self.observability_id}:stream:{self._stream_sequence}"
+            stream = Stream(
+                ssrc, self.is_rtp, on_close, observability_id=stream_id,
+            )
             self._streams[ssrc] = stream
-            emit_domain_event(SrtpStreamCreated, ssrc=ssrc,
-                              protocol="rtp" if self.is_rtp else "rtcp")
+            protocol = "rtp" if self.is_rtp else "rtcp"
+            ssrc_id = "ssrc-" + hashlib.blake2s(
+                ssrc.to_bytes(4, "big"), key=self._observability_key,
+                digest_size=6,
+            ).hexdigest()
+            emit_domain_event(
+                SrtpStreamCreated, ssrc=ssrc, protocol=protocol,
+                session_id=self.observability_id, stream_id=stream_id,
+                ssrc_id=ssrc_id, stream_count=len(self._streams),
+            )
             return stream, True
 
     async def write_incoming(self, ciphertext: bytes) -> None:
@@ -382,12 +410,21 @@ class Session(ObservedComponent):
         write_success = await stream.write(decrypted)
         if not write_success:
             seq = int.from_bytes(decrypted[2:4], 'big') if len(decrypted) >= 4 else -1
-            emit_domain_event(SrtpPacketDelivery, ssrc=ssrc,
-                              protocol="rtp" if self.is_rtp else "rtcp", delivered=False)
+            emit_domain_event(
+                SrtpPacketDelivery, ssrc=ssrc,
+                protocol="rtp" if self.is_rtp else "rtcp", delivered=False,
+                failure_reason="stream_queue_full",
+                session_id=self.observability_id,
+                stream_id=stream.observability_id,
+            )
             logger.warn(Component.SRTP, f"Stream write FAILED - queue full", ssrc=ssrc, seq=seq)
         else:
-            emit_domain_event(SrtpPacketDelivery, ssrc=ssrc,
-                              protocol="rtp" if self.is_rtp else "rtcp", delivered=True)
+            emit_domain_event(
+                SrtpPacketDelivery, ssrc=ssrc,
+                protocol="rtp" if self.is_rtp else "rtcp", delivered=True,
+                session_id=self.observability_id,
+                stream_id=stream.observability_id,
+            )
 
     async def accept_stream(self) -> tuple[Stream, int]:
         """

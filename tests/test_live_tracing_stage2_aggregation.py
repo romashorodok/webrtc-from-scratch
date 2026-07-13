@@ -10,6 +10,7 @@ from webrtc.performance import (
     event_loop,
     observe,
     performance,
+    task,
     worker,
 )
 
@@ -38,6 +39,62 @@ def test_repeated_aggregate_calls_reuse_one_compact_group_without_trace_events(m
             assert snapshots[0].calls == snapshots[0].successes == 100
             assert snapshots[0].in_flight == 0
             assert published == []
+
+    asyncio.run(scenario())
+
+
+def test_runtime_registers_peer_root_and_top_level_aggregate_owns_it():
+    class Subject(ObservedComponent):
+        @event_loop
+        def call(self):
+            return 1
+
+    async def scenario():
+        async with Runtime(scope_id="scope") as runtime:
+            peer = runtime.projection.machines.get("peer:scope")
+            assert peer is not None
+            assert peer.machine_type == "peer"
+            assert peer.state == "new"
+
+            assert Subject().call() == 1
+            group = next(
+                item for item in runtime.activity_groups.snapshots()
+                if item.operation.endswith("Subject.call")
+            )
+            assert group.owner_entity_id == peer.entity_id
+            assert runtime.projection.machines.get(group.owner_entity_id) == peer
+
+    asyncio.run(scenario())
+
+
+def test_aggregate_calls_in_selected_machine_task_inherit_machine_owner():
+    class Subject(ObservedComponent):
+        @event_loop
+        def step(self):
+            return 1
+
+        @task(state="worker")
+        async def serve(self):
+            return await self.child()
+
+        @task()
+        async def child(self):
+            # This operation runs under a distinct scheduled task context. It
+            # must retain the selected worker owner inherited from ``serve``.
+            return self.step()
+
+    async def scenario():
+        async with Runtime(scope_id="scope") as runtime:
+            assert await Subject().serve() == 1
+            worker_machine = runtime.projection.machines.get("worker:scope")
+            assert worker_machine is not None
+            owned = {
+                item.operation: item.owner_entity_id
+                for item in runtime.activity_groups.snapshots()
+                if item.operation.endswith("Subject.step")
+            }
+            assert len(owned) == 1
+            assert set(owned.values()) == {worker_machine.entity_id}
 
     asyncio.run(scenario())
 

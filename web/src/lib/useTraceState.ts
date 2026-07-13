@@ -36,6 +36,7 @@ export function useTraceState(onResyncRequest?: (request: TraceResyncRequest) =>
     enqueueTraceSnapshot,
     enqueueTraceResyncRequired,
     machinesById: state.machinesById,
+    transitions: state.transitions,
     controlsById: state.controlsById,
     groupsById: state.groupsById,
     facetsById: state.facetsById,

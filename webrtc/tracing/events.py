@@ -1,12 +1,55 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
+from collections import Counter, deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import RLock
 from typing import Any
 import json
 import weakref
+
+
+class ObservableDiagnostics(Counter[str]):
+    """Counter that coalesces diagnostic changes onto a transport dirty edge."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._dirty_callback = None
+        self._notification_depth = 0
+
+    def set_dirty_callback(self, callback) -> None:
+        self._dirty_callback = callback
+
+    @contextmanager
+    def suspend_notifications(self):
+        self._notification_depth += 1
+        try:
+            yield
+        finally:
+            self._notification_depth -= 1
+
+    def __setitem__(self, key: str, value: int) -> None:
+        previous = self.get(key, 0)
+        super().__setitem__(key, value)
+        if (
+            value != previous
+            and self._notification_depth == 0
+            and self._dirty_callback is not None
+        ):
+            self._dirty_callback()
+
+    def __delitem__(self, key: str) -> None:
+        existed = key in self
+        super().__delitem__(key)
+        if existed and self._notification_depth == 0 and self._dirty_callback is not None:
+            self._dirty_callback()
+
+    def clear(self) -> None:
+        changed = bool(self)
+        super().clear()
+        if changed and self._notification_depth == 0 and self._dirty_callback is not None:
+            self._dirty_callback()
 
 
 @dataclass(eq=False)
@@ -296,6 +339,7 @@ class TracePatchTransport:
         journal_limit: int = 128,
         max_batch_records: int = 256,
         max_batch_bytes: int = 256 * 1024,
+        health_callback=None,
     ) -> None:
         from collections import Counter
 
@@ -313,10 +357,17 @@ class TracePatchTransport:
         self._published_removal_checkpoint = 0
         self._removal_checkpoint_by_sequence: dict[int, int] = {}
         self._machine_revisions: dict[str, tuple[int, int]] = {}
+        self._transition_order = 0
         self._facet_revisions: dict[str, tuple[int, int]] = {}
         self._control_signatures: dict[str, tuple[Any, ...]] = {}
         self._control_revisions: dict[str, int] = {}
         self._flush_handle: asyncio.TimerHandle | None = None
+        self._health_callback = health_callback
+        self._published_diagnostics: dict[str, int] = dict(self.diagnostics)
+
+    def _publish_health(self, admitted: bool = True) -> None:
+        if self._health_callback is not None:
+            self._health_callback(admitted, self.viewer_count, self.journal_depth)
 
     @property
     def journal_depth(self) -> int:
@@ -337,9 +388,11 @@ class TracePatchTransport:
             peer_id=peer_id, acknowledged=self._sequence,
         )
         self._subscribers.add(subscriber)
+        self._publish_health()
         # A consistent snapshot is captured synchronously on the single writer.
         # Dirty records represented by it need not be repeated in the next patch.
         snapshot = self.snapshot()
+        self._published_diagnostics = dict(self.diagnostics)
         if not had_viewers:
             self.activity_groups.drain_dirty()
             if self.captures is not None:
@@ -359,10 +412,12 @@ class TracePatchTransport:
         if not self._subscribers and self._flush_handle is not None:
             self._flush_handle.cancel()
             self._flush_handle = None
+        self._publish_health()
 
     def close(self) -> None:
         for subscriber in tuple(self._subscribers):
             self.unsubscribe(subscriber)
+        self._publish_health(False)
 
     def dirty(self) -> None:
         """Schedule one source-side coalescing drain when viewers are present."""
@@ -395,7 +450,9 @@ class TracePatchTransport:
         )
         self._published_removal_checkpoint = self.activity_groups.removal_checkpoint
         projection_events = self._drain_projection()
-        if not groups and not removals and not projection_events and not captures and not capture_removals:
+        diagnostic_values = dict(self.diagnostics)
+        diagnostics_changed = diagnostic_values != self._published_diagnostics
+        if not groups and not removals and not projection_events and not captures and not capture_removals and not diagnostics_changed:
             return ()
 
         events: list[dict[str, Any]] = list(projection_events)
@@ -411,7 +468,14 @@ class TracePatchTransport:
             events.append({"type": "group:upsert", "records": records})
         if removals:
             events.append({"type": "group:remove", "ids": list(removals)})
-        events.append({"type": "diagnostics:patch", "values": dict(self.diagnostics)})
+        diagnostic_patch = {
+            **diagnostic_values,
+            **{
+                name: 0 for name in self._published_diagnostics
+                if name not in diagnostic_values
+            },
+        }
+        events.append({"type": "diagnostics:patch", "values": diagnostic_patch})
         chunks = self._budget_events(events)
         batches: list[dict[str, Any]] = []
         for chunk in chunks:
@@ -421,7 +485,20 @@ class TracePatchTransport:
             ] = self._published_removal_checkpoint
             self._gc_acknowledged_tombstones()
             batches.append(batch)
-        self.diagnostics["trace_patch_batches"] += len(batches)
+        suspension = getattr(self.diagnostics, "suspend_notifications", None)
+        if suspension is None:
+            self.diagnostics["trace_patch_batches"] += len(batches)
+        else:
+            with suspension():
+                self.diagnostics["trace_patch_batches"] += len(batches)
+        # Transport accounting is intentionally snapshot-only.  Treat it as
+        # published so observing tracing cannot recursively create tracing.
+        # Diagnostics raised while broadcasting (notably replica resyncs)
+        # remain ahead of this cursor and are delivered by the next flush.
+        self._published_diagnostics = diagnostic_values
+        self._published_diagnostics["trace_patch_batches"] = self.diagnostics[
+            "trace_patch_batches"
+        ]
         return tuple(batches)
 
     def snapshot(self) -> dict[str, Any]:
@@ -436,6 +513,11 @@ class TracePatchTransport:
                 "snapshot_sequence": self._sequence,
                 "server_monotonic_ms": self._monotonic_ms(),
                 "machines": [self._machine(item) for item in self.projection.machines.snapshots()],
+                "transitions": [
+                    self._transition(item)
+                    for item in self.projection.machines.transition_snapshots()
+                ],
+                "transition_journal_limit": self.projection.machines.transition_limit,
                 "controls": [
                     self._control(item, self._control_revisions.get(item.handle_id, 1))
                     for item in self.projection.controls.snapshots()
@@ -450,7 +532,17 @@ class TracePatchTransport:
                 "diagnostics": dict(self.diagnostics),
             },
         }
-        self.diagnostics["trace_snapshots"] += 1
+        suspension = getattr(self.diagnostics, "suspend_notifications", None)
+        if suspension is None:
+            self.diagnostics["trace_snapshots"] += 1
+        else:
+            with suspension():
+                self.diagnostics["trace_snapshots"] += 1
+        # Snapshot accounting is useful to operators but must not itself make
+        # a diagnostic-only patch dirty.
+        self._published_diagnostics["trace_snapshots"] = self.diagnostics[
+            "trace_snapshots"
+        ]
         return snapshot
 
     def _append_batch(self, events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -594,17 +686,25 @@ class TracePatchTransport:
                 chunks.append(current)
             current, count, size = [], 0, 0
 
-        def append_item(event_type: str, field: str, item: Any) -> None:
+        def append_item(
+            event_type: str, field: str, item: Any,
+            extras: dict[str, Any] | None = None,
+        ) -> None:
             nonlocal count, size
             item_size = len(json.dumps(item, separators=(",", ":"), default=str))
             if current and (
                 count >= self.max_batch_records or size + item_size > self.max_batch_bytes
             ):
                 flush()
-            if current and current[-1].get("type") == event_type and field in current[-1]:
+            extras = extras or {}
+            if (
+                current and current[-1].get("type") == event_type
+                and field in current[-1]
+                and all(current[-1].get(key) == value for key, value in extras.items())
+            ):
                 current[-1][field].append(item)
             else:
-                current.append({"type": event_type, field: [item]})
+                current.append({"type": event_type, field: [item], **extras})
             count += 1
             size += item_size
 
@@ -613,8 +713,15 @@ class TracePatchTransport:
             records = event.get("records")
             ids = event.get("ids")
             if isinstance(event_type, str) and isinstance(records, list):
-                for record in records:
-                    append_item(event_type, "records", record)
+                extras = {
+                    key: value for key, value in event.items()
+                    if key not in {"type", "records"}
+                }
+                for index, record in enumerate(records):
+                    append_item(
+                        event_type, "records", record,
+                        extras if index == 0 else None,
+                    )
             elif isinstance(event_type, str) and isinstance(ids, list):
                 for item_id in ids:
                     append_item(event_type, "ids", item_id)
@@ -632,6 +739,19 @@ class TracePatchTransport:
         return {
             "entity_id": item.entity_id, "machine_type": item.machine_type,
             "state": item.state, "machine_epoch": item.machine_epoch,
+            "revision": item.revision, "cause_id": item.cause_id,
+            "monotonic_ns": item.monotonic_ns,
+        }
+
+    @staticmethod
+    def _transition(item: Any) -> dict[str, Any]:
+        # ``state`` keeps the schema-2 transition record usable as a latest
+        # machine upsert for older clients. New clients use the explicit edge.
+        return {
+            "order": item.order, "entity_id": item.entity_id,
+            "machine_type": item.machine_type,
+            "from_state": item.from_state, "to_state": item.to_state,
+            "state": item.to_state, "machine_epoch": item.machine_epoch,
             "revision": item.revision, "cause_id": item.cause_id,
             "monotonic_ns": item.monotonic_ns,
         }
@@ -670,6 +790,7 @@ class TracePatchTransport:
             item.entity_id: (item.machine_epoch, item.revision)
             for item in self.projection.machines.snapshots()
         }
+        self._transition_order = self.projection.machines.transition_order
         self._facet_revisions = {
             item.facet_id: (item.owner_epoch, item.revision)
             for item in self.projection.facets.snapshots()
@@ -683,6 +804,9 @@ class TracePatchTransport:
     def _drain_projection(self) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
         machines = self.projection.machines.snapshots()
+        transitions, reset = self.projection.machines.transitions_after(
+            self._transition_order
+        )
         changed_machines = [
             item for item in machines
             if (item.machine_epoch, item.revision) > self._machine_revisions.get(
@@ -692,9 +816,18 @@ class TracePatchTransport:
         if changed_machines:
             changed_machines.sort(key=lambda item: item.entity_id)
             events.append({
-                "type": "machine:transition",
+                "type": "machine:upsert",
                 "records": [self._machine(item) for item in changed_machines],
             })
+        if transitions:
+            events.append({
+                "type": "machine:transition",
+                "records": [self._transition(item) for item in transitions],
+                **({"reset": True} if reset else {}),
+            })
+        if reset:
+            self.diagnostics["machine_transition_journal_resets"] += 1
+        self._transition_order = self.projection.machines.transition_order
         self._machine_revisions = {
             item.entity_id: (item.machine_epoch, item.revision) for item in machines
         }

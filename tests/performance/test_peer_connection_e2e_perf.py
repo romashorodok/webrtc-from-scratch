@@ -26,6 +26,7 @@ from helpers import (
 from webrtc.ice import net
 from webrtc.lifecycle import PeerCondition
 from webrtc.peer_connection import ICEGatherer, PeerConnection
+from webrtc.runtime_services import current_execution_scope
 from webrtc.session_description import SessionDescriptionType
 from webrtc.tracing import PerformanceRecorder, measure_perf, perf_mark, use_performance_recorder
 from webrtc.transceiver import RTPCodecKind, RTPTransceiverDirection
@@ -95,11 +96,174 @@ def test_peer_connection_loopback_av1_rtp_rtcp_twcc_e2e(record_property):
         return await original_create_agent(self, port, loopback_interfaces)
 
     with patch.object(ICEGatherer, "_ICEGatherer__create_agent", create_loopback_agent):
-        summary, recorder = asyncio.run(_run_av1_rtp_rtcp_twcc_scenario())
+        summary, recorder, _ = asyncio.run(_run_av1_rtp_rtcp_twcc_scenario())
 
     record_property("performance_summary", json.dumps(summary, sort_keys=True))
     assert_matches_baseline(recorder, summary, AV1_E2E_BASELINE)
     assert summary["status"] == "completed"
+
+
+def test_secured_peer_session_publishes_complete_observability_inventory():
+    """Project the inventory from a real secured RTP/RTCP peer session.
+
+    The reused fixture sends seven AV1 RTP packets and reverse TWCC through the
+    production UDP, ICE, DTLS, SRTP, stream-demux and remote-track boundaries.
+    This test intentionally inspects state before peer shutdown so terminal
+    teardown cannot erase or replace the live ownership graph.
+    """
+    loopback_interfaces = [
+        interface
+        for interface in net.interface_factory(
+            net.InterfaceProvider.PSUTIL, [socket.AF_INET], True
+        )
+        if str(interface.address).startswith("127.")
+    ]
+    assert loopback_interfaces, "no IPv4 loopback interface available for E2E test"
+
+    original_create_agent = ICEGatherer._ICEGatherer__create_agent
+
+    async def create_loopback_agent(self, port=0, interfaces=None):
+        return await original_create_agent(self, port, loopback_interfaces)
+
+    with patch.object(ICEGatherer, "_ICEGatherer__create_agent", create_loopback_agent):
+        summary, _, observed = asyncio.run(_run_av1_rtp_rtcp_twcc_scenario())
+
+    assert summary["status"] == "completed"
+    assert observed["packet_count"] == 7
+    _assert_peer_observability_inventory(observed["offerer"], "pc-av1-offerer")
+    _assert_peer_observability_inventory(observed["answerer"], "pc-av1-answerer")
+    _assert_received_media_observability(observed)
+
+
+def _facet_owners(snapshot: dict) -> dict[str, dict[str, dict]]:
+    owners: dict[str, dict[str, dict]] = {}
+    for facet_id, facet in snapshot["facets"].items():
+        owners.setdefault(facet["owner"], {})[facet_id.rsplit(":", 1)[-1]] = facet
+    return owners
+
+
+def _assert_peer_observability_inventory(snapshot: dict, scope: str) -> None:
+    machines = snapshot["machines"]
+    machine_types = {item["machine_type"] for item in machines.values()}
+    assert {"peer", "ice", "dtls", "transceiver"} <= machine_types
+    assert machines[f"peer:{scope}"]["state"] == "new"
+    assert machines[f"ice:{scope}"]["state"] == "connected"
+    assert machines[f"transceiver:{scope}"]["state"] == "active"
+    assert machines[f"dtls:{scope}"]["state"] == "Finished"
+
+    # Every top-level operation is rooted in an entity present in the machine
+    # inventory; nested aggregate groups retain the same valid owner.
+    assert snapshot["groups"]
+    root_groups = [item for item in snapshot["groups"] if item["parent_type"] == "root"]
+    assert root_groups
+    assert all(item["parent_id"] is None for item in root_groups)
+    assert {item["owner"] for item in snapshot["groups"]} <= set(machines)
+
+    owners = _facet_owners(snapshot)
+    peer = owners[f"peer:{scope}"]
+    assert {name: peer[name]["value"] for name in ("lifecycle", "connection")} == {
+        "lifecycle": "active", "connection": "connected",
+    }
+    ice = owners[f"ice:{scope}"]
+    transport = owners[f"transport:{scope}"]
+    assert ice["selected_pair"]["value"] is True
+    assert transport["selected"]["value"] is True
+    assert transport["lifecycle"]["value"] == "ready"
+    assert transport["selected_pair_id"]["value"] == ice["selected_pair_id"]["value"]
+
+    transceivers = {
+        owner: values for owner, values in owners.items()
+        if owner.startswith(f"transceiver:{scope}:")
+    }
+    media = {
+        owner: values for owner, values in owners.items()
+        if owner.startswith(f"media:{scope}:")
+    }
+    assert len(transceivers) == 1
+    transceiver_id, transceiver = next(iter(transceivers.items()))
+    matching_media_id = transceiver_id.replace("transceiver:", "media:", 1)
+    assert matching_media_id in media
+    assert transceiver["active"]["value"] is True
+    assert transceiver["direction"]["value"] == "sendrecv"
+    assert media[matching_media_id]["active"]["value"] is True
+
+    sessions = {
+        owner: values for owner, values in media.items()
+        if values.get("media_kind", {}).get("value") == "srtp_session"
+    }
+    streams = {
+        owner: values for owner, values in media.items()
+        if values.get("media_kind", {}).get("value") == "srtp_stream"
+    }
+    assert {values["protocol"]["value"] for values in sessions.values()} == {"rtp", "rtcp"}
+    assert len(sessions) == 2
+    assert len(streams) >= 3
+    assert len(set(streams)) == len(streams)
+    assert all(values["session_id"]["value"] in owner for owner, values in streams.items())
+    assert len({values["ssrc_id"]["value"] for values in streams.values()}) == len(streams)
+
+    queues = {
+        values["queue_kind"]["value"]
+        for owner, values in owners.items()
+        if owner.startswith(f"queue:{scope}:") and "queue_kind" in values
+    }
+    assert "packet" in queues
+    assert "ice-dtls" in queues
+    worker = owners[f"worker:{scope}:{snapshot['worker_lane_id']}"]
+    assert worker["lane_kind"]["value"] == "serialized"
+    assert worker["running"]["value"] is False
+    trace_health = owners[f"tracing:{scope}"]
+    assert trace_health["admitted"]["value"] is True
+    assert trace_health["dispatcher_drops"]["value"] == 0
+    assert trace_health["dispatcher_observer_failures"]["value"] == 0
+
+    transitions = snapshot["transitions"]
+    assert transitions
+    for entity_id in {item["entity_id"] for item in transitions}:
+        history = [item for item in transitions if item["entity_id"] == entity_id]
+        assert [item["revision"] for item in history] == list(range(1, len(history) + 1))
+        assert all(
+            previous["to_state"] == current["from_state"]
+            for previous, current in zip(history, history[1:])
+        )
+        assert history[-1]["to_state"] == machines[entity_id]["state"]
+    assert [
+        (item["from_state"], item["to_state"])
+        for item in transitions if item["entity_id"] == f"ice:{scope}"
+    ] == [("new", "checking"), ("checking", "connected")]
+
+
+def _assert_received_media_observability(observed: dict) -> None:
+    scope = "pc-av1-answerer"
+    before = _facet_owners(observed["answerer_before_media"])
+    before_flush = _facet_owners(observed["answerer_after_media_before_flush"])
+    after = _facet_owners(observed["answerer"])
+
+    # Packet success stays in the cadence aggregate: seven packets do not
+    # revise projection facets seven times.  The first flush publishes one
+    # absolute queue-health revision for the actual SRTP stream.
+    def srtp_delivery_owners(owners):
+        return {
+            owner: values for owner, values in owners.items()
+            if owner.startswith(f"queue:{scope}:srtp-rtp-")
+        }
+
+    assert srtp_delivery_owners(before) == {}
+    assert srtp_delivery_owners(before_flush) == {}
+    delivery = srtp_delivery_owners(after)
+    assert len(delivery) == 1
+    values = next(iter(delivery.values()))
+    assert values["delivered_packets"]["value"] == observed["packet_count"]
+    assert values["dropped_packets"]["value"] == 0
+    assert values["delivery_health"]["value"] == "healthy"
+    assert {item["revision"] for item in values.values()} == {1}
+
+    queue_kinds = {
+        values["queue_kind"]["value"]
+        for owner, values in after.items()
+        if owner.startswith(f"queue:{scope}:") and "queue_kind" in values
+    }
+    assert "ice-rtp" in queue_kinds
 
 
 async def _run_av1_rtp_rtcp_twcc_scenario():
@@ -122,6 +286,8 @@ async def _run_av1_rtp_rtcp_twcc_scenario():
             # independently from the local sender encoding; target the
             # negotiated receiver stream to test the actual delivery path.
             media_ssrc = remote_track.ssrc
+
+            before_media = await _observability_snapshot(answerer)
 
             frame = _synthetic_av1_frame(payload_size=500)
             perf_mark("media", "frame", "generated", metadata={"counter.media.frames": 1})
@@ -166,6 +332,8 @@ async def _run_av1_rtp_rtcp_twcc_scenario():
                     DEFAULT_EXT_MAP,
                 ))
 
+            after_media_before_flush = await _observability_snapshot(answerer)
+
             assert [packet.payload_type for packet in received] == [AV1_PAYLOAD_TYPE] * len(packets)
             assert [packet.ssrc for packet in received] == [media_ssrc] * len(packets)
             assert [packet.sequence_number for packet in received] == [packet.sequence_number for packet in packets]
@@ -197,8 +365,66 @@ async def _run_av1_rtp_rtcp_twcc_scenario():
             assert _confirmed_twcc_sequences(parsed_feedback[0]) == transport_sequences
             perf_mark("scenario", "run", "completed", metadata={"scenario": AV1_E2E_BASELINE["scenario"]})
 
+            observability = {
+                "offerer": await _observability_snapshot(offerer, flush=True),
+                "answerer": await _observability_snapshot(answerer, flush=True),
+                "answerer_before_media": before_media,
+                "answerer_after_media_before_flush": after_media_before_flush,
+                "packet_count": len(received),
+            }
+
     summary = build_summary_from_baseline(recorder, AV1_E2E_BASELINE)
-    return summary, recorder
+    return summary, recorder, observability
+
+
+async def _observability_snapshot(peer: PeerDriver, *, flush: bool = False) -> dict:
+    def snapshot(_peer):
+        runtime = current_execution_scope()
+        assert runtime is not None
+        if flush:
+            runtime.trace_patch_flush()
+        return {
+            "machines": {
+                item.entity_id: {
+                    "machine_type": item.machine_type,
+                    "state": item.state,
+                    "revision": item.revision,
+                }
+                for item in runtime.projection.machines.snapshots()
+            },
+            "transitions": [
+                {
+                    "entity_id": item.entity_id,
+                    "machine_type": item.machine_type,
+                    "from_state": item.from_state,
+                    "to_state": item.to_state,
+                    "revision": item.revision,
+                }
+                for item in runtime.projection.machines.transition_snapshots()
+            ],
+            "facets": {
+                item.facet_id: {
+                    "owner": item.owner_entity_id,
+                    "value": item.value,
+                    "revision": item.revision,
+                }
+                for item in runtime.projection.facets.snapshots()
+            },
+            "groups": [
+                {
+                    "operation": item.operation,
+                    "owner": item.owner_entity_id,
+                    "parent_type": item.parent_ref_type,
+                    "parent_id": item.parent_ref_id,
+                    "calls": item.calls,
+                    "revision": item.revision,
+                }
+                for item in runtime.activity_groups.snapshots()
+            ],
+            "worker_lane_id": runtime.worker_lane.observability_id,
+        }
+
+    return await peer.call(snapshot)
 
 
 async def _setup_synthetic_video(peer: PeerDriver) -> None:

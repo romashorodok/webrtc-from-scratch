@@ -1,11 +1,13 @@
 import { useState } from "react";
 import type {
   GroupSnapshot, TraceCapture, TraceControl, TraceFacet, TraceMachine,
+  TraceMachineTransition,
 } from "./trace";
 import { NormalizedTraceView } from "./TraceNormalizedView";
 
 type TraceOverlayProps = {
   machinesById?: Map<string, TraceMachine>;
+  transitions?: TraceMachineTransition[];
   controlsById?: Map<string, TraceControl>;
   groupsById?: Map<number, GroupSnapshot>;
   facetsById?: Map<string, TraceFacet>;
@@ -21,6 +23,7 @@ export function TraceOverlay(props: TraceOverlayProps) {
   const [open, setOpen] = useState(false);
   const count =
     (props.machinesById?.size ?? 0) + (props.controlsById?.size ?? 0) +
+    (props.transitions?.length ?? 0) +
     (props.groupsById?.size ?? 0) + (props.facetsById?.size ?? 0) +
     (props.capturesById?.size ?? 0) + Object.keys(props.diagnostics ?? {}).length;
 
@@ -37,6 +40,7 @@ export function TraceOverlay(props: TraceOverlayProps) {
           </header>
           <NormalizedTraceView
             machinesById={props.machinesById ?? new Map()}
+            transitions={props.transitions ?? []}
             controlsById={props.controlsById ?? new Map()}
             groupsById={props.groupsById ?? new Map()}
             facetsById={props.facetsById ?? new Map()}

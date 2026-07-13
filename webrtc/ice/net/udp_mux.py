@@ -1,4 +1,5 @@
 import asyncio
+import secrets
 import socket
 from typing import override, Any
 
@@ -7,6 +8,7 @@ from webrtc.logger import get_logger, Component
 from webrtc.config import get_config
 from webrtc.performance import ObservedComponent, event_loop
 from webrtc.tracing import perf_mark
+from webrtc.domain_events import QueueStateChanged, emit_domain_event
 
 from .interface import Interface
 from .types import (
@@ -20,9 +22,28 @@ from .types import (
 
 
 class Interceptor:
-    def __init__(self, maxsize: int = 0, *, drop_oldest: bool = False):
+    def __init__(
+        self, maxsize: int = 0, *, drop_oldest: bool = False,
+        queue_id: str = "packet",
+    ):
         self._queue = asyncio.Queue[Packet](maxsize=maxsize)
         self._drop_oldest = drop_oldest
+        self._queue_id = queue_id
+        self._observability_id = f"{queue_id}:{secrets.token_hex(6)}"
+        self._high_water = 0
+
+    def _publish_depth(self) -> None:
+        depth = self._queue.qsize()
+        self._high_water = max(self._high_water, depth)
+        emit_domain_event(
+            QueueStateChanged, queue_id=self._queue_id,
+            queue_instance_id=self._observability_id,
+            depth=depth, high_water=self._high_water,
+        )
+
+    @property
+    def observability_id(self) -> str:
+        return self._observability_id
 
     def put_nowait(self, pkt: Packet):
         if self._drop_oldest and self._queue.full():
@@ -34,12 +55,17 @@ class Interceptor:
             except asyncio.QueueEmpty:
                 pass
         self._queue.put_nowait(pkt)
+        self._publish_depth()
 
     async def put(self, pkt: Packet):
-        return await self._queue.put(pkt)
+        result = await self._queue.put(pkt)
+        self._publish_depth()
+        return result
 
     async def get(self) -> Packet:
-        return await self._queue.get()
+        result = await self._queue.get()
+        self._publish_depth()
+        return result
 
 
 class InterfaceMuxUDPHandler(asyncio.DatagramProtocol):

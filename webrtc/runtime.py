@@ -36,12 +36,13 @@ from .runtime_services import (
     use_execution_scope,
 )
 from .tracing.service import TraceService, TraceSubscription
-from .tracing.events import JournalSubscription, TracePatchTransport
+from .tracing.events import JournalSubscription, ObservableDiagnostics, TracePatchTransport
 from .activity import ActivityGroupStore, DrainedMetricSinkAdapter
 from .observability import ObservabilityService, ProducerDot
 from .state_machine import NullTransitionController
-from .domain_events import get_domain_event_dispatcher
+from .domain_events import TraceHealthChanged, emit_domain_event, get_domain_event_dispatcher
 from .state_facets import DomainStateFacetAdapter, StateTaskProjection
+from .machine_specs import MACHINE_SPECS
 from .diagnostic_capture import CaptureAuthorization, DiagnosticCaptureManager
 
 T = TypeVar("T")
@@ -132,14 +133,16 @@ class Runtime(ExecutionScope):
         trace_subscriber_batch_interval: float = 1.0,
         trace_patch_cadence: float = 0.15,
         trace_journal_limit: int = 128,
+        trace_transition_journal_limit: int = 512,
         trace_patch_record_budget: int = 256,
         trace_patch_byte_budget: int = 256 * 1024,
+        srtp_delivery_facet_cadence: float = 1.0,
         task_observers=(),
         failure_observers=(),
     ) -> None:
         self.scope_id = scope_id
         self.shutdown_timeout = shutdown_timeout
-        self.diagnostics: Counter[str] = Counter()
+        self.diagnostics: Counter[str] = ObservableDiagnostics()
         self.runtime_epoch = time.monotonic_ns()
         self.observability_epoch = 1
         # Runtime-owned projection operations are one ordered producer.  A new
@@ -162,6 +165,7 @@ class Runtime(ExecutionScope):
             # API removal; default task lifecycle never enters it.
             [*task_observers],
             [self, *failure_observers],
+            diagnostics=self.diagnostics,
         )
 
         executor_resource, executor_owned = self._resource(executor, name="executor")
@@ -184,6 +188,7 @@ class Runtime(ExecutionScope):
         self.projection = ObservabilityService(
             runtime_epoch=self.runtime_epoch, scope_id=scope_id,
             diagnostics=self.diagnostics, activity_groups=self.activity_groups,
+            transition_limit=trace_transition_journal_limit,
         )
         self.capture_manager = DiagnosticCaptureManager(
             diagnostics=self.diagnostics,
@@ -201,10 +206,15 @@ class Runtime(ExecutionScope):
             journal_limit=trace_journal_limit,
             max_batch_records=trace_patch_record_budget,
             max_batch_bytes=trace_patch_byte_budget,
+            health_callback=self._trace_health_changed,
         )
         self.activity_groups.set_dirty_callback(self.trace_transport.dirty)
         self.projection.set_dirty_callback(self.trace_transport.dirty)
         self.capture_manager.set_dirty_callback(self.trace_transport.dirty)
+        self._diagnostic_health: tuple[int, int] | None = None
+        self._publishing_diagnostic_health = False
+        self._event_loop: asyncio.AbstractEventLoop | None = None
+        self.diagnostics.set_dirty_callback(self._diagnostics_changed)
 
         if transition_controller is None:
             controller, controller_owned = NullTransitionController(), True
@@ -233,7 +243,9 @@ class Runtime(ExecutionScope):
         self._scope_manager = None
         self._execution_token = None
         self.observability = RuntimeObservability(self)
-        self._state_facet_adapter = DomainStateFacetAdapter(self)
+        self._state_facet_adapter = DomainStateFacetAdapter(
+            self, srtp_delivery_cadence=srtp_delivery_facet_cadence
+        )
         self._state_task_projection = StateTaskProjection(self)
         self.task_scheduler.observers.append(self._state_task_projection)
 
@@ -241,6 +253,79 @@ class Runtime(ExecutionScope):
         """Return the next dot for the Runtime's event-loop-owned producer."""
         self._producer_sequence += 1
         return ProducerDot(self.runtime_epoch, 1, self._producer_sequence)
+
+    def _trace_health_changed(
+        self, admitted: bool, subscriber_count: int, journal_depth: int
+    ) -> None:
+        dispatcher_health = (
+            self.diagnostics["domain_dispatcher_dropped"],
+            self.diagnostics["domain_dispatcher_observer_failures"],
+        )
+        suspension = self.diagnostics.suspend_notifications()
+        with suspension:
+            emit_domain_event(
+                TraceHealthChanged, admitted=admitted,
+                subscriber_count=subscriber_count, journal_depth=journal_depth,
+                dispatcher_drops=self.diagnostics["domain_dispatcher_dropped"],
+                dispatcher_observer_failures=self.diagnostics[
+                    "domain_dispatcher_observer_failures"
+                ],
+            )
+        # A failing observer can increment dispatcher diagnostics while the
+        # health event is being delivered. Notifications are suspended above
+        # to prevent a health-event feedback loop, so reconcile that increment
+        # directly into the semantic facet once, without emitting another
+        # domain event that would fail again.
+        current = (
+            self.diagnostics["domain_dispatcher_dropped"],
+            self.diagnostics["domain_dispatcher_observer_failures"],
+        )
+        self._diagnostic_health = current
+        if current != dispatcher_health and self._root_context is not None:
+            scope = self.scope_id or self._root_context.trace_id
+            self.projection.merge_values(
+                f"tracing:{scope}", self.new_producer_dot(), {
+                    "dispatcher_drops": current[0],
+                    "dispatcher_observer_failures": current[1],
+                },
+            )
+
+    def _diagnostics_changed(self) -> None:
+        owner_loop = self._event_loop
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if owner_loop is not None and running_loop is not owner_loop:
+            if not owner_loop.is_closed():
+                try:
+                    owner_loop.call_soon_threadsafe(self._diagnostics_changed)
+                except RuntimeError:
+                    pass
+            return
+        self.trace_transport.dirty()
+        current = (
+            self.diagnostics["domain_dispatcher_dropped"],
+            self.diagnostics["domain_dispatcher_observer_failures"],
+        )
+        if (
+            current == self._diagnostic_health
+            or self._publishing_diagnostic_health
+            or self._root_context is None
+        ):
+            return
+        self._diagnostic_health = current
+        scope = self.scope_id or self._root_context.trace_id
+        self._publishing_diagnostic_health = True
+        try:
+            self.projection.merge_values(
+                f"tracing:{scope}", self.new_producer_dot(), {
+                    "dispatcher_drops": current[0],
+                    "dispatcher_observer_failures": current[1],
+                },
+            )
+        finally:
+            self._publishing_diagnostic_health = False
 
     @staticmethod
     def _resource(value, *, name: str):
@@ -275,6 +360,7 @@ class Runtime(ExecutionScope):
         # No await occurs before activation, so task creation and close cannot
         # observe a half-activated Runtime.
         self.state = ScopeState.ACTIVE
+        self._event_loop = asyncio.get_running_loop()
         self._scope_manager = use_execution_scope(self)
         self._scope_activation = self._scope_manager.__enter__()
         root = ExecutionContext(
@@ -284,8 +370,16 @@ class Runtime(ExecutionScope):
         )
         self._root_context = root
         self.projection.bind_trace(root.trace_id)
-        get_domain_event_dispatcher().add_observer(self._state_facet_adapter)
+        peer_identity = self.scope_id or root.trace_id
+        self.projection.machines.register(
+            f"peer:{peer_identity}", MACHINE_SPECS["peer"],
+            epoch=self.observability_epoch,
+        )
+        dispatcher = get_domain_event_dispatcher()
+        dispatcher.add_diagnostic_sink(self.diagnostics)
+        dispatcher.add_observer(self._state_facet_adapter)
         self._execution_token = set_execution_context(root)
+        self._trace_health_changed(True, 0, self.trace_transport.journal_depth)
         spec = TaskSpec("execution.root", "scope", {"scope_id": self.scope_id}, False)
         self.task_registry.add(TaskEntry(root, asyncio.current_task(), False, spec))
         self.task_scheduler._notify(
@@ -446,6 +540,7 @@ class Runtime(ExecutionScope):
 
     def trace_patch_flush(self):
         """Drain dirty schema-2 records once and fan out the shared batches."""
+        self._state_facet_adapter.flush_srtp_delivery()
         return self.trace_transport.flush()
 
     def trace_snapshot(self):
@@ -503,8 +598,13 @@ class Runtime(ExecutionScope):
                 self.task_registry.remove(root.task_id)
 
             self._tracing.close()
-            get_domain_event_dispatcher().remove_observer(self._state_facet_adapter)
+            # Publish the terminal tracing-health state while the semantic
+            # adapter is still attached.
             self.trace_transport.close()
+            dispatcher = get_domain_event_dispatcher()
+            dispatcher.remove_observer(self._state_facet_adapter)
+            dispatcher.remove_diagnostic_sink(self.diagnostics)
+            self._state_facet_adapter.close()
             self.capture_manager.close()
             self.drain_external_metrics()
             if self._owns_metric_sink:
