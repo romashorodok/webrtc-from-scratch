@@ -2,15 +2,19 @@ import { useEffect, useRef, useState } from "react";
 import { attachStream, parseJson } from "./media";
 import { Signal } from "./Signal";
 import { normalizeRemoteDescription } from "./sdp";
-import { traceDeleteFailureMessage, type TraceDeleteResultPayload } from "./toast";
-import { traceEventsFromBatch, useTraceState } from "./useTraceState";
+import { useTraceState } from "./useTraceState";
 
 export function useClientSession() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const signalRef = useRef<Signal | null>(null);
   const [status, setStatus] = useState("Disconnected");
   const [toasts, setToasts] = useState<string[]>([]);
-  const { enqueueTraceEvent, enqueueTraceEvents, performanceEvents, groups, summaries, tasks } = useTraceState();
+  const {
+    enqueueTraceBatch,
+    enqueueTraceSnapshot, enqueueTraceResyncRequired,
+    machinesById, controlsById, groupsById, facetsById, capturesById,
+    operationNamesById, diagnostics, topologyVersion, valueVersion,
+  } = useTraceState((request) => signalRef.current?.send("trace:resync_request", request));
 
   useEffect(() => {
     const signal = new Signal();
@@ -37,37 +41,16 @@ export function useClientSession() {
     const unsubscribeConnected = signal.on("connected", () => {
       setStatus("Connected to signaling server");
     });
-    const unsubscribeTraceInit = signal.on("trace:init", (data) => {
-      enqueueTraceEvent("trace:init", data);
-    });
-    const unsubscribeTraceUpdate = signal.on("trace:update", (data) => {
-      enqueueTraceEvent("trace:update", data);
-    });
-    const unsubscribeTraceComplete = signal.on("trace:complete", (data) => {
-      enqueueTraceEvent("trace:complete", data);
-    });
-    const unsubscribeTraceDelete = signal.on("trace:delete", (data) => {
-      enqueueTraceEvent("trace:delete", data);
-    });
-    const unsubscribeTraceDeleteResult = signal.on("trace:delete_result", (data) => {
-      const payload = parseJson<TraceDeleteResultPayload>(data);
-      if (payload?.success === false) {
-        setToasts((previous) => [...previous, traceDeleteFailureMessage(payload)]);
-      }
-      enqueueTraceEvent("trace:delete_result", data);
-    });
-    const unsubscribeTraceBatch = signal.on("trace:batch", (data) => {
-      const events = traceEventsFromBatch(data)
-        .map((event) => {
-          if (event.event === "trace:delete_result") {
-            const payload = parseJson<TraceDeleteResultPayload>(event.data);
-            if (payload?.success === false) {
-              setToasts((previous) => [...previous, traceDeleteFailureMessage(payload)]);
-            }
-          }
-          return { event: event.event, data: event.data };
-        });
-      enqueueTraceEvents(events);
+    const unsubscribeTraceBatch = signal.on("trace:batch", enqueueTraceBatch);
+    const unsubscribeTraceSnapshot = signal.on("trace:snapshot", enqueueTraceSnapshot);
+    const unsubscribeTraceResyncRequired = signal.on(
+      "trace:resync_required", enqueueTraceResyncRequired,
+    );
+    const unsubscribeCaptureResult = signal.on("trace:capture_result", (data) => {
+      const result = parseJson<{ success?: boolean; capture_id?: number; error?: string }>(data);
+      setToasts((previous) => [...previous, result?.success
+        ? `Diagnostic capture #${result.capture_id} authorized`
+        : `Capture rejected: ${result?.error ?? "unknown error"}`]);
     });
 
     pc.onicecandidate = (event) => {
@@ -96,17 +79,18 @@ export function useClientSession() {
     return () => {
       unsubscribeOffer();
       unsubscribeConnected();
-      unsubscribeTraceInit();
-      unsubscribeTraceUpdate();
-      unsubscribeTraceComplete();
-      unsubscribeTraceDelete();
-      unsubscribeTraceDeleteResult();
       unsubscribeTraceBatch();
+      unsubscribeTraceSnapshot();
+      unsubscribeTraceResyncRequired();
+      unsubscribeCaptureResult();
       signal.close();
       pc.close();
       attachStream(videoRef.current, null);
     };
-  }, [enqueueTraceEvent, enqueueTraceEvents]);
+  }, [
+    enqueueTraceBatch,
+    enqueueTraceSnapshot, enqueueTraceResyncRequired,
+  ]);
 
   const startNegotiation = () => {
     signalRef.current?.send("negotiate", undefined);
@@ -125,6 +109,10 @@ export function useClientSession() {
     signalRef.current?.send("trace:delete", { task_id: taskId });
   };
 
+  const requestTraceCapture = (request: Record<string, unknown>) => {
+    signalRef.current?.send("trace:capture_request", request);
+  };
+
   const dismissToast = (index: number) => {
     setToasts((previous) => previous.filter((_item, current) => current !== index));
   };
@@ -137,10 +125,16 @@ export function useClientSession() {
     status,
     toasts,
     dismissToast,
-    performanceEvents,
-    groups,
-    summaries,
-    tasks,
+    requestTraceCapture,
+    machinesById,
+    controlsById,
+    groupsById,
+    facetsById,
+    capturesById,
+    operationNamesById,
+    diagnostics,
+    topologyVersion,
+    valueVersion,
     videoRef,
   };
 }

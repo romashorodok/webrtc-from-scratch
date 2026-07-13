@@ -23,10 +23,11 @@ def test_srtp_crypto_is_metaclass_offloaded_and_aggregated():
         async with runtime:
             trace_id = runtime.root_context.trace_id
             await owner()
-        groups = runtime.metric_sink.snapshots()
+        groups = runtime.activity_groups.snapshots()
         operations = {item.operation for item in groups}
-        assert {"srtp.encrypt", "srtp.encrypt.queue", "srtp.encrypt.worker",
-                "srtp.decrypt", "srtp.decrypt.queue", "srtp.decrypt.worker"} <= operations
+        assert operations == {"srtp.encrypt", "srtp.decrypt"}
+        assert all(item.total_worker_ns > 0 for item in groups)
+        assert all(item.total_queue_ns >= 0 for item in groups)
         assert all(item.trace_id == trace_id for item in groups)
     asyncio.run(scenario())
 
@@ -39,7 +40,7 @@ def test_srtp_failure_is_recorded_and_original_exception_is_reraised():
             with pytest.raises(Exception): await sender.decrypt(bytes(encrypted))
         async with runtime:
             await owner()
-        failed = next(item for item in runtime.metric_sink.snapshots()
+        failed = next(item for item in runtime.activity_groups.snapshots()
                       if item.operation == "srtp.decrypt")
         assert failed.errors == 1 and failed.latest_failure_class
     asyncio.run(scenario())
@@ -54,7 +55,7 @@ def test_packet_rate_calls_do_not_create_task_nodes():
             gate.set(); await asyncio.sleep(0)
         async with runtime:
             await owner()
-        group = next(item for item in runtime.metric_sink.snapshots() if item.operation == "srtp.encrypt")
+        group = next(item for item in runtime.activity_groups.snapshots() if item.operation == "srtp.encrypt")
         assert group.calls == 100
         assert runtime.task_registry.task_ids() == ()
     asyncio.run(scenario())

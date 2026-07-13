@@ -6,7 +6,9 @@ Remove `PeerContext` completely and centralize execution-policy compilation in
 `ObservedMeta`, exposed through a stateless `ObservedComponent` base class.
 
 The metaclass instruments every eligible synchronous and asynchronous component
-method. It creates full live trace nodes for method calls, automatically sends
+method. At class creation it compiles each method to state, aggregate, exact,
+or off observation detail; only explicitly addressable or temporarily captured
+work requires a full live trace node. It automatically sends
 eligible synchronous calls to the active execution scope's worker lane, and
 schedules only explicitly marked autonomous routines. It does not own mutable
 execution resources.
@@ -37,8 +39,12 @@ executors, registries, locks, worker lanes, or shutdown state.
   `ObservedComponent`; exclude properties and most dunder methods.
 - Permit explicit `@unobserved` exclusions for recursion-sensitive
   infrastructure and measured hot paths.
-- Create a full trace node for every observed method call. Retain only live
-  nodes, stream completion events, and retain bounded aggregate metrics.
+- Account for every eligible observed method call, normally through one stable
+  aggregate activity group. Create exact live nodes only for explicit control
+  handles, bounded diagnostic capture, and operations whose identity is needed
+  for cancellation or failure diagnosis. `@task` ownership remains internal;
+  `@task(state=...)` projects its owner machine while ordinary helper tasks are
+  off in the frontend observation plane.
 - Outside an active `Runtime`, observed methods execute normally and do not
   record traces or metrics.
 - Inside an active `Runtime`, eligible synchronous component methods return an
@@ -117,8 +123,11 @@ ObservedComponent method / @task / @unobserved
        `-- Diagnostics
 ```
 
-`ObservedMeta` compiles method execution policy. It initiates scheduling for
-`@task` entry points, creates method trace nodes, and routes synchronous calls.
+`ObservedMeta` compiles method execution and immutable observation policy. It
+initiates scheduling for `@task` entry points and routes synchronous calls.
+The Stage 1 compatibility implementation may still execute the old exact-node
+path, but compiled metadata—not component calls into Runtime services—selects
+the eventual state, aggregate, exact, or off path.
 Resource ownership remains in an explicitly activated execution scope.
 
 This behavior is automatic for every class inheriting `ObservedComponent`.

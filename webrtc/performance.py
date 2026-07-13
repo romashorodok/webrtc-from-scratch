@@ -1,17 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import inspect
+import itertools
 import time
 import uuid
-from collections import OrderedDict, Counter
+from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from threading import RLock
+from threading import Lock, RLock
 from types import MappingProxyType
 from typing import Any, Generic, ParamSpec, Protocol, TypeVar, cast
+
+from .activity import (
+    ActivityGroupRecord,
+    WorkerObservationDelta,
+    begin_local,
+    end_local,
+)
 
 from .runtime_services import (
     FailurePolicy,
@@ -82,65 +91,6 @@ class CaptureMetricSink:
 
 
 @dataclass(frozen=True, slots=True)
-class GroupSnapshot:
-    trace_id: str
-    task_id: str
-    group: str
-    operation: str
-    calls: int
-    successes: int
-    cancellations: int
-    errors: int
-    total_duration_ms: float
-    average_duration_ms: float
-    min_duration_ms: float
-    max_duration_ms: float
-    latest_failure_class: str | None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {field: getattr(self, field) for field in self.__dataclass_fields__}
-
-
-class MetricGroupAggregator:
-    def __init__(self, max_groups: int = 4096) -> None:
-        self.max_groups = max(1, max_groups)
-        self._groups: OrderedDict[tuple[str, str, str, str], dict[str, Any]] = OrderedDict()
-        self.diagnostics: Counter[str] = Counter()
-        self._lock = RLock()
-
-    def emit(self, event: MetricEvent) -> None:
-        try:
-            key = (event.trace_id, event.task_id, event.group or event.operation, event.operation)
-            with self._lock:
-                value = self._groups.pop(key, None)
-                if value is None:
-                    if len(self._groups) >= self.max_groups:
-                        self._groups.popitem(last=False)
-                        self.diagnostics["evicted_groups"] += 1
-                    value = {"calls": 0, "successes": 0, "cancellations": 0, "errors": 0,
-                             "total": 0.0, "min": float("inf"), "max": 0.0, "failure": None}
-                value["calls"] += 1
-                value["total"] += event.duration_ms
-                value["min"] = min(value["min"], event.duration_ms)
-                value["max"] = max(value["max"], event.duration_ms)
-                if event.outcome == "success": value["successes"] += 1
-                elif event.outcome == "cancelled": value["cancellations"] += 1
-                else:
-                    value["errors"] += 1
-                    value["failure"] = event.attributes.get("exception")
-                self._groups[key] = value
-        except Exception:
-            self.diagnostics["aggregation_failures"] += 1
-
-    def snapshots(self, trace_id: str | None = None) -> tuple[GroupSnapshot, ...]:
-        with self._lock:
-            items = list(self._groups.items())
-        return tuple(GroupSnapshot(*key, v["calls"], v["successes"], v["cancellations"],
-            v["errors"], v["total"], v["total"] / v["calls"], v["min"], v["max"], v["failure"])
-            for key, v in items if trace_id is None or key[0] == trace_id)
-
-
-@dataclass(frozen=True, slots=True)
 class CallInfo:
     args: tuple[Any, ...]
     kwargs: Mapping[str, Any]
@@ -164,6 +114,74 @@ class PerformanceSpec:
     on_error: Callable[[ErrorInfo], Mapping[str, Any]] | None = None
 
 
+class TraceDetail(str, Enum):
+    STATE = "state"
+    AGGREGATE = "aggregate"
+    EXACT = "exact"
+    OFF = "off"
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledObservation:
+    operation_id: int
+    operation: str
+    group: str
+    detail: TraceDetail
+    slow_ms: float | None
+    capture_failures: bool
+    slow_ns: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationSpec:
+    detail: TraceDetail
+    group: str | None = None
+    slow_ms: float | None = None
+    capture_failures: bool = True
+
+
+_operation_ids = itertools.count(1)
+_operation_ids_by_name: dict[str, int] = {}
+_operation_names_by_id: dict[int, str] = {}
+_operation_ids_lock = Lock()
+
+
+def _intern_operation(operation: str) -> int:
+    # This runs only while a class is created, never on an observed call.
+    with _operation_ids_lock:
+        operation_id = _operation_ids_by_name.get(operation)
+        if operation_id is None:
+            operation_id = next(_operation_ids)
+            _operation_ids_by_name[operation] = operation_id
+            _operation_names_by_id[operation_id] = operation
+        return operation_id
+
+
+def compiled_operation_strings() -> Mapping[int, str]:
+    """Snapshot the intern table for a future schema-2 snapshot/patch."""
+    with _operation_ids_lock:
+        return MappingProxyType(dict(_operation_names_by_id))
+
+
+def observe(
+    *, detail: TraceDetail | str, group: str | None = None,
+    slow_ms: float | None = None, capture_failures: bool = True,
+):
+    """Override the automatically selected observation policy for a method."""
+    detail = TraceDetail(detail)
+    if group is not None and not group:
+        raise ValueError("observation group must not be empty")
+    if slow_ms is not None and slow_ms < 0:
+        raise ValueError("slow_ms must be non-negative")
+    spec = ObservationSpec(detail, group, slow_ms, bool(capture_failures))
+
+    def mark(fn):
+        setattr(fn, "__observation_spec__", spec)
+        return fn
+
+    return mark
+
+
 def performance(*, name: str, group: str | None = None, on_call=None, on_success=None, on_error=None):
     if not name:
         raise ValueError("performance name must not be empty")
@@ -179,6 +197,7 @@ class TaskSpec:
     kind: str = "task"
     metadata: Callable[[CallInfo], Mapping[str, Any]] | Mapping[str, Any] | None = None
     failure: FailurePolicy = FailurePolicy.REPORT
+    state: str | None = None
 
 
 class MethodPolicy(str, Enum):
@@ -187,8 +206,12 @@ class MethodPolicy(str, Enum):
 
 
 def task(*, name: str | None = None, kind: str = "task", metadata=None,
-         failure: FailurePolicy = FailurePolicy.REPORT):
-    spec = TaskSpec(name, kind, metadata, FailurePolicy(failure))
+         failure: FailurePolicy = FailurePolicy.REPORT, state: str | None = None):
+    if state is not None:
+        from .machine_specs import TASK_STATE_MACHINE_MAP
+        if state not in TASK_STATE_MACHINE_MAP:
+            raise ValueError(f"unknown observable task state owner: {state}")
+    spec = TaskSpec(name, kind, metadata, FailurePolicy(failure), state)
     def mark(fn):
         if not inspect.iscoroutinefunction(fn):
             raise TypeError("@task requires an async method")
@@ -247,6 +270,144 @@ def _notify_trace(scope, method, event):
         callback(event)
     except Exception:
         scope.diagnostics["trace_failures"] += 1
+
+
+_current_activity_group: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "webrtc_activity_group", default=None
+)
+_worker_observation_delta: contextvars.ContextVar[WorkerObservationDelta | None] = (
+    contextvars.ContextVar("webrtc_worker_observation_delta", default=None)
+)
+
+
+def _aggregate_identity(scope):
+    context = current_execution_context()
+    root = getattr(scope, "root_context", None)
+    owner = getattr(scope, "scope_id", None) or (
+        root.task_id if root is not None else (context.task_id if context is not None else "")
+    )
+    if context is not None:
+        return context.trace_id, owner
+    if root is not None:
+        return root.trace_id, owner
+    return "", getattr(scope, "scope_id", None) or ""
+
+
+def _aggregate_record(scope, policy) -> ActivityGroupRecord:
+    trace_id, owner_id = _aggregate_identity(scope)
+    return scope.activity_groups.resolve(
+        policy,
+        trace_id=trace_id,
+        owner_entity_id=owner_id,
+        parent_ref_id=_current_activity_group.get(),
+        owner_epoch=getattr(scope, "observability_epoch", 1),
+    )
+
+
+def _aggregate_call_info(args, kwargs, spec):
+    if spec is None or not (spec.on_call or spec.on_success or spec.on_error):
+        return None
+    return CallInfo(args, MappingProxyType(dict(kwargs)))
+
+
+def _activity_failed(scope) -> None:
+    scope.diagnostics["activity_failures"] += 1
+
+
+def _finish_activity(
+    scope, finish, record, outcome, duration_ns, finished_ns, failure_class,
+    slow_ns, capture_failures,
+) -> None:
+    try:
+        finish(
+            record, outcome, duration_ns, finished_ns, failure_class,
+            slow_ns, capture_failures,
+        )
+    except Exception:
+        _activity_failed(scope)
+
+
+def _run_aggregate_inline(scope, fn, args, kwargs, spec, policy):
+    delta = _worker_observation_delta.get()
+    started = time.monotonic_ns()
+    try:
+        if delta is None:
+            record = _aggregate_record(scope, policy)
+            scope.activity_groups.begin(record, started)
+        else:
+            record = delta.resolve(policy, _current_activity_group.get())
+            begin_local(record, started)
+    except Exception:
+        _activity_failed(scope)
+        return fn(*args, **kwargs)
+    token = _current_activity_group.set(record.group_id)
+    call = _aggregate_call_info(args, kwargs, spec)
+    if call is not None:
+        _extract_attributes(spec.on_call, call, scope.diagnostics)
+    try:
+        result = fn(*args, **kwargs)
+    except BaseException as error:
+        finished = time.monotonic_ns()
+        outcome = "cancelled" if isinstance(error, asyncio.CancelledError) else "error"
+        if call is not None:
+            _extract_attributes(spec.on_error, ErrorInfo(call, error), scope.diagnostics)
+        finish = scope.activity_groups.end if delta is None else end_local
+        _finish_activity(
+            scope, finish, record, outcome, finished - started, finished,
+            type(error).__name__, policy.slow_ns, policy.capture_failures,
+        )
+        raise
+    else:
+        finished = time.monotonic_ns()
+        if call is not None:
+            _extract_attributes(spec.on_success, SuccessInfo(call, result), scope.diagnostics)
+        finish = scope.activity_groups.end if delta is None else end_local
+        _finish_activity(
+            scope, finish, record, "success", finished - started, finished,
+            None, policy.slow_ns, policy.capture_failures,
+        )
+        return result
+    finally:
+        _current_activity_group.reset(token)
+
+
+async def _invoke_aggregate_async(scope, fn, args, kwargs, spec, policy):
+    started = time.monotonic_ns()
+    try:
+        record = _aggregate_record(scope, policy)
+        scope.activity_groups.begin(record, started)
+    except Exception:
+        _activity_failed(scope)
+        return await fn(*args, **kwargs)
+    token = _current_activity_group.set(record.group_id)
+    call = _aggregate_call_info(args, kwargs, spec)
+    if call is not None:
+        _extract_attributes(spec.on_call, call, scope.diagnostics)
+    try:
+        result = await fn(*args, **kwargs)
+    except BaseException as error:
+        finished = time.monotonic_ns()
+        outcome = "cancelled" if isinstance(error, asyncio.CancelledError) else "error"
+        if call is not None:
+            _extract_attributes(spec.on_error, ErrorInfo(call, error), scope.diagnostics)
+        _finish_activity(
+            scope, scope.activity_groups.end, record,
+            outcome, finished - started, finished, type(error).__name__,
+            policy.slow_ns, policy.capture_failures,
+        )
+        raise
+    else:
+        finished = time.monotonic_ns()
+        if call is not None:
+            _extract_attributes(spec.on_success, SuccessInfo(call, result), scope.diagnostics)
+        _finish_activity(
+            scope, scope.activity_groups.end, record,
+            "success", finished - started, finished, None,
+            policy.slow_ns, policy.capture_failures,
+        )
+        return result
+    finally:
+        _current_activity_group.reset(token)
 
 
 def _start_node(scope, fn, node_type, *, cancelable=False, metadata=None):
@@ -423,8 +584,8 @@ async def _run_worker_call(scope, fn, args, kwargs, spec):
             lane_task.cancel()
             await asyncio.gather(lane_task, return_exceptions=True)
         if not dispatched or physical_completed:
-            elapsed = (time.monotonic_ns() - started) / 1_000_000
-            record_terminal(WorkerCallCompleted("cancelled", elapsed, 0.0, elapsed), "cancelled")
+            elapsed = time.monotonic_ns() - started
+            record_terminal(WorkerCallCompleted("cancelled", elapsed, 0, elapsed), "cancelled")
         raise
     except BaseException as error:
         attributes.update(_extract_attributes(spec.on_error if spec else None,
@@ -433,17 +594,17 @@ async def _run_worker_call(scope, fn, args, kwargs, spec):
         if not terminal_recorded:
             event = completed_event
             if event is None:
-                elapsed = (time.monotonic_ns() - started) / 1_000_000
-                event = WorkerCallCompleted("error", elapsed, 0.0, elapsed, error)
+                elapsed = time.monotonic_ns() - started
+                event = WorkerCallCompleted("error", elapsed, 0, elapsed, error)
             record_terminal(event, "error")
         raise
     else:
         attributes.update(_extract_attributes(spec.on_success if spec else None,
                                               SuccessInfo(call, result), scope.diagnostics))
         if not terminal_recorded:
-            total_ms = (time.monotonic_ns() - started) / 1_000_000
+            total_ns = time.monotonic_ns() - started
             event = completed_event or WorkerCallCompleted(
-                "success", queue_ms, worker_ms, total_ms
+                "success", int(queue_ms * 1_000_000), int(worker_ms * 1_000_000), total_ns
             )
             record_terminal(event, "success")
         return result
@@ -451,6 +612,115 @@ async def _run_worker_call(scope, fn, args, kwargs, spec):
         scope.task_registry.unregister_node_canceller(descriptor.node_id)
         if token is not None:
             reset_execution_context(token)
+
+
+async def _run_aggregate_worker(scope, fn, args, kwargs, spec, policy):
+    started = time.monotonic_ns()
+    try:
+        record = _aggregate_record(scope, policy)
+        scope.activity_groups.begin(record, started)
+    except Exception:
+        _activity_failed(scope)
+        return await scope.worker_lane.run(fn, *args, **kwargs)
+    parent_token = _current_activity_group.set(record.group_id)
+    trace_id, owner_id = _aggregate_identity(scope)
+    call = _aggregate_call_info(args, kwargs, spec)
+    if call is not None:
+        _extract_attributes(spec.on_call, call, scope.diagnostics)
+    dispatched = False
+    physically_completed = False
+    terminal_recorded = False
+    caller_cancelled = False
+    delta_holder: list[WorkerObservationDelta | None] = [None]
+    owner_context = current_execution_context()
+    worker_dot = scope.new_producer_dot()
+
+    def invoke_in_worker():
+        delta = WorkerObservationDelta(record.group_id, worker_dot)
+        delta_holder[0] = delta
+        token = _worker_observation_delta.set(delta)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _worker_observation_delta.reset(token)
+
+    def finish(event: WorkerCallCompleted, outcome: str) -> None:
+        nonlocal terminal_recorded
+        if terminal_recorded:
+            return
+        terminal_recorded = True
+        try:
+            scope.activity_groups.merge_worker_delta(
+                event.observation_delta, trace_id=trace_id,
+                owner_entity_id=owner_id,
+                owner_epoch=getattr(scope, "observability_epoch", 1),
+            )
+            failure = type(event.exception).__name__ if event.exception is not None else None
+            scope.activity_groups.end(
+                record,
+                outcome, event.total_ns, started + event.total_ns, failure,
+                policy.slow_ns, policy.capture_failures,
+                event.queue_ns, event.worker_ns,
+            )
+        except Exception:
+            _activity_failed(scope)
+
+    def on_dispatch() -> None:
+        nonlocal dispatched
+        dispatched = True
+        if owner_context is not None:
+            scope.task_registry.block_cancel(owner_context.task_id)
+
+    def on_complete(event: WorkerCallCompleted) -> None:
+        nonlocal physically_completed
+        physically_completed = True
+        if event.observation_delta is None:
+            event = replace(event, observation_delta=delta_holder[0])
+        finish(event, "cancelled" if caller_cancelled else event.outcome)
+        if owner_context is not None:
+            scope.task_registry.unblock_cancel(owner_context.task_id)
+
+    def on_future(future) -> None:
+        if owner_context is not None:
+            scope.task_registry.add_barrier(owner_context.task_id, future)
+
+    try:
+        result, queue_ms, worker_ms = await scope.worker_lane.run_observed(
+            invoke_in_worker,
+            on_dispatch=on_dispatch,
+            on_future=on_future,
+            on_complete=on_complete,
+        )
+    except asyncio.CancelledError:
+        caller_cancelled = True
+        if not dispatched or physically_completed:
+            elapsed = time.monotonic_ns() - started
+            finish(WorkerCallCompleted(
+                "cancelled", elapsed, 0, elapsed,
+                observation_delta=delta_holder[0],
+            ), "cancelled")
+        raise
+    except BaseException as error:
+        if call is not None:
+            _extract_attributes(spec.on_error, ErrorInfo(call, error), scope.diagnostics)
+        if not terminal_recorded:
+            elapsed = time.monotonic_ns() - started
+            finish(WorkerCallCompleted(
+                "error", elapsed, 0, elapsed, error, delta_holder[0]
+            ), "error")
+        raise
+    else:
+        if call is not None:
+            _extract_attributes(spec.on_success, SuccessInfo(call, result), scope.diagnostics)
+        if not terminal_recorded:
+            elapsed = time.monotonic_ns() - started
+            finish(WorkerCallCompleted(
+                "success", int(queue_ms * 1_000_000), int(worker_ms * 1_000_000), elapsed,
+                observation_delta=delta_holder[0],
+            ), "success")
+        return result
+    finally:
+        _current_activity_group.reset(parent_token)
 
 
 async def _invoke_task_body(scope, fn, args, kwargs, spec):
@@ -502,26 +772,115 @@ def _classify_sync_affinity(fn):
     )
 
 
-def _compile_async_call(fn, spec):
+def _begin_capture(scope, policy):
+    if _worker_observation_delta.get() is not None:
+        return None
+    manager = scope.capture_manager
+    if not manager.has_active_rules:
+        return None
+    _, owner_id = _aggregate_identity(scope)
+    try:
+        projection = getattr(scope, "_state_task_projection", None)
+        entity_alias = (
+            projection.owner_entity_id(owner_id) if projection is not None else None
+        )
+        return manager.begin(
+            policy, owner_id, getattr(scope, "scope_id", None), entity_alias
+        )
+    except Exception:
+        scope.diagnostics["capture_failures"] += 1
+        return None
+
+
+def _capture_metadata(record) -> dict[str, Any]:
+    return {
+        "diagnostic_capture": True,
+        "capture_id": record.capture_id,
+        "capture_record_id": record.record_id,
+        "selector_kind": record.selector_kind,
+        "selector_value": record.selector_value,
+    }
+
+
+async def _invoke_captured_async(scope, fn, args, kwargs, spec, policy, capture):
+    async def invoke(*call_args, **call_kwargs):
+        try:
+            result = await fn(*call_args, **call_kwargs)
+        except BaseException as error:
+            outcome = "cancelled" if isinstance(error, asyncio.CancelledError) else "error"
+            scope.capture_manager.finish(capture, outcome, error)
+            raise
+        else:
+            scope.capture_manager.finish(capture, "success")
+            return result
+    return await _invoke_aggregate_async(scope, invoke, args, kwargs, spec, policy)
+
+
+def _run_captured_inline(scope, fn, args, kwargs, spec, policy, capture):
+    def invoke(*call_args, **call_kwargs):
+        try:
+            result = fn(*call_args, **call_kwargs)
+        except BaseException as error:
+            outcome = "cancelled" if isinstance(error, asyncio.CancelledError) else "error"
+            scope.capture_manager.finish(capture, outcome, error)
+            raise
+        else:
+            scope.capture_manager.finish(capture, "success")
+            return result
+    return _run_aggregate_inline(scope, invoke, args, kwargs, spec, policy)
+
+
+async def _run_captured_worker(scope, fn, args, kwargs, spec, policy, capture):
+    try:
+        result = await _run_aggregate_worker(scope, fn, args, kwargs, spec, policy)
+    except BaseException as error:
+        outcome = "cancelled" if isinstance(error, asyncio.CancelledError) else "error"
+        scope.capture_manager.finish(capture, outcome, error)
+        raise
+    else:
+        scope.capture_manager.finish(capture, "success")
+        return result
+
+
+def _compile_async_call(fn, spec, observation):
     @functools.wraps(fn)
     async def observed(*args, **kwargs):
         scope = current_execution_scope()
         if scope is None:
             return await fn(*args, **kwargs)
-        return await _invoke_observed(scope, fn, args, kwargs, spec)
+        capture = _begin_capture(scope, observation)
+        if capture is not None:
+            return await _invoke_captured_async(
+                scope, fn, args, kwargs, spec, observation, capture
+            )
+        if observation.detail in (TraceDetail.AGGREGATE, TraceDetail.EXACT):
+            return await _invoke_aggregate_async(scope, fn, args, kwargs, spec, observation)
+        return await fn(*args, **kwargs)
     return observed
 
 
-def _compile_sync_call(fn, spec, policy):
+def _compile_sync_call(fn, spec, affinity, observation):
     @functools.wraps(fn)
     def observed(*args, **kwargs):
         scope = current_execution_scope()
         if scope is None:
             return fn(*args, **kwargs)
-        if policy is MethodPolicy.EVENT_LOOP or scope.worker_lane.is_current_worker_context():
-            return _run_inline_call(scope, fn, args, kwargs, spec)
-        return _run_worker_call(scope, fn, args, kwargs, spec)
-    if policy is MethodPolicy.WORKER:
+        inline = affinity is MethodPolicy.EVENT_LOOP or scope.worker_lane.is_current_worker_context()
+        capture = _begin_capture(scope, observation)
+        if capture is not None:
+            if inline:
+                return _run_captured_inline(
+                    scope, fn, args, kwargs, spec, observation, capture
+                )
+            return _run_captured_worker(
+                scope, fn, args, kwargs, spec, observation, capture
+            )
+        if observation.detail not in (TraceDetail.AGGREGATE, TraceDetail.EXACT):
+            return fn(*args, **kwargs)
+        if inline:
+            return _run_aggregate_inline(scope, fn, args, kwargs, spec, observation)
+        return _run_aggregate_worker(scope, fn, args, kwargs, spec, observation)
+    if affinity is MethodPolicy.WORKER:
         # Runtime reflection contract used by generated/application protocols:
         # in an active Runtime this callable's result must be awaited.
         setattr(observed, "__runtime_worker__", True)
@@ -533,7 +892,7 @@ def _compile_sync_call(fn, spec, policy):
     return observed
 
 
-def _compile_task_entry(fn, performance_spec, task_spec):
+def _compile_task_entry(fn, performance_spec, task_spec, observation):
     @functools.wraps(fn)
     def scheduled(*args, **kwargs):
         scope = require_execution_scope()
@@ -541,11 +900,20 @@ def _compile_task_entry(fn, performance_spec, task_spec):
         metadata = task_spec.metadata
         if callable(metadata):
             metadata = _extract_attributes(metadata, call, scope.diagnostics)
+        metadata = dict(metadata or {})
+        if task_spec.state is not None:
+            metadata["_observable_machine"] = task_spec.state
+        if observation.detail in (TraceDetail.AGGREGATE, TraceDetail.EXACT):
+            factory = lambda: _invoke_aggregate_async(
+                scope, fn, args, kwargs, performance_spec, observation
+            )
+        else:
+            factory = lambda: fn(*args, **kwargs)
         return scope.task_scheduler.spawn_factory(
-            lambda: _invoke_task_body(scope, fn, args, kwargs, performance_spec),
+            factory,
             name=task_spec.name or fn.__qualname__,
             kind=task_spec.kind,
-            metadata=metadata or {},
+            metadata=metadata,
             failure=task_spec.failure,
         )
     return scheduled
@@ -558,6 +926,7 @@ def _validate_markers(owner, attr, fn):
         "worker": bool(getattr(fn, "__worker__", False)),
         "task": getattr(fn, "__task_spec__", None) is not None,
         "performance": getattr(fn, "__performance_spec__", None) is not None,
+        "observe": getattr(fn, "__observation_spec__", None) is not None,
     }
     where = f"{owner}.{attr}"
     if marked["unobserved"] and any(value for key, value in marked.items() if key != "unobserved"):
@@ -570,9 +939,35 @@ def _validate_markers(owner, attr, fn):
         raise TypeError(f"@task requires an async method: {where}")
 
 
+def _compile_observation(owner, attr, fn, performance_spec, task_spec):
+    explicit = getattr(fn, "__observation_spec__", None)
+    operation = performance_spec.name if performance_spec is not None else fn.__qualname__
+    if explicit is not None:
+        detail = explicit.detail
+    elif task_spec is not None:
+        detail = TraceDetail.STATE if task_spec.state is not None else TraceDetail.OFF
+    else:
+        detail = TraceDetail.AGGREGATE
+    group = (
+        explicit.group if explicit is not None and explicit.group is not None
+        else performance_spec.group if performance_spec is not None and performance_spec.group
+        else operation
+    )
+    return CompiledObservation(
+        _intern_operation(operation), operation, group, detail,
+        explicit.slow_ms if explicit is not None else None,
+        explicit.capture_failures if explicit is not None else True,
+        int(explicit.slow_ms * 1_000_000)
+        if explicit is not None and explicit.slow_ms is not None else None,
+    )
+
+
 class ObservedMeta(type):
     def __new__(mcls, name, bases, namespace, **kwargs):
         cls = super().__new__(mcls, name, bases, namespace, **kwargs)
+        observations = {}
+        for base in bases:
+            observations.update(getattr(base, "__observations__", {}))
         for attr, descriptor in namespace.items():
             if attr == "__init__" or (attr.startswith("__") and attr.endswith("__")):
                 continue
@@ -586,17 +981,24 @@ class ObservedMeta(type):
                 continue
             performance_spec = getattr(fn, "__performance_spec__", None)
             task_spec = getattr(fn, "__task_spec__", None)
+            policy = _compile_observation(name, attr, fn, performance_spec, task_spec)
             if task_spec is not None:
-                wrapped = _compile_task_entry(fn, performance_spec, task_spec)
+                wrapped = _compile_task_entry(fn, performance_spec, task_spec, policy)
             elif inspect.iscoroutinefunction(fn):
-                wrapped = _compile_async_call(fn, performance_spec)
+                wrapped = _compile_async_call(fn, performance_spec, policy)
             else:
-                wrapped = _compile_sync_call(fn, performance_spec, _classify_sync_affinity(fn))
+                wrapped = _compile_sync_call(
+                    fn, performance_spec, _classify_sync_affinity(fn), policy
+                )
             if isinstance(descriptor, staticmethod):
                 wrapped = staticmethod(wrapped)
             elif isinstance(descriptor, classmethod):
                 wrapped = classmethod(wrapped)
+            target = wrapped.__func__ if isinstance(wrapped, (staticmethod, classmethod)) else wrapped
+            setattr(target, "__compiled_observation__", policy)
+            observations[attr] = policy
             setattr(cls, attr, wrapped)
+        cls.__observations__ = MappingProxyType(observations)
         return cls
 
 

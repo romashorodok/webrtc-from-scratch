@@ -44,10 +44,12 @@ class TraceSubscription:
 class TraceService(TaskObserver):
     """Projects neutral runtime lifecycle events into a live-only task tree."""
 
-    def __init__(self, registry: TaskRegistry, *, trace_context_limit: int = 4096,
+    def __init__(self, registry: TaskRegistry, *, peer_id: str | None = None,
+                 trace_context_limit: int = 4096,
                  trace_subscriber_batch_interval: float = 1.0,
                  diagnostics: Counter[str] | None = None) -> None:
         self.registry = registry
+        self.peer_id = peer_id
         self.store = TraceStore(
             context_limit=trace_context_limit, diagnostics=diagnostics
         )
@@ -55,6 +57,10 @@ class TraceService(TaskObserver):
         self.events = TraceEventBus(batch_interval=trace_subscriber_batch_interval)
 
     def task_started(self, event: TaskStarted) -> None:
+        if event.metadata.get("_observable_machine") is not None:
+            # The selected controller is represented by one stable machine,
+            # not a duplicate exact task node.
+            return
         now = time.time(); monotonic = time.monotonic_ns(); context = event.context
         task = TaskTrace(context.trace_id, context.task_id, context.parent_task_id, event.name, event.kind,
                          created_at=now, created_monotonic_ns=monotonic, started_at=now,
@@ -129,12 +135,11 @@ class TraceService(TaskObserver):
         task.transitions.append({"at": task.ended_at, "event": status, "status": status,
                                  "duration_ms": task.duration_ms, **({"error": error} if error else {})})
         if not self.store.update(task): return
-        peer_id = task.metadata.get("peer_id") if isinstance(task.metadata.get("peer_id"), str) else None
         self.events.publish("trace:complete", self._payload(task.trace_id, tasks=[task.to_dict()]))
         ok, promoted = self.store.remove_only(task_id)
         if ok:
             self.events.publish("trace:delete", {"trace_id": task.trace_id, "task_ids": [task_id],
-                "auto_prune": True, **self._peer(peer_id)})
+                "auto_prune": True, **self._peer(self.peer_id)})
             if promoted:
                 self.events.publish("trace:update", self._payload(task.trace_id, tasks=[item.to_dict() for item in promoted]))
 
@@ -198,9 +203,7 @@ class TraceService(TaskObserver):
         return ok
 
     def _payload(self, trace_id: str, **values: Any) -> dict[str, Any]:
-        peer_id = next((task.metadata.get("peer_id") for task in self.store.all_tasks()
-                        if task.trace_id == trace_id and isinstance(task.metadata.get("peer_id"), str)), None)
-        return {"trace_id": trace_id, **values, **self._peer(peer_id)}
+        return {"trace_id": trace_id, **values, **self._peer(self.peer_id)}
 
     @staticmethod
     def _peer(peer_id: str | None) -> dict[str, str]:

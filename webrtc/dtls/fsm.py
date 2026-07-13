@@ -2,12 +2,18 @@ import asyncio
 from contextlib import suppress
 import logging
 import uuid
+import time
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import Protocol
 
 from webrtc.dtls.certificate import Certificate
 from webrtc.performance import ObservedComponent, event_loop, task
-from webrtc.runtime_services import FailurePolicy
+from webrtc.runtime_services import FailurePolicy, current_execution_scope
+from webrtc.machine_specs import MACHINE_SPECS
+from webrtc.observability import MachineTransitionOp
+from webrtc.state_machine import MachineSpec, TransitionCommit, TransitionCheckpoint
+from webrtc.domain_events import DtlsStateChanged, emit_domain_event
 from webrtc.tracing import measure_perf_async
 
 # Structured logging for DTLS handshake
@@ -55,6 +61,29 @@ class FSMState(IntEnum):
     Finished = 4
 
 
+@dataclass(frozen=True, slots=True)
+class StartHandshake:
+    """Start or idempotently wake the one DTLS phase runner."""
+
+
+@dataclass(frozen=True, slots=True)
+class WakeHandshake:
+    reason: str = "network"
+
+
+FSMCommand = StartHandshake | WakeHandshake
+
+DTLS_PHASE_SPEC = MachineSpec(
+    "dtls", "Preparing", {
+        "Preparing": frozenset({"Sending", "Errored"}),
+        "Sending": frozenset({"Sending", "Waiting", "Finished", "Errored"}),
+        "Waiting": frozenset({"Preparing", "Waiting", "Finished", "Errored"}),
+        "Errored": frozenset({"Preparing"}),
+        "Finished": frozenset(),
+    }, frozenset({"Finished"}), frozenset({"cancel_owner", "inject_failure"}),
+)
+
+
 FLIGHT_TRANSITIONS: dict[Flight, FlightTransition] = {
     # Server side
     Flight.FLIGHT0: Flight0(),
@@ -88,11 +117,19 @@ class FSM(ObservedComponent):
 
         self.state = State(remote, certificate, Keypair.generate_P256(), is_server=self.is_server)
 
-        self.handshake_state_transition = asyncio.Queue[FSMState]()
-        self.handshake_state_transition_lock = asyncio.Lock()
-
+        self.commands: asyncio.Queue[FSMCommand] = asyncio.Queue()
         self.handshake_state: FSMState = FSMState.Preparing
+        self.transition_revision = 0
         self.flight: Flight = flight
+
+        scope = current_execution_scope()
+        self._transition_controller = getattr(scope, "transition_controller", None)
+        self._projection = getattr(scope, "projection", None)
+        root = getattr(scope, "root_context", None)
+        identity = getattr(scope, "scope_id", None) or getattr(root, "trace_id", None)
+        self.entity_id = f"dtls:{identity or id(self)}"
+        if self._projection is not None:
+            self._projection.machines.register(self.entity_id, DTLS_PHASE_SPEC)
 
         self.pending_record_layers: list[RecordLayer] | None = None
 
@@ -190,8 +227,7 @@ class FSM(ObservedComponent):
             metadata=metadata,
         ):
             try:
-                async with self.handshake_state_transition_lock:
-                    await self.handshake_state_transition.put(self.handshake_state)
+                await self.commands.put(StartHandshake())
             except Exception:
                 metadata.update(
                     error_stage="state_transition_enqueue",
@@ -318,9 +354,8 @@ class FSM(ObservedComponent):
         self._last_sent_flight = send_batch
 
         # Check if handshake is complete (after sending Flight6 - server Finished)
-        if self.flight == Flight.FLIGHT6 and not self.handshake_complete.is_set():
-            self._complete_handshake()
-
+        if self.flight == Flight.FLIGHT6:
+            return FSMState.Finished
         return FSMState.Waiting
 
     @event_loop
@@ -338,8 +373,6 @@ class FSM(ObservedComponent):
                         f"client_salt={len(self._srtp_keying_material.client_write_salt)}B, "
                         f"server_salt={len(self._srtp_keying_material.server_write_salt)}B")
 
-            # Signal handshake completion
-            self.handshake_complete.set()
             logger.info("DTLS handshake complete!")
         except Exception as e:
             logger.error(f"Error deriving SRTP keys: {e}")
@@ -372,7 +405,6 @@ class FSM(ObservedComponent):
             # Check if handshake is complete (client-side: Flight5.parse returns None)
             if new_flight is None:
                 logger.info("FSM: Client-side handshake complete (Flight5 received server Finished)")
-                self._complete_handshake()
                 return FSMState.Finished
 
             # If parse() returns the same flight, it means we received retransmitted
@@ -408,64 +440,99 @@ class FSM(ObservedComponent):
             logger.error(f"transition Flight{flight} error: {e}")
             return FSMState.Errored
 
-        # If we're at Flight 6 and handshake is complete, we're done
-        if self.flight == Flight.FLIGHT6 and self.handshake_complete.is_set():
-            logger.info("FSM: Handshake complete, transitioning to Finished state")
-            return FSMState.Finished
-
         return FSMState.Preparing
 
     async def finish(self) -> FSMState: ...
 
+    async def _step(self) -> FSMState:
+        match self.handshake_state:
+            case FSMState.Preparing:
+                return await self.prepare()
+            case FSMState.Sending:
+                return await self.send()
+            case FSMState.Waiting:
+                return await self.wait()
+            case FSMState.Errored:
+                logger.error("FSM Error occurred, retrying...")
+                await asyncio.sleep(4)
+                return FSMState.Preparing
+            case FSMState.Finished:
+                return FSMState.Finished
+        raise RuntimeError(f"unknown DTLS state {self.handshake_state!r}")
+
+    @event_loop
+    def _checkpoint(
+        self, previous: FSMState, proposed: FSMState, revision: int, phase: str
+    ) -> TransitionCheckpoint:
+        factory = getattr(self._transition_controller, "checkpoint", None)
+        values = dict(
+            entity_id=self.entity_id, machine_type="dtls",
+            from_state=previous.name, to_state=proposed.name,
+            revision=revision, phase=phase,
+            allowed_actions=DTLS_PHASE_SPEC.test_actions,
+        )
+        if factory is not None:
+            return factory(**values)
+        return TransitionCheckpoint(0, **values)
+
+    @event_loop
+    def _commit(self, proposed: FSMState, command: FSMCommand) -> TransitionCommit:
+        previous = self.handshake_state
+        DTLS_PHASE_SPEC.validate(previous.name, proposed.name)
+        self.handshake_state = proposed
+        self.transition_revision += 1
+        committed = TransitionCommit(
+            self.entity_id, "dtls", previous.name, proposed.name,
+            self.transition_revision, command, time.monotonic_ns(),
+        )
+        if self._projection is not None:
+            scope = current_execution_scope()
+            self._projection.machines.apply(MachineTransitionOp(
+                self.entity_id, "dtls", previous.name, proposed.name, 1,
+                committed.revision, scope.new_producer_dot(), None,
+                committed.monotonic_ns,
+            ))
+        emit_domain_event(
+            DtlsStateChanged, state=proposed.name, revision=committed.revision
+        )
+        return committed
+
+    async def _transition(self, proposed: FSMState, command: FSMCommand) -> None:
+        previous = self.handshake_state
+        DTLS_PHASE_SPEC.validate(previous.name, proposed.name)
+        checkpoint = self._checkpoint(
+            previous, proposed, self.transition_revision + 1, "before_commit"
+        )
+        if self._transition_controller is not None:
+            await self._transition_controller.before_commit(checkpoint)
+        committed = self._commit(proposed, command)
+        if self._transition_controller is not None:
+            await self._transition_controller.after_commit(self._checkpoint(
+                previous, proposed, committed.revision, "after_commit"
+            ))
+        if proposed is FSMState.Finished:
+            # One terminal commit owns completion: projected state, after-commit,
+            # key derivation/event, then the terminal checkpoint.
+            self._complete_handshake()
+            self.handshake_complete.set()
+            if self._transition_controller is not None:
+                await self._transition_controller.terminal(self._checkpoint(
+                    previous, proposed, committed.revision, "terminal"
+                ))
+
     @task(
         name="dtls:fsm",
         kind="dtls",
+        state="dtls",
         metadata={"expected_long_running": True, "loop_role": "fsm"},
         failure=FailurePolicy.FAIL_CONNECTION,
     )
     async def run(self):
-        while True:
-            next_state = await self.handshake_state_transition.get()
-
-            async with self.handshake_state_transition_lock:
-                while True:
-                    if self.handshake_state_transition.empty() and not next_state:
-                        logger.debug("Handshake state transition done")
-                        break
-
-                    handshake_state = (
-                        next_state or await self.handshake_state_transition.get()
-                    )
-                    # print("after next_state lock", next_state)
-                    if next_state:
-                        next_state = None
-
-                    match handshake_state:
-                        case FSMState.Preparing:
-                            await self.handshake_state_transition.put(
-                                await self.prepare(),
-                            )
-                        case FSMState.Sending:
-                            await self.handshake_state_transition.put(
-                                await self.send(),
-                            )
-                        case FSMState.Waiting:
-                            await self.handshake_state_transition.put(
-                                await self.wait(),
-                            )
-                        case FSMState.Errored:
-                            logger.error("FSM Error occurred, retrying...")
-                            await asyncio.sleep(4)
-                            await self.handshake_state_transition.put(
-                                FSMState.Preparing
-                            )
-                        case FSMState.Finished:
-                            logger.info("FSM: Handshake finished successfully!")
-                            print("[FSM] Handshake finished successfully!")
-                            return  # Exit the FSM run loop
-
-                        case _:
-                            break
+        command = await self.commands.get()
+        while self.handshake_state is not FSMState.Finished:
+            proposed = await self._step()
+            await self._transition(proposed, command)
+        logger.info("FSM: Handshake finished successfully!")
 
 
 # TODO: Validate epoch

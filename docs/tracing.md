@@ -1,6 +1,27 @@
-# Task-Centric Live Tracing
+# Bounded Live Tracing
 
-Tracing is a live projection of runtime task lifecycle events. It is not a metrics store and does not retain completed or deleted tasks.
+Tracing is a bounded, causally structured projection of meaningful runtime
+state. Runtime task ownership remains internal and is not mirrored one-for-one
+to the browser.
+
+## Observable planes
+
+The live view combines four independently bounded planes:
+
+1. Observable state machines: peer, ICE, DTLS, transport, worker lane,
+   transceiver, and media entities with validated revisioned transitions.
+2. Activity groups: stable aggregate spans for repeated observed operations,
+   including in-flight and cumulative outcome counters.
+3. Control handles and facets: exact cancel/pause/inspection targets plus
+   revisioned bounded scalar domain values.
+4. Diagnostics: admission, cardinality, extractor, subscriber lag, resync, and
+   observation-loss counters.
+
+`ObservedMeta` compiles a `CompiledObservation` once per eligible method.
+Ordinary methods default to aggregate, ordinary `@task` entry points to off,
+and `@task(state=...)` owners to state. `@observe` declares bounded exceptions;
+`@unobserved` remains the explicit infrastructure exclusion. Operation names
+are interned at class creation and calls use their integer operation ID.
 
 ## Identity
 
@@ -20,7 +41,7 @@ The same context is propagated to executor workers. Metrics and domain events co
 - `TaskRegistry` owns active cancellation state and is keyed by `task_id`.
 - `SyncOffloader` owns executor capacity, queueing, context propagation, and shutdown.
 - `TraceService` observes lifecycle events and owns only the live task tree and subscriptions.
-- `MetricGroupAggregator` owns a bounded in-memory metric aggregation keyed by task context. Its snapshots are filtered to live task IDs at the runtime transport boundary. Metric groups are not trace-tree tasks.
+- `ActivityGroupStore` is the sole live activity aggregation path. Optional external metric sinks receive lower-rate drained absolute snapshots and never add per-call metric allocation.
 - Domain event dispatch describes semantic protocol milestones without importing tracing or performance code.
 
 ## Live lifecycle
@@ -31,34 +52,22 @@ There is no server-side completed or deleted archive. A terminal task is removed
 
 ## Transport schema
 
-Every server delivery uses one canonical batch envelope:
+The aggregate projection uses versioned, idempotent schema 2. The initial
+`trace:snapshot` contains the complete bounded machine/control/group/facet
+projection, operation string table, diagnostics, and snapshot sequence.
+Subsequent `trace:batch` messages carry monotonically sequenced absolute record
+values and revisions, so duplicate delivery is harmless. A cursor gap produces
+`trace:resync_required`; it is never treated as a valid partial stream.
 
-```json
-{
-  "event": "trace:batch",
-  "data": {
-    "events": [
-      {"event": "trace:update", "data": {"trace_id": "…", "tasks": [...], "groups": [...]}}
-    ]
-  }
-}
-```
+There is no schema-1 lifecycle adapter or global raw mode. The WebSocket pump
+forwards only schema-2 snapshots, patches, and resynchronization messages.
 
-The first delivery is immediate and contains `trace:init` with `snapshot: true`, the complete live task tree, and the current live groups. A snapshot init replaces client live state, tombstones, summaries, performance events, and groups. Later `trace:init` events do not carry `snapshot: true`; they upsert newly started tasks without clearing state.
-
-Inner event payloads are task-centric:
-
-```json
-{"event":"trace:init","data":{"trace_id":"…","snapshot":true,"tasks":[...],"groups":[...]}}
-{"event":"trace:update","data":{"trace_id":"…","tasks":[...],"groups":[...]}}
-{"event":"trace:complete","data":{"trace_id":"…","tasks":[...]}}
-{"event":"trace:delete","data":{"trace_id":"…","task_ids":["…"]}}
-{"event":"trace:delete_result","data":{"trace_id":"…","task_id":"…","task_ids":["…"],"failed_task_ids":[],"success":true,"reason":null}}
-```
-
-Task snapshots contain `trace_id`, `task_id`, `parent_task_id`, name, kind, status, timestamps, duration, error, bounded scalar metadata, and lifecycle transitions. Group snapshots are separate metric objects keyed by `(trace_id, task_id, group, operation)`; metric groups are not inserted into the task tree. The backend sends them only while their owning `task_id` remains in the live tree. The frontend may create presentation-only virtual nodes to compact dense task siblings; these are unrelated to backend metric groups.
-
-The event bus is the only coalescing stage for published lifecycle traffic and uses a one-second window. Within a lifecycle-safe segment it keeps the latest update per `task_id` and the highest sequence, and removes exact duplicate non-update events while ignoring sequence differences. Updates never move across `trace:init`, `trace:complete`, or `trace:delete` boundaries. The WebSocket pump computes the current live group list once per outgoing batch and forwards it immediately. Heartbeat snapshots are generated by the pump and sent directly in the same canonical envelope; the frontend dispatch adds no batching delay.
+Diagnostic exact capture is server-authorized and scoped to one operation,
+entity, control handle, or facet. Every authorization has both a monotonic time
+deadline and a call budget, is capped by Runtime limits, and is cancelled on
+teardown. Captured invocations remain accounted in their activity group and are
+published as bounded `capture:upsert` records marked `diagnostic_capture`.
+Exception messages, arguments, and return values are never retained.
 
 ## Deletion
 
@@ -70,4 +79,6 @@ A successful `trace:delete_result` acknowledges that cancellation was accepted a
 
 ## Heartbeats and export
 
-Heartbeats update durations for running tasks without adding lifecycle transitions. The live reducer stores one latest record per `task_id`; `trace_id` remains correlation data and never merges distinct tasks. Dense leaf siblings are compacted into stable virtual UI groups, and rendering is bounded, but those virtual nodes are presentation-only. Live export contains visible tasks and current live groups. Deleted export uses only the selected client-local frozen archive.
+The browser derives running duration from the server monotonic anchor. It renders
+backend aggregate groups directly, virtualizes complete-data lists, and marks
+captures and failure exemplars explicitly in diagnostic exports.

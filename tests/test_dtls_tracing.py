@@ -3,7 +3,7 @@ import asyncio
 import webrtc_rs
 
 from webrtc.dtls.dtlstransport import DTLSTransport
-from webrtc.dtls.fsm import FSM, FSMState
+from webrtc.dtls.fsm import FSM, FSMState, StartHandshake
 from webrtc.dtls.flight_state import Flight
 from webrtc.tracing import PerformanceRecorder, use_performance_recorder
 
@@ -66,13 +66,12 @@ def test_dtls_reconstruction_failure_is_separate_from_parse(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_dtls_fsm_dispatch_has_timing_events():
+def test_dtls_fsm_dispatch_uses_typed_command_mailbox():
     async def scenario():
         fsm = object.__new__(FSM)
         fsm.flight = Flight.FLIGHT1
         fsm.handshake_state = FSMState.Preparing
-        fsm.handshake_state_transition_lock = asyncio.Lock()
-        fsm.handshake_state_transition = asyncio.Queue()
+        fsm.commands = asyncio.Queue()
         recorder = PerformanceRecorder()
 
         with use_performance_recorder(recorder):
@@ -82,6 +81,7 @@ def test_dtls_fsm_dispatch_has_timing_events():
             "dtls.fsm.dispatch.started",
             "dtls.fsm.dispatch.completed",
         ]
-        assert await fsm.handshake_state_transition.get() is FSMState.Preparing
+        assert isinstance(await fsm.commands.get(), StartHandshake)
+        assert fsm.handshake_state is FSMState.Preparing
 
     asyncio.run(scenario())

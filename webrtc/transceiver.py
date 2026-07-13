@@ -634,6 +634,7 @@ class RTPReceiver(ObservedComponent):
     @task(
         name="rtp:receiver",
         kind="rtp",
+        state="transceiver",
         metadata={"expected_long_running": True, "loop_role": "receive"},
         failure=FailurePolicy.FAIL_CONNECTION,
     )

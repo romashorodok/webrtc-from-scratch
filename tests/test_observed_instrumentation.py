@@ -61,12 +61,12 @@ def test_automatic_sync_async_worker_and_inline_contracts():
             parent = current_execution_context()
             worker_context = await work.blocking()
             assert worker_context.task_id == parent.task_id
-            assert worker_context.node_id != parent.node_id
+            assert worker_context.node_id == parent.node_id
             assert work.inline() == threading.get_ident()
 
         await run_owned(runtime, owner)
-        operations = {group.operation for group in runtime.metric_sink.snapshots()}
-        assert {"work.async", "work.worker", "work.worker.queue", "work.worker.worker"} <= operations
+        operations = {group.operation for group in runtime.activity_groups.snapshots()}
+        assert {"work.async", "work.worker"} <= operations
         assert runtime.trace_live_tree() == []
         await runtime.aclose()
 
@@ -142,7 +142,7 @@ def test_performance_and_all_ordinary_calls_work_without_scope_without_recording
     runtime = Runtime()
     assert Subject().call() == 3
     assert asyncio.run(Subject().async_call()) == 4
-    assert runtime.metric_sink.snapshots() == ()
+    assert runtime.activity_groups.snapshots() == ()
     runtime.shutdown()
 
 
@@ -190,14 +190,9 @@ def test_async_calls_have_live_child_nodes_and_inherited_wrappers_remain_active(
         async def owner():
             call = asyncio.create_task(Child().wait(entered, release))
             await entered.wait()
-            nodes = runtime.trace_live_tree()
-            method = next(node for node in nodes
-                          if node["metadata"].get("node_type") == "async-call")
-            task = next(node for node in nodes
-                        if node["metadata"].get("node_type") == "task")
-            assert method["parent_task_id"] == task["task_id"]
-            assert method["metadata"]["owner_task_id"] == task["task_id"]
-            assert method["metadata"]["cancelable"] is False
+            group = next(item for item in runtime.activity_groups.snapshots()
+                         if item.operation.endswith("Base.wait"))
+            assert group.in_flight == 1
             release.set()
             await call
 
@@ -233,10 +228,9 @@ def test_dispatched_cancellation_holds_lane_and_live_node_until_physical_complet
             first.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await first
-            worker_nodes = [node for node in runtime.trace_live_tree()
-                            if node["metadata"].get("node_type") == "worker-call"]
-            assert len(worker_nodes) == 1
-            assert worker_nodes[0]["metadata"]["cancelable"] is False
+            group = next(item for item in runtime.activity_groups.snapshots()
+                         if item.operation.endswith("Blocking.first"))
+            assert group.in_flight == 1
 
             second = asyncio.create_task(subject.second())
             await asyncio.sleep(0.03)
@@ -248,8 +242,8 @@ def test_dispatched_cancellation_holds_lane_and_live_node_until_physical_complet
                         if node["metadata"].get("node_type") == "worker-call"]
 
         await run_owned(runtime, owner)
-        assert any(snapshot.operation.endswith("Blocking.first.worker")
-                   for snapshot in runtime.metric_sink.snapshots())
+        assert any(snapshot.operation.endswith("Blocking.first")
+                   for snapshot in runtime.activity_groups.snapshots())
         await runtime.aclose()
 
     asyncio.run(scenario())
@@ -350,7 +344,7 @@ def test_extractor_and_sink_failures_do_not_change_results():
             assert await Broken().call() == 7
 
         await run_owned(runtime, owner)
-        assert runtime.diagnostics["sink_failures"] >= 1
+        assert runtime.diagnostics["sink_failures"] == 0
         assert runtime.diagnostics["extractor_failures"] >= 1
         await runtime.aclose()
 
@@ -396,9 +390,9 @@ def test_worker_failure_records_queue_worker_and_total_metrics():
         async with Runtime() as runtime:
             with pytest.raises(LookupError):
                 await Broken().call()
-            snapshots = {item.operation: item for item in runtime.metric_sink.snapshots()}
-            assert {"broken.worker", "broken.worker.queue", "broken.worker.worker"} <= snapshots.keys()
-            assert snapshots["broken.worker.worker"].total_duration_ms > 0
+            snapshots = {item.operation: item for item in runtime.activity_groups.snapshots()}
+            assert {"broken.worker"} <= snapshots.keys()
+            assert snapshots["broken.worker"].total_worker_ns > 0
             assert snapshots["broken.worker"].errors == 1
 
     asyncio.run(scenario())

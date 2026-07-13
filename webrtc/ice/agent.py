@@ -779,6 +779,7 @@ class CandidatePairController(AsyncEventEmitter, ObservedComponent):
     @task(
         name="ice:candidate-pair-controller",
         kind="ice",
+        state="ice",
         metadata={"expected_long_running": True, "loop_role": "controller"},
         failure=FailurePolicy.FAIL_CONNECTION,
     )

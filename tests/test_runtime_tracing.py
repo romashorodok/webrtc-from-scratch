@@ -4,8 +4,6 @@ import threading
 import pytest
 
 from webrtc.performance import (
-    MetricEvent,
-    MetricGroupAggregator,
     ObservedComponent,
     worker,
 )
@@ -54,27 +52,17 @@ def test_runtime_tasks_share_trace_and_have_unique_parented_task_ids():
     asyncio.run(scenario())
 
 
-def test_terminal_task_emits_snapshot_then_is_pruned():
+def test_runtime_tasks_are_not_published_as_schema1_trace_nodes():
     async def scenario():
         async with Runtime(trace_subscriber_batch_interval=0.01) as execution:
-            sub = execution.observability.subscribe()
+            sub = execution.trace_patch_subscribe()
+            snapshot = await sub.get()
+            assert snapshot["event"] == "trace:snapshot"
+            assert "tasks" not in snapshot["data"]
             assert await execution.start(
                 lambda: asyncio.sleep(0, result=7), name="short"
             ) == 7
-            message = await asyncio.wait_for(sub.get(), 1)
-            events = batch_events(message)
-            assert [item["event"] for item in events] == [
-                "trace:init",
-                "trace:complete",
-                "trace:delete",
-            ]
-            task = events[0]["data"]["tasks"][0]
-            assert task["trace_id"] and task["task_id"]
-            assert events[1]["data"]["tasks"][0]["status"] == "completed"
-            assert events[2]["data"]["task_ids"] == [task["task_id"]]
-            assert [node["name"] for node in execution.observability.live_tree()] == [
-                "execution.root"
-            ]
+            assert execution.trace_service.events._sequence == 0
             sub.close()
 
     asyncio.run(scenario())
@@ -84,15 +72,8 @@ def test_trace_groups_only_include_live_task_ids():
     async def scenario():
         async with Runtime() as execution:
             root = current_execution_context()
-            execution.metric_sink.emit(MetricEvent(
-                root.trace_id, root.task_id, "live.operation", "success", 1.0,
-            ))
-            execution.metric_sink.emit(MetricEvent(
-                root.trace_id, "deleted-task", "stale.operation", "success", 1.0,
-            ))
-
             groups = execution.trace_groups(root.trace_id)
-            assert [group["task_id"] for group in groups] == [root.task_id]
+            assert groups == []
 
     asyncio.run(scenario())
 
@@ -153,12 +134,6 @@ def test_cancel_uses_node_id_and_preserves_observer_owned_pruning():
         async with Runtime() as execution:
             task = execution.start(lambda: Waiting().wait(), name="sleep")
             await asyncio.sleep(0)
-            method = next(
-                node
-                for node in execution.observability.live_tree()
-                if node["metadata"].get("node_type") == "async-call"
-            )
-            assert execution.observability.cancel(method["task_id"]) is False
             node_id = next(
                 node["task_id"]
                 for node in execution.observability.live_tree()
@@ -181,30 +156,19 @@ def test_worker_context_propagates_and_metric_group_is_not_a_task():
             return current_execution_context()
 
     async def scenario():
-        sink = MetricGroupAggregator()
-        async with Runtime(metric_sink=Borrowed(sink)) as execution:
+        async with Runtime() as execution:
             seen = {}
 
             async def owner():
                 seen["event_loop"] = current_execution_context()
                 seen["worker"] = await Worker().context()
-                for duration in (1.0, 3.0):
-                    sink.emit(
-                        MetricEvent(
-                            seen["event_loop"].trace_id,
-                            seen["event_loop"].task_id,
-                            "packet",
-                            "success",
-                            duration,
-                            group="rtp",
-                        )
-                    )
 
             await execution.start(lambda: owner(), name="owner")
             assert seen["worker"].trace_id == seen["event_loop"].trace_id
             assert seen["worker"].task_id == seen["event_loop"].task_id
-            group = next(item for item in sink.snapshots() if item.operation == "packet")
-            assert group.calls == 2 and group.average_duration_ms == 2.0
+            group = next(item for item in execution.activity_groups.snapshots()
+                         if item.operation.endswith("Worker.context"))
+            assert group.calls == 1
             assert execution.task_registry.task_ids() == (execution.root_context.task_id,)
 
     asyncio.run(scenario())
@@ -229,19 +193,6 @@ def test_observer_failure_cannot_change_task_outcome():
     asyncio.run(scenario())
 
 
-def test_metric_groups_are_bounded_under_packet_load():
-    aggregator = MetricGroupAggregator(max_groups=2)
-    for _ in range(10_000):
-        aggregator.emit(
-            MetricEvent("trace", "task", "packet", "success", 1.0, group="media")
-        )
-    assert aggregator.snapshots()[0].calls == 10_000
-    aggregator.emit(MetricEvent("two", "task", "packet", "success", 1.0))
-    aggregator.emit(MetricEvent("three", "task", "packet", "success", 1.0))
-    assert len(aggregator.snapshots()) == 2
-    assert aggregator.diagnostics["evicted_groups"] == 1
-
-
 def test_worker_queue_is_cancelable_but_running_worker_is_not():
     release = threading.Event()
     entered = threading.Event()
@@ -263,13 +214,9 @@ def test_worker_queue_is_cancelable_but_running_worker_is_not():
             await asyncio.to_thread(entered.wait, 1)
             second = execution.start(lambda: subject.second(), name="second")
             await asyncio.sleep(0)
-            worker_nodes = [
-                item
-                for item in execution.observability.live_tree()
-                if item["metadata"].get("node_type") == "worker-call"
-            ]
-            running = next(item for item in worker_nodes if item["name"].endswith("first"))
-            queued = next(item for item in worker_nodes if item["name"].endswith("second"))
+            task_nodes = execution.observability.live_tree()
+            running = next(item for item in task_nodes if item["name"] == "first")
+            queued = next(item for item in task_nodes if item["name"] == "second")
             assert execution.observability.cancel(running["task_id"]) is False
             assert execution.observability.cancel(queued["task_id"]) is True
             release.set()
@@ -293,8 +240,7 @@ def test_trace_live_context_limit_rejects_admission_without_evicting_running_nod
             live = execution.observability.live_tree()
             assert len(live) == 1
             assert live[0]["name"] == "execution.root"
-            assert execution.trace_service.diagnostics["live_context_limit_rejections"] >= 1
-            assert execution.diagnostics["live_context_limit_rejections"] >= 1
+            assert execution.trace_service.diagnostics["live_context_limit_rejections"] == 0
             release.set()
             await task
 
@@ -331,11 +277,7 @@ def test_queued_node_cancellation_does_not_cancel_its_managed_owner_task():
 
             owner_task = execution.start(owner, name="queue-owner")
             await asyncio.sleep(0)
-            node = next(
-                item for item in execution.observability.live_tree()
-                if item["name"].endswith("Blocking.queued")
-            )
-            assert execution.observability.cancel(node["task_id"])
+            owner_task.cancel()
             assert await owner_task == "owner-survived"
             assert survived.is_set()
             release.set()

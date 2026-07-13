@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "status": "provisional",
+  "description": "Stage 0 measurement profiles and acceptance budgets. Numeric performance budgets are reporting-only until the secured peer E2E workload validates them.",
+  "profiles": {
+    "call_counts": [10000, 100000, 1000000],
+    "group_cardinalities": [10, 100, 4097],
+    "modes": ["unobserved", "exact", "aggregate"],
+    "overlay_states": ["closed", "open", "exact-capture"],
+    "subscriber_counts": [1, 4],
+    "include_slow_subscriber": true,
+    "include_nested_calls": true,
+    "include_event_loop_and_worker_calls": true
+  },
+  "limits": {
+    "groups": 4096,
+    "normal_batch_records": 256,
+    "maximum_batch_records": 2048,
+    "visible_nodes": 300
+  },
+  "stage0_structural_baseline": {
+    "unobserved": {
+      "published_events_per_inline_call": 0,
+      "metric_groups": 0
+    },
+    "current_exact": {
+      "published_events_per_successful_inline_call": 3,
+      "metric_groups_equal_bounded_input_cardinality": true,
+      "completed_call_nodes_retained": 0
+    },
+    "current_slow_subscriber": {
+      "queue_is_bounded": true,
+      "drops_are_explicitly_resynced": false
+    },
+    "aggregate": {
+      "available": true,
+      "implementation_stage": 2
+    }
+  },
+  "acceptance_budgets": {
+    "aggregate_cpu_overhead_percent": {"max": 5, "relative_to": "unobserved"},
+    "frontend_normal_batch_p95_ms": {"max": 4},
+    "frontend_max_batch_p95_ms": {"max": 16},
+    "pan_zoom_frame_ms": {"max": 16.7},
+    "live_records_per_aggregate_key": {"max": 1},
+    "overlay_closed_application_messages": {"max": 0},
+    "slow_subscriber_requires_explicit_resync": true,
+    "memory_must_stabilize_with_call_count": true
+  },
+  "enforcement": {
+    "structural_smoke_checks": true,
+    "numeric_performance_checks": false,
+    "enable_numeric_checks_after": "secured full peer E2E validation"
+  }
+}

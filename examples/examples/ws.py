@@ -165,9 +165,9 @@ async def profile_allocations(
             f"ice_ready={pc._transport is not None}",
             f"srtp_ready={srtp_ready}",
             f"ice_queues={queue_depths}",
-            f"metric_groups={len(runtime.metric_sink.snapshots())}",
+            f"metric_groups={len(runtime.activity_groups.snapshots())}",
             f"trace_tasks={len(runtime.task_registry.task_ids())}",
-            f"metric_keys={len(runtime.metric_sink.snapshots())}",
+            f"metric_keys={len(runtime.activity_groups.snapshots())}",
             flush=True,
         )
         if current is not None and previous is not None:
@@ -487,6 +487,35 @@ async def ws_endpoint(ws: WebSocket):
 
                     if isinstance(task_id, str):
                         execution.observability.cancel(task_id)
+
+                case "trace:capture_request":
+                    data = msg.get("data")
+                    payload: dict[str, Any] = json.loads(data) if isinstance(data, str) else data or {}
+                    try:
+                        authorization = execution.authorize_trace_capture(
+                            selector_kind=payload.get("selector_kind"),
+                            selector_value=payload.get("selector_value"),
+                            duration_seconds=payload.get("duration_seconds"),
+                            call_budget=payload.get("call_budget"),
+                        )
+                    except (TypeError, ValueError, RuntimeError) as error:
+                        await send_json({
+                            "event": "trace:capture_result",
+                            "data": {"success": False, "error": str(error)[:160]},
+                        })
+                    else:
+                        await send_json({
+                            "event": "trace:capture_result",
+                            "data": {
+                                "success": True,
+                                "capture_id": authorization.capture_id,
+                                "expires_ns": authorization.expires_ns,
+                                "call_budget": authorization.call_budget,
+                            },
+                        })
+
+                case "trace:resync_request":
+                    await send_json(execution.trace_snapshot())
 
                 case _:
                     print("Unknown event")

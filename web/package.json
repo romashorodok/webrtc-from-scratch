@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "bun --hot src/index.ts",
     "start": "NODE_ENV=production bun src/index.ts",
-    "build": "bun run build.ts"
+    "build": "bun run build.ts",
+    "benchmark:tracing": "bun run src/lib/trace.benchmark.ts"
   },
   "dependencies": {
     "bun-plugin-tailwind": "^0.1.2",
@@ -16,8 +17,9 @@
     "tailwindcss": "^4.1.11"
   },
   "devDependencies": {
+    "@types/bun": "latest",
+    "@types/d3": "^7.4.3",
     "@types/react": "^19",
-    "@types/react-dom": "^19",
-    "@types/bun": "latest"
+    "@types/react-dom": "^19"
   }
 }

@@ -13,10 +13,25 @@ from dataclasses import dataclass, field
 from enum import Enum
 from threading import RLock
 from types import MappingProxyType
-from typing import Any, Generic, Protocol, TypeVar, cast, runtime_checkable
+from typing import Any, Generic, Protocol, TypeAlias, TypeVar, cast, runtime_checkable
+
+from .observability import ProducerClock, ProducerDot
 
 T = TypeVar("T")
 R = TypeVar("R")
+
+Scalar: TypeAlias = str | int | float | bool | None
+
+
+@runtime_checkable
+class StateFacetSink(Protocol):
+    """Observation-neutral sink for bounded semantic component state."""
+
+    def transition(self, operation: Any) -> None: ...
+    def merge_values(
+        self, entity_id: str, dot: ProducerDot, values: Mapping[str, Scalar]
+    ) -> None: ...
+    def remove(self, entity_id: str, epoch: int, dot: ProducerDot) -> None: ...
 
 
 class ScopeState(str, Enum):
@@ -132,10 +147,23 @@ class TraceNodeCancelabilityChanged:
 @dataclass(frozen=True, slots=True)
 class WorkerCallCompleted:
     outcome: str
-    queue_ms: float
-    worker_ms: float
-    total_ms: float
+    queue_ns: int
+    worker_ns: int
+    total_ns: int
     exception: BaseException | None = None
+    observation_delta: Any | None = None
+
+    @property
+    def queue_ms(self) -> float:
+        return self.queue_ns / 1_000_000
+
+    @property
+    def worker_ms(self) -> float:
+        return self.worker_ns / 1_000_000
+
+    @property
+    def total_ms(self) -> float:
+        return self.total_ns / 1_000_000
 
 
 @runtime_checkable
@@ -162,10 +190,16 @@ class ExecutionScope(Protocol):
     worker_lane: SerializedWorkerLane
     trace_service: TraceServiceProtocol
     metric_sink: MetricSinkProtocol
+    activity_groups: Any
+    capture_manager: Any
     diagnostics: Counter[str]
+    transition_controller: Any
+    runtime_epoch: int
+    observability_epoch: int
     state: ScopeState
 
     def observe_task_failure(self, event: TaskFailureEvent) -> None: ...
+    def new_producer_dot(self) -> ProducerDot: ...
 
 
 _execution_context: contextvars.ContextVar[ExecutionContext | None] = contextvars.ContextVar(
@@ -438,27 +472,27 @@ class SyncOffloader:
             raise ScopeNotActive("execution scope is closing")
         loop = asyncio.get_running_loop()
         copied = contextvars.copy_context()
-        queued = loop.time()
+        queued = time.monotonic_ns()
         limiter = self._semaphore()
         await limiter.acquire()
         future: asyncio.Future[Any] | None = None
         try:
             if self.closed:
                 raise ScopeNotActive("execution scope is closing")
-            dispatched = loop.time()
+            dispatched = time.monotonic_ns()
 
-            worker_timing = [0.0, 0.0]
+            worker_timing = [0, 0]
 
-            def invoke() -> tuple[T, float, float]:
-                started = time.monotonic()
+            def invoke() -> tuple[T, int, int]:
+                started = time.monotonic_ns()
                 worker_timing[0] = started
                 try:
                     result = copied.run(fn, *args, **kwargs)
-                    finished = time.monotonic()
+                    finished = time.monotonic_ns()
                     worker_timing[1] = finished
                     return result, started, finished
                 except BaseException:
-                    worker_timing[1] = time.monotonic()
+                    worker_timing[1] = time.monotonic_ns()
                     raise
 
             future = loop.run_in_executor(self.executor, invoke)
@@ -475,17 +509,17 @@ class SyncOffloader:
                     except BaseException as error:
                         event = WorkerCallCompleted(
                             "cancelled" if isinstance(error, asyncio.CancelledError) else "error",
-                            (dispatched - queued) * 1000,
-                            max(0.0, worker_timing[1] - worker_timing[0]) * 1000,
-                            max(0.0, worker_timing[1] - queued) * 1000,
+                            dispatched - queued,
+                            max(0, worker_timing[1] - worker_timing[0]),
+                            max(0, worker_timing[1] - queued),
                             error,
                         )
                     else:
                         event = WorkerCallCompleted(
                             "success",
-                            (dispatched - queued) * 1000,
-                            (worker_finished - worker_started) * 1000,
-                            (worker_finished - queued) * 1000,
+                            dispatched - queued,
+                            worker_finished - worker_started,
+                            worker_finished - queued,
                         )
                     try:
                         on_complete(event)
@@ -495,8 +529,8 @@ class SyncOffloader:
             result, worker_started, worker_finished = await asyncio.shield(future)
             observed = (
                 result,
-                (dispatched - queued) * 1000,
-                (worker_finished - worker_started) * 1000,
+                (dispatched - queued) / 1_000_000,
+                (worker_finished - worker_started) / 1_000_000,
             )
         except asyncio.CancelledError:
             if future is None or future.done():

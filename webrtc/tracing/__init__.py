@@ -1,4 +1,14 @@
 from .models import TaskTrace, TraceNode
+from webrtc.activity import (
+    ActivityGroupDelta, ActivityGroupSnapshot, ActivityGroupStore,
+    ActivityGroupTombstone, DrainedActivityMetric, DrainedMetricSinkAdapter,
+    WorkerObservationDelta,
+)
+from webrtc.observability import (
+    ControlHandle, ControlHandleStore, FacetOp, FacetSnapshot, FacetStore,
+    MachineSnapshot, MachineStore, MachineTransitionOp, ObservabilityService,
+    ProducerClock, ProducerDot,
+)
 from .performance import (
     PerfEvent,
     PerformanceRecorder,
@@ -20,20 +30,43 @@ from .performance_summary import (
     check_smoke_thresholds,
 )
 from .service import TraceService, TraceSubscription
+from .events import JournalSubscription, JournalSubscriber, TracePatchTransport
 from webrtc.performance import (
-    CallInfo, CaptureMetricSink, ErrorInfo, GroupSnapshot, MetricEvent,
-    MetricGroupAggregator, MetricSink, ObservedComponent, ObservedMeta, PerformanceSpec,
-    SuccessInfo, event_loop, performance, task, unobserved, worker,
+    CallInfo, CaptureMetricSink, ErrorInfo, MetricEvent,
+    CompiledObservation, MetricSink, ObservedComponent, ObservedMeta,
+    PerformanceSpec, SuccessInfo, TraceDetail, compiled_operation_strings, event_loop, observe,
+    performance, task, unobserved, worker,
 )
 
 __all__ = [
     "BaselineCheck",
+    "ActivityGroupSnapshot",
+    "ActivityGroupStore",
+    "ActivityGroupDelta",
+    "ActivityGroupTombstone",
+    "WorkerObservationDelta",
+    "DrainedActivityMetric",
+    "DrainedMetricSinkAdapter",
+    "ProducerDot",
+    "ProducerClock",
+    "MachineTransitionOp",
+    "MachineSnapshot",
+    "MachineStore",
+    "FacetOp",
+    "FacetSnapshot",
+    "FacetStore",
+    "ControlHandle",
+    "ControlHandleStore",
+    "ObservabilityService",
     "PerfEvent",
     "PerformanceRecorder",
     "TaskTrace",
     "TraceNode",
     "TraceService",
     "TraceSubscription",
+    "JournalSubscription",
+    "JournalSubscriber",
+    "TracePatchTransport",
     "build_performance_summary",
     "check_counters",
     "check_event_ordering",
@@ -47,7 +80,9 @@ __all__ = [
     "perf_measured",
     "perf_measured_async",
     "use_performance_recorder",
-    "CallInfo", "CaptureMetricSink", "ErrorInfo", "GroupSnapshot", "MetricEvent",
-    "MetricGroupAggregator", "MetricSink", "ObservedComponent", "ObservedMeta", "PerformanceSpec",
-    "SuccessInfo", "event_loop", "performance", "task", "unobserved", "worker",
+    "CallInfo", "CaptureMetricSink", "ErrorInfo", "MetricEvent",
+    "CompiledObservation", "MetricSink", "ObservedComponent",
+    "ObservedMeta", "PerformanceSpec", "SuccessInfo", "TraceDetail",
+    "compiled_operation_strings", "event_loop", "observe", "performance", "task",
+    "unobserved", "worker",
 ]

@@ -3,6 +3,8 @@ import { parseJson } from "./media";
 const TRACE_SUMMARY_LIMIT = 512;
 const ARCHIVED_TRACES_PER_SUMMARY_LIMIT = 512;
 const PERFORMANCE_EVENT_LIMIT = 160;
+export const NORMALIZED_ARCHIVE_LIMIT = 512;
+export const NORMALIZED_TOMBSTONE_LIMIT = 1024;
 
 export type TraceStatus = "created" | "running" | "completed" | "failed" | "cancelled";
 
@@ -31,11 +33,18 @@ export type TraceRecord = {
 };
 
 export type GroupSnapshot = {
+  group_id?: number;
   trace_id: string;
   task_id: string;
+  owner_entity_id?: string;
+  owner_epoch?: number;
+  parent_ref_type?: string;
+  parent_ref_id?: number | string | null;
+  operation_id?: number;
   group: string;
   operation: string;
   calls: number;
+  in_flight?: number;
   successes: number;
   cancellations: number;
   errors: number;
@@ -44,7 +53,62 @@ export type GroupSnapshot = {
   min_duration_ms: number;
   max_duration_ms: number;
   latest_failure_class: string | null;
+  revision?: number;
+  overflow?: boolean;
+  exemplars?: Array<Record<string, unknown>>;
 };
+
+export type TraceMachine = {
+  entity_id: string;
+  machine_type: string;
+  state: string;
+  machine_epoch: number;
+  revision: number;
+  cause_id: number | string | null;
+  monotonic_ns: number;
+};
+
+export type TraceControl = {
+  handle_id: string;
+  trace_id: string;
+  owner_entity_id: string;
+  owner_epoch: number;
+  name: string;
+  cancelable: boolean;
+  revision: number;
+};
+
+export type TraceFacet = {
+  facet_id: string;
+  owner_entity_id: string;
+  owner_epoch: number;
+  value: unknown;
+  revision: number;
+};
+
+export type TraceCapture = {
+  record_id: number;
+  capture_id: number;
+  selector_kind: "operation" | "entity" | "control" | "facet";
+  selector_value: number | string;
+  operation_id: number;
+  operation: string;
+  owner_entity_id: string;
+  started_ns: number;
+  finished_ns: number | null;
+  duration_ms: number;
+  outcome: string;
+  failure_class: string | null;
+  revision: number;
+  diagnostic_capture: true;
+};
+
+export type NormalizedArchive<T> = {
+  recordsById: Map<string, T>;
+  order: string[];
+};
+
+type EpochRevision = { epoch: number; revision: number };
 
 export type TraceSummary = {
   summary_id: string;
@@ -113,6 +177,34 @@ export type TraceState = {
   deletedTaskIds: Set<string>;
   tasksById: Map<string, TraceRecord>;
   taskOrder: string[];
+  schema: 2;
+  traceId: string | null;
+  sequence: number | null;
+  serverMonotonicMs: number | null;
+  machinesById: Map<string, TraceMachine>;
+  controlsById: Map<string, TraceControl>;
+  groupsById: Map<number, GroupSnapshot>;
+  facetsById: Map<string, TraceFacet>;
+  capturesById: Map<number, TraceCapture>;
+  operationNamesById: Map<number, string>;
+  groupIdsByOwner: Map<string, number[]>;
+  controlIdsByOwner: Map<string, string[]>;
+  facetIdsByOwner: Map<string, string[]>;
+  groupArchive: NormalizedArchive<GroupSnapshot>;
+  machineArchive: NormalizedArchive<TraceMachine>;
+  controlArchive: NormalizedArchive<TraceControl>;
+  facetArchive: NormalizedArchive<TraceFacet>;
+  removedMachineRevisions: Map<string, EpochRevision>;
+  removedControlRevisions: Map<string, number>;
+  removedGroupRevisions: Map<number, number>;
+  removedFacetRevisions: Map<string, EpochRevision>;
+  diagnostics: Record<string, number>;
+  topologyVersion: number;
+  valueVersion: number;
+  commitVersion: number;
+  resyncRequired: boolean;
+  resyncRequestVersion: number;
+  resyncReason: string | null;
 };
 
 export type TraceStateAction = {
@@ -138,6 +230,34 @@ export function createInitialTraceState(): TraceState {
     deletedTaskIds: new Set<string>(),
     tasksById: new Map<string, TraceRecord>(),
     taskOrder: [],
+    schema: 2,
+    traceId: null,
+    sequence: null,
+    serverMonotonicMs: null,
+    machinesById: new Map(),
+    controlsById: new Map(),
+    groupsById: new Map(),
+    facetsById: new Map(),
+    capturesById: new Map(),
+    operationNamesById: new Map(),
+    groupIdsByOwner: new Map(),
+    controlIdsByOwner: new Map(),
+    facetIdsByOwner: new Map(),
+    groupArchive: emptyNormalizedArchive(),
+    machineArchive: emptyNormalizedArchive(),
+    controlArchive: emptyNormalizedArchive(),
+    facetArchive: emptyNormalizedArchive(),
+    removedMachineRevisions: new Map(),
+    removedControlRevisions: new Map(),
+    removedGroupRevisions: new Map(),
+    removedFacetRevisions: new Map(),
+    diagnostics: {},
+    topologyVersion: 0,
+    valueVersion: 0,
+    commitVersion: 0,
+    resyncRequired: false,
+    resyncRequestVersion: 0,
+    resyncReason: null,
   };
 }
 
@@ -145,43 +265,411 @@ export function reduceTraceState(
   state: TraceState,
   action: TraceStateAction,
 ): TraceState {
-  const currentTasks = state.tasks ?? [];
-  const currentGroups = state.groups ?? [];
-  const deletedTaskIds = new Set(state.deletedTaskIds ?? []);
-  const archivedTrees = collectArchivedTreesForEvents(currentTasks, currentGroups, action.events);
-  const summaries = trimTraceSummaries(
-    synthesizeArchivedSummaries(
-      applyTraceSummaryEvents(state.summaries, action.events),
-      archivedTrees,
-    ),
-  );
-  const tasks = applyTraceEvents(currentTasks, action.events, {
-    deletedTaskIds,
-    summaries,
-  });
-  const groups = applyGroupEvents(currentGroups, action.events);
-  const performanceEvents = applyPerformanceEvents(state.performanceEvents, action.events);
+  const envelope = action.events.length === 1 ? schema2Envelope(action.events[0]) : null;
+  return envelope ? reduceNormalizedTraceState(state, envelope.event, envelope.data) : state;
+}
 
-  const unchanged =
-    tasks === state.tasks &&
-    groups === state.groups &&
-    summaries === state.summaries &&
-    performanceEvents === state.performanceEvents &&
-    setsEqual(deletedTaskIds, state.deletedTaskIds ?? new Set());
+type Schema2Snapshot = {
+  schema: 2;
+  trace_id: string;
+  snapshot_sequence: number;
+  server_monotonic_ms?: number;
+  machines?: TraceMachine[];
+  controls?: TraceControl[];
+  groups?: GroupSnapshot[];
+  facets?: TraceFacet[];
+  captures?: TraceCapture[];
+  operation_strings?: Record<string, string>;
+  diagnostics?: Record<string, number>;
+};
 
-  if (unchanged) {
-    return state;
+type Schema2Patch = {
+  schema: 2;
+  trace_id: string;
+  sequence: number;
+  server_monotonic_ms?: number;
+  operation_strings?: Record<string, string>;
+  events?: Array<{
+    type?: string;
+    records?: unknown[];
+    ids?: Array<string | number>;
+    values?: Record<string, number>;
+  }>;
+};
+
+type Schema2Envelope = {
+  event: "trace:snapshot" | "trace:batch" | "trace:resync_required";
+  data: Schema2Snapshot | Schema2Patch;
+};
+
+function schema2Envelope(input: TraceEventInput | undefined): Schema2Envelope | null {
+  if (!input || !["trace:snapshot", "trace:batch", "trace:resync_required"].includes(input.event)) {
+    return null;
+  }
+  const data = parseJson<Record<string, unknown>>(input.data);
+  if (data?.schema !== 2) {
+    return null;
+  }
+  return { event: input.event as Schema2Envelope["event"], data: data as Schema2Snapshot | Schema2Patch };
+}
+
+function reduceNormalizedTraceState(
+  state: TraceState,
+  event: Schema2Envelope["event"],
+  data: Schema2Snapshot | Schema2Patch,
+): TraceState {
+  if (event === "trace:resync_required") {
+    if (state.resyncRequired) {
+      return state;
+    }
+    return requestTraceResync(state, "server_requested_resync");
+  }
+  if (event === "trace:snapshot") {
+    return replaceNormalizedSnapshot(state, data as Schema2Snapshot);
   }
 
+  const patch = data as Schema2Patch;
+  if (state.schema !== 2 || state.sequence == null || patch.trace_id !== state.traceId) {
+    return requestTraceResync(state, "patch_before_snapshot");
+  }
+  if (!Number.isSafeInteger(patch.sequence) || patch.sequence <= state.sequence) {
+    return state;
+  }
+  if (state.resyncRequired) {
+    return state;
+  }
+  if (patch.sequence !== state.sequence + 1) {
+    return requestTraceResync(state, `sequence_gap:${state.sequence + 1}:${patch.sequence}`);
+  }
+
+  let machinesById = state.machinesById;
+  let controlsById = state.controlsById;
+  let groupsById = state.groupsById;
+  let facetsById = state.facetsById;
+  let capturesById = state.capturesById;
+  let removedMachineRevisions = state.removedMachineRevisions;
+  let removedControlRevisions = state.removedControlRevisions;
+  let removedGroupRevisions = state.removedGroupRevisions;
+  let removedFacetRevisions = state.removedFacetRevisions;
+  let groupArchive = state.groupArchive;
+  let machineArchive = state.machineArchive;
+  let controlArchive = state.controlArchive;
+  let facetArchive = state.facetArchive;
+  let diagnostics = state.diagnostics;
+  let topologyChanged = false;
+  let valueChanged = false;
+
+  for (const operation of patch.events ?? []) {
+    switch (operation.type) {
+      case "machine:transition": {
+        for (const record of validRecords<TraceMachine>(operation.records, "entity_id")) {
+          const previous = machinesById.get(record.entity_id);
+          if (!acceptEpochRevision(previous, record, "machine_epoch", removedMachineRevisions.get(record.entity_id))) continue;
+          if (machinesById === state.machinesById) machinesById = new Map(machinesById);
+          machinesById.set(record.entity_id, record);
+          if (removedMachineRevisions.has(record.entity_id)) {
+            if (removedMachineRevisions === state.removedMachineRevisions) removedMachineRevisions = new Map(removedMachineRevisions);
+            removedMachineRevisions.delete(record.entity_id);
+          }
+          topologyChanged ||= !previous || previous.machine_epoch !== record.machine_epoch || previous.machine_type !== record.machine_type;
+          valueChanged = true;
+        }
+        break;
+      }
+      case "machine:remove": {
+        for (const id of stringIds(operation.ids)) {
+          const previous = machinesById.get(id);
+          if (!previous) continue;
+          if (machinesById === state.machinesById) machinesById = new Map(machinesById);
+          machinesById.delete(id);
+          machineArchive = archiveNormalized(machineArchive, id, previous);
+          removedMachineRevisions = recordEpochTombstone(
+            removedMachineRevisions, state.removedMachineRevisions, id,
+            previous.machine_epoch, previous.revision,
+          );
+          topologyChanged = valueChanged = true;
+        }
+        break;
+      }
+      case "control:upsert": {
+        for (const record of validRecords<TraceControl>(operation.records, "handle_id")) {
+          const previous = controlsById.get(record.handle_id);
+          if (!acceptRevision(previous?.revision, record.revision, removedControlRevisions.get(record.handle_id))) continue;
+          if (controlsById === state.controlsById) controlsById = new Map(controlsById);
+          controlsById.set(record.handle_id, record);
+          topologyChanged ||= !previous || controlTopology(previous) !== controlTopology(record);
+          valueChanged = true;
+        }
+        break;
+      }
+      case "control:remove": {
+        for (const id of stringIds(operation.ids)) {
+          const previous = controlsById.get(id);
+          if (!previous) continue;
+          if (controlsById === state.controlsById) controlsById = new Map(controlsById);
+          controlsById.delete(id);
+          controlArchive = archiveNormalized(controlArchive, id, previous);
+          removedControlRevisions = recordTombstone(removedControlRevisions, state.removedControlRevisions, id, previous.revision);
+          topologyChanged = valueChanged = true;
+        }
+        break;
+      }
+      case "group:upsert": {
+        for (const record of validRecords<GroupSnapshot>(operation.records, "group_id")) {
+          if (typeof record.group_id !== "number") continue;
+          const id = record.group_id;
+          const previous = groupsById.get(id);
+          if (!acceptRevision(previous?.revision, record.revision, removedGroupRevisions.get(id))) continue;
+          if (groupsById === state.groupsById) groupsById = new Map(groupsById);
+          groupsById.set(id, record);
+          topologyChanged ||= !previous || groupTopology(previous) !== groupTopology(record);
+          valueChanged = true;
+        }
+        break;
+      }
+      case "group:remove": {
+        for (const id of numberIds(operation.ids)) {
+          const previous = groupsById.get(id);
+          if (!previous) continue;
+          if (groupsById === state.groupsById) groupsById = new Map(groupsById);
+          groupsById.delete(id);
+          groupArchive = archiveNormalized(groupArchive, String(id), previous);
+          removedGroupRevisions = recordTombstone(removedGroupRevisions, state.removedGroupRevisions, id, previous.revision ?? 0);
+          topologyChanged = valueChanged = true;
+        }
+        break;
+      }
+      case "state:upsert": {
+        for (const record of validRecords<TraceFacet>(operation.records, "facet_id")) {
+          const previous = facetsById.get(record.facet_id);
+          if (!acceptEpochRevision(previous, record, "owner_epoch", removedFacetRevisions.get(record.facet_id))) continue;
+          if (facetsById === state.facetsById) facetsById = new Map(facetsById);
+          facetsById.set(record.facet_id, record);
+          topologyChanged ||= !previous || previous.owner_entity_id !== record.owner_entity_id || previous.owner_epoch !== record.owner_epoch;
+          valueChanged = true;
+        }
+        break;
+      }
+      case "state:remove": {
+        for (const id of stringIds(operation.ids)) {
+          const previous = facetsById.get(id);
+          if (!previous) continue;
+          if (facetsById === state.facetsById) facetsById = new Map(facetsById);
+          facetsById.delete(id);
+          facetArchive = archiveNormalized(facetArchive, id, previous);
+          removedFacetRevisions = recordEpochTombstone(
+            removedFacetRevisions, state.removedFacetRevisions, id,
+            previous.owner_epoch, previous.revision,
+          );
+          topologyChanged = valueChanged = true;
+        }
+        break;
+      }
+      case "diagnostics:patch":
+        if (operation.values) {
+          diagnostics = { ...diagnostics, ...operation.values };
+          valueChanged = true;
+        }
+        break;
+      case "capture:upsert":
+        for (const record of validRecords<TraceCapture>(operation.records, "record_id")) {
+          if (typeof record.record_id !== "number" || record.diagnostic_capture !== true) continue;
+          const previous = capturesById.get(record.record_id);
+          if (previous && previous.revision >= record.revision) continue;
+          if (capturesById === state.capturesById) capturesById = new Map(capturesById);
+          capturesById.set(record.record_id, record);
+          topologyChanged ||= !previous;
+          valueChanged = true;
+        }
+        break;
+      case "capture:remove":
+        for (const id of numberIds(operation.ids)) {
+          if (!capturesById.has(id)) continue;
+          if (capturesById === state.capturesById) capturesById = new Map(capturesById);
+          capturesById.delete(id);
+          topologyChanged = valueChanged = true;
+        }
+        break;
+    }
+  }
+
+  const operationNamesById = mergeOperationNames(state.operationNamesById, patch.operation_strings);
+  valueChanged ||= operationNamesById !== state.operationNamesById;
+  const indexes = topologyChanged
+    ? buildNormalizedIndexes(controlsById, groupsById, facetsById)
+    : { groupIdsByOwner: state.groupIdsByOwner, controlIdsByOwner: state.controlIdsByOwner, facetIdsByOwner: state.facetIdsByOwner };
+
   return {
-    deletedTaskIds,
-    summaries,
-    performanceEvents,
-    tasks,
-    groups,
-    tasksById: new Map(tasks.map((task) => [task.task_id, task])),
-    taskOrder: tasks.map((task) => task.task_id),
+    ...state,
+    schema: 2,
+    sequence: patch.sequence,
+    serverMonotonicMs: finiteNumber(patch.server_monotonic_ms),
+    machinesById, controlsById, groupsById, facetsById, capturesById, operationNamesById,
+    ...indexes,
+    groups: groupsById === state.groupsById ? state.groups : [...groupsById.values()],
+    groupArchive, machineArchive, controlArchive, facetArchive,
+    removedMachineRevisions: boundMap(removedMachineRevisions),
+    removedControlRevisions: boundMap(removedControlRevisions),
+    removedGroupRevisions: boundMap(removedGroupRevisions),
+    removedFacetRevisions: boundMap(removedFacetRevisions),
+    diagnostics,
+    topologyVersion: state.topologyVersion + (topologyChanged ? 1 : 0),
+    valueVersion: state.valueVersion + (valueChanged ? 1 : 0),
+    commitVersion: state.commitVersion + 1,
   };
+}
+
+function replaceNormalizedSnapshot(state: TraceState, snapshot: Schema2Snapshot): TraceState {
+  const machinesById = new Map((snapshot.machines ?? []).map((item) => [item.entity_id, item]));
+  const controlsById = new Map((snapshot.controls ?? []).map((item) => [item.handle_id, item]));
+  const groupsById = new Map(
+    (snapshot.groups ?? []).flatMap((item) => typeof item.group_id === "number" ? [[item.group_id, item] as const] : []),
+  );
+  const facetsById = new Map((snapshot.facets ?? []).map((item) => [item.facet_id, item]));
+  const capturesById = new Map((snapshot.captures ?? []).map((item) => [item.record_id, item]));
+  return {
+    ...state,
+    schema: 2,
+    traceId: snapshot.trace_id,
+    sequence: snapshot.snapshot_sequence,
+    serverMonotonicMs: finiteNumber(snapshot.server_monotonic_ms),
+    machinesById, controlsById, groupsById, facetsById, capturesById,
+    operationNamesById: mergeOperationNames(new Map(), snapshot.operation_strings),
+    ...buildNormalizedIndexes(controlsById, groupsById, facetsById),
+    groups: [...groupsById.values()],
+    diagnostics: snapshot.diagnostics ?? {},
+    removedMachineRevisions: new Map(),
+    removedControlRevisions: new Map(),
+    removedGroupRevisions: new Map(),
+    removedFacetRevisions: new Map(),
+    resyncRequired: false,
+    resyncReason: null,
+    topologyVersion: state.topologyVersion + 1,
+    valueVersion: state.valueVersion + 1,
+    commitVersion: state.commitVersion + 1,
+  };
+}
+
+function requestTraceResync(state: TraceState, reason: string): TraceState {
+  return {
+    ...state,
+    resyncRequired: true,
+    resyncReason: reason,
+    resyncRequestVersion: state.resyncRequestVersion + 1,
+    commitVersion: state.commitVersion + 1,
+    valueVersion: state.valueVersion + 1,
+  };
+}
+
+function emptyNormalizedArchive<T>(): NormalizedArchive<T> {
+  return { recordsById: new Map(), order: [] };
+}
+
+function archiveNormalized<T>(archive: NormalizedArchive<T>, id: string, record: T): NormalizedArchive<T> {
+  const recordsById = new Map(archive.recordsById);
+  recordsById.set(id, record);
+  const order = [...archive.order.filter((item) => item !== id), id];
+  while (order.length > NORMALIZED_ARCHIVE_LIMIT) recordsById.delete(order.shift()!);
+  return { recordsById, order };
+}
+
+function validRecords<T>(records: unknown[] | undefined, id: string): T[] {
+  return (records ?? []).filter(
+    (record): record is T => record !== null && typeof record === "object" && id in record,
+  );
+}
+
+function acceptRevision(previous: number | undefined, incoming: number | undefined, tombstone: number | undefined) {
+  return typeof incoming === "number" && incoming > (previous ?? tombstone ?? -1);
+}
+
+function acceptEpochRevision<T extends { revision: number }>(
+  previous: T | undefined,
+  incoming: T,
+  epochKey: keyof T,
+  tombstone: EpochRevision | undefined,
+) {
+  const newEpoch = Number(incoming[epochKey]);
+  if (!previous) {
+    return !tombstone || newEpoch > tombstone.epoch || (
+      newEpoch === tombstone.epoch && incoming.revision > tombstone.revision
+    );
+  }
+  const oldEpoch = Number(previous[epochKey]);
+  return newEpoch > oldEpoch || (newEpoch === oldEpoch && incoming.revision > previous.revision);
+}
+
+function recordTombstone<K>(map: Map<K, number>, original: Map<K, number>, id: K, revision: number) {
+  const next = map === original ? new Map(map) : map;
+  next.set(id, Math.max(next.get(id) ?? -1, revision));
+  return next;
+}
+
+function recordEpochTombstone<K>(
+  map: Map<K, EpochRevision>, original: Map<K, EpochRevision>, id: K,
+  epoch: number, revision: number,
+) {
+  const next = map === original ? new Map(map) : map;
+  const previous = next.get(id);
+  if (!previous || epoch > previous.epoch || (epoch === previous.epoch && revision > previous.revision)) {
+    next.set(id, { epoch, revision });
+  }
+  return next;
+}
+
+function boundMap<K, V>(map: Map<K, V>) {
+  if (map.size <= NORMALIZED_TOMBSTONE_LIMIT) return map;
+  const next = new Map(map);
+  while (next.size > NORMALIZED_TOMBSTONE_LIMIT) next.delete(next.keys().next().value!);
+  return next;
+}
+
+function stringIds(ids: Array<string | number> | undefined) {
+  return (ids ?? []).filter((id): id is string => typeof id === "string");
+}
+
+function numberIds(ids: Array<string | number> | undefined) {
+  return (ids ?? []).filter((id): id is number => typeof id === "number");
+}
+
+function controlTopology(item: TraceControl) {
+  return `${item.owner_entity_id}\u0000${item.owner_epoch}\u0000${item.name}`;
+}
+
+function groupTopology(item: GroupSnapshot) {
+  return `${item.owner_entity_id ?? ""}\u0000${item.owner_epoch ?? 0}\u0000${item.parent_ref_type ?? ""}\u0000${item.parent_ref_id ?? ""}\u0000${item.operation_id ?? item.operation}`;
+}
+
+function mergeOperationNames(previous: Map<number, string>, names: Record<string, string> | undefined) {
+  if (!names || Object.keys(names).length === 0) return previous;
+  let next = previous;
+  for (const [key, value] of Object.entries(names)) {
+    const id = Number(key);
+    if (!Number.isSafeInteger(id) || typeof value !== "string" || previous.get(id) === value) continue;
+    if (next === previous) next = new Map(previous);
+    next.set(id, value);
+  }
+  return next;
+}
+
+function buildNormalizedIndexes(
+  controls: Map<string, TraceControl>,
+  groups: Map<number, GroupSnapshot>,
+  facets: Map<string, TraceFacet>,
+) {
+  const groupIdsByOwner = new Map<string, number[]>();
+  const controlIdsByOwner = new Map<string, string[]>();
+  const facetIdsByOwner = new Map<string, string[]>();
+  for (const [id, item] of groups) appendIndex(groupIdsByOwner, item.owner_entity_id ?? "", id);
+  for (const [id, item] of controls) appendIndex(controlIdsByOwner, item.owner_entity_id, id);
+  for (const [id, item] of facets) appendIndex(facetIdsByOwner, item.owner_entity_id, id);
+  return { groupIdsByOwner, controlIdsByOwner, facetIdsByOwner };
+}
+
+function appendIndex<T>(index: Map<string, T[]>, owner: string, id: T) {
+  const ids = index.get(owner) ?? [];
+  ids.push(id);
+  index.set(owner, ids);
 }
 
 function applyGroupEvents(previous: GroupSnapshot[], events: TraceEventInput[]) {

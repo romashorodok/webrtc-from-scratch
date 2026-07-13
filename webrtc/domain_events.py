@@ -3,8 +3,9 @@ from __future__ import annotations
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from queue import Full, Queue
-from threading import RLock
+from queue import Empty, Full, Queue
+import asyncio
+import threading
 from typing import Any, Protocol
 
 from .runtime_services import ExecutionContext, current_execution_context
@@ -22,7 +23,10 @@ class IcePairNominated(DomainEvent):
 
 @dataclass(frozen=True, slots=True)
 class SrtpKeysReady(DomainEvent):
-    profile: str | None = None
+    # The current SRTP implementation always uses the one profile selected by
+    # the server hello.  Keep the semantic event useful instead of publishing
+    # an unexplained null after key derivation succeeds.
+    profile: str = "SRTP_AES128_CM_HMAC_SHA1_80"
 
 @dataclass(frozen=True, slots=True)
 class SrtpSessionReady(DomainEvent):
@@ -39,6 +43,60 @@ class SrtpPacketDelivery(DomainEvent):
     protocol: str = "rtp"
     delivered: bool = True
 
+
+@dataclass(frozen=True, slots=True)
+class PeerStateChanged(DomainEvent):
+    lifecycle: str = "new"
+    signaling: str = "stable"
+    connection: str = "new"
+
+
+@dataclass(frozen=True, slots=True)
+class IceStateChanged(DomainEvent):
+    gathering: str = "new"
+    connection: str = "new"
+
+
+@dataclass(frozen=True, slots=True)
+class DtlsStateChanged(DomainEvent):
+    state: str = "new"
+    revision: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class TransceiverStateChanged(DomainEvent):
+    transceiver_id: str = "default"
+    direction: str = "inactive"
+    active: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class MediaStateChanged(DomainEvent):
+    media_id: str = "default"
+    direction: str = "recv"
+    active: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class QueueStateChanged(DomainEvent):
+    queue_id: str = "default"
+    depth: int = 0
+    high_water: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerLaneStateChanged(DomainEvent):
+    lane_id: str = "default"
+    queued: int = 0
+    running: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class TraceHealthChanged(DomainEvent):
+    admitted: bool = True
+    subscriber_count: int = 0
+    journal_depth: int = 0
+
 class DomainEventObserver(Protocol):
     def on_domain_event(self, event: DomainEvent) -> None: ...
 
@@ -49,22 +107,70 @@ class DomainEventDispatcher:
         self.observers = list(observers)
         self.capacity = max(1, capacity)
         self.diagnostics = Counter()
-        self._inflight = 0
-        self._lock = RLock()
+        self._owner_thread: int | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._ingress: Queue[DomainEvent] = Queue(maxsize=self.capacity)
+        self._drain_scheduled = False
+        self._delivery_depth = 0
 
     def publish(self, event: DomainEvent) -> bool:
-        with self._lock:
-            if self._inflight >= self.capacity:
+        current = threading.get_ident()
+        if self._owner_thread is None:
+            try:
+                self._loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self._loop = None
+            self._owner_thread = current
+        if current == self._owner_thread:
+            if self._delivery_depth >= self.capacity:
                 self.diagnostics["dropped"] += 1
                 return False
-            self._inflight += 1
-        try:
-            for observer in tuple(self.observers):
-                try: observer.on_domain_event(event)
-                except Exception: self.diagnostics["observer_failures"] += 1
+            self._delivery_depth += 1
+            try:
+                self._deliver(event)
+            finally:
+                self._delivery_depth -= 1
             return True
-        finally:
-            with self._lock: self._inflight -= 1
+        # Exceptional external-thread producers enqueue only immutable events.
+        # Queue/wakeup internals may lock; projection records never do.
+        if self._loop is None or self._loop.is_closed():
+            self.diagnostics["external_without_loop"] += 1
+            return False
+        try:
+            self._ingress.put_nowait(event)
+        except Full:
+            self.diagnostics["dropped"] += 1
+            return False
+        if not self._drain_scheduled:
+            self._drain_scheduled = True
+            self._loop.call_soon_threadsafe(self._drain_ingress)
+        return True
+
+    def _deliver(self, event: DomainEvent) -> None:
+        for observer in tuple(self.observers):
+            try:
+                observer.on_domain_event(event)
+            except Exception:
+                self.diagnostics["observer_failures"] += 1
+
+    def add_observer(self, observer: DomainEventObserver) -> None:
+        if observer not in self.observers:
+            self.observers.append(observer)
+
+    def remove_observer(self, observer: DomainEventObserver) -> None:
+        try:
+            self.observers.remove(observer)
+        except ValueError:
+            pass
+
+    def _drain_ingress(self) -> None:
+        self._drain_scheduled = False
+        while True:
+            try:
+                event = self._ingress.get_nowait()
+            except Empty:
+                return
+            self._deliver(event)
 
 
 _default_dispatcher = DomainEventDispatcher()

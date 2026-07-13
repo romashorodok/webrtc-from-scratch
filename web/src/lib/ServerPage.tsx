@@ -10,10 +10,9 @@ export function ServerPage() {
     status,
     toasts,
     dismissToast,
-    performanceEvents,
-    groups,
-    summaries,
-    tasks,
+    requestTraceCapture,
+    machinesById, controlsById, groupsById, facetsById, capturesById, operationNamesById,
+    diagnostics, topologyVersion, valueVersion,
     videoRef,
   } = useServerSession();
 
@@ -55,13 +54,19 @@ export function ServerPage() {
       </div>
 
       <TraceOverlay
-        performanceEvents={performanceEvents}
-        groups={groups}
-        tasks={tasks}
         onClearCompleted={clearCompletedTraces}
         onClearFailed={clearFailedTraces}
         onDeleteTask={deleteTask}
-        summaries={summaries}
+        machinesById={machinesById}
+        controlsById={controlsById}
+        groupsById={groupsById}
+        facetsById={facetsById}
+        capturesById={capturesById}
+        onRequestCapture={requestTraceCapture}
+        operationNamesById={operationNamesById}
+        diagnostics={diagnostics}
+        topologyVersion={topologyVersion}
+        valueVersion={valueVersion}
       />
     </section>
   );

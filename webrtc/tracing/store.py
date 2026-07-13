@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from threading import RLock
+import threading
 from typing import Any, Mapping
 from collections import Counter
 
@@ -15,10 +15,10 @@ class TraceStore:
     def __init__(
         self, *, context_limit: int = 4096, diagnostics: Counter[str] | None = None
     ) -> None:
-        self.lock = RLock()
+        self.diagnostics: Counter[str] = diagnostics if diagnostics is not None else Counter()
+        self.lock = _OwnerGuard(self.diagnostics)
         self.arena = TraceArena()
         self.context_limit = max(1, context_limit)
-        self.diagnostics: Counter[str] = diagnostics if diagnostics is not None else Counter()
 
     def create(self, task: TaskTrace) -> bool:
         with self.lock:
@@ -148,3 +148,25 @@ class TraceStore:
                 item["duration_ms"] = max(0.0, (now - start) / 1_000_000)
             snapshots.append(item)
         return snapshots
+
+
+class _OwnerGuard:
+    """Context-manager-shaped loop ownership assertion, not a mutex."""
+
+    __slots__ = ("owner", "diagnostics")
+
+    def __init__(self, diagnostics: Counter[str]) -> None:
+        self.owner: int | None = None
+        self.diagnostics = diagnostics
+
+    def __enter__(self):
+        current = threading.get_ident()
+        if self.owner is None:
+            self.owner = current
+        elif self.owner != current:
+            self.diagnostics["trace_store_wrong_thread"] += 1
+            raise RuntimeError("TraceStore may only be used by its owning event loop")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
