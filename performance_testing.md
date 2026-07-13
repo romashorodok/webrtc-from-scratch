@@ -35,12 +35,12 @@ The repo already has most of the task infrastructure needed:
 - `webrtc/tracing/models.py`
   - `TaskContext` already stores task identity, parent links, monotonic timestamps, duration, status, metadata, and transitions.
 - `webrtc/runtime.py`
-  - `WebRTCRuntimeResources.trace_awaitable()` measures async task lifetime.
-  - `spawn_task()` creates traced tasks.
-  - `offload_sync()` measures thread work.
-- `webrtc/peer_context.py`
-  - `PeerContext` creates one root trace per peer.
-  - `spawn_peer_task()` attaches component metadata.
+  - `TaskScheduler.spawn_factory()` owns autonomous task lifetime.
+  - `Runtime.start(factory, ...)` starts genuinely dynamic application work.
+  - The serialized worker lane measures worker-classified component calls.
+- `webrtc/peer_connection.py`
+  - `PeerConnection` owns the WebRTC domain lifecycle inside an active `Runtime`.
+  - `ObservedMeta` attaches task and component metadata automatically.
   - Existing ICE readiness helpers provide a useful boundary, but should be consolidated behind a typed condition-based wait API.
 - `webrtc/ice/agent.py`
   - ICE gather, candidate pair creation, connectivity checks, pair success, and nomination are all visible.
@@ -51,7 +51,7 @@ The missing piece is a low-overhead performance event layer. Task tracing measur
 
 Before adding the E2E performance test, fix the current lifecycle surface:
 
-- Expose typed condition-based wait APIs on `Agent`, `ICEGatherer`, `DTLSTransport`, `PeerConnection`, and `PeerContext`.
+- Expose typed condition-based wait APIs on `Agent`, `ICEGatherer`, `DTLSTransport`, and `PeerConnection`.
 - Use `wait(condition, timeout)` as the canonical readiness contract for ICE, DTLS, and SRTP.
 - Keep method-specific wait wrappers optional and thin if they improve readability.
 - Remove the obsolete DTLS dequeue bridge task from `PeerConnection`; the Python DTLS FSM sends records directly through `DTLSLocal.sendto()`, and `DTLSTransport.dequeue_record()` intentionally never returns.
@@ -108,7 +108,6 @@ class PeerCondition(StrEnum):
 - `DTLSTransport.wait(condition: TransportCondition, timeout)` waits on DTLS handshake and SRTP readiness conditions.
 - `TransportCondition.SRTP_READY` waits for both RTP and RTCP SRTP sessions.
 - `PeerConnection.wait(condition: PeerCondition, timeout)` routes to ICE, DTLS, or SRTP internals.
-- `PeerContext.wait(condition: PeerCondition, timeout)` delegates to `PeerConnection`.
 - Existing methods such as `DTLSTransport.wait_handshake()` may remain as compatibility wrappers, but should delegate to the condition-based wait path.
 
 This makes tests, app code, and tracing use the same readiness contract.
@@ -359,14 +358,14 @@ perf_mark("ice", "candidate_pair", "succeeded", metadata={...})
 
 If no recorder is active, this helper must do nothing. This keeps instrumentation optional and avoids threading a recorder through every protocol class.
 
-`PerformanceRecorder.mark()` should use `get_current_task_context()` to attach:
+`PerformanceRecorder.mark()` should use `current_execution_context()` to attach:
 
 - `trace_id`
 - `parent_trace_id`
 - task name
 - task kind
 - existing component metadata where useful
-- peer metadata from the active `PeerContext`, when available
+- scope metadata from the active `Runtime`, when available
 
 The recorder should also provide a run-level event:
 
@@ -521,22 +520,16 @@ Counters:
 
 Keep `TaskContext` as the task ownership layer.
 
-Add a way for `PerformanceRecorder` to be available through runtime or peer context:
+Make `PerformanceRecorder` available through the active execution context:
 
 ```python
-runtime.performance
-```
-
-or:
-
-```python
-peer_context.performance
+use_performance_recorder(recorder)
 ```
 
 Preferred path:
 
 - Runtime owns the recorder for the whole test run.
-- PeerContext adds peer metadata automatically.
+- Runtime scope metadata supplies the peer identifier automatically.
 - Protocol code calls a small helper:
 
 ```python
@@ -565,7 +558,7 @@ Complete these cleanup items before the E2E performance test is added:
 - Keep method-specific wrappers optional and implemented only as thin aliases over `wait(condition, timeout)`.
 - Replace remaining `print()` calls in SDP, ICE, and DTLS protocol paths with structured logging.
 - Convert swallowed setup errors into raised exceptions or explicit `*.failed` events.
-- Make `PeerContext.aclose()` produce predictable cleanup and allow the perf test to assert no unexpected active routines remain after close.
+- Make `PeerConnection.aclose()` produce predictable cleanup and allow the perf test to assert no unexpected managed tasks remain after close.
 
 ## Baseline Files
 
@@ -645,10 +638,10 @@ Test flow:
 ```text
 1. Create runtime with active PerformanceRecorder.
 2. Create two PeerConnection instances.
-3. Enter two PeerContext scopes:
+3. Enter one `Runtime` and one nested `PeerConnection` context per peer:
    - peer_id = "offerer"
    - peer_id = "answerer"
-4. Start both peer contexts.
+4. Start both peer connections.
 5. Add minimal synthetic transceiver/media setup required to reach DTLS/SRTP.
 6. Create offer on offerer.
 7. Set local offer on offerer.
@@ -794,10 +787,10 @@ Implement the performance work in layers:
 
 **Goal:** Make readiness observable through public APIs before adding performance tests.
 
-**Areas:** `Agent`, `ICEGatherer`, `DTLSTransport`, `PeerConnection`, `PeerContext`, lifecycle wait tests.
+**Areas:** `Agent`, `ICEGatherer`, `DTLSTransport`, `PeerConnection`, lifecycle wait tests.
 
 **Changes:**
-- Add typed `wait(condition, timeout)` APIs for `Agent`, `ICEGatherer`, `DTLSTransport`, `PeerConnection`, and `PeerContext`.
+- Add typed `wait(condition, timeout)` APIs for `Agent`, `ICEGatherer`, `DTLSTransport`, and `PeerConnection`.
 - Add `ICECondition`, `TransportCondition`, and `PeerCondition`.
 - Support waits for ICE gathering complete, candidate-pair succeeded, nomination, nominated transport ready, DTLS handshake complete, and SRTP ready.
 - Ensure SRTP readiness waits for both RTP and RTCP SRTP sessions.
@@ -807,7 +800,7 @@ Implement the performance work in layers:
 **Tests:**
 - Add unit tests for each condition wait.
 - Add a timeout test for an unmet condition.
-- Add a peer-level test proving `PeerContext.wait(PeerCondition.SRTP_READY)` delegates correctly.
+- Add a peer-level test proving `PeerConnection.wait(PeerCondition.SRTP_READY)` delegates correctly.
 
 **Done when:**
 - Tests no longer depend on private internals for readiness.
@@ -914,7 +907,7 @@ Implement the performance work in layers:
 - Add `tests/performance/helpers.py`.
 - Add baseline JSON at `tests/performance/baselines/pc_e2e_loopback_ice_dtls_srtp.json`.
 - Use two in-process peers, in-memory signaling, real loopback UDP, and synthetic media setup only.
-- Await readiness using `PeerContext.wait(PeerCondition, timeout)`.
+- Await readiness using `PeerConnection.wait(PeerCondition, timeout)`.
 - Assert required events, forbidden events, ordering, counters, loose timing thresholds, and cleanup.
 - Attach the performance summary to pytest output through `record_property`.
 
@@ -987,7 +980,7 @@ Implement the performance work in layers:
 
 - Should strict timing regression checks be a marked pytest test, an environment-gated assertion, or a separate script?
 - Should the first synthetic transceiver be audio-only, video-only, or one of each?
-- Should the E2E test create both peers with the default runtime or always inject an isolated `WebRTCRuntimeResources` instance?
+- Should the E2E test create both peers with the default composition root or inject isolated runtime services?
 - Should event artifacts be written to disk on failure for debugging, or only attached through pytest `record_property`?
 - Should failure events include sanitized exception text, exception class only, or both?
 

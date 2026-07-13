@@ -80,7 +80,7 @@ def test_peer_connection_loopback_av1_rtp_rtcp_twcc_e2e(record_property):
     """Exercise AV1 RTP and reverse TWCC over the negotiated secure transport.
 
     Sending, receiver-owned TWCC construction, and sender-side feedback
-    acceptance all go through ``PeerContext`` public media APIs.
+    acceptance all go through ``PeerConnection`` public media APIs.
     """
     loopback_interfaces = [
         interface
@@ -115,7 +115,7 @@ async def _run_av1_rtp_rtcp_twcc_scenario():
 
             # The remote track is the application-visible RTP boundary.
             remote_track = await answerer.call(
-                lambda context: context.pc._transceivers[0]._receiver.track
+                lambda context: context._transceivers[0]._receiver.track
             )
             assert remote_track is not None
             # The current SDP implementation assigns its receiver SSRC
@@ -203,7 +203,7 @@ async def _run_av1_rtp_rtcp_twcc_scenario():
 
 async def _setup_synthetic_video(peer: PeerDriver) -> None:
     await peer.call(
-        lambda context: context.pc.add_transceiver_from_kind(
+        lambda context: context.add_transceiver_from_kind(
             RTPCodecKind.Video, RTPTransceiverDirection.Sendrecv
         )
     )
@@ -258,9 +258,9 @@ async def _negotiate_loopback(
         ),
     )
 
-    offer = await offerer.call(lambda peer: peer.pc.create_offer())
+    offer = await offerer.call(lambda peer: peer.create_offer())
     await offerer.call(
-        lambda peer: peer.pc.set_local_description(
+        lambda peer: peer.set_local_description(
             SessionDescriptionType.Offer,
             offer,
         )
@@ -268,15 +268,15 @@ async def _negotiate_loopback(
 
     await _set_remote_credentials(answerer, offer)
     await answerer.call(
-        lambda peer: peer.pc.set_remote_description(
+        lambda peer: peer.set_remote_description(
             SessionDescriptionType.Offer,
             offer,
         )
     )
 
-    answer = await answerer.call(lambda peer: peer.pc.create_answer())
+    answer = await answerer.call(lambda peer: peer.create_answer())
     await answerer.call(
-        lambda peer: peer.pc.set_local_description(
+        lambda peer: peer.set_local_description(
             SessionDescriptionType.Answer,
             answer,
         )
@@ -284,7 +284,7 @@ async def _negotiate_loopback(
 
     await _set_remote_credentials(offerer, answer)
     await offerer.call(
-        lambda peer: peer.pc.set_remote_description(
+        lambda peer: peer.set_remote_description(
             SessionDescriptionType.Answer,
             answer,
         )
@@ -308,7 +308,7 @@ async def _negotiate_loopback(
 
 async def _setup_synthetic_audio(peer: PeerDriver) -> None:
     await peer.call(
-        lambda context: context.pc.add_transceiver_from_kind(
+        lambda context: context.add_transceiver_from_kind(
             RTPCodecKind.Audio,
             RTPTransceiverDirection.Sendrecv,
         )
@@ -316,14 +316,14 @@ async def _setup_synthetic_audio(peer: PeerDriver) -> None:
 
 
 async def _local_candidate_strings(peer: PeerDriver) -> list[str]:
-    candidates = await peer.call(lambda context: context.pc.gatherer.get_local_candidates())
+    candidates = await peer.call(lambda context: context.gatherer.get_local_candidates())
     return [candidate.to_ice_str() for candidate in candidates or []]
 
 
 async def _set_remote_credentials(peer: PeerDriver, desc) -> None:
     for ufrag, pwd in media_credentials(desc):
         await peer.call(
-            lambda context, ufrag=ufrag, pwd=pwd: context.set_remote_credentials(
+            lambda context, ufrag=ufrag, pwd=pwd: context.gatherer.set_remote_credentials(
                 ufrag,
                 pwd,
             )
@@ -342,11 +342,11 @@ async def _exchange_candidates(
 
     for candidate in offerer_candidates:
         await answerer.call(
-            lambda context, candidate=candidate: context.add_remote_candidate(candidate)
+            lambda context, candidate=candidate: context.gatherer.add_remote_candidate(candidate)
         )
     for candidate in answerer_candidates:
         await offerer.call(
-            lambda context, candidate=candidate: context.add_remote_candidate(candidate)
+            lambda context, candidate=candidate: context.gatherer.add_remote_candidate(candidate)
         )
 
 

@@ -1,12 +1,13 @@
 import socket
 import re
 import asyncio
+import inspect
 import queue
 from datetime import datetime, timedelta
 
 from dataclasses import dataclass
 from enum import Enum, StrEnum
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol, cast
 
 from . import stun
 from . import net
@@ -26,9 +27,11 @@ from .stun_message import stun_message_parse_attrs, stun_message_parse_header
 from webrtc.utils import impl_protocol, AsyncEventEmitter, Handler_T
 from webrtc.logger import get_logger, Component
 from webrtc.config import get_config
-from webrtc.peer_context import spawn_peer_task
+from webrtc.performance import ObservedComponent, event_loop, task
+from webrtc.runtime_services import FailurePolicy
 from webrtc.lifecycle import ICECondition, require_timeout, wait_for_event, wait_until
 from webrtc.tracing import perf_mark, perf_measured_async
+from webrtc.domain_events import IcePairNominated, emit_domain_event
 
 from .candidate_base import (
     CandidateBase,
@@ -305,7 +308,7 @@ class ControllingSelector(AsyncEventEmitter):
             "Nominating candidate pair",
             pair_id=pair.get_pair_id(),
         )
-        perf_mark("ice", "candidate_pair", "nominated", metadata=_pair_metadata(pair))
+        emit_domain_event(IcePairNominated)
         self._nominated_pair = pair
         self.emit(SelectorEvent.NOMINATE, pair)
 
@@ -604,7 +607,7 @@ class CandidatePairTransport:
 
         # self._rtp = queue.Queue[Packet]()
         # self._rtcp = queue.Queue[Packet]()
-        self._rtp = Interceptor()
+        self._rtp = Interceptor(maxsize=2048, drop_oldest=True)
         self._rtcp = Interceptor()
         self._dtls = Interceptor()
 
@@ -742,7 +745,7 @@ class CandidatePairControllerEvent(StrEnum):
     NOMINATE_TRANSPORT = "nominate-transport"
 
 
-class CandidatePairController(AsyncEventEmitter):
+class CandidatePairController(AsyncEventEmitter, ObservedComponent):
     def __init__(
         self, pair: CandidatePair, selector: SelectorProtocol, tie_breaker: int
     ) -> None:
@@ -757,7 +760,12 @@ class CandidatePairController(AsyncEventEmitter):
         )
         self.__transport = CandidatePairTransport(self.__conn, pair_id=pair.get_pair_id())
         self.__nominated = asyncio.Event()
+        self._task_handle: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
+        self._closing = False
+        self._closed = False
 
+    @event_loop
     def __pair_nominate(self, _: CandidatePair):
         get_logger().debug(
             Component.ICE,
@@ -765,9 +773,15 @@ class CandidatePairController(AsyncEventEmitter):
             pair_id=self._pair.get_pair_id(),
         )
         self.__nominated.set()
-        perf_mark("ice", "transport", "nominated", metadata=_pair_metadata(self._pair))
+        emit_domain_event(IcePairNominated)
         self.emit(CandidatePairControllerEvent.NOMINATE_TRANSPORT, self.__transport)
 
+    @task(
+        name="ice:candidate-pair-controller",
+        kind="ice",
+        metadata={"expected_long_running": True, "loop_role": "controller"},
+        failure=FailurePolicy.FAIL_CONNECTION,
+    )
     async def start(self):
         self.__selector.start()
         self.__selector.on(SelectorEvent.NOMINATE, self.__pair_nominate)
@@ -824,6 +838,39 @@ class CandidatePairController(AsyncEventEmitter):
                 )
                 raise
 
+    async def start_managed(self) -> asyncio.Task[None]:
+        """Atomically start and retain the controller's managed task."""
+        if self._closing or self._closed:
+            raise RuntimeError("candidate pair controller is closing")
+        if self._task_handle is None:
+            self._task_handle = cast(asyncio.Task[None], self.start())
+        return cast(asyncio.Task[None], self._task_handle)
+
+    async def _close(self) -> None:
+        task_handle = self._task_handle
+        if task_handle is not None and not task_handle.done():
+            task_handle.cancel()
+        if task_handle is not None:
+            await asyncio.gather(task_handle, return_exceptions=True)
+        self._task_handle = None
+        self.remove_all_listeners()
+        await self.__selector.aclose()
+        await super().aclose()
+        self._closed = True
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closing = True
+        if self._close_task is None or (
+            self._close_task.done()
+            and (self._close_task.cancelled() or self._close_task.exception() is not None)
+        ):
+            self._close_task = asyncio.create_task(
+                self._close(), name="ice:candidate-pair-controller-close"
+            )
+        await asyncio.shield(self._close_task)
+
     async def _on_inbound_pkt(self, pkt: Packet):
         self.__transport.pipe(pkt)
 
@@ -879,6 +926,7 @@ class CandidatePairController(AsyncEventEmitter):
         # NOTE: How to make state observing/notifying
         await self.__selector.send_ping_stun_message(self._pair, self.__conn)
 
+    @event_loop
     def get_transport(self) -> CandidatePairTransport:
         return self.__transport
 
@@ -919,7 +967,7 @@ mdns_pattern = re.compile(r"\b(?:[a-zA-Z0-9_-]+\.)*local\.?\b")
 
 
 # Controlling agent must know remote user credentials
-class Agent(AsyncEventEmitter):
+class Agent(AsyncEventEmitter, ObservedComponent):
     def __init__(self, options: AgentOptions) -> None:
         super().__init__()
 
@@ -944,6 +992,23 @@ class Agent(AsyncEventEmitter):
         self._candidate_pair_transports = list[CandidatePairTransport]()
         self._gathering_complete = asyncio.Event()
 
+    async def aclose(self) -> None:
+        await self.aclose_controllers()
+        for transport in reversed(self._candidate_pair_transports):
+            closer = getattr(transport, "aclose", None) or getattr(transport, "close", None)
+            if closer is not None:
+                result = closer()
+                if inspect.isawaitable(result):
+                    await result
+        self._candidate_pair_transports.clear()
+        await self._udp.aclose()
+        await super().aclose()
+
+    async def aclose_controllers(self) -> None:
+        for controller in reversed(self._controller_registry.controllers()):
+            await controller.aclose()
+
+    @event_loop
     def set_on_candidate(self, on_candidate: Callable[[CandidateBase], None]):
         self._on_candidate = on_candidate
 
@@ -964,19 +1029,14 @@ class Agent(AsyncEventEmitter):
             match candidate_type:
                 case CandidateType.Host:
                     coros.append(
-                        spawn_peer_task(
-                            self._gather_host_candidate(),
-                            name="ice:gather-host-candidate",
-                            component="ice",
-                            kind="ice",
-                            loop=self._loop,
-                        )
+                        self._gather_host_candidate()
                     )
                 case _:
                     pass
         await asyncio.gather(*coros)
         self._gathering_complete.set()
 
+    @event_loop
     def _on_nominate_pair(self, pair: CandidatePair):
         get_logger().debug(
             Component.ICE,
@@ -984,6 +1044,7 @@ class Agent(AsyncEventEmitter):
             pair_id=pair.get_pair_id(),
         )
 
+    @event_loop
     def _start_controller(self, pair: CandidatePair):
         if self._role == AgentRole.Controlling:
             selector = ControllingSelector(self._pair_registry, self._tie_breaker)
@@ -1005,6 +1066,7 @@ class Agent(AsyncEventEmitter):
         )
 
     # Look at func (s *controllingSelector) ContactCandidates() to know more
+    @event_loop
     def connect(self, controlling: bool):
         if self._remote_ufrag is None or self._remote_pwd is None:
             raise RuntimeError("ICE remote credentials are not set")
@@ -1036,11 +1098,13 @@ class Agent(AsyncEventEmitter):
 
         return
 
+    @event_loop
     def dial(self):
         "Initiates a connection to another peer"
         self._role = AgentRole.Controlling
         self.connect(True)
 
+    @event_loop
     def accept(self):
         self._role = AgentRole.Controlled
         self.connect(False)
@@ -1139,13 +1203,7 @@ class Agent(AsyncEventEmitter):
         remotes = self._remote_candidates.get(net_type)
         if remotes:
             for remote in remotes:
-                spawn_peer_task(
-                    self._add_candidate_pair(local, remote),
-                    name="ice:add-candidate-pair",
-                    component="ice",
-                    kind="ice",
-                    loop=self._loop,
-                )
+                await self._add_candidate_pair(local, remote)
 
     async def _add_remote_candidate(self, remote: CandidateBase):
         # async with self._candidate_lock:
@@ -1177,30 +1235,20 @@ class Agent(AsyncEventEmitter):
         locals = self._local_candidates.get(net_type)
         if locals:
             for local in locals:
-                spawn_peer_task(
-                    self._add_candidate_pair(local, remote),
-                    name="ice:add-candidate-pair",
-                    component="ice",
-                    kind="ice",
-                    loop=self._loop,
-                )
+                await self._add_candidate_pair(local, remote)
 
-    def add_remote_candidate(self, candidate_raw: str):
+    async def add_remote_candidate(self, candidate_raw: str):
         remote = parse_candidate_str(candidate_raw)
         if not remote:
             return
-        spawn_peer_task(
-            self._add_remote_candidate(remote),
-            name="ice:add-remote-candidate",
-            component="ice",
-            kind="ice",
-            loop=self._loop,
-        )
+        await self._add_remote_candidate(remote)
 
+    @event_loop
     def get_local_credentials(self) -> tuple[str, str]:
         return (self._local_ufrag, self._local_pwd)
 
     # TODO: may remote this
+    @event_loop
     def set_remote_credentials(self, ufrag: str, pwd: str):
         self._remote_ufrag = ufrag
         self._remote_pwd = pwd
@@ -1211,21 +1259,25 @@ class Agent(AsyncEventEmitter):
             metadata={"remote_ufrag": ufrag, "password_length": len(pwd)},
         )
 
+    @event_loop
     def get_role(self) -> AgentRole:
         return self._role
 
+    @event_loop
     def _has_succeeded_candidate_pair(self) -> bool:
         return any(
             pair.state == CandidatePairState.SUCCEEDED
             for pair in self._pair_registry.get_pair_list().values()
         )
 
+    @event_loop
     def _has_nominated_pair(self) -> bool:
         return any(
             controller.nominated
             for controller in self._controller_registry.controllers()
         )
 
+    @event_loop
     def _has_nominated_transport_ready(self) -> bool:
         return self._has_nominated_pair()
 

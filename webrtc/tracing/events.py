@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass, field
 from threading import RLock
 from typing import Any
+import json
 import weakref
 
 
@@ -13,12 +14,11 @@ class TraceSubscriber:
     loop: asyncio.AbstractEventLoop
     peer_id: str | None = None
     pending_events: list[dict[str, Any]] = field(default_factory=list)
-    pending_update_positions: dict[str, int] = field(default_factory=dict)
     flush_handle: asyncio.TimerHandle | None = None
 
 
 class TraceEventBus:
-    def __init__(self, *, batch_interval: float = 0.25, max_pending_events: int = 2048) -> None:
+    def __init__(self, *, batch_interval: float = 1.0, max_pending_events: int = 2048) -> None:
         self._lock = RLock()
         self._subscribers: set[TraceSubscriber] = weakref.WeakSet()
         self._sequence = 0
@@ -52,9 +52,15 @@ class TraceEventBus:
             handle = sub.flush_handle
             sub.flush_handle = None
             sub.pending_events.clear()
-            sub.pending_update_positions.clear()
         if handle is not None:
             handle.cancel()
+
+    def close(self) -> None:
+        """Detach subscribers and cancel all owned batching timers."""
+        with self._lock:
+            subscribers = list(self._subscribers)
+        for subscriber in subscribers:
+            self.unsubscribe(subscriber)
 
     def batch_event(self, events: list[dict[str, Any]]) -> dict[str, Any]:
         return {"event": "trace:batch", "data": {"events": events}}
@@ -78,25 +84,15 @@ class TraceEventBus:
             sub.loop.call_soon_threadsafe(offer)
 
     def _flush(self, sub: TraceSubscriber) -> None:
-        events = sub.pending_events
+        events = self._coalesce(sub.pending_events)
         sub.pending_events = []
-        sub.pending_update_positions = {}
         sub.flush_handle = None
         if not events:
             return
         self._offer(sub.queue, self.batch_event(events))
 
     def _append_pending(self, sub: TraceSubscriber, event: dict[str, Any]) -> None:
-        trace_id = self._trace_update_id(event)
-        if trace_id is not None:
-            position = sub.pending_update_positions.get(trace_id)
-            if position is None:
-                sub.pending_update_positions[trace_id] = len(sub.pending_events)
-                sub.pending_events.append(event)
-            else:
-                sub.pending_events[position] = event
-        else:
-            sub.pending_events.append(event)
+        sub.pending_events.append(event)
         self._trim_pending_events(sub)
 
     def _trim_pending_events(self, sub: TraceSubscriber) -> None:
@@ -105,23 +101,100 @@ class TraceEventBus:
             return
 
         del sub.pending_events[:overflow]
-        if not sub.pending_update_positions:
-            return
+    @classmethod
+    def _coalesce(cls, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Coalesce updates without crossing task lifecycle boundaries."""
+        output: list[dict[str, Any]] = []
+        segment: list[dict[str, Any]] = []
 
-        trimmed_positions: dict[str, int] = {}
-        for trace_id, position in sub.pending_update_positions.items():
-            if position >= overflow:
-                trimmed_positions[trace_id] = position - overflow
-        sub.pending_update_positions = trimmed_positions
+        def flush_segment() -> None:
+            if not segment:
+                return
+            output.extend(cls._coalesce_segment(segment))
+            segment.clear()
+
+        for event in events:
+            if event.get("event") in {"trace:init", "trace:complete", "trace:delete"}:
+                flush_segment()
+                if output and cls._event_signature(output[-1]) == cls._event_signature(event):
+                    cls._retain_highest_sequence(output[-1], event)
+                else:
+                    output.append(event)
+            else:
+                segment.append(event)
+        flush_segment()
+        return output
+
+    @classmethod
+    def _coalesce_segment(cls, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        update_position: int | None = None
+        update_tasks: dict[str, dict[str, Any]] = {}
+        update_data: dict[str, Any] = {}
+
+        for event in events:
+            if event.get("event") != "trace:update":
+                cls._append_distinct(output, event)
+                continue
+            data = event.get("data")
+            if not isinstance(data, dict):
+                cls._append_distinct(output, event)
+                continue
+            if update_position is None:
+                update_position = len(output)
+                output.append({"event": "trace:update", "data": {}})
+            sequence = data.get("sequence")
+            previous_sequence = update_data.get("sequence")
+            if isinstance(sequence, int) and (
+                not isinstance(previous_sequence, int) or sequence > previous_sequence
+            ):
+                update_data["sequence"] = sequence
+            for key, value in data.items():
+                if key not in {"tasks", "sequence", "groups"}:
+                    update_data[key] = value
+            if "groups" in data:
+                update_data["groups"] = data["groups"]
+            tasks = data.get("tasks")
+            if isinstance(tasks, list):
+                for task in tasks:
+                    task_id = task.get("task_id") if isinstance(task, dict) else None
+                    if isinstance(task_id, str):
+                        update_tasks[task_id] = task
+
+        if update_position is not None:
+            output[update_position] = {
+                "event": "trace:update",
+                "data": {**update_data, "tasks": list(update_tasks.values())},
+            }
+        return output
 
     @staticmethod
-    def _trace_update_id(event: dict[str, Any]) -> str | None:
-        if event.get("event") != "trace:update":
-            return None
+    def _append_distinct(output: list[dict[str, Any]], event: dict[str, Any]) -> None:
+        signature = TraceEventBus._event_signature(event)
+        for existing in reversed(output):
+            if existing.get("event") in {"trace:init", "trace:complete", "trace:delete"}:
+                break
+            if TraceEventBus._event_signature(existing) == signature:
+                TraceEventBus._retain_highest_sequence(existing, event)
+                return
+        output.append(event)
+
+    @staticmethod
+    def _event_signature(event: dict[str, Any]) -> str:
         data = event.get("data")
-        trace = data.get("trace") if isinstance(data, dict) else None
-        trace_id = trace.get("trace_id") if isinstance(trace, dict) else None
-        return trace_id if isinstance(trace_id, str) else None
+        normalized = {key: value for key, value in data.items() if key != "sequence"} if isinstance(data, dict) else data
+        return json.dumps({"event": event.get("event"), "data": normalized}, sort_keys=True, default=str)
+
+    @staticmethod
+    def _retain_highest_sequence(existing: dict[str, Any], incoming: dict[str, Any]) -> None:
+        existing_data = existing.get("data")
+        incoming_data = incoming.get("data")
+        if not isinstance(existing_data, dict) or not isinstance(incoming_data, dict):
+            return
+        current = existing_data.get("sequence")
+        candidate = incoming_data.get("sequence")
+        if isinstance(candidate, int) and (not isinstance(current, int) or candidate > current):
+            existing_data["sequence"] = candidate
 
     @staticmethod
     def _event_peer_id(event: dict[str, Any]) -> str | None:
@@ -151,14 +224,8 @@ class TraceEventBus:
         if not isinstance(data, dict):
             return []
 
-        traces: list[dict[str, Any]] = []
-        trace = data.get("trace")
-        if isinstance(trace, dict):
-            traces.append(trace)
-        trace_list = data.get("traces")
-        if isinstance(trace_list, list):
-            traces.extend(item for item in trace_list if isinstance(item, dict))
-        return traces
+        tasks = data.get("tasks")
+        return [item for item in tasks if isinstance(item, dict)] if isinstance(tasks, list) else []
 
     @staticmethod
     def _offer(queue: asyncio.Queue[dict[str, Any]], event: dict[str, Any]) -> None:

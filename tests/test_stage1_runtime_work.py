@@ -1,13 +1,18 @@
 import asyncio
 from types import SimpleNamespace
+from typing import NoReturn
+
+import pytest
 
 from webrtc.dtls import DTLSRole
 from webrtc.dtls.dtlstransport import DTLSLocal
 from webrtc.ice import AgentRole, CandidatePairControllerEvent
+from webrtc.ice.agent import CandidatePairController
 from webrtc.peer_connection import PeerConnection
 from webrtc.peer_connection_types import ConnectionRole
-from webrtc.peer_context import PeerContext
-from webrtc.runtime import WebRTCRuntimeResources
+from webrtc.performance import ObservedComponent, event_loop, task
+from webrtc import Runtime
+from webrtc.runtime_services import FailurePolicy
 from webrtc.session_description import (
     MediaDescription,
     SessionDescription,
@@ -49,13 +54,15 @@ class FakePairTransport:
         self.sent.append(data)
 
 
-class FakePairController:
+class FakePairController(ObservedComponent):
     def __init__(self):
         self.handlers = {}
 
+    @event_loop
     def remove_all_listeners(self):
         pass
 
+    @event_loop
     def on(self, event):
         def decorator(handler):
             self.handlers[event] = handler
@@ -63,8 +70,18 @@ class FakePairController:
 
         return decorator
 
+    @task(
+        name="ice:candidate-pair-controller",
+        kind="ice",
+        metadata={"expected_long_running": True, "loop_role": "controller"},
+        failure=FailurePolicy.FAIL_CONNECTION,
+    )
     async def start(self):
         await asyncio.Event().wait()
+
+    async def start_managed(self):
+        self._task_handle = self.start()
+        return self._task_handle
 
 
 def make_peer_connection_subject(role=AgentRole.Controlling):
@@ -106,12 +123,12 @@ def test_dtls_local_sends_records_through_ice_transport_sendto():
 
 def test_nomination_startup_excludes_obsolete_dequeue_bridge_and_marks_long_running_tasks():
     async def scenario():
-        runtime = WebRTCRuntimeResources(max_workers=1)
+        runtime = Runtime(max_workers=1)
         pc = make_peer_connection_subject()
         controller = FakePairController()
         transport = FakePairTransport()
 
-        async with PeerContext(pc, runtime=runtime, peer_id="stage1-peer") as peer:
+        async with runtime:
             await pc._PeerConnection__on_ice_pair_controller(controller)
             await controller.handlers[
                 CandidatePairControllerEvent.NOMINATE_TRANSPORT
@@ -134,9 +151,62 @@ def test_nomination_startup_excludes_obsolete_dequeue_bridge_and_marks_long_runn
             assert queue_metadata["expected_long_running"] is True
             assert queue_metadata["loop_role"] == "receive"
 
-        assert peer.active_routine_count() == 0
         assert runtime.trace_live_running() == []
-        await runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_candidate_pair_controller_close_owns_start_handle_and_is_retryable():
+    class Selector:
+        def __init__(self):
+            self.close_entered = asyncio.Event()
+            self.close_release = asyncio.Event()
+
+        async def aclose(self):
+            self.close_entered.set()
+            await self.close_release.wait()
+
+    class Subject(CandidatePairController):
+        def __init__(self):
+            super(CandidatePairController, self).__init__()
+            self._task_handle = None
+            self._close_task = None
+            self._closing = False
+            self._closed = False
+            self._CandidatePairController__selector = Selector()
+            self.started = asyncio.Event()
+            self.stopped = asyncio.Event()
+
+        @task(name="test:candidate-controller", kind="ice")
+        async def start(self) -> NoReturn:
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+            finally:
+                self.stopped.set()
+
+    async def scenario():
+        async with Runtime() as runtime:
+            controller = Subject()
+            task_handle = await controller.start_managed()
+            assert controller._task_handle is task_handle
+            await controller.started.wait()
+
+            first_close = asyncio.create_task(controller.aclose())
+            await controller._CandidatePairController__selector.close_entered.wait()
+            first_close.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first_close
+
+            assert controller.stopped.is_set()
+            controller._CandidatePairController__selector.close_release.set()
+            await controller.aclose()
+            assert controller._closed
+            assert controller._task_handle is None
+            assert task_handle.done()
+            assert runtime.root_context is not None
+            assert runtime.task_registry.get(runtime.root_context.task_id) is not None
 
     asyncio.run(scenario())
 

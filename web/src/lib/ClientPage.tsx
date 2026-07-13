@@ -5,14 +5,15 @@ export function ClientPage() {
   const {
     clearCompletedTraces,
     clearFailedTraces,
-    deleteTrace,
+    deleteTask,
     startNegotiation,
     status,
     toasts,
     dismissToast,
     performanceEvents,
+    groups,
     summaries,
-    traces,
+    tasks,
     videoRef,
   } = useClientSession();
 
@@ -55,10 +56,11 @@ export function ClientPage() {
 
       <TraceOverlay
         performanceEvents={performanceEvents}
-        traces={traces}
+        groups={groups}
+        tasks={tasks}
         onClearCompleted={clearCompletedTraces}
         onClearFailed={clearFailedTraces}
-        onDeleteTrace={deleteTrace}
+        onDeleteTask={deleteTask}
         summaries={summaries}
       />
     </section>

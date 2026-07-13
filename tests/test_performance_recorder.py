@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from webrtc.runtime import WebRTCRuntimeResources
+from webrtc import Runtime
 from webrtc.tracing import (
     PerformanceRecorder,
     get_current_performance_recorder,
@@ -135,21 +135,16 @@ def test_sync_decorator_records_events():
 
 
 def test_perf_events_attach_task_context_peer_metadata():
-    runtime = WebRTCRuntimeResources(max_workers=1)
+    runtime = Runtime(scope_id="peer-a", max_workers=1)
     recorder = PerformanceRecorder()
     try:
-        context = runtime.create_task_context(
-            name="protocol-task",
-            kind="protocol",
-            metadata={"peer_id": "peer-a", "component": "ice"},
-        )
-        runtime.start_task_context(context)
-
         async def scenario():
             with use_performance_recorder(recorder):
-                await runtime.trace_awaitable(
-                    _mark_once(),
-                    context=context,
+              async with runtime:
+                await runtime.start(
+                    lambda: _mark_once(),
+                    name="protocol-task",
+                    kind="protocol",
                 )
 
         asyncio.run(scenario())
@@ -157,11 +152,9 @@ def test_perf_events_attach_task_context_peer_metadata():
         runtime.shutdown()
 
     event = recorder.events()[0]
-    assert event.metadata["trace_id"] == context.trace_id
-    assert event.metadata["task_name"] == "protocol-task"
-    assert event.metadata["task_kind"] == "protocol"
+    assert event.metadata["trace_id"]
+    assert event.metadata["task_id"]
     assert event.metadata["peer_id"] == "peer-a"
-    assert event.metadata["component"] == "ice"
 
 
 async def _mark_once():

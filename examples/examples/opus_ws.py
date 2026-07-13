@@ -19,6 +19,7 @@ from webrtc.media.packetizer import Sequencer
 from webrtc.media.rtcp import RtcpPacket
 from webrtc.media.rtp_extensions import DEFAULT_EXT_MAP
 from webrtc.peer_connection import PeerConnection
+from webrtc.runtime import Runtime
 from webrtc.session_description import (
     SessionDescription,
     SessionDescriptionType,
@@ -71,6 +72,7 @@ async def analyze_and_send(
 
 async def start_audio_loop(
     pc: PeerConnection,
+    execution: Runtime,
     config: OpusConfig | None = None,
 ):
     """
@@ -163,8 +165,7 @@ async def start_audio_loop(
                 print(f"[Opus] SRTP monitor error: {e}")
                 await asyncio.sleep(1)
 
-    # Start SRTP monitor as async task
-    asyncio.create_task(srtp_monitor())
+    execution.start(srtp_monitor, name="opus:srtp-monitor", kind="media")
 
     # Buffer to store received Opus frames (payloads only)
     pcm_frames_queue = asyncio.Queue(maxsize=100)
@@ -430,9 +431,16 @@ async def start_audio_loop(
                     print(f"[Opus] RTCP error: {e}")
                 await asyncio.sleep(0.1)
 
-    # Start all async tasks in the main event loop
-    asyncio.create_task(receive_routine(), name=f"OpusReceiver-{remote_track.ssrc}")
-    asyncio.create_task(rtcp_handler(), name=f"OpusRTCP-{encoding.ssrc}")
+    execution.start(
+        receive_routine,
+        name=f"OpusReceiver-{remote_track.ssrc}",
+        kind="media",
+    )
+    execution.start(
+        rtcp_handler,
+        name=f"OpusRTCP-{encoding.ssrc}",
+        kind="media",
+    )
 
     # Run send routine (this will run until cancelled)
     await send_routine()
@@ -449,137 +457,146 @@ async def ws_endpoint(ws: WebSocket):
 
     # Create PeerConnection
     pc = PeerConnection()
-    pc.start()
+    async with Runtime(scope_id=pc.id) as execution:
+        async with pc:
 
-    # Add SINGLE sendrecv transceiver for bidirectional audio
-    await pc.add_transceiver_from_kind(
-        RTPCodecKind.Audio, RTPTransceiverDirection.Sendrecv
-    )
-    logger.info(Component.OPUS, "Added sendrecv audio transceiver")
+            # Add SINGLE sendrecv transceiver for bidirectional audio
+            await pc.add_transceiver_from_kind(
+                RTPCodecKind.Audio, RTPTransceiverDirection.Sendrecv
+            )
+            logger.info(Component.OPUS, "Added sendrecv audio transceiver")
 
-    # Create Opus configuration
-    config = OpusConfig(
-        sample_rate=48000,
-        channels=1,
-        application="voip",
-        bitrate=32000,
-        complexity=5,
-        dtx=True,
-        decode_fec=False,
-    )
+            # Create Opus configuration
+            config = OpusConfig(
+                sample_rate=48000,
+                channels=1,
+                application="voip",
+                bitrate=32000,
+                complexity=5,
+                dtx=True,
+                decode_fec=False,
+            )
 
-    # Flag to ensure start() is only called once
-    audio_loop_started = False
+            # Flag to ensure start() is only called once
+            audio_loop_started = False
 
-    def start():
-        """Start audio processing with configuration."""
-        nonlocal audio_loop_started
-        if audio_loop_started:
-            logger.info(Component.OPUS, "Audio loop already started, skipping")
-            return
-        audio_loop_started = True
-        logger.info(Component.OPUS, "Starting audio loop", config=config)
-        asyncio.create_task(start_audio_loop(pc, config), name="OpusAudioLoop")
-        logger.info(Component.OPUS, "Audio loop task created")
+            def start():
+                """Start audio processing with configuration."""
+                nonlocal audio_loop_started
+                if audio_loop_started:
+                    logger.info(Component.OPUS, "Audio loop already started, skipping")
+                    return
+                audio_loop_started = True
+                logger.info(Component.OPUS, "Starting audio loop", config=config)
+                execution.start(
+                    lambda: start_audio_loop(pc, execution, config),
+                    name="OpusAudioLoop",
+                    kind="media",
+                )
+                logger.info(Component.OPUS, "Audio loop task created")
 
-    def on_close():
-        print("[Opus] WebSocket connection closed")
+            def on_close():
+                print("[Opus] WebSocket connection closed")
 
-    # Start audio loop proactively once DTLS is ready
-    async def auto_start_when_ready():
-        """Monitor DTLS/SRTP and auto-start audio loop when ready."""
-        await asyncio.sleep(0.5)  # Give DTLS time to establish
-        max_wait = 50  # 5 seconds
-        for i in range(max_wait):
-            if pc._dtls_transport and pc._dtls_transport._srtp_rtp:
-                logger.info(Component.OPUS, "DTLS/SRTP ready, auto-starting audio loop")
-                start()
-                return
-            await asyncio.sleep(0.1)
-        logger.info(
-            Component.OPUS, "DTLS/SRTP not ready after 5s, audio loop not started"
-        )
-
-    # Start monitor task
-    asyncio.create_task(auto_start_when_ready(), name="OpusAutoStart")
-
-    # Handle WebSocket messages
-    print("[Opus] Waiting for messages...")
-    async for data in on_recv(ws, on_close):
-        print(f"[Opus] Received message: {data[:100]}...")  # Log first 100 chars
-        msg: dict[str, Any] = json.loads(data)
-        print(f"[Opus] Event type: {msg.get('event')}")
-
-        match msg.get("event"):
-            case "negotiate":
-                print("[Opus] Negotiate event received")
-                try:
-                    start()
-                except RuntimeError as e:
-                    print(f"[Opus] RuntimeError in start(): {e}")
-                except Exception as e:
-                    print(f"[Opus] Error in start(): {e}")
-
-            case "offer":
-                print("[Opus] Offer event received")
-                if offer := await pc.create_offer():
-                    await pc.set_local_description(SessionDescriptionType.Offer, offer)
-                    await ws.send_json(
-                        {"event": "offer", "data": offer.marshal().decode()}
-                    )
-                    print("[Opus] Offer sent")
-
-            case "answer":
-                data = msg.get("data")
-                if not data:
-                    continue
-
-                payload: dict[str, Any] = json.loads(data)
-                sdp = payload.get("sdp")
-                sdp_type = payload.get("type")
-
-                if not sdp or not sdp_type:
-                    continue
-
-                if not isinstance(sdp, str):
-                    continue
-
-                desc_type = SessionDescriptionType(sdp_type)
-                desc = SessionDescription.parse(sdp)
-
-                print(f"[Opus] Setting remote description (type={sdp_type})")
-
-                for ufrag, pwd in desc.get_media_credentials():
-                    await pc.gatherer.set_remote_credentials(ufrag, pwd)
-
-                await pc.set_remote_description(desc_type, desc)
-
-                # Start audio processing automatically after answer
-                if desc_type is SessionDescriptionType.Answer:
-                    await pc.gatherer.dial()
-                    print("[Opus] Answer received, starting audio processing...")
-                    try:
+            # Start audio loop proactively once DTLS is ready
+            async def auto_start_when_ready():
+                """Monitor DTLS/SRTP and auto-start audio loop when ready."""
+                await asyncio.sleep(0.5)  # Give DTLS time to establish
+                max_wait = 50  # 5 seconds
+                for i in range(max_wait):
+                    if pc._dtls_transport and pc._dtls_transport._srtp_rtp:
+                        logger.info(Component.OPUS, "DTLS/SRTP ready, auto-starting audio loop")
                         start()
-                    except RuntimeError as e:
-                        print(f"[Opus] RuntimeError in start(): {e}")
-                    except Exception as e:
-                        print(f"[Opus] Error in start(): {e}")
+                        return
+                    await asyncio.sleep(0.1)
+                logger.info(
+                    Component.OPUS, "DTLS/SRTP not ready after 5s, audio loop not started"
+                )
 
-            case "trickle-ice":
-                data = msg.get("data")
-                if not data:
-                    continue
-                payload: dict[str, Any] = json.loads(data)
+            # Start monitor task
+            execution.start(
+                auto_start_when_ready,
+                name="OpusAutoStart",
+                kind="lifecycle",
+            )
 
-                candidate_str = payload.get("candidate")
-                if not candidate_str:
-                    continue
+            # Handle WebSocket messages
+            print("[Opus] Waiting for messages...")
+            async for data in on_recv(ws, on_close):
+                print(f"[Opus] Received message: {data[:100]}...")  # Log first 100 chars
+                msg: dict[str, Any] = json.loads(data)
+                print(f"[Opus] Event type: {msg.get('event')}")
 
-                await pc.gatherer.add_remote_candidate(candidate_str)
-                print("[Opus] Added ICE candidate")
+                match msg.get("event"):
+                    case "negotiate":
+                        print("[Opus] Negotiate event received")
+                        try:
+                            start()
+                        except RuntimeError as e:
+                            print(f"[Opus] RuntimeError in start(): {e}")
+                        except Exception as e:
+                            print(f"[Opus] Error in start(): {e}")
 
-            case "audio_config" | "get_filter_presets":
-                print(f"[Opus] Ignoring control event: {msg.get('event')}")
+                    case "offer":
+                        print("[Opus] Offer event received")
+                        if offer := await pc.create_offer():
+                            await pc.set_local_description(SessionDescriptionType.Offer, offer)
+                            await ws.send_json(
+                                {"event": "offer", "data": offer.marshal().decode()}
+                            )
+                            print("[Opus] Offer sent")
 
-            case _:
-                print(f"[Opus] Unknown event: {msg.get('event')}")
+                    case "answer":
+                        data = msg.get("data")
+                        if not data:
+                            continue
+
+                        payload: dict[str, Any] = json.loads(data)
+                        sdp = payload.get("sdp")
+                        sdp_type = payload.get("type")
+
+                        if not sdp or not sdp_type:
+                            continue
+
+                        if not isinstance(sdp, str):
+                            continue
+
+                        desc_type = SessionDescriptionType(sdp_type)
+                        desc = SessionDescription.parse(sdp)
+
+                        print(f"[Opus] Setting remote description (type={sdp_type})")
+
+                        for ufrag, pwd in desc.get_media_credentials():
+                            await pc.gatherer.set_remote_credentials(ufrag, pwd)
+
+                        await pc.set_remote_description(desc_type, desc)
+
+                        # Start audio processing automatically after answer
+                        if desc_type is SessionDescriptionType.Answer:
+                            await pc.gatherer.dial()
+                            print("[Opus] Answer received, starting audio processing...")
+                            try:
+                                start()
+                            except RuntimeError as e:
+                                print(f"[Opus] RuntimeError in start(): {e}")
+                            except Exception as e:
+                                print(f"[Opus] Error in start(): {e}")
+
+                    case "trickle-ice":
+                        data = msg.get("data")
+                        if not data:
+                            continue
+                        payload: dict[str, Any] = json.loads(data)
+
+                        candidate_str = payload.get("candidate")
+                        if not candidate_str:
+                            continue
+
+                        await pc.gatherer.add_remote_candidate(candidate_str)
+                        print("[Opus] Added ICE candidate")
+
+                    case "audio_config" | "get_filter_presets":
+                        print(f"[Opus] Ignoring control event: {msg.get('event')}")
+
+                    case _:
+                        print(f"[Opus] Unknown event: {msg.get('event')}")

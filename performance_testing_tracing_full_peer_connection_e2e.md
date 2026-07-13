@@ -25,7 +25,7 @@ Known gaps in the full peer connection E2E path:
 - SRTP stream creation, stream queue delivery, and stream drops are not asserted in the E2E baseline.
 - RTP sender frame packetization and network send are not covered in the full secured peer-connection loopback test.
 - RTCP transmit/receive and feedback confirmation are covered in the isolated TWCC test, not in the full peer-connection E2E pipeline.
-- Peer-level public send helpers exist in `PeerContext`, but the corresponding `PeerConnection` media send path should be reviewed before tests rely on it.
+- The `PeerConnection` public media send path should be reviewed before tests rely on it.
 - CPU-bound operations are not consistently marked as `bounded` peer tasks or offloaded through the runtime executor.
 
 ## Pipeline To Cover
@@ -57,7 +57,7 @@ Status: planned
 
 Tasks:
 
-- Inventory every packet boundary from `webrtc/ice/net/udp_mux.py`, `webrtc/ice/agent.py`, `webrtc/dtls/dtlstransport.py`, `webrtc/srtp/session.py`, `webrtc/transceiver.py`, `webrtc/peer_connection.py`, and `webrtc/peer_context.py`.
+- Inventory every packet boundary from `webrtc/ice/net/udp_mux.py`, `webrtc/ice/agent.py`, `webrtc/dtls/dtlstransport.py`, `webrtc/srtp/session.py`, `webrtc/transceiver.py`, and `webrtc/peer_connection.py`.
 - Produce a trace coverage matrix with these columns:
   - component
   - boundary
@@ -191,7 +191,7 @@ Tasks:
 Optimization suggestion:
 
 - Keep FSM orchestration on the event loop.
-- Offload expensive certificate/key/crypto helper calls through `PeerContext.offload_sync()` or runtime executor only when measurement shows they block the loop.
+- Classify expensive certificate/key/crypto helpers as worker methods only when measurement shows they block the loop.
 - Use `bounded=True` metadata for short protocol tasks that must complete, and `expected_long_running=True` for loops.
 
 Done when:
@@ -218,7 +218,7 @@ Tasks:
 CPU-bound review:
 
 - SRTP crypto is synchronous today.
-- Measure it first; if it shows loop blocking under burst load, move burst encryption/decryption to executor-backed `offload_sync`.
+- Measure it first; if it shows loop blocking under burst load, move burst encryption/decryption to a worker-classified component method.
 - Avoid offloading single tiny packets unless measurements show benefit, because thread handoff may cost more than crypto.
 
 Done when:
@@ -232,7 +232,7 @@ Status: planned
 Areas:
 
 - `webrtc/peer_connection.py`
-- `webrtc/peer_context.py`
+- `webrtc/runtime.py`
 - `webrtc/transceiver.py`
 
 Tasks:
@@ -241,7 +241,7 @@ Tasks:
   - `PeerConnection.send_rtp_packet`
   - `PeerConnection.send_rtp_packets`
   - `PeerConnection.send_rtcp_packet`
-  - existing `PeerContext` wrappers
+  - existing `ObservedMeta` wrappers
 - Ensure send helpers wait for SRTP readiness and selected transport readiness.
 - Trace send start/completion/failure.
 - Keep packet mutation, serialization, and encryption boundaries separate.
@@ -341,8 +341,8 @@ Candidate operations to measure first:
 Offload rules:
 
 - Keep event-loop work limited to socket callbacks, queue handoff, state transitions, and scheduling.
-- Use `spawn_peer_task` for protocol loops and bounded peer operations.
-- Use `PeerContext.offload_sync()` or runtime executor for CPU-bound synchronous work once measured.
+- Use `@task` for autonomous protocol loops and bounded peer operations.
+- Use worker-classified component methods for CPU-bound synchronous work once measured.
 - Prefer batch offload for bursts over one executor hop per packet.
 - Preserve packet ordering when offloading RTP/RTCP work.
 - Include trace metadata:
@@ -365,8 +365,8 @@ Review must verify:
 
 - No packet-path trace creates heavy work in UDP callbacks.
 - No long-running loop is measured as a completed phase.
-- Every spawned peer task has component metadata.
-- CPU-bound offload uses runtime/peer context, not ad hoc thread creation.
+- Every autonomous task has component metadata.
+- CPU-bound worker execution uses Runtime, not ad hoc thread creation.
 - Tests use public APIs where possible.
 - Full E2E test proves socket-to-receive packet delivery, not only readiness.
 - RTCP/TWCC confirms every sent RTP transport sequence.

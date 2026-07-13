@@ -4,6 +4,7 @@ import {
   formatTraceExport,
   restoreVisibleTraceParents,
   type PerformanceEvent,
+  type GroupSnapshot,
   type TraceRecord,
   type TraceSummary,
 } from "./trace";
@@ -14,29 +15,33 @@ type TraceDatum = {
 };
 
 type TraceOverlayProps = {
-  traces: TraceRecord[];
+  tasks: TraceRecord[];
+  groups?: GroupSnapshot[];
   performanceEvents?: PerformanceEvent[];
   summaries?: TraceSummary[];
   onClearCompleted?: () => void;
   onClearFailed?: () => void;
-  onDeleteTrace?: (traceId: string) => void;
+  onDeleteTask?: (taskId: string) => void;
 };
 
 const statusClass: Record<string, string> = {
   created: "trace-node--created",
   running: "trace-node--running",
   completed: "trace-node--completed",
+  success: "trace-node--completed",
   failed: "trace-node--failed",
+  error: "trace-node--failed",
   cancelled: "trace-node--cancelled",
 };
 
-const MAX_RENDERED_TRACES = 650;
+const MAX_RENDERED_TRACES = 300;
 const MAX_SIDE_ITEMS = 50;
+const DENSE_SIBLING_GROUP_THRESHOLD = 12;
 
 function durationLabel(trace: TraceRecord) {
   const avgDuration = numberMetadata(trace, "avg_duration_ms");
   const callCount = numberMetadata(trace, "call_count");
-  if (callCount > 1 && avgDuration != null) {
+  if (callCount != null && callCount > 1 && avgDuration != null) {
     return `${callCount} calls | avg ${Math.round(avgDuration)}ms`;
   }
   if (trace.duration_ms == null) {
@@ -76,7 +81,7 @@ function isFailedTrace(trace: TraceRecord) {
 }
 
 function isVirtualTrace(trace: TraceRecord) {
-  return trace.trace_id.startsWith("ui-group:");
+  return trace.task_id.startsWith("ui-group:");
 }
 
 function isArchivedTrace(trace: TraceRecord) {
@@ -87,10 +92,10 @@ function archivedTracesForSummary(summary: TraceSummary | null | undefined) {
   if (!summary) {
     return [];
   }
-  if (Array.isArray(summary.archived_traces) && summary.archived_traces.length > 0) {
-    return summary.archived_traces;
+  if (Array.isArray(summary.archived_tasks) && summary.archived_tasks.length > 0) {
+    return summary.archived_tasks;
   }
-  return summary.deleted_trace ? [summary.deleted_trace] : [];
+  return summary.deleted_task ? [summary.deleted_task] : [];
 }
 
 function statusForGroup(records: TraceRecord[]) {
@@ -103,37 +108,54 @@ function statusForGroup(records: TraceRecord[]) {
   return "completed";
 }
 
-function groupTraceRecords(traces: TraceRecord[]) {
-  const childParents = new Set(traces.map((trace) => trace.parent_id).filter(Boolean));
+export function groupTraceRecords(traces: TraceRecord[]) {
+  const childParents = new Set(traces.map((trace) => trace.parent_task_id).filter(Boolean));
+  const denseSiblingCounts = new Map<string, number>();
+  for (const trace of traces) {
+    if (childParents.has(trace.task_id) || isFailedTrace(trace)) {
+      continue;
+    }
+    const key = denseSiblingKey(trace);
+    denseSiblingCounts.set(key, (denseSiblingCounts.get(key) ?? 0) + 1);
+  }
   const grouped = new Map<string, TraceRecord[]>();
   const output: TraceRecord[] = [];
 
   for (const trace of traces) {
-    const isLeaf = !childParents.has(trace.trace_id);
+    const isLeaf = !childParents.has(trace.task_id);
     const isBackendGroup = trace.metadata.trace_group === true;
     if (!isLeaf || isBackendGroup || isFailedTrace(trace)) {
       output.push(trace);
       continue;
     }
 
-    const key = [trace.parent_id ?? "root", trace.kind, trace.name, trace.status].join("|");
+    const denseKey = denseSiblingKey(trace);
+    const key = (denseSiblingCounts.get(denseKey) ?? 0) >= DENSE_SIBLING_GROUP_THRESHOLD
+      ? denseKey
+      : [denseKey, trace.name].join("|");
     const bucket = grouped.get(key) ?? [];
     bucket.push(trace);
     grouped.set(key, bucket);
   }
 
-  for (const records of grouped.values()) {
+  for (const [key, records] of grouped) {
+    const first = records[0];
+    if (!first) {
+      continue;
+    }
     if (records.length === 1) {
-      output.push(records[0]);
+      output.push(first);
       continue;
     }
 
     const totalDuration = records.reduce((sum, trace) => sum + (trace.duration_ms ?? 0), 0);
     const groupedStatus = statusForGroup(records);
+    const sameName = records.every((record) => record.name === first.name);
+    const virtualName = sameName ? first.name : `${first.kind} operations`;
     output.push({
-      ...records[0],
-      trace_id: `ui-group:${records[0].parent_id ?? "root"}:${records[0].kind}:${records[0].name}:${records.length}`,
-      name: records[0].name,
+      ...first,
+      task_id: `ui-group:${key}`,
+      name: virtualName,
       status: groupedStatus,
       duration_ms: totalDuration,
       error: null,
@@ -145,7 +167,7 @@ function groupTraceRecords(traces: TraceRecord[]) {
       },
       transitions: [
         {
-          at: records[0].created_at,
+          at: first.created_at,
           event: "grouped",
           status: groupedStatus,
           duration_ms: totalDuration,
@@ -157,24 +179,28 @@ function groupTraceRecords(traces: TraceRecord[]) {
   return output.sort((a, b) => a.created_at - b.created_at);
 }
 
-function limitTraceRecords(traces: TraceRecord[], selectedTraceId: string | null) {
+function denseSiblingKey(trace: TraceRecord) {
+  return [trace.parent_task_id ?? "root", trace.kind, trace.status].join("|");
+}
+
+function limitTraceRecords(traces: TraceRecord[], selectedTaskId: string | null) {
   if (traces.length <= MAX_RENDERED_TRACES) {
     return { hiddenCount: 0, records: traces };
   }
 
-  const byId = new Map(traces.map((trace) => [trace.trace_id, trace]));
+  const byId = new Map(traces.map((trace) => [trace.task_id, trace]));
   const included = new Set<string>();
 
   const includeWithAncestors = (trace: TraceRecord | undefined) => {
     let current = trace;
-    while (current && !included.has(current.trace_id) && included.size < MAX_RENDERED_TRACES) {
-      included.add(current.trace_id);
-      current = current.parent_id ? byId.get(current.parent_id) : undefined;
+    while (current && !included.has(current.task_id) && included.size < MAX_RENDERED_TRACES) {
+      included.add(current.task_id);
+      current = current.parent_task_id ? byId.get(current.parent_task_id) : undefined;
     }
   };
 
   for (const trace of traces) {
-    if (trace.trace_id === selectedTraceId || isFailedTrace(trace) || trace.status === "running") {
+    if (trace.task_id === selectedTaskId || isFailedTrace(trace) || trace.status === "running") {
       includeWithAncestors(trace);
     }
   }
@@ -187,7 +213,7 @@ function limitTraceRecords(traces: TraceRecord[], selectedTraceId: string | null
     includeWithAncestors(trace);
   }
 
-  const records = traces.filter((trace) => included.has(trace.trace_id));
+  const records = traces.filter((trace) => included.has(trace.task_id));
   return { hiddenCount: traces.length - records.length, records };
 }
 
@@ -195,7 +221,8 @@ function buildTree(traces: TraceRecord[]) {
   const root: TraceDatum = {
     trace: {
       trace_id: "__root__",
-      parent_id: null,
+      task_id: "__root__",
+      parent_task_id: null,
       name: "Runtime",
       kind: "root",
       created_at: 0,
@@ -211,15 +238,15 @@ function buildTree(traces: TraceRecord[]) {
 
   const byId = new Map<string, TraceDatum>();
   for (const trace of traces) {
-    byId.set(trace.trace_id, { trace, children: [] });
+    byId.set(trace.task_id, { trace, children: [] });
   }
 
   for (const trace of traces) {
-    const node = byId.get(trace.trace_id);
+    const node = byId.get(trace.task_id);
     if (!node) {
       continue;
     }
-    const parent = trace.parent_id ? byId.get(trace.parent_id) : null;
+    const parent = trace.parent_task_id ? byId.get(trace.parent_task_id) : null;
     (parent ?? root).children.push(node);
   }
 
@@ -227,16 +254,17 @@ function buildTree(traces: TraceRecord[]) {
 }
 
 export function TraceOverlay({
-  traces,
+  tasks = [],
+  groups: _groups = [],
   performanceEvents: _performanceEvents = [],
   summaries = [],
   onClearCompleted,
   onClearFailed,
-  onDeleteTrace,
+  onDeleteTask,
 }: TraceOverlayProps) {
   const [open, setOpen] = useState(true);
   const [groupedView, setGroupedView] = useState(true);
-  const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null);
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [inspectedSummaryId, setInspectedSummaryId] = useState<string | null>(null);
   const [preferLiveWhenEmpty, setPreferLiveWhenEmpty] = useState(true);
   const [exportOpen, setExportOpen] = useState(false);
@@ -248,8 +276,8 @@ export function TraceOverlay({
   const zoomRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
   const panelPositionRef = useRef({ x: 0, y: 0 });
   const panelFrameRef = useRef<number | null>(null);
-  const pendingArchiveTraceIdRef = useRef<string | null>(null);
-  const pendingArchiveTraceIdsRef = useRef<Set<string>>(new Set());
+  const pendingArchiveTaskIdRef = useRef<string | null>(null);
+  const pendingArchiveTaskIdsRef = useRef<Set<string>>(new Set());
   const dragRef = useRef<{
     pointerId: number;
     startX: number;
@@ -257,13 +285,14 @@ export function TraceOverlay({
     originX: number;
     originY: number;
   } | null>(null);
+  const liveTasks = tasks;
   const runningCount = useMemo(
-    () => traces.filter((trace) => trace.status === "running").length,
-    [traces],
+    () => liveTasks.filter((trace) => trace.status === "running").length,
+    [liveTasks],
   );
   const failedTraceRecords = useMemo(
-    () => traces.filter(isFailedTrace).sort((a, b) => b.created_at - a.created_at),
-    [traces],
+    () => liveTasks.filter(isFailedTrace).sort((a, b) => b.created_at - a.created_at),
+    [liveTasks],
   );
   const failedTraceCount = failedTraceRecords.length;
   const failedTraces = useMemo(
@@ -278,15 +307,15 @@ export function TraceOverlay({
     if (inspectedSummaryId) {
       return summaries.find((summary) => summary.summary_id === inspectedSummaryId) ?? null;
     }
-    return traces.length === 0 && !preferLiveWhenEmpty ? restorableSummary : null;
-  }, [inspectedSummaryId, preferLiveWhenEmpty, restorableSummary, summaries, traces.length]);
+    return liveTasks.length === 0 && !preferLiveWhenEmpty ? restorableSummary : null;
+  }, [inspectedSummaryId, liveTasks.length, preferLiveWhenEmpty, restorableSummary, summaries]);
   const inspectedTraces = useMemo(
     () => archivedTracesForSummary(inspectedSummary),
     [inspectedSummary],
   );
   const repairedLiveTraces = useMemo(
-    () => restoreVisibleTraceParents(traces, summaries),
-    [summaries, traces],
+    () => restoreVisibleTraceParents(liveTasks, summaries),
+    [liveTasks, summaries],
   );
   const treeSourceTraces = inspectedSummary ? inspectedTraces : repairedLiveTraces;
   const groupedTraces = useMemo(
@@ -306,30 +335,30 @@ export function TraceOverlay({
     () =>
       inspectedSummary
         ? { hiddenCount: 0, records: groupedTraces }
-        : limitTraceRecords(groupedTraces, selectedTraceId),
-    [groupedTraces, inspectedSummary, selectedTraceId],
+        : limitTraceRecords(groupedTraces, selectedTaskId),
+    [groupedTraces, inspectedSummary, selectedTaskId],
   );
   const visibleTraces = limitedTraces.records;
   const visibleTraceById = useMemo(
-    () => new Map(visibleTraces.map((trace) => [trace.trace_id, trace])),
+    () => new Map(visibleTraces.map((trace) => [trace.task_id, trace])),
     [visibleTraces],
   );
   const visibleTraceShapeKey = useMemo(
     () =>
       visibleTraces
-        .map((trace) => `${trace.trace_id}:${trace.parent_id ?? ""}:${trace.created_at}`)
+        .map((trace) => `${trace.task_id}:${trace.parent_task_id ?? ""}:${trace.created_at}`)
         .join("|"),
     [visibleTraces],
   );
   const selectedTrace = useMemo(
     () =>
-      selectedTraceId
-        ? visibleTraces.find((trace) => trace.trace_id === selectedTraceId) ??
-          inspectedTraces.find((trace) => trace.trace_id === selectedTraceId) ??
-          traces.find((trace) => trace.trace_id === selectedTraceId) ??
+      selectedTaskId
+        ? visibleTraces.find((trace) => trace.task_id === selectedTaskId) ??
+          inspectedTraces.find((trace) => trace.task_id === selectedTaskId) ??
+          liveTasks.find((trace) => trace.task_id === selectedTaskId) ??
           null
         : null,
-    [inspectedTraces, selectedTraceId, traces, visibleTraces],
+    [inspectedTraces, liveTasks, selectedTaskId, visibleTraces],
   );
   const selectedPerformanceMetrics = useMemo(
     () => performanceMetricsForTrace(selectedTrace),
@@ -343,7 +372,7 @@ export function TraceOverlay({
     ? "Deleted"
     : runningCount > 0
       ? "Live"
-      : traces.length > 0
+      : liveTasks.length > 0
         ? "Idle"
         : "Waiting";
   const exportText = useMemo(
@@ -367,13 +396,13 @@ export function TraceOverlay({
   }, [exportOpen, exportText]);
 
   useEffect(() => {
-    if (selectedTraceId && !selectedTrace) {
-      setSelectedTraceId(null);
+    if (selectedTaskId && !selectedTrace) {
+      setSelectedTaskId(null);
     }
-  }, [selectedTrace, selectedTraceId]);
+  }, [selectedTrace, selectedTaskId]);
 
-  const selectTrace = useCallback((traceId: string) => {
-    setSelectedTraceId(traceId);
+  const selectTrace = useCallback((taskId: string) => {
+    setSelectedTaskId(taskId);
   }, []);
 
   const handleNodeKeyDown = useCallback(
@@ -392,10 +421,10 @@ export function TraceOverlay({
     const positioned = tree(root);
     const nodes = positioned
       .descendants()
-      .filter((node) => node.data.trace.trace_id !== "__root__");
+      .filter((node) => node.data.trace.task_id !== "__root__");
     const links = positioned
       .links()
-      .filter((link) => link.target.data.trace.trace_id !== "__root__");
+      .filter((link) => link.target.data.trace.task_id !== "__root__");
     const minX = Math.min(0, ...nodes.map((node) => node.x));
     const maxX = Math.max(220, ...nodes.map((node) => node.x));
     const maxY = Math.max(360, ...nodes.map((node) => node.y));
@@ -463,14 +492,14 @@ export function TraceOverlay({
     }
     setPreferLiveWhenEmpty(false);
     setInspectedSummaryId(summary.summary_id);
-    setSelectedTraceId(summary.deleted_trace_id);
+    setSelectedTaskId(summary.deleted_task_id);
     resetZoom();
   }, [resetZoom]);
 
   const showLiveTraces = useCallback(() => {
     setPreferLiveWhenEmpty(true);
     setInspectedSummaryId(null);
-    setSelectedTraceId(null);
+    setSelectedTaskId(null);
     resetZoom();
   }, [resetZoom]);
 
@@ -501,10 +530,10 @@ export function TraceOverlay({
   }, [exportText]);
 
   useEffect(() => {
-    const liveTraceIds = new Set(traces.map((trace) => trace.trace_id));
+    const liveTraceIds = new Set(liveTasks.map((trace) => trace.task_id));
     const pendingTraceIds = [
-      pendingArchiveTraceIdRef.current,
-      ...pendingArchiveTraceIdsRef.current,
+      pendingArchiveTaskIdRef.current,
+      ...pendingArchiveTaskIdsRef.current,
     ].filter((traceId, index, traceIds): traceId is string => {
       return Boolean(traceId) && traceIds.indexOf(traceId) === index;
     });
@@ -513,9 +542,9 @@ export function TraceOverlay({
       if (!liveTraceIds.has(traceId)) {
         continue;
       }
-      pendingArchiveTraceIdsRef.current.delete(traceId);
-      if (pendingArchiveTraceIdRef.current === traceId) {
-        pendingArchiveTraceIdRef.current = null;
+      pendingArchiveTaskIdsRef.current.delete(traceId);
+      if (pendingArchiveTaskIdRef.current === traceId) {
+        pendingArchiveTaskIdRef.current = null;
       }
     }
 
@@ -525,25 +554,25 @@ export function TraceOverlay({
     }
 
     for (const traceId of unresolvedPendingTraceIds) {
-      pendingArchiveTraceIdsRef.current.delete(traceId);
-      if (pendingArchiveTraceIdRef.current === traceId) {
-        pendingArchiveTraceIdRef.current = null;
+      pendingArchiveTaskIdsRef.current.delete(traceId);
+      if (pendingArchiveTaskIdRef.current === traceId) {
+        pendingArchiveTaskIdRef.current = null;
       }
     }
-  }, [inspectedSummaryId, traces]);
+  }, [inspectedSummaryId, liveTasks]);
 
-  const deleteTrace = useCallback(
+  const deleteTask = useCallback(
     (traceId: string) => {
-      if (pendingArchiveTraceIdsRef.current.has(traceId)) {
+      if (pendingArchiveTaskIdsRef.current.has(traceId)) {
         return;
       }
-      pendingArchiveTraceIdsRef.current.add(traceId);
-      pendingArchiveTraceIdRef.current = traceId;
+      pendingArchiveTaskIdsRef.current.add(traceId);
+      pendingArchiveTaskIdRef.current = traceId;
       setPreferLiveWhenEmpty(true);
       setInspectedSummaryId(null);
-      onDeleteTrace?.(traceId);
+      onDeleteTask?.(traceId);
     },
-    [onDeleteTrace],
+    [onDeleteTask],
   );
 
   const applyPanelPosition = useCallback(() => {
@@ -688,7 +717,7 @@ export function TraceOverlay({
                   <g className="trace-links">
                     {layout.links.map((link) => (
                       <path
-                        key={`${link.source.data.trace.trace_id}-${link.target.data.trace.trace_id}`}
+                        key={`${link.source.data.trace.task_id}-${link.target.data.trace.task_id}`}
                         d={`M${link.source.y},${link.source.x}C${(link.source.y + link.target.y) / 2},${link.source.x} ${(link.source.y + link.target.y) / 2},${link.target.x} ${link.target.y},${link.target.x}`}
                       />
                     ))}
@@ -697,12 +726,12 @@ export function TraceOverlay({
                   <g className="trace-nodes">
                     {layout.nodes.map((node) => {
                       const trace =
-                        visibleTraceById.get(node.data.trace.trace_id) ?? node.data.trace;
+                        visibleTraceById.get(node.data.trace.task_id) ?? node.data.trace;
                       const label = durationLabel(trace);
-                      const selected = trace.trace_id === selectedTraceId;
+                      const selected = trace.task_id === selectedTaskId;
                       return (
                         <g
-                          key={trace.trace_id}
+                          key={trace.task_id}
                           className={`trace-node ${selected ? "is-selected" : ""}`}
                           transform={`translate(${node.y},${node.x})`}
                           role="button"
@@ -710,9 +739,9 @@ export function TraceOverlay({
                           aria-label={`${trace.name} ${trace.status}`}
                           onClick={(event) => {
                             event.stopPropagation();
-                            selectTrace(trace.trace_id);
+                            selectTrace(trace.task_id);
                           }}
-                          onKeyDown={(event) => handleNodeKeyDown(event, trace.trace_id)}
+                          onKeyDown={(event) => handleNodeKeyDown(event, trace.task_id)}
                         >
                           <circle className={statusClass[trace.status] ?? "trace-node--created"} r="7" />
                           <svg className="trace-node__clip" x="14" y="-18" width="156" height="38" overflow="hidden">
@@ -762,13 +791,13 @@ export function TraceOverlay({
                       <dd>{compactDuration(selectedTrace.duration_ms)}</dd>
                     </div>
                     <div>
-                      <dt>Trace</dt>
-                      <dd title={selectedTrace.trace_id}>
+                      <dt>Task</dt>
+                      <dd title={selectedTrace.task_id}>
                         {isVirtualTrace(selectedTrace)
                           ? "group"
                           : isArchivedTrace(selectedTrace)
-                            ? `arch ${selectedTrace.trace_id.slice(0, 6)}`
-                            : selectedTrace.trace_id.slice(0, 8)}
+                            ? `arch ${selectedTrace.task_id.slice(0, 6)}`
+                            : selectedTrace.task_id.slice(0, 8)}
                       </dd>
                     </div>
                   </dl>
@@ -806,8 +835,8 @@ export function TraceOverlay({
                   {!isVirtualTrace(selectedTrace) && !isArchivedTrace(selectedTrace) ? (
                     <button
                       type="button"
-                      onClick={() => deleteTrace(selectedTrace.trace_id)}
-                      title="Delete selected trace"
+                      onClick={() => deleteTask(selectedTrace.task_id)}
+                      title="Delete selected task"
                     >
                       Delete
                     </button>
@@ -829,15 +858,15 @@ export function TraceOverlay({
                 <ul>
                   {failedTraces.map((trace) => (
                     <li
-                      key={trace.trace_id}
-                      className={trace.trace_id === selectedTraceId ? "is-selected" : ""}
+                      key={trace.task_id}
+                      className={trace.task_id === selectedTaskId ? "is-selected" : ""}
                       role="button"
                       tabIndex={0}
-                      onClick={() => selectTrace(trace.trace_id)}
+                      onClick={() => selectTrace(trace.task_id)}
                       onKeyDown={(event) => {
                         if (event.key === "Enter" || event.key === " ") {
                           event.preventDefault();
-                          selectTrace(trace.trace_id);
+                          selectTrace(trace.task_id);
                         }
                       }}
                     >
@@ -851,7 +880,7 @@ export function TraceOverlay({
                         type="button"
                         onClick={(event) => {
                           event.stopPropagation();
-                          deleteTrace(trace.trace_id);
+                          deleteTask(trace.task_id);
                         }}
                         title="Delete failed trace"
                       >

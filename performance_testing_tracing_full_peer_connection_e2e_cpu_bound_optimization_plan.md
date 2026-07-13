@@ -23,7 +23,7 @@ evidence that it must be offloaded.
 | DTLS `measure_perf` phases | Record batch parse, reconstruction, and FSM dispatch boundaries have duration events. | They need burst distributions and correlation with loop lag. |
 | SRTP `measure_perf` phases | RTP/RTCP encrypt and decrypt durations are emitted around the synchronous Rust-backed calls. | Current metadata is per packet; it does not compare batching or executor handoff. |
 | Public ordered RTP batch send | `PeerConnection.send_rtp_packets` serializes the ordered burst under one media-send lock and deliberately avoids per-packet spawned tasks. | It does not yet state a batch operation id or quantify CPU cost. |
-| Runtime and peer context offload support | `PeerContext.offload_sync()` routes work through the bounded runtime executor and preserves task tracing; aggregate groups are available. | Availability is not a performance justification. |
+| Runtime worker support | Worker-classified component methods route through the bounded serialized lane and preserve task tracing; aggregate groups are available. | Availability is not a performance justification. |
 
 ## Candidate operations and decision evidence
 
@@ -87,8 +87,8 @@ recorded; no universal millisecond cutoff is justified by the current trace.
 
 ## Approved shape if a candidate earns offload
 
-Use `PeerContext.offload_sync()` (or its runtime-backed equivalent), never ad
-hoc threads. Invoke it from a bounded peer operation—not from the UDP callback
+Use a worker-classified `ObservedComponent` method, never ad hoc threads.
+Invoke it from a bounded peer operation—not from the UDP callback
 or a long-running receive loop itself. The executor callable must be pure with
 respect to peer state: inputs in, ordered immutable results out. Apply results
 and emit canonical packet-path events back on the owning event-loop boundary.
@@ -120,10 +120,9 @@ trace calls, but packet application still requires the per-flow sequence gate.
 
 ## Required task and trace metadata
 
-Every proposed separately scheduled bounded wrapper must use
-`spawn_peer_task` with `component`, an operation-specific name, and
-`bounded=True`. An awaited `offload_sync()` operation need not add a redundant
-spawned task solely for tracing, but it must receive the same operation metadata
+Every proposed separately scheduled bounded wrapper must use `@task` with an
+operation-specific name and metadata. An awaited worker method need not add a
+redundant spawned task solely for tracing, but it must receive the same operation metadata
 and retain its parent peer task context. Its task metadata must include at
 least:
 

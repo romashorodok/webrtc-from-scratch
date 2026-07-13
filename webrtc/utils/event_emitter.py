@@ -2,9 +2,6 @@ import asyncio
 from threading import Lock
 from typing import Any, Callable, OrderedDict, TypeVar
 
-from webrtc.runtime import get_default_runtime
-
-
 Handler_T = TypeVar("Handler_T", bound=Callable)
 
 
@@ -100,6 +97,7 @@ class AsyncEventEmitter(EventEmitter):
         super(AsyncEventEmitter, self).__init__()
         self.__loop = loop
         self._waiting = set[asyncio.Future]()
+        self._fallback_waiting = set[asyncio.Future]()
 
     def _on_call_handler(
         self, event: str, f: Callable, args: tuple[Any, ...], kwargs: dict[str, Any]
@@ -110,13 +108,24 @@ class AsyncEventEmitter(EventEmitter):
             self.emit("error", e)
         else:
             if asyncio.iscoroutine(coro):
-                future = get_default_runtime().spawn_task(
-                    coro,
-                    name=f"event:{event}",
-                    kind="event",
-                    loop=self.__loop,
-                    metadata={"event": event},
-                )
+                from webrtc.runtime_services import current_execution_scope, ScopeState
+
+                scope = current_execution_scope()
+                if scope is not None and scope.state is ScopeState.ACTIVE:
+                    try:
+                        future = scope.start(
+                            lambda: coro,
+                            name=f"event:{event}",
+                            kind="event",
+                            metadata={"event": event},
+                        )
+                    except BaseException:
+                        coro.close()
+                        raise
+                else:
+                    future = (self.__loop or asyncio.get_running_loop()).create_task(
+                        coro, name=f"event:{event}")
+                    self._fallback_waiting.add(future)
             elif isinstance(coro, asyncio.Future):
                 future = coro
             else:
@@ -124,6 +133,7 @@ class AsyncEventEmitter(EventEmitter):
 
             def callback(f: asyncio.Future):
                 self._waiting.discard(f)
+                self._fallback_waiting.discard(f)
 
                 if f.cancelled():
                     return
@@ -133,3 +143,17 @@ class AsyncEventEmitter(EventEmitter):
 
             future.add_done_callback(callback)
             self._waiting.add(future)
+
+    async def aclose(self) -> None:
+        """Cancel and join emitter-owned callbacks, including no-Runtime fallbacks."""
+        waiting = tuple(self._waiting)
+        current = asyncio.current_task()
+        for future in waiting:
+            if future is not current and not future.done():
+                future.cancel()
+        await asyncio.gather(
+            *(future for future in waiting if future is not current),
+            return_exceptions=True,
+        )
+        self._waiting.clear()
+        self._fallback_waiting.clear()

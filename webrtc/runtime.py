@@ -1,598 +1,321 @@
+from __future__ import annotations
+
 import asyncio
-import atexit
-import contextvars
-from collections.abc import Awaitable, Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from threading import RLock
+import inspect
+import uuid
+from collections import Counter
+from collections.abc import Callable
+from concurrent.futures import Executor
 from typing import Any, TypeVar
 
-from .tracing import (
-    TaskContext,
-    TraceService,
-    TraceSubscription,
-    get_current_performance_recorder,
-    use_performance_recorder,
+from .performance import MetricGroupAggregator
+from .runtime_services import (
+    Borrowed,
+    ExecutionContext,
+    ExecutionScope,
+    FailurePolicy,
+    MetricSinkProtocol,
+    Owned,
+    ResourceDeclaration,
+    ScopeNotActive,
+    ScopeState,
+    SerializedWorkerLane,
+    SyncOffloader,
+    TaskCompleted,
+    TaskCancelled,
+    TaskEntry,
+    TaskFailed,
+    TaskFailureEvent,
+    TaskRegistry,
+    TaskScheduler,
+    TaskSpec,
+    TaskStarted,
+    current_execution_context,
+    reset_execution_context,
+    set_execution_context,
+    use_execution_scope,
 )
+from .tracing.service import TraceService, TraceSubscription
 
 T = TypeVar("T")
 
-_current_task_context: contextvars.ContextVar[TaskContext | None] = contextvars.ContextVar(
-    "webrtc_current_task_context",
-    default=None,
-)
+
+class RuntimeObservability:
+    """Scoped query/cancellation surface owned by one Runtime."""
+
+    def __init__(self, runtime: "Runtime") -> None:
+        self._runtime = runtime
+
+    def _trace_id(self) -> str | None:
+        root = self._runtime.root_context
+        return root.trace_id if root is not None else None
+
+    def live_tree(self):
+        return self._runtime.trace_live_tree(scope_trace_id=self._trace_id())
+
+    def live_running(self, include_duration: bool = False):
+        return self._runtime.trace_live_running(
+            include_duration=include_duration, scope_trace_id=self._trace_id()
+        )
+
+    def running_signature(self):
+        return self._runtime.trace_running_signature(scope_trace_id=self._trace_id())
+
+    def metric_snapshots(self):
+        return self._runtime.trace_groups(self._trace_id())
+
+    def subscribe(self, *, maxsize: int = 1024) -> TraceSubscription:
+        return self._runtime.trace_subscribe(maxsize=maxsize, peer_id=self._runtime.scope_id)
+
+    def cancel(self, node_id: str) -> bool:
+        return self._runtime.cancel(node_id, peer_id=self._runtime.scope_id)
 
 
-@dataclass
-class RuntimeTaskEntry:
-    trace_id: str
-    parent_id: str | None
-    cancelable: bool
-    active: bool
-    task: asyncio.Task[Any] | None = None
+class Runtime(ExecutionScope):
+    """The resource-owning execution scope for one peer connection.
 
+    A Runtime owns its scheduler, task hierarchy, trace service, logical worker
+    lane and diagnostics.  Physical executors and metric sinks have explicit
+    ownership declarations; resources created by Runtime are owned implicitly.
+    """
 
-def get_current_task_context() -> TaskContext | None:
-    return _current_task_context.get()
-
-
-def set_current_task_context(
-    context: TaskContext | None,
-) -> contextvars.Token[TaskContext | None]:
-    return _current_task_context.set(context)
-
-
-def reset_current_task_context(token: contextvars.Token[TaskContext | None]) -> None:
-    _current_task_context.reset(token)
-
-
-class WebRTCRuntimeResources:
     def __init__(
         self,
         *,
-        executor: ThreadPoolExecutor | None = None,
+        scope_id: str | None = None,
+        executor: ResourceDeclaration[Executor] | None = None,
+        metric_sink: ResourceDeclaration[MetricSinkProtocol] | None = None,
         offload_capacity: int = 32,
-        owns_executor: bool | None = None,
         max_workers: int = 4,
         max_pending_offloads: int | None = None,
+        shutdown_timeout: float = 2.0,
         trace_context_limit: int = 4096,
-        trace_group_update_interval: float = 0.5,
-        trace_subscriber_batch_interval: float = 0.5,
+        trace_subscriber_batch_interval: float = 1.0,
+        task_observers=(),
+        failure_observers=(),
     ) -> None:
-        if max_pending_offloads is not None:
-            offload_capacity = max_pending_offloads
-
-        self._executor = executor or ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix="webrtc-offload",
-        )
-        self._owns_executor = (executor is None) if owns_executor is None else owns_executor
-        self._offload_limiter = asyncio.Semaphore(offload_capacity)
-        self._shutdown = False
-        self._trace_group_update_interval = trace_group_update_interval
-
+        self.scope_id = scope_id
+        self.shutdown_timeout = shutdown_timeout
+        self.diagnostics: Counter[str] = Counter()
+        self.task_registry = TaskRegistry()
         self._tracing = TraceService(
+            self.task_registry,
             trace_context_limit=trace_context_limit,
             trace_subscriber_batch_interval=trace_subscriber_batch_interval,
-            executor=self._executor,
+            diagnostics=self.diagnostics,
         )
-        self._trace_groups: dict[tuple[str | None, str, str, str], TaskContext] = {}
-        self._trace_group_last_emit: dict[str, float] = {}
-        self._trace_group_emit_handles: dict[str, asyncio.TimerHandle] = {}
-        self._task_registry_lock = RLock()
-        self._task_registry: dict[str, RuntimeTaskEntry] = {}
+        self._failure_observers = tuple(failure_observers)
+        self.task_scheduler = TaskScheduler(
+            self.task_registry,
+            [self._tracing, *task_observers],
+            [self, *failure_observers],
+        )
+
+        executor_resource, executor_owned = self._resource(executor, name="executor")
+        capacity = max_pending_offloads if max_pending_offloads is not None else offload_capacity
+        self.sync_offloader = SyncOffloader(
+            executor_resource,
+            capacity=capacity,
+            max_workers=max_workers,
+            owns_executor=executor_owned,
+        )
+        self.worker_lane = SerializedWorkerLane(self.sync_offloader)
+
+        if metric_sink is None:
+            sink, sink_owned = MetricGroupAggregator(), True
+        else:
+            sink, sink_owned = self._resource(metric_sink, name="metric_sink")
+        self.metric_sink = sink
+        self._owns_metric_sink = sink_owned
+
+        self.state = ScopeState.NEW
+        self._close_lock: asyncio.Lock | None = None
+        self._root_context: ExecutionContext | None = None
+        self._root_error: BaseException | None = None
+        self._scope_activation = None
+        self._scope_manager = None
+        self._execution_token = None
+        self.observability = RuntimeObservability(self)
+
+    @staticmethod
+    def _resource(value, *, name: str):
+        if isinstance(value, Owned):
+            return value.resource, True
+        if isinstance(value, Borrowed):
+            return value.resource, False
+        if value is None:
+            return None, True
+        raise TypeError(f"injected {name} must be declared as Owned(...) or Borrowed(...)")
+
+    @property
+    def trace_service(self) -> TraceService:
+        return self._tracing
 
     @property
     def shutdown_started(self) -> bool:
-        return self._shutdown
+        return self.state in (ScopeState.CLOSING, ScopeState.CLOSED)
 
-    def create_task(
-        self,
-        awaitable: Awaitable[T],
-        *,
-        name: str | None = None,
-        loop: asyncio.AbstractEventLoop | None = None,
-    ) -> asyncio.Task[T]:
-        loop = loop or asyncio.get_running_loop()
-        return loop.create_task(awaitable, name=name)
+    @property
+    def root_context(self) -> ExecutionContext | None:
+        return self._root_context
 
-    def create_task_context(
+    @staticmethod
+    def current_execution_context() -> ExecutionContext | None:
+        return current_execution_context()
+
+    async def __aenter__(self) -> Runtime:
+        if self.state is not ScopeState.NEW:
+            raise ScopeNotActive(f"execution scope is {self.state.value}")
+
+        # No await occurs before activation, so task creation and close cannot
+        # observe a half-activated Runtime.
+        self.state = ScopeState.ACTIVE
+        self._scope_manager = use_execution_scope(self)
+        self._scope_activation = self._scope_manager.__enter__()
+        root = ExecutionContext(
+            trace_id=uuid.uuid4().hex,
+            task_id=uuid.uuid4().hex,
+            scope_id=self.scope_id,
+        )
+        self._root_context = root
+        self._execution_token = set_execution_context(root)
+        spec = TaskSpec("execution.root", "scope", {"scope_id": self.scope_id}, False)
+        self.task_registry.add(TaskEntry(root, asyncio.current_task(), False, spec))
+        self.task_scheduler._notify(
+            "task_started",
+            TaskStarted(root, spec.name, spec.kind, dict(spec.metadata), spec.cancelable),
+        )
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self._root_error = exc
+        try:
+            await self.aclose()
+        finally:
+            self._deactivate()
+
+    def _deactivate(self) -> None:
+        if self._execution_token is not None:
+            reset_execution_context(self._execution_token)
+            self._execution_token = None
+        if self._scope_manager is not None:
+            self._scope_manager.__exit__(None, None, None)
+            self._scope_manager = None
+            self._scope_activation = None
+
+    def start(
         self,
+        factory: Callable[[], Any],
         *,
         name: str,
-        kind: str = "task",
-        parent: TaskContext | None | object = None,
-        parent_id: str | None = None,
-        metadata: Mapping[str, Any] | None = None,
-    ) -> TaskContext:
-        parent_context: TaskContext | None
-        if parent is None:
-            parent_context = get_current_task_context()
-        elif isinstance(parent, TaskContext):
-            parent_context = parent
-        else:
-            parent_context = None
-        return self._tracing.create_context(
-            name=name,
-            kind=kind,
-            parent=parent_context,
-            parent_id=parent_id,
-            metadata=metadata,
-        )
-
-    def start_task_context(self, context: TaskContext) -> None:
-        self._tracing.start_context(context)
-        if context.status in {"created", "running"}:
-            existing = self._task_entry(context.trace_id)
-            if existing is None:
-                self._register_task_entry(
-                    trace_id=context.trace_id,
-                    parent_id=context.parent_id,
-                    cancelable=self._default_cancelable_for_context(context),
-                    active=True,
-                    task=None,
-                )
-
-    def complete_task_context(
-        self,
-        context: TaskContext,
-        *,
-        status: str = "completed",
-        error: BaseException | str | None = None,
-    ) -> None:
-        self._tracing.complete_context(
-            context,
-            status=status,
-            error=self._format_error(error) if error is not None else None,
-        )
-
-    def get_or_create_trace_group(
-        self,
-        *,
-        name: str,
-        kind: str,
-        parent: TaskContext | None = None,
-        group_key: str | None = None,
-        metadata: Mapping[str, Any] | None = None,
-    ) -> TaskContext:
-        parent_context = parent or get_current_task_context()
-        key = (
-            parent_context.trace_id if parent_context else None,
-            group_key or name,
-            name,
-            kind,
-        )
-        existing = self._trace_groups.get(key)
-        if existing is not None and existing.status in {"created", "running"}:
-            return existing
-        if existing is not None:
-            self._forget_trace_group(key, existing.trace_id)
-
-        group = self.create_task_context(
-            name=name,
-            kind=kind,
-            parent=parent_context,
-            metadata={
-                "trace_group": True,
-                "group_key": key[1],
-                "call_count": 0,
-                "success_count": 0,
-                "cancelled_count": 0,
-                "error_count": 0,
-                "total_duration_ms": 0.0,
-                "avg_duration_ms": 0.0,
-                "last_duration_ms": None,
-                **(metadata or {}),
-            },
-        )
-        self.start_task_context(group)
-        self._trace_groups[key] = group
-        self._trace_group_last_emit[group.trace_id] = 0.0
-        return group
-
-    def record_trace_group_call(
-        self,
-        group: TaskContext,
-        *,
-        duration_ms: float,
-        status: str = "completed",
-        error: BaseException | str | None = None,
-        force: bool = False,
-    ) -> None:
-        now = asyncio.get_running_loop().time()
-        metadata = group.metadata
-        metadata["call_count"] = int(metadata.get("call_count", 0)) + 1
-        metadata["last_duration_ms"] = duration_ms
-        metadata["last_status"] = status
-        metadata["updated_at"] = now
-
-        if status == "completed":
-            metadata["success_count"] = int(metadata.get("success_count", 0)) + 1
-            total = float(metadata.get("total_duration_ms", 0.0)) + duration_ms
-            metadata["total_duration_ms"] = total
-            metadata["avg_duration_ms"] = total / max(1, int(metadata["success_count"]))
-        elif status == "cancelled":
-            metadata["cancelled_count"] = int(metadata.get("cancelled_count", 0)) + 1
-        else:
-            metadata["error_count"] = int(metadata.get("error_count", 0)) + 1
-            self.complete_task_context(group, status="failed", error=error)
-            self._forget_trace_group_by_id(group.trace_id)
-            return
-
-        should_emit = force or (
-            now - self._trace_group_last_emit.get(group.trace_id, 0.0) >= self._trace_group_update_interval
-        )
-        if should_emit:
-            self._trace_group_last_emit[group.trace_id] = now
-            self._cancel_trace_group_emit(group.trace_id)
-            self._tracing.start_context(group)
-            return
-
-        if group.trace_id not in self._trace_group_emit_handles:
-            remaining = max(
-                0.0,
-                self._trace_group_update_interval - (now - self._trace_group_last_emit.get(group.trace_id, 0.0)),
-            )
-            loop = asyncio.get_running_loop()
-            self._trace_group_emit_handles[group.trace_id] = loop.call_later(
-                remaining,
-                self._emit_trace_group_update,
-                group.trace_id,
-            )
-
-    def close_trace_groups(self, trace_ids: set[str] | None = None) -> None:
-        for group in list(self._trace_groups.values()):
-            if trace_ids is not None and group.trace_id not in trace_ids:
-                continue
-            if group.status == "failed":
-                continue
-            self.complete_task_context(group, status="completed")
-            self._forget_trace_group_by_id(group.trace_id)
-
-    async def trace_awaitable(
-        self,
-        awaitable: Awaitable[T],
-        *,
-        name: str | None = None,
-        kind: str = "task",
-        metadata: Mapping[str, Any] | None = None,
-        context: TaskContext | None = None,
-    ) -> T:
-        task_context = context or self.create_task_context(
-            name=name or self._awaitable_name(awaitable),
-            kind=kind,
-            metadata=metadata,
-        )
-        self.start_task_context(task_context)
-        task = asyncio.current_task()
-        self._register_task_entry(
-            trace_id=task_context.trace_id,
-            parent_id=task_context.parent_id,
-            cancelable=True,
-            active=True,
-            task=task,
-        )
-        token = set_current_task_context(task_context)
-        try:
-            # Preserve an explicitly installed recorder (tests and callers use
-            # this for isolated captures); otherwise stream through runtime.
-            with use_performance_recorder(
-                get_current_performance_recorder() or self._tracing.performance_recorder
-            ):
-                result = await awaitable
-        except asyncio.CancelledError:
-            self.complete_task_context(task_context, status="cancelled")
-            raise
-        except BaseException as exc:
-            self.complete_task_context(task_context, status="failed", error=exc)
-            raise
-        else:
-            self.complete_task_context(task_context, status="completed")
-            return result
-        finally:
-            self._set_task_entry_active(task_context.trace_id, False)
-            reset_current_task_context(token)
-
-    def spawn_task(
-        self,
-        awaitable: Awaitable[T],
-        *,
-        name: str | None = None,
-        kind: str = "task",
-        metadata: Mapping[str, Any] | None = None,
-        loop: asyncio.AbstractEventLoop | None = None,
-        context: TaskContext | None = None,
+        kind: str = "application",
+        metadata=None,
+        failure: FailurePolicy = FailurePolicy.REPORT,
     ) -> asyncio.Task[T]:
-        trace_context = context or self.create_task_context(
-            name=name or self._awaitable_name(awaitable),
+        """Start a genuinely dynamic managed child from a coroutine factory."""
+        if self.state is not ScopeState.ACTIVE:
+            raise ScopeNotActive(f"execution scope is {self.state.value}")
+        return self.task_scheduler.spawn_factory(
+            factory,
+            name=name,
             kind=kind,
             metadata=metadata,
-        )
-        return self.create_task(
-            self.trace_awaitable(awaitable, context=trace_context),
-            name=name or trace_context.name,
-            loop=loop,
+            scope_id=self.scope_id,
+            failure=failure,
         )
 
-    async def offload_sync(self, *args: Any, name: str | None = None, kind: str = "thread", metadata: Mapping[str, Any] | None = None, aggregate: bool = False, group_name: str | None = None, group_key: str | None = None, **kwargs: Any) -> T:
-        if not args:
-            raise TypeError("offload_sync requires a callable")
+    def observe_task_failure(self, event: TaskFailureEvent) -> None:
+        # TaskScheduler already fans out to configured failure observers.  The
+        # Runtime hook is the stable ExecutionScope protocol surface.
+        self.diagnostics["task_failures"] += 1
 
-        if self._looks_like_loop(args[0]):
-            if len(args) < 2:
-                raise TypeError("offload_sync requires a callable after the loop")
-            loop = args[0]
-            fn = args[1]
-            fn_args = args[2:]
-        else:
-            loop = asyncio.get_running_loop()
-            fn = args[0]
-            fn_args = args[1:]
+    def trace_live_tree(self, *, scope_trace_id=None):
+        return self._tracing.live_tree(scope_trace_id)
 
-        if not callable(fn):
-            raise TypeError("offload_sync expected a callable")
+    def trace_groups(self, trace_id=None):
+        snapshots = getattr(self.metric_sink, "snapshots", lambda *_: ())(trace_id)
+        live_task_ids = {
+            task["task_id"]
+            for task in self._tracing.live_tree(trace_id)
+            if isinstance(task.get("task_id"), str)
+        }
+        return [
+            snapshot.to_dict()
+            for snapshot in snapshots
+            if snapshot.task_id in live_task_ids
+        ]
 
-        if aggregate:
-            return await self._offload_sync_aggregate(loop, fn, *fn_args, name=name, kind=kind, metadata=metadata, group_name=group_name, group_key=group_key, **kwargs)
+    def trace_live_running(self, include_duration=False, *, scope_trace_id=None):
+        return self._tracing.live_running(include_duration=include_duration, trace_id=scope_trace_id)
 
-        trace_context = self.create_task_context(name=name or getattr(fn, "__qualname__", getattr(fn, "__name__", "offload")), kind=kind, metadata=metadata)
-        self.start_task_context(trace_context)
-        self._register_task_entry(
-            trace_id=trace_context.trace_id,
-            parent_id=trace_context.parent_id,
-            cancelable=False,
-            active=True,
-            task=None,
-        )
-        token = set_current_task_context(trace_context)
+    def trace_running_signature(self, *, scope_trace_id=None):
+        return self._tracing.running_signature(trace_id=scope_trace_id)
 
-        def call_in_thread() -> T:
-            thread_token = set_current_task_context(trace_context)
-            try:
-                with use_performance_recorder(
-                    get_current_performance_recorder() or self._tracing.performance_recorder
-                ):
-                    return fn(*fn_args, **kwargs)
-            finally:
-                reset_current_task_context(thread_token)
-
-        try:
-            if self._shutdown:
-                raise RuntimeError("WebRTC runtime is shutting down")
-            async with self._offload_limiter:
-                if self._shutdown:
-                    raise RuntimeError("WebRTC runtime is shutting down")
-                result = await loop.run_in_executor(self._executor, call_in_thread)
-        except asyncio.CancelledError:
-            self.complete_task_context(trace_context, status="cancelled")
-            raise
-        except BaseException as exc:
-            self.complete_task_context(trace_context, status="failed", error=exc)
-            raise
-        else:
-            self.complete_task_context(trace_context, status="completed")
-            return result
-        finally:
-            self._set_task_entry_active(trace_context.trace_id, False)
-            reset_current_task_context(token)
-
-    async def to_thread(self, fn: Callable[..., T], *args: Any, name: str | None = None, metadata: Mapping[str, Any] | None = None, aggregate: bool = False, group_name: str | None = None, group_key: str | None = None, **kwargs: Any) -> T:
-        return await self.offload_sync(fn, *args, name=name, kind="thread", metadata=metadata, aggregate=aggregate, group_name=group_name, group_key=group_key, **kwargs)
-
-    async def _offload_sync_aggregate(self, loop: asyncio.AbstractEventLoop, fn: Callable[..., T], *args: Any, name: str | None, kind: str, metadata: Mapping[str, Any] | None, group_name: str | None, group_key: str | None, **kwargs: Any) -> T:
-        if self._shutdown:
-            raise RuntimeError("WebRTC runtime is shutting down")
-        parent = get_current_task_context()
-        call_name = name or getattr(fn, "__qualname__", getattr(fn, "__name__", "offload"))
-        group = self.get_or_create_trace_group(name=group_name or call_name, kind=kind, parent=parent, group_key=group_key or call_name, metadata=metadata)
-        token = set_current_task_context(group)
-        started = asyncio.get_running_loop().time()
-
-        def call_in_thread() -> T:
-            thread_token = set_current_task_context(group)
-            try:
-                with use_performance_recorder(
-                    get_current_performance_recorder() or self._tracing.performance_recorder
-                ):
-                    return fn(*args, **kwargs)
-            finally:
-                reset_current_task_context(thread_token)
-
-        try:
-            async with self._offload_limiter:
-                if self._shutdown:
-                    raise RuntimeError("WebRTC runtime is shutting down")
-                result = await loop.run_in_executor(self._executor, call_in_thread)
-        except asyncio.CancelledError:
-            self.record_trace_group_call(group, duration_ms=(asyncio.get_running_loop().time() - started) * 1000, status="cancelled", force=True)
-            raise
-        except BaseException as exc:
-            self.record_trace_group_call(group, duration_ms=(asyncio.get_running_loop().time() - started) * 1000, status="failed", error=exc, force=True)
-            raise
-        else:
-            self.record_trace_group_call(group, duration_ms=(asyncio.get_running_loop().time() - started) * 1000, status="completed")
-            return result
-        finally:
-            reset_current_task_context(token)
-
-    def trace_live_tree(self, *, scope_trace_id: str | None = None) -> list[dict[str, Any]]:
-        return self._tracing.store.live_tree(scope_trace_id=scope_trace_id)
-
-    def trace_live_running(
-        self,
-        include_duration: bool = False,
-        *,
-        scope_trace_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        return self._tracing.trace_live_running(
-            include_duration=include_duration,
-            scope_trace_id=scope_trace_id,
-        )
-
-    def trace_running_signature(
-        self,
-        *,
-        scope_trace_id: str | None = None,
-    ) -> tuple[tuple[str, str | None, str], ...]:
-        return self._tracing.trace_running_signature(scope_trace_id=scope_trace_id)
-
-    def trace_subscribe(
-        self,
-        *,
-        maxsize: int = 1024,
-        peer_id: str | None = None,
-    ) -> TraceSubscription:
+    def trace_subscribe(self, *, maxsize=1024, peer_id=None) -> TraceSubscription:
         return self._tracing.trace_subscribe(maxsize=maxsize, peer_id=peer_id)
 
-    def delete_trace(self, trace_id: str, *, peer_id: str | None = None) -> bool:
-        deleted_contexts = self._tracing.store.subtree_contexts(trace_id)
-        ok = self._tracing.delete_trace(
-            trace_id,
-            is_cancelable=self._is_running_trace_cancelable,
-            cancel_trace=self._cancel_running_trace,
-            mark_inactive=lambda tid: self._set_task_entry_active(tid, False),
-            peer_id=peer_id,
-        )
-        if ok:
-            for context in deleted_contexts:
-                self._forget_trace_group_by_id(context.trace_id)
-        return ok
-
-    def delete_traces(
-        self,
-        *,
-        statuses: set[str] | None = None,
-        include_running: bool = False,
-        peer_id: str | None = None,
-    ) -> int:
-        count, ids = self._tracing.delete_traces(
-            statuses=statuses,
-            include_running=include_running,
-            peer_id=peer_id,
-        )
-        for trace_id in ids:
-            self._forget_trace_group_by_id(trace_id)
-        return count
-
-    def shutdown(self, *, wait: bool = False, cancel_futures: bool = True) -> None:
-        self._shutdown = True
-        if self._owns_executor:
-            self._executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+    def cancel(self, node_id: str, *, peer_id=None) -> bool:
+        return self._tracing.cancel(node_id, peer_id=peer_id)
 
     async def aclose(self) -> None:
-        self.shutdown(wait=False, cancel_futures=True)
+        if self.state is ScopeState.CLOSED:
+            return
+        if self._close_lock is None:
+            self._close_lock = asyncio.Lock()
 
-    @staticmethod
-    def _format_error(error: BaseException | str) -> str:
-        if isinstance(error, BaseException):
-            return f"{error.__class__.__name__}: {error}"
-        return error
+        # Reject intake before the first suspension.  Concurrent start()/worker
+        # calls therefore see either ACTIVE or CLOSING, never an intermediate.
+        if self.state in (ScopeState.NEW, ScopeState.ACTIVE):
+            self.state = ScopeState.CLOSING
+            self.task_scheduler.closed = True
+            self.sync_offloader.closed = True
+            self.worker_lane.state = ScopeState.CLOSING
 
-    @staticmethod
-    def _awaitable_name(awaitable: Awaitable[Any]) -> str:
-        name = getattr(awaitable, "__qualname__", None) or getattr(awaitable, "__name__", None)
-        if name:
-            return str(name)
-        coro = getattr(awaitable, "cr_code", None)
-        if coro is not None:
-            return str(getattr(coro, "co_name", "task"))
-        return awaitable.__class__.__name__
-
-    @staticmethod
-    def _looks_like_loop(value: Any) -> bool:
-        return hasattr(value, "run_in_executor") and hasattr(value, "call_soon")
-
-    def _register_task_entry(
-        self,
-        *,
-        trace_id: str,
-        parent_id: str | None,
-        cancelable: bool,
-        active: bool,
-        task: asyncio.Task[Any] | None,
-    ) -> None:
-        with self._task_registry_lock:
-            self._task_registry[trace_id] = RuntimeTaskEntry(
-                trace_id=trace_id,
-                parent_id=parent_id,
-                cancelable=cancelable,
-                active=active,
-                task=task,
+        async with self._close_lock:
+            if self.state is ScopeState.CLOSED:
+                return
+            root_ids = (self._root_context.task_id,) if self._root_context is not None else ()
+            deadline = asyncio.get_running_loop().time() + self.shutdown_timeout
+            await self.task_scheduler.aclose(
+                exclude_task_ids=root_ids,
+                timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+            )
+            # May raise ScopeShutdownTimeout.  In that case state remains
+            # CLOSING and every resource stays available for a truthful retry.
+            await self.worker_lane.aclose(
+                max(0.0, deadline - asyncio.get_running_loop().time())
             )
 
-    def _set_task_entry_active(self, trace_id: str, active: bool) -> None:
-        with self._task_registry_lock:
-            entry = self._task_registry.get(trace_id)
-            if entry is not None:
-                entry.active = active
+            root = self._root_context
+            if root is not None and self.task_registry.get(root.task_id) is not None:
+                if isinstance(self._root_error, asyncio.CancelledError):
+                    self.task_scheduler._notify("task_cancelled", TaskCancelled(root))
+                elif self._root_error is not None:
+                    self.task_scheduler._notify("task_failed", TaskFailed(root, self._root_error))
+                else:
+                    self.task_scheduler._notify("task_completed", TaskCompleted(root))
+                self.task_registry.remove(root.task_id)
 
-    def _task_entry(self, trace_id: str) -> RuntimeTaskEntry | None:
-        with self._task_registry_lock:
-            return self._task_registry.get(trace_id)
-
-    def _cancel_running_trace(self, trace_id: str) -> None:
-        entry = self._task_entry(trace_id)
-        if entry and entry.task and not entry.task.done():
-            entry.task.cancel()
-
-    def _is_running_trace_cancelable(self, context: TaskContext) -> bool:
-        entry = self._task_entry(context.trace_id)
-        if entry is not None:
-            return entry.active and entry.cancelable
-        return self._default_cancelable_for_context(context)
+            self._tracing.close()
+            if self._owns_metric_sink:
+                await self._close_resource(self.metric_sink)
+            self.sync_offloader.shutdown(wait=False, cancel_futures=True)
+            self.state = ScopeState.CLOSED
 
     @staticmethod
-    def _default_cancelable_for_context(context: TaskContext) -> bool:
-        # Aggregate trace-group nodes are runtime counters, not active thread jobs.
-        # They should never block deleting their parent coroutine subtree.
-        if context.metadata.get("trace_group") is True:
-            return True
-        return context.kind != "thread"
-
-    def _emit_trace_group_update(self, trace_id: str) -> None:
-        self._trace_group_emit_handles.pop(trace_id, None)
-        group = self._trace_group_by_id(trace_id)
-        if group is None or group.status not in {"created", "running"}:
+    async def _close_resource(resource: Any) -> None:
+        closer = getattr(resource, "aclose", None) or getattr(resource, "close", None)
+        if closer is None:
             return
-        self._trace_group_last_emit[trace_id] = asyncio.get_running_loop().time()
-        self._tracing.start_context(group)
+        result = closer()
+        if inspect.isawaitable(result):
+            await result
 
-    def _trace_group_by_id(self, trace_id: str) -> TaskContext | None:
-        for group in self._trace_groups.values():
-            if group.trace_id == trace_id:
-                return group
-        return None
-
-    def _cancel_trace_group_emit(self, trace_id: str) -> None:
-        handle = self._trace_group_emit_handles.pop(trace_id, None)
-        if handle is not None:
-            handle.cancel()
-
-    def _forget_trace_group_by_id(self, trace_id: str) -> None:
-        self._cancel_trace_group_emit(trace_id)
-        self._trace_group_last_emit.pop(trace_id, None)
-        keys_to_remove = [key for key, group in self._trace_groups.items() if group.trace_id == trace_id]
-        for key in keys_to_remove:
-            self._trace_groups.pop(key, None)
-
-    def _forget_trace_group(self, key: tuple[str | None, str, str, str], trace_id: str) -> None:
-        self._trace_groups.pop(key, None)
-        self._forget_trace_group_by_id(trace_id)
-
-
-_default_runtime: WebRTCRuntimeResources | None = None
-
-
-def get_default_runtime() -> WebRTCRuntimeResources:
-    global _default_runtime
-    if _default_runtime is None:
-        _default_runtime = WebRTCRuntimeResources()
-    return _default_runtime
-
-
-def _shutdown_default_runtime() -> None:
-    if _default_runtime is not None:
-        _default_runtime.shutdown(wait=False, cancel_futures=True)
-
-
-atexit.register(_shutdown_default_runtime)
+    def shutdown(self, *, wait=False, cancel_futures=True) -> None:
+        """Synchronous shutdown for non-async compatibility callers."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self.aclose())
+            return
+        raise RuntimeError("Runtime.shutdown() cannot run on an event loop; await Runtime.aclose()")

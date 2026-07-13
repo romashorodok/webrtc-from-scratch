@@ -1,15 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import time
-import uuid
-from collections.abc import Callable, Iterable, Mapping
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
+from webrtc.runtime_services import (
+    TaskCancelled,
+    TaskCompleted,
+    TaskFailed,
+    TaskObserver,
+    TaskRegistry,
+    TaskStarted,
+    TraceNodeCompleted,
+    TraceNodeCancelabilityChanged,
+    TraceNodeStarted,
+)
+
 from .events import TraceEventBus, TraceSubscriber
-from .metrics import MetricDelta, TraceMetricsAggregator
-from .models import TaskContext
-from .performance import PerfEvent, PerformanceRecorder
+from .models import TaskTrace
 from .store import TraceStore
 
 
@@ -23,285 +33,175 @@ class TraceSubscription:
         return await self.subscriber.queue.get()
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self.service.unsubscribe(self)
+        if not self._closed:
+            self._closed = True
+            self.service.unsubscribe(self)
 
-    async def __aenter__(self) -> "TraceSubscription":
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb) -> None:
-        self.close()
-
-    def __aiter__(self):
-        async def iterator():
-            while not self._closed:
-                yield await self.get()
-
-        return iterator()
+    async def __aenter__(self): return self
+    async def __aexit__(self, exc_type, exc, tb): self.close()
 
 
-class TraceService:
-    def __init__(
-        self,
-        *,
-        trace_context_limit: int = 4096,
-        trace_subscriber_batch_interval: float = 0.25,
-        executor=None,
-    ) -> None:
-        self.store = TraceStore(context_limit=trace_context_limit)
+class TraceService(TaskObserver):
+    """Projects neutral runtime lifecycle events into a live-only task tree."""
+
+    def __init__(self, registry: TaskRegistry, *, trace_context_limit: int = 4096,
+                 trace_subscriber_batch_interval: float = 1.0,
+                 diagnostics: Counter[str] | None = None) -> None:
+        self.registry = registry
+        self.store = TraceStore(
+            context_limit=trace_context_limit, diagnostics=diagnostics
+        )
+        self.diagnostics = self.store.diagnostics
         self.events = TraceEventBus(batch_interval=trace_subscriber_batch_interval)
-        self.metrics = TraceMetricsAggregator(executor=executor)
-        # Runtime events are immediately folded into their owning trace. Keeping
-        # individual packet-path samples would grow memory without adding data
-        # to the replacement snapshots consumed by trace subscribers.
-        self.performance_recorder = PerformanceRecorder(
-            event_sink=self.record_performance_event,
-            retain_events=False,
-        )
 
-    def record_performance_event(self, event: PerfEvent) -> None:
-        """Aggregate a packet-path measurement onto its owning live trace."""
-        trace_id = event.metadata.get("trace_id")
-        if isinstance(trace_id, str):
-            self.store.aggregate_performance_event(
-                trace_id, event.name, event.duration_ms, event.metadata
-            )
-
-    def create_context(
-        self,
-        *,
-        name: str,
-        kind: str,
-        parent: TaskContext | None,
-        parent_id: str | None,
-        metadata: Mapping[str, Any] | None,
-    ) -> TaskContext:
-        resolved_parent_id = parent_id if parent_id is not None else (parent.trace_id if parent else None)
-        trace_id = uuid.uuid4().hex
-        context = TaskContext(
-            trace_id=trace_id,
-            parent_id=resolved_parent_id,
-            name=name,
-            kind=kind,
-            metadata=self.store.normalize_metadata(metadata),
-        )
-        if parent is not None:
-            parent_peer_id = self._context_peer_id(parent)
-            if parent_peer_id is not None and "peer_id" not in context.metadata:
-                context.metadata["peer_id"] = parent_peer_id
-        context.transitions.append(
-            {"at": context.created_at, "event": "created", "status": "created", "duration_ms": 0.0}
-        )
-        self.store.create(context)
-        self.events.publish(
-            "trace:init",
-            {"trace": context.to_dict(), **self._peer_event_data(context)},
-        )
-        return context
-
-    def start_context(self, context: TaskContext) -> None:
-        if context.started_at is None:
-            context.started_at = time.time()
-            context.started_monotonic_ns = time.monotonic_ns()
-            context.transitions.append(
-                {"at": context.started_at, "event": "started", "status": "running", "duration_ms": 0.0}
-            )
-        context.status = "running"
-        self.store.start(context)
-        updates = self.store.live_running(include_duration=True)
-        trace = next((item for item in updates if item.get("trace_id") == context.trace_id), context.to_dict())
-        self.events.publish("trace:update", {"trace": trace, **self._peer_event_data(context)})
-
-    def complete_context(self, context: TaskContext, *, status: str, error: str | None) -> None:
-        if context.ended_at is not None:
+    def task_started(self, event: TaskStarted) -> None:
+        now = time.time(); monotonic = time.monotonic_ns(); context = event.context
+        task = TaskTrace(context.trace_id, context.task_id, context.parent_task_id, event.name, event.kind,
+                         created_at=now, created_monotonic_ns=monotonic, started_at=now,
+                         started_monotonic_ns=monotonic, status="running",
+                         metadata=self.store.normalize_metadata({
+                             "peer_id": context.scope_id,
+                             "node_type": "task",
+                             "owner_task_id": context.task_id,
+                             "cancelable": event.cancelable,
+                             **event.metadata,
+                         }),
+                         transitions=[{"at": now, "event": "started", "status": "running", "duration_ms": 0.0}])
+        if not self.store.create(task):
             return
-        context.ended_at = time.time()
-        context.ended_monotonic_ns = time.monotonic_ns()
-        start_ns = context.started_monotonic_ns or context.created_monotonic_ns
-        context.duration_ms = max(0.0, (context.ended_monotonic_ns - start_ns) / 1_000_000)
-        context.status = status
-        context.error = error
-        context.transitions.append(
-            {
-                "at": context.ended_at,
-                "event": status,
-                "status": status,
-                "duration_ms": context.duration_ms,
-                **({"error": error} if error else {}),
-            }
+        self.events.publish("trace:init", self._payload(context.trace_id, tasks=[task.to_dict()]))
+
+    def task_completed(self, event: TaskCompleted) -> None: self._complete(event.context.task_id, "completed")
+    def task_cancelled(self, event: TaskCancelled) -> None: self._complete(event.context.task_id, "cancelled")
+    def task_failed(self, event: TaskFailed) -> None:
+        self._complete(event.context.task_id, "failed", f"{type(event.exception).__name__}: {event.exception}")
+
+    def node_started(self, event: TraceNodeStarted) -> None:
+        descriptor = event.descriptor
+        now = time.time(); monotonic = time.monotonic_ns()
+        task = TaskTrace(
+            descriptor.trace_id,
+            descriptor.node_id,
+            descriptor.parent_node_id,
+            descriptor.name,
+            descriptor.node_type.value,
+            created_at=now,
+            created_monotonic_ns=monotonic,
+            started_at=now,
+            started_monotonic_ns=monotonic,
+            status="running",
+            metadata=self.store.normalize_metadata({
+                "node_type": descriptor.node_type.value,
+                "owner_task_id": descriptor.owner_task_id,
+                "cancelable": descriptor.cancelable,
+                **descriptor.metadata,
+            }),
+            transitions=[{"at": now, "event": "started", "status": "running", "duration_ms": 0.0}],
         )
-        if not self.store.complete(context):
+        if not self.store.create(task):
             return
-        self.events.publish("trace:complete", {"trace": context.to_dict(), **self._peer_event_data(context)})
-        self.metrics.enqueue(
-            MetricDelta(
-                key=(self.store.root_trace_id(context.trace_id), str(context.metadata.get("group_key") or context.name), context.name, context.kind),
-                duration_ms=float(context.duration_ms or 0.0),
-                status=status,
-            )
-        )
-        self._prune_terminal_trace(context.trace_id, peer_id=self._context_peer_id(context))
+        self.events.publish("trace:init", self._payload(descriptor.trace_id, tasks=[task.to_dict()]))
 
-    def _prune_terminal_trace(self, trace_id: str, *, peer_id: str | None = None) -> None:
-        ok, promoted_contexts = self.store.remove_trace_only(trace_id)
-        if not ok:
+    def node_completed(self, event: TraceNodeCompleted) -> None:
+        error = None
+        if event.exception is not None:
+            error = f"{type(event.exception).__name__}: {event.exception}"
+        self._complete(event.descriptor.node_id, event.outcome, error)
+
+    def node_cancelability_changed(self, event: TraceNodeCancelabilityChanged) -> None:
+        tasks = self.store.subtree(event.node_id)
+        if not tasks:
             return
-        data = {"trace_ids": [trace_id], "auto_prune": True}
-        if peer_id is not None:
-            data["peer_id"] = peer_id
-        self.events.publish("trace:delete", data)
-        for promoted in promoted_contexts:
-            self.events.publish("trace:update", {"trace": promoted.to_dict(), **self._peer_event_data(promoted)})
+        task = tasks[0]
+        task.metadata["cancelable"] = event.cancelable
+        if self.store.update(task):
+            self.events.publish("trace:update", self._payload(
+                task.trace_id, tasks=[task.to_dict()]
+            ))
 
-    def trace_live_tree(self) -> list[dict[str, Any]]:
-        return self.store.live_tree()
+    def _complete(self, task_id: str, status: str, error: str | None = None) -> None:
+        tasks = self.store.subtree(task_id)
+        if not tasks: return
+        task = tasks[0]; task.ended_at = time.time(); task.ended_monotonic_ns = time.monotonic_ns()
+        start = task.started_monotonic_ns or task.created_monotonic_ns
+        task.duration_ms = max(0.0, (task.ended_monotonic_ns - start) / 1_000_000)
+        task.status = status; task.error = error
+        task.transitions.append({"at": task.ended_at, "event": status, "status": status,
+                                 "duration_ms": task.duration_ms, **({"error": error} if error else {})})
+        if not self.store.update(task): return
+        peer_id = task.metadata.get("peer_id") if isinstance(task.metadata.get("peer_id"), str) else None
+        self.events.publish("trace:complete", self._payload(task.trace_id, tasks=[task.to_dict()]))
+        ok, promoted = self.store.remove_only(task_id)
+        if ok:
+            self.events.publish("trace:delete", {"trace_id": task.trace_id, "task_ids": [task_id],
+                "auto_prune": True, **self._peer(peer_id)})
+            if promoted:
+                self.events.publish("trace:update", self._payload(task.trace_id, tasks=[item.to_dict() for item in promoted]))
 
-    def trace_live_running(
-        self,
-        *,
-        include_duration: bool = False,
-        scope_trace_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        return self.store.live_running(include_duration=include_duration, scope_trace_id=scope_trace_id)
+    def live_tree(self, trace_id: str | None = None) -> list[dict[str, Any]]:
+        return self.store.live_tree(trace_id=trace_id)
 
-    def trace_running_signature(
-        self,
-        *,
-        scope_trace_id: str | None = None,
-    ) -> tuple[tuple[str, str | None, str], ...]:
-        return self.store.running_signature(scope_trace_id=scope_trace_id)
+    def live_running(self, *, include_duration=False, trace_id=None):
+        return self.store.live_running(include_duration=include_duration, trace_id=trace_id)
 
-    def trace_subscribe(
-        self,
-        *,
-        maxsize: int = 1024,
-        peer_id: str | None = None,
-    ) -> TraceSubscription:
-        return TraceSubscription(
-            service=self,
-            subscriber=self.events.subscribe(maxsize=maxsize, peer_id=peer_id),
-        )
+    def running_signature(self, *, trace_id=None):
+        return self.store.running_signature(trace_id=trace_id)
+
+    def trace_subscribe(self, *, maxsize=1024, peer_id=None) -> TraceSubscription:
+        return TraceSubscription(self, self.events.subscribe(maxsize=maxsize, peer_id=peer_id))
 
     def unsubscribe(self, subscription: TraceSubscription) -> None:
         self.events.unsubscribe(subscription.subscriber)
 
-    def delete_trace(
-        self,
-        trace_id: str,
-        *,
-        is_cancelable: Callable[[TaskContext], bool] | None = None,
-        cancel_trace: Callable[[str], None] | None = None,
-        mark_inactive: Callable[[str], None] | None = None,
-        peer_id: str | None = None,
-    ) -> bool:
-        contexts = self.store.subtree_contexts(trace_id)
-        if not contexts:
-            self.events.publish(
-                "trace:delete_result",
-                {
-                    "success": False,
-                    "trace_id": trace_id,
-                    "reason": "trace_not_found",
-                    "failed_trace_ids": [],
-                    **({"peer_id": peer_id} if peer_id is not None else {}),
-                },
-            )
+    def close(self) -> None:
+        self.events.close()
+
+    def cancel(self, task_id: str, *, peer_id: str | None = None) -> bool:
+        tasks = self.store.subtree(task_id)
+        if not tasks:
+            self.events.publish("trace:delete_result", {"success": False, "task_id": task_id,
+                "reason": "task_not_found", "failed_task_ids": [], **self._peer(peer_id)})
             return False
-
-        subtree_ids = [context.trace_id for context in contexts]
-        running = [context for context in contexts if context.status in {"created", "running"}]
-        failed_ids = [
-            context.trace_id
-            for context in running
-            if is_cancelable is not None and not is_cancelable(context)
-        ]
-        if failed_ids:
-            self.events.publish(
-                "trace:delete_result",
-                {
-                    "success": False,
-                    "trace_id": trace_id,
-                    "trace_ids": subtree_ids,
-                    "reason": "non_cancelable_path",
-                    "failed_trace_ids": failed_ids,
-                    **self._peer_event_data(contexts[0]),
-                },
-            )
+        requested = tasks[0]
+        failed: list[str] = []
+        node_type = requested.metadata.get("node_type")
+        target_id = requested.task_id if node_type == "task" else None
+        if (
+            not requested.metadata.get("cancelable", False)
+            or (node_type == "task" and (
+                not isinstance(target_id, str)
+                or not self.registry.can_cancel([target_id])
+            ))
+        ):
+            failed.append(requested.task_id)
+        if failed:
+            self.events.publish("trace:delete_result", self._payload(tasks[0].trace_id,
+                success=False, task_id=task_id, task_ids=[t.task_id for t in tasks],
+                reason="non_cancelable_path", failed_task_ids=failed))
             return False
-
-        if cancel_trace is not None:
-            for context in running:
-                cancel_trace(context.trace_id)
-
-        ok, ids = self.store.remove_trace_subtree(trace_id)
-        if ok and ids:
-            self.events.publish("trace:delete", {"trace_ids": ids, **self._peer_event_data(contexts[0])})
-        self.events.publish(
-            "trace:delete_result",
-            {
-                "success": bool(ok),
-                "trace_id": trace_id,
-                "trace_ids": ids if ok else subtree_ids,
-                "reason": None if ok else "delete_failed",
-                "failed_trace_ids": [],
-                **({"peer_id": peer_id} if peer_id is not None else self._peer_event_data(contexts[0])),
-            },
+        # Eligibility is checked for the entire subtree before cancellation.
+        # Completion observers own pruning so live nodes are never presented as
+        # deleted while their work is still running.
+        ok = (
+            self.registry.cancel(target_id)
+            if isinstance(target_id, str)
+            else self.registry.cancel_node(requested.task_id)
         )
-        if ok and mark_inactive is not None:
-            for tid in ids:
-                mark_inactive(tid)
+        if not ok:
+            self.events.publish("trace:delete_result", self._payload(tasks[0].trace_id,
+                success=False, task_id=task_id, task_ids=[t.task_id for t in tasks],
+                reason="cancellation_rejected", failed_task_ids=[requested.task_id]))
+            return False
+        ids = [task.task_id for task in tasks]
+        self.events.publish("trace:delete_result", self._payload(tasks[0].trace_id,
+            success=ok, task_id=task_id, task_ids=ids, reason=None, failed_task_ids=[]))
         return ok
 
-    def delete_traces(
-        self,
-        *,
-        statuses: set[str] | None = None,
-        include_running: bool = False,
-        peer_id: str | None = None,
-    ) -> tuple[int, list[str]]:
-        with self.store.lock:
-            selected = [
-                node
-                for node in self.store._iter_nodes_locked()
-                if (statuses is None or node.context.status in statuses)
-                and (include_running or node.context.status not in {"created", "running"})
-                and (peer_id is None or self._context_peer_id(node.context) == peer_id)
-            ]
-
-        removed_ids: list[str] = []
-        for node in selected:
-            ok, ids = self.store.remove_trace_subtree(node.trace_id)
-            if ok:
-                removed_ids.extend(ids)
-
-        if removed_ids:
-            event_data: dict[str, Any] = {"trace_ids": removed_ids}
-            resolved_peer_id = peer_id or self._peer_id_for_contexts((node.context for node in selected))
-            if resolved_peer_id is not None:
-                event_data["peer_id"] = resolved_peer_id
-            self.events.publish("trace:delete", event_data)
-        return len(selected), removed_ids
+    def _payload(self, trace_id: str, **values: Any) -> dict[str, Any]:
+        peer_id = next((task.metadata.get("peer_id") for task in self.store.all_tasks()
+                        if task.trace_id == trace_id and isinstance(task.metadata.get("peer_id"), str)), None)
+        return {"trace_id": trace_id, **values, **self._peer(peer_id)}
 
     @staticmethod
-    def _context_peer_id(context: TaskContext) -> str | None:
-        peer_id = context.metadata.get("peer_id")
-        return peer_id if isinstance(peer_id, str) else None
-
-    def _peer_id_for_contexts(self, contexts: Iterable[TaskContext]) -> str | None:
-        peer_ids = {
-            self._context_peer_id(context)
-            for context in contexts
-            if self._context_peer_id(context) is not None
-        }
-        if len(peer_ids) == 1:
-            return next(iter(peer_ids))
-        return None
-
-    def _peer_event_data(self, context: TaskContext) -> dict[str, Any]:
-        peer_id = self._context_peer_id(context)
-        return {"peer_id": peer_id} if peer_id is not None else {}
-
-    async def flush_metrics(self) -> dict[tuple[str | None, str, str, str], dict[str, Any]]:
-        return await self.metrics.flush()
+    def _peer(peer_id: str | None) -> dict[str, str]:
+        return {"peer_id": peer_id} if peer_id else {}

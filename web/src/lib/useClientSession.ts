@@ -3,23 +3,14 @@ import { attachStream, parseJson } from "./media";
 import { Signal } from "./Signal";
 import { normalizeRemoteDescription } from "./sdp";
 import { traceDeleteFailureMessage, type TraceDeleteResultPayload } from "./toast";
-import { useTraceState } from "./useTraceState";
-
-type TraceBatchPayload = {
-  events?: Array<{
-    event?: unknown;
-    data?: unknown;
-  }>;
-  trace?: unknown;
-  traces?: unknown[];
-};
+import { traceEventsFromBatch, useTraceState } from "./useTraceState";
 
 export function useClientSession() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const signalRef = useRef<Signal | null>(null);
   const [status, setStatus] = useState("Disconnected");
   const [toasts, setToasts] = useState<string[]>([]);
-  const { enqueueTraceEvent, enqueueTraceEvents, performanceEvents, summaries, traces } = useTraceState();
+  const { enqueueTraceEvent, enqueueTraceEvents, performanceEvents, groups, summaries, tasks } = useTraceState();
 
   useEffect(() => {
     const signal = new Signal();
@@ -63,34 +54,15 @@ export function useClientSession() {
       if (payload?.success === false) {
         setToasts((previous) => [...previous, traceDeleteFailureMessage(payload)]);
       }
-      if (payload?.success === true) {
-        const traceIds = payload.trace_ids ?? (payload.trace_id ? [payload.trace_id] : []);
-        if (traceIds.length > 0) {
-          enqueueTraceEvent("trace:delete", { trace_ids: traceIds });
-        }
-      }
       enqueueTraceEvent("trace:delete_result", data);
     });
     const unsubscribeTraceBatch = signal.on("trace:batch", (data) => {
-      const payload = parseJson<TraceBatchPayload>(data);
-      const batchEvents =
-        payload?.events ??
-        (payload?.trace || payload?.traces ? [{ event: "trace:update", data }] : []);
-      const events = batchEvents
-        .filter((event): event is { event: string; data: unknown } =>
-          typeof event.event === "string",
-        )
+      const events = traceEventsFromBatch(data)
         .map((event) => {
           if (event.event === "trace:delete_result") {
             const payload = parseJson<TraceDeleteResultPayload>(event.data);
             if (payload?.success === false) {
               setToasts((previous) => [...previous, traceDeleteFailureMessage(payload)]);
-            }
-            if (payload?.success === true) {
-              const traceIds = payload.trace_ids ?? (payload.trace_id ? [payload.trace_id] : []);
-              if (traceIds.length > 0) {
-                enqueueTraceEvent("trace:delete", { trace_ids: traceIds });
-              }
             }
           }
           return { event: event.event, data: event.data };
@@ -149,8 +121,8 @@ export function useClientSession() {
     signalRef.current?.send("trace:delete", { scope: "failed" });
   };
 
-  const deleteTrace = (traceId: string) => {
-    signalRef.current?.send("trace:delete", { trace_id: traceId });
+  const deleteTask = (taskId: string) => {
+    signalRef.current?.send("trace:delete", { task_id: taskId });
   };
 
   const dismissToast = (index: number) => {
@@ -160,14 +132,15 @@ export function useClientSession() {
   return {
     clearCompletedTraces,
     clearFailedTraces,
-    deleteTrace,
+    deleteTask,
     startNegotiation,
     status,
     toasts,
     dismissToast,
     performanceEvents,
+    groups,
     summaries,
-    traces,
+    tasks,
     videoRef,
   };
 }

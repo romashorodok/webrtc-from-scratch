@@ -17,7 +17,6 @@ Usage:
 
 import asyncio
 import json
-import threading
 import time
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
@@ -34,6 +33,7 @@ from webrtc.media.rtcp import RtcpPacket, TransportLayerCC
 from webrtc.media.rtp_extensions import DEFAULT_EXT_MAP
 from webrtc.media.y4m import Y4mFrame
 from webrtc.peer_connection import PeerConnection
+from webrtc.runtime import Runtime
 from webrtc.session_description import (
     SessionDescription,
     SessionDescriptionType,
@@ -190,10 +190,8 @@ async def process_frame(
     )
 
 
-def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
+async def start_write_loop(pc: PeerConnection):
     """Video encoding and sending loop."""
-    rw_loop = asyncio.new_event_loop()
-
     sender = pc._transceivers[0].sender
     if not sender:
         raise ValueError("Sender not found")
@@ -237,31 +235,34 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
     async def send_routine():
         frame_index = 0
         max_inflight_tasks = len(shm_slots)
-        inflight_tasks = set()
+        inflight_tasks: set[asyncio.Task[None]] = set()
 
-        async for pts, time_base in encoding._packetizer.ticker():
-            start_time = asyncio.get_event_loop().time()
+        async with asyncio.TaskGroup() as frame_tasks:
+            async for pts, time_base in encoding._packetizer.ticker():
+                start_time = asyncio.get_running_loop().time()
 
-            if frame_index >= frame_count:
-                frame_index = 0
+                if frame_index >= frame_count:
+                    frame_index = 0
 
-            if len(inflight_tasks) >= max_inflight_tasks:
-                _done, inflight_tasks = await asyncio.wait(
-                    inflight_tasks, return_when=asyncio.FIRST_COMPLETED
+                if len(inflight_tasks) >= max_inflight_tasks:
+                    done, _ = await asyncio.wait(
+                        inflight_tasks, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    inflight_tasks.difference_update(done)
+
+                slot_idx = frame_index % max_inflight_tasks
+                frame = frames[frame_index]
+
+                task = frame_tasks.create_task(
+                    process_frame(slot_idx, shm_slots, frame, executor, frame_index)
                 )
+                inflight_tasks.add(task)
+                task.add_done_callback(inflight_tasks.discard)
+                frame_index += 1
 
-            slot_idx = frame_index % max_inflight_tasks
-            frame = frames[frame_index]
-
-            task = asyncio.create_task(
-                process_frame(slot_idx, shm_slots, frame, executor, frame_index)
-            )
-            inflight_tasks.add(task)
-            frame_index += 1
-
-            elapsed = asyncio.get_event_loop().time() - start_time
-            sleep_time = max(0, FRAME_PERIOD - elapsed)
-            await asyncio.sleep(sleep_time)
+                elapsed = asyncio.get_running_loop().time() - start_time
+                sleep_time = max(0, FRAME_PERIOD - elapsed)
+                await asyncio.sleep(sleep_time)
 
     encoded_frames = asyncio.Queue[bytes]()
 
@@ -295,10 +296,11 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
                 send_time_cache.add(pkt.extensions.transport_sequence_number)
                 pc._transport.sendto(encoded)
 
-    rw_loop.create_task(encoded_result())
-    rw_loop.create_task(send_routine())
-    rw_loop.create_task(rtcp_handler())
-    rw_loop.run_until_complete(encode())
+    async with asyncio.TaskGroup() as write_tasks:
+        write_tasks.create_task(encoded_result(), name="client:encoded-result")
+        write_tasks.create_task(send_routine(), name="client:send-routine")
+        write_tasks.create_task(rtcp_handler(), name="client:rtcp-handler")
+        write_tasks.create_task(encode(), name="client:encode")
 
 
 @app.websocket("/ws")
@@ -317,98 +319,99 @@ async def ws_endpoint(ws: WebSocket):
     print("[CLIENT] WebSocket connected, waiting for browser offer...")
 
     pc = PeerConnection()
-    pc.start()
+    async with Runtime(scope_id=pc.id) as execution:
+        async with pc:
 
-    # Add video transceiver (send only)
-    await pc.add_transceiver_from_kind(
-        RTPCodecKind.Video, RTPTransceiverDirection.Sendonly
-    )
-
-    rw_thread: threading.Thread | None = None
-
-    def start_video():
-        nonlocal rw_thread
-        if rw_thread is None:
-            rw_thread = threading.Thread(
-                target=start_write_loop,
-                args=(pc, asyncio.get_running_loop())
+            # Add video transceiver (send only)
+            await pc.add_transceiver_from_kind(
+                RTPCodecKind.Video, RTPTransceiverDirection.Sendonly
             )
-            rw_thread.start()
-            print("[CLIENT] Video thread started")
 
-    def on_close():
-        print("[CLIENT] WebSocket closed")
+            write_task: asyncio.Task[None] | None = None
 
-    async for data in on_recv(ws, on_close):
-        msg: dict[str, Any] = json.loads(data)
+            def start_video():
+                nonlocal write_task
+                if write_task is None or write_task.done():
+                    write_task = execution.start(
+                        lambda: start_write_loop(pc),
+                        name="client:video-write-loop",
+                        kind="media",
+                    )
+                    print("[CLIENT] Video loop started")
 
-        match msg.get("event"):
-            case "offer":
-                # Browser sends offer, we create answer
-                print("[CLIENT] Received offer from browser")
-                data = msg.get("data")
-                if not data:
-                    continue
+            def on_close():
+                print("[CLIENT] WebSocket closed")
 
-                payload: dict[str, Any] = json.loads(data) if isinstance(data, str) else data
-                sdp = payload.get("sdp")
-                sdp_type = payload.get("type")
+            async for data in on_recv(ws, on_close):
+                msg: dict[str, Any] = json.loads(data)
 
-                if not sdp or sdp_type != "offer":
-                    print(f"[CLIENT] Invalid offer: sdp={bool(sdp)}, type={sdp_type}")
-                    continue
+                match msg.get("event"):
+                    case "offer":
+                        # Browser sends offer, we create answer
+                        print("[CLIENT] Received offer from browser")
+                        data = msg.get("data")
+                        if not data:
+                            continue
 
-                # Parse and set remote description (the offer)
-                remote_desc = SessionDescription.parse(sdp)
-                print("[CLIENT] Parsed remote offer")
+                        payload: dict[str, Any] = json.loads(data) if isinstance(data, str) else data
+                        sdp = payload.get("sdp")
+                        sdp_type = payload.get("type")
 
-                # Set remote credentials for ICE
-                for ufrag, pwd in remote_desc.get_media_credentials():
-                    await pc.gatherer.set_remote_credentials(ufrag, pwd)
+                        if not sdp or sdp_type != "offer":
+                            print(f"[CLIENT] Invalid offer: sdp={bool(sdp)}, type={sdp_type}")
+                            continue
 
-                await pc.set_remote_description(SessionDescriptionType.Offer, remote_desc)
-                print("[CLIENT] Remote description set")
+                        # Parse and set remote description (the offer)
+                        remote_desc = SessionDescription.parse(sdp)
+                        print("[CLIENT] Parsed remote offer")
 
-                # Start ICE as Controlled (answerer) - this makes Python DTLS Server
-                await pc.gatherer.accept()
-                print("[CLIENT] ICE accept() called - acting as Controlled/DTLS Server")
+                        # Set remote credentials for ICE
+                        for ufrag, pwd in remote_desc.get_media_credentials():
+                            await pc.gatherer.set_remote_credentials(ufrag, pwd)
 
-                # Create and send answer
-                answer = await pc.create_answer()
-                if answer:
-                    await pc.set_local_description(SessionDescriptionType.Answer, answer)
-                    print("[CLIENT] Created answer, sending to browser")
-                    await ws.send_json({
-                        "event": "answer",
-                        "data": json.dumps({
-                            "type": "answer",
-                            "sdp": answer.marshal().decode()
-                        })
-                    })
+                        await pc.set_remote_description(SessionDescriptionType.Offer, remote_desc)
+                        print("[CLIENT] Remote description set")
 
-                    # Start video after answer is sent
-                    try:
-                        start_video()
-                    except RuntimeError:
-                        pass
-                else:
-                    print("[CLIENT] Failed to create answer")
+                        # Start ICE as Controlled (answerer) - this makes Python DTLS Server
+                        await pc.gatherer.accept()
+                        print("[CLIENT] ICE accept() called - acting as Controlled/DTLS Server")
 
-            case "trickle-ice" | "candidate":
-                data = msg.get("data")
-                if not data:
-                    continue
+                        # Create and send answer
+                        answer = await pc.create_answer()
+                        if answer:
+                            await pc.set_local_description(SessionDescriptionType.Answer, answer)
+                            print("[CLIENT] Created answer, sending to browser")
+                            await ws.send_json({
+                                "event": "answer",
+                                "data": json.dumps({
+                                    "type": "answer",
+                                    "sdp": answer.marshal().decode()
+                                })
+                            })
 
-                payload: dict[str, Any] = json.loads(data) if isinstance(data, str) else data
-                candidate_str = payload.get("candidate")
+                            # Start video after answer is sent
+                            try:
+                                start_video()
+                            except RuntimeError:
+                                pass
+                        else:
+                            print("[CLIENT] Failed to create answer")
 
-                if candidate_str:
-                    print(f"[CLIENT] Adding remote ICE candidate")
-                    await pc.gatherer.add_remote_candidate(candidate_str)
+                    case "trickle-ice" | "candidate":
+                        data = msg.get("data")
+                        if not data:
+                            continue
 
-            case "negotiate":
-                # If browser asks to negotiate, we wait for their offer
-                print("[CLIENT] Negotiate requested, waiting for browser offer...")
+                        payload: dict[str, Any] = json.loads(data) if isinstance(data, str) else data
+                        candidate_str = payload.get("candidate")
 
-            case _:
-                print(f"[CLIENT] Unknown event: {msg.get('event')}")
+                        if candidate_str:
+                            print(f"[CLIENT] Adding remote ICE candidate")
+                            await pc.gatherer.add_remote_candidate(candidate_str)
+
+                    case "negotiate":
+                        # If browser asks to negotiate, we wait for their offer
+                        print("[CLIENT] Negotiate requested, waiting for browser offer...")
+
+                    case _:
+                        print(f"[CLIENT] Unknown event: {msg.get('event')}")

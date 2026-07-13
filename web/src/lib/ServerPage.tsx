@@ -6,13 +6,14 @@ export function ServerPage() {
     clearCompletedTraces,
     clearFailedTraces,
     createOffer,
-    deleteTrace,
+    deleteTask,
     status,
     toasts,
     dismissToast,
     performanceEvents,
+    groups,
     summaries,
-    traces,
+    tasks,
     videoRef,
   } = useServerSession();
 
@@ -55,10 +56,11 @@ export function ServerPage() {
 
       <TraceOverlay
         performanceEvents={performanceEvents}
-        traces={traces}
+        groups={groups}
+        tasks={tasks}
         onClearCompleted={clearCompletedTraces}
         onClearFailed={clearFailedTraces}
-        onDeleteTrace={deleteTrace}
+        onDeleteTask={deleteTask}
         summaries={summaries}
       />
     </section>

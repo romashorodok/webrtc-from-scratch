@@ -125,21 +125,30 @@ def test_srtp_ready_events_are_decorated(monkeypatch):
         )()
         transport._srtp_keying_material = keys
         recorder = PerformanceRecorder()
+        from webrtc.domain_events import SrtpSessionReady, get_domain_event_dispatcher
+        captured = []
+        observer = type("Observer", (), {"on_domain_event": lambda self, event: captured.append(event)})()
+        dispatcher = get_domain_event_dispatcher()
+        dispatcher.observers.append(observer)
 
         monkeypatch.setattr(
             "webrtc.dtls.dtlstransport.SrtpSession.from_keying_material",
             lambda **kwargs: _FakeSrtpSession(),
         )
 
-        with use_performance_recorder(recorder):
-            await transport._init_srtp(is_client=True)
+        try:
+            with use_performance_recorder(recorder):
+                from webrtc import Runtime
+                async with Runtime(scope_id="protocol-performance"):
+                    await transport._init_srtp(is_client=True)
+        finally:
+            dispatcher.observers.remove(observer)
 
-        assert _event_names(recorder)[:4] == [
+        assert _event_names(recorder)[:2] == [
             "srtp.ready.started",
-            "srtp.rtp_session.ready",
-            "srtp.rtcp_session.ready",
             "srtp.ready.completed",
         ]
+        assert [event.protocol for event in captured if isinstance(event, SrtpSessionReady)] == ["rtp", "rtcp"]
 
     asyncio.run(scenario())
 

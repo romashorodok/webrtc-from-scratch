@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 from webrtc.ice.agent import CandidatePairController, CandidatePairTransport
+from webrtc import Runtime
 from webrtc.ice.net.types import Address, Packet
 from webrtc.ice.net.udp_mux import InterfaceMuxUDPHandler, Interceptor, UDPMuxConn
 from webrtc.tracing import PerformanceRecorder, use_performance_recorder
@@ -24,6 +25,20 @@ class _DatagramTransport:
 
 def _events(recorder):
     return {event.name: event for event in recorder.events()}
+
+
+def test_interceptor_bounds_backlog_and_keeps_freshest_packets():
+    async def scenario():
+        interceptor = Interceptor(maxsize=2, drop_oldest=True)
+        address = Address("127.0.0.1", 5000)
+        interceptor.put_nowait(Packet(address, b"old"))
+        interceptor.put_nowait(Packet(address, b"kept"))
+        interceptor.put_nowait(Packet(address, b"new"))
+
+        assert (await interceptor.get()).data == b"kept"
+        assert (await interceptor.get()).data == b"new"
+
+    asyncio.run(scenario())
 
 
 def test_udp_bound_rx_tx_and_unbound_drop_are_traced():
@@ -94,13 +109,14 @@ def test_controller_traces_packet_before_branch_and_after_routing():
         controller._CandidatePairController__conn = conn
         controller._CandidatePairController__transport = CandidatePairTransport(conn, pair_id="pair-1")
         recorder = PerformanceRecorder()
-        with use_performance_recorder(recorder):
-            task = asyncio.create_task(controller.start())
-            await conn.queue.put(Packet(Address("127.0.0.2", 6000), b"\x80\x60" + b"x" * 10))
-            await asyncio.sleep(0)
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+        async with Runtime(scope_id="socket-ice"):
+            with use_performance_recorder(recorder):
+                task = controller.start()
+                await conn.queue.put(Packet(Address("127.0.0.2", 6000), b"\x80\x60" + b"x" * 10))
+                await asyncio.sleep(0)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
         names = [event.name for event in recorder.events()]
         assert names.index("ice.controller.packet_received") < names.index("ice.packet_demux.rtp")
         assert names.index("ice.packet_demux.rtp") < names.index("ice.controller.packet_routed")

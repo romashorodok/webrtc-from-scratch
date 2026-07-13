@@ -1,11 +1,13 @@
 import asyncio
+from contextlib import suppress
 import logging
 import uuid
 from enum import IntEnum
 from typing import Protocol
 
 from webrtc.dtls.certificate import Certificate
-from webrtc.peer_context import spawn_peer_task
+from webrtc.performance import ObservedComponent, event_loop, task
+from webrtc.runtime_services import FailurePolicy
 from webrtc.tracing import measure_perf_async
 
 # Structured logging for DTLS handshake
@@ -66,7 +68,7 @@ FLIGHT_TRANSITIONS: dict[Flight, FlightTransition] = {
 }
 
 
-class FSM:
+class FSM(ObservedComponent):
     def __init__(
         self,
         remote: DTLSRemote,
@@ -105,6 +107,7 @@ class FSM:
         self._last_received_flight: Flight | None = None
         self._handshake_start_time: float | None = None
 
+    @event_loop
     def get_srtp_keying_material(self) -> SRTPKeyingMaterial | None:
         """
         Get SRTP keying material after handshake completion.
@@ -129,11 +132,13 @@ class FSM:
         except asyncio.TimeoutError:
             return False
 
+    @event_loop
     def _reset_retransmit_state(self) -> None:
         """Reset retransmission state after successful flight transition."""
         self._retransmit_timeout = INITIAL_RETRANSMIT_TIMEOUT
         self._retransmit_count = 0
 
+    @event_loop
     def _increase_retransmit_timeout(self) -> None:
         """Implement exponential backoff for retransmission timer (RFC 6347)."""
         self._retransmit_timeout = min(
@@ -142,6 +147,7 @@ class FSM:
         )
         self._retransmit_count += 1
 
+    @event_loop
     def _check_handshake_timeout(self) -> bool:
         """
         Check if the overall handshake timeout has been exceeded.
@@ -155,6 +161,7 @@ class FSM:
         elapsed = time.time() - self._handshake_start_time
         return elapsed > HANDSHAKE_TIMEOUT
 
+    @event_loop
     def _is_duplicate_flight(self, flight: Flight) -> bool:
         """
         Detect if the received flight is a duplicate (retransmission from peer).
@@ -316,6 +323,7 @@ class FSM:
 
         return FSMState.Waiting
 
+    @event_loop
     def _complete_handshake(self) -> None:
         """
         Complete the handshake and derive SRTP keying material.
@@ -409,6 +417,12 @@ class FSM:
 
     async def finish(self) -> FSMState: ...
 
+    @task(
+        name="dtls:fsm",
+        kind="dtls",
+        metadata={"expected_long_running": True, "loop_role": "fsm"},
+        failure=FailurePolicy.FAIL_CONNECTION,
+    )
     async def run(self):
         while True:
             next_state = await self.handshake_state_transition.get()
@@ -457,7 +471,7 @@ class FSM:
 # TODO: Validate epoch
 # TODO: Anti-replay protection
 # TODO: Decrypt
-class DTLSConn:
+class DTLSConn(ObservedComponent):
     def __init__(
         self,
         remote: DTLSRemote,
@@ -476,6 +490,7 @@ class DTLSConn:
         """Event signaling handshake completion."""
         return self.fsm.handshake_complete
 
+    @event_loop
     def get_srtp_keying_material(self) -> SRTPKeyingMaterial | None:
         """Get SRTP keying material after handshake completion."""
         return self.fsm.get_srtp_keying_material()
@@ -484,6 +499,7 @@ class DTLSConn:
         """Wait for handshake to complete."""
         return await self.fsm.wait_handshake_complete(timeout)
 
+    @event_loop
     def __handle_encrypted_message(
         self, layer: RecordLayer, raw: bytes, message: EncryptedHandshakeMessage
     ):
@@ -524,16 +540,16 @@ class DTLSConn:
 
         logger.warning(f"__handle_encrypted_message: decrypt returned None/empty")
 
+    @task(
+        name="dtls:handle-inbound-record-layers",
+        kind="dtls",
+        metadata={"expected_long_running": True, "loop_role": "receive"},
+        failure=FailurePolicy.FAIL_CONNECTION,
+    )
     async def handle_inbound_record_layers(self):
         print("[FSM] handle_inbound_record_layers: STARTED")
         logger.info("handle_inbound_record_layers: starting inbound message handler")
-        fsm_runnable = spawn_peer_task(
-            self.fsm.run(),
-            name="dtls:fsm",
-            component="dtls",
-            kind="dtls",
-            metadata={"expected_long_running": True, "loop_role": "fsm"},
-        )
+        fsm_runnable = self.fsm.run()
 
         # Queue for encrypted messages that arrive before cipher suite is ready
         pending_encrypted: list[tuple[RecordLayer, bytes, EncryptedHandshakeMessage]] = []
@@ -663,3 +679,5 @@ class DTLSConn:
             logger.error(f"DTLS handle inbound record layers error: {e}")
         finally:
             fsm_runnable.cancel()
+            with suppress(asyncio.CancelledError):
+                await fsm_runnable

@@ -1,4 +1,4 @@
-from .models import TaskContext, TraceNode
+from .models import TaskTrace, TraceNode
 from .performance import (
     PerfEvent,
     PerformanceRecorder,
@@ -20,12 +20,17 @@ from .performance_summary import (
     check_smoke_thresholds,
 )
 from .service import TraceService, TraceSubscription
+from webrtc.performance import (
+    CallInfo, CaptureMetricSink, ErrorInfo, GroupSnapshot, MetricEvent,
+    MetricGroupAggregator, MetricSink, ObservedComponent, ObservedMeta, PerformanceSpec,
+    SuccessInfo, event_loop, performance, task, unobserved, worker,
+)
 
 __all__ = [
     "BaselineCheck",
     "PerfEvent",
     "PerformanceRecorder",
-    "TaskContext",
+    "TaskTrace",
     "TraceNode",
     "TraceService",
     "TraceSubscription",
@@ -42,4 +47,7 @@ __all__ = [
     "perf_measured",
     "perf_measured_async",
     "use_performance_recorder",
+    "CallInfo", "CaptureMetricSink", "ErrorInfo", "GroupSnapshot", "MetricEvent",
+    "MetricGroupAggregator", "MetricSink", "ObservedComponent", "ObservedMeta", "PerformanceSpec",
+    "SuccessInfo", "event_loop", "performance", "task", "unobserved", "worker",
 ]

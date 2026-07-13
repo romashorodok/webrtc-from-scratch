@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import time
+import tracemalloc
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable
@@ -20,8 +22,8 @@ from webrtc.media.rtp_extensions import DEFAULT_EXT_MAP
 from webrtc.peer_connection import (
     PeerConnection,
 )
-from webrtc.peer_context import PeerContext
-from webrtc.runtime import WebRTCRuntimeResources, get_default_runtime
+from webrtc.performance import ObservedComponent, worker
+from webrtc import Runtime
 from webrtc.session_description import (
     SessionDescription,
     SessionDescriptionType,
@@ -33,6 +35,12 @@ app = FastAPI()
 VIDEO_FILE = Path(__file__).resolve().parents[1] / "output_av1.ivf"
 
 
+class WebSocketMediaWorker(ObservedComponent):
+    @worker
+    def invoke(self, function: Callable[..., Any], *args: Any) -> Any:
+        return function(*args)
+
+
 async def on_recv(ws: WebSocket, on_close: Callable | None = None):
     try:
         while True:
@@ -42,13 +50,16 @@ async def on_recv(ws: WebSocket, on_close: Callable | None = None):
             _on_close()
 
 
-def read_frames(file_path: str):
-    frames: list[tuple[bytes, media.IVFFrameHeader]] = []
-    with open(file_path, "rb") as file:
-        reader = media.IVFReader(file)
-        for frame, header in reader:
-            frames.append((frame, header))
-    return frames
+def loop_frames(file_path: str):
+    """Yield IVF frames forever without retaining the complete video."""
+    while True:
+        yielded = False
+        with open(file_path, "rb") as file:
+            for frame, header in media.IVFReader(file):
+                yielded = True
+                yield frame, header
+        if not yielded:
+            raise RuntimeError(f"IVF video contains no frames: {file_path}")
 
 
 class SendTimeCache:
@@ -84,9 +95,96 @@ class SendTimeCache:
 
 TARGET_FPS = 30
 FRAME_PERIOD = 1 / TARGET_FPS
+_allocation_profiler_started = False
 
 
-async def start_write_loop(pc: PeerConnection, peer: PeerContext):
+def _allocation_profiler_finished(task: asyncio.Task[Any]) -> None:
+    global _allocation_profiler_started
+    _allocation_profiler_started = False
+    if tracemalloc.is_tracing():
+        tracemalloc.stop()
+    if task.cancelled():
+        print("[allocation-profile] task stopped with WebSocket", flush=True)
+        return
+    error = task.exception()
+    if error is not None:
+        print(
+            "[allocation-profile] task failed: "
+            f"{error.__class__.__name__}: {error}",
+            flush=True,
+        )
+
+
+async def profile_allocations(
+    pc: PeerConnection,
+    runtime: Runtime,
+) -> None:
+    """Print retained Python allocations while the real WebRTC sender runs."""
+    import psutil
+
+    interval = float(os.getenv("WEBRTC_ALLOCATION_PROFILE_INTERVAL", "15"))
+    print(
+        "[allocation-profile] enabled; lightweight sampling started "
+        f"(interval={interval:g}s)",
+        flush=True,
+    )
+    process = psutil.Process()
+    previous_rss = process.memory_info().rss
+    previous = None
+    previous_python = 0
+    while True:
+        await asyncio.sleep(interval)
+        srtp_ready = pc._dtls_transport._srtp_rtp is not None
+        if srtp_ready and not tracemalloc.is_tracing():
+            tracemalloc.start(25)
+            previous = tracemalloc.take_snapshot()
+            previous_python = tracemalloc.get_traced_memory()[0]
+            print(
+                "[allocation-profile] SRTP ready; detailed Python sampling started",
+                flush=True,
+            )
+
+        current = tracemalloc.take_snapshot() if tracemalloc.is_tracing() else None
+        current_bytes, peak_bytes = (
+            tracemalloc.get_traced_memory() if tracemalloc.is_tracing() else (0, 0)
+        )
+        transport = pc._transport
+        queue_depths: dict[str, int] = {}
+        for name in ("_rtp", "_rtcp", "_dtls"):
+            interceptor = getattr(transport, name, None)
+            queue = getattr(interceptor, "_queue", None)
+            if queue is not None:
+                queue_depths[name.removeprefix("_")] = queue.qsize()
+        print(
+            "[allocation-profile]",
+            f"rss={process.memory_info().rss}",
+            f"rss_delta={process.memory_info().rss - previous_rss:+d}",
+            f"python_current={current_bytes if current is not None else 'disabled'}",
+            f"python_delta={current_bytes - previous_python:+d}" if current is not None else "python_delta=disabled",
+            f"python_peak={peak_bytes if current is not None else 'disabled'}",
+            f"ice_ready={pc._transport is not None}",
+            f"srtp_ready={srtp_ready}",
+            f"ice_queues={queue_depths}",
+            f"metric_groups={len(runtime.metric_sink.snapshots())}",
+            f"trace_tasks={len(runtime.task_registry.task_ids())}",
+            f"metric_keys={len(runtime.metric_sink.snapshots())}",
+            flush=True,
+        )
+        if current is not None and previous is not None:
+            for stat in current.compare_to(previous, "lineno")[:12]:
+                if stat.size_diff > 0:
+                    print(f"[allocation-profile] + {stat}", flush=True)
+            previous = current
+        previous_rss = process.memory_info().rss
+        if current is not None:
+            previous_python = current_bytes
+
+
+async def start_write_loop(
+    pc: PeerConnection,
+    execution: Runtime,
+):
+    worker = WebSocketMediaWorker()
     sender = pc._transceivers[0].sender
     if not sender:
         raise ValueError("Not found the sender")
@@ -97,11 +195,7 @@ async def start_write_loop(pc: PeerConnection, peer: PeerContext):
 
     encoding = sender._track_encodings[0]
 
-    frames = await peer.to_thread(
-        read_frames,
-        str(VIDEO_FILE),
-        name="ws:read-ivf-frames",
-    )
+    frames = loop_frames(str(VIDEO_FILE))
 
     ptime = encoding.codec.refresh_rate
     ms = 1000
@@ -194,7 +288,8 @@ async def start_write_loop(pc: PeerConnection, peer: PeerContext):
                             # Apply EWMA smoothing
                             alpha = 0.1
                             smoothed_gradient = alpha * delay_gradient_us + (1 - alpha) * smoothed_gradient
-                            print(f"Seq {seq}: delay_gradient = {smoothed_gradient / 1000:.3f} ms")
+                            if os.getenv("WEBRTC_ALLOCATION_PROFILE") != "1":
+                                print(f"Seq {seq}: delay_gradient = {smoothed_gradient / 1000:.3f} ms")
 
                     prev_seq = seq
                     prev_send_time = send_time
@@ -214,23 +309,8 @@ async def start_write_loop(pc: PeerConnection, peer: PeerContext):
 
                 # Read decrypted RTCP from stream
                 rtcp = await stream.read()
-                pkts = await peer.to_thread(
-                    RtcpPacket.parse,
-                    rtcp,
-                    name="rtcp:parse",
-                    aggregate=True,
-                    group_name="rtcp:parse-feedback",
-                    group_key="rtcp:parse-feedback",
-                )
-                await peer.to_thread(
-                    print_rtcp,
-                    pkts,
-                    smoothed_gradient,
-                    name="rtcp:print-feedback",
-                    aggregate=True,
-                    group_name="rtcp:feedback-processing",
-                    group_key="rtcp:feedback-processing",
-                )
+                pkts = await worker.invoke(RtcpPacket.parse, rtcp)
+                await worker.invoke(print_rtcp, pkts, smoothed_gradient)
 
             except Exception as e:
                 print("rtcp error", e)
@@ -238,8 +318,6 @@ async def start_write_loop(pc: PeerConnection, peer: PeerContext):
 
 
     async def encode():
-        frame_index = 0
-
         srtp: SrtpSession | None = None
 
         async for _ in media.ticker(ptime / ms):
@@ -249,11 +327,7 @@ async def start_write_loop(pc: PeerConnection, peer: PeerContext):
                 else:
                     continue
 
-            if frame_index >= len(frames):
-                frame_index = 0
-
-            frame, _ = frames[frame_index]
-            frame_index += 1
+            frame, _ = next(frames)
             pts, time_base = await encoding._packetizer.next_timestamp()
 
             pkts = encoding._packetizer.packetize(
@@ -266,74 +340,77 @@ async def start_write_loop(pc: PeerConnection, peer: PeerContext):
                 )
                 serialized = pkt.serialize(DEFAULT_EXT_MAP)
                 # Offload encrypt to thread pool to avoid blocking event loop
-                encoded = await peer.to_thread(
-                    srtp.encrypt,
-                    serialized,
-                    name="srtp:encrypt-rtp",
-                    aggregate=True,
-                    group_name="srtp:encrypt-rtp-packets",
-                    group_key="srtp:encrypt-rtp-packets",
-                )
+                encoded = await srtp.encrypt(serialized)
                 if not pc._transport:
                     print(f"[WS] ERROR: pc._transport is None!")
                     continue
                 send_time_cache.add(pkt.extensions.transport_sequence_number)
-                await peer.to_thread(
-                    pc._transport.sendto,
-                    encoded,
-                    name="ice:sendto-rtp",
-                    aggregate=True,
-                    group_name="ice:send-rtp-packets",
-                    group_key="ice:send-rtp-packets",
-                )
+                await worker.invoke(pc._transport.sendto, encoded)
 
-    await pc.wait_transport_ready(timeout=10)
-    await pc.wait_srtp_ready(timeout=10)
-    await wait_sender_rtcp_stream(timeout=10)
-    peer.spawn_app(rtcp_handler(), name="ws:rtcp-handler", kind="rtcp")
+    await pc.wait_transport_ready(timeout=30)
+    await pc.wait_srtp_ready(timeout=30)
+    await wait_sender_rtcp_stream(timeout=30)
+    execution.start(lambda: rtcp_handler(), name="ws:rtcp-handler", kind="rtcp")
     await encode()
 
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
-    runtime = get_default_runtime()
     pc = PeerConnection()
+    runtime = Runtime(scope_id=pc.id)
     send_lock = asyncio.Lock()
 
     async def send_json(message: dict[str, Any]) -> None:
         async with send_lock:
             await ws.send_json(message)
 
-    async with PeerContext(pc, runtime=runtime) as peer:
-        trace_task = peer.spawn_app(
-            pump_trace_updates(
-                runtime,
+    async with runtime as execution:
+      async with pc:
+        global _allocation_profiler_started
+        if (
+            os.getenv("WEBRTC_ALLOCATION_PROFILE") == "1"
+            and not _allocation_profiler_started
+        ):
+            # tracemalloc is process-global. Keep a single sampler for this
+            # explicitly profiled server process instead of competing peers.
+            _allocation_profiler_started = True
+            profiler_task = execution.start(
+                lambda: profile_allocations(pc, runtime),
+                name="ws:allocation-profile",
+                kind="diagnostic",
+            )
+            profiler_task.add_done_callback(_allocation_profiler_finished)
+            print("[allocation-profile] task scheduled", flush=True)
+        elif os.getenv("WEBRTC_ALLOCATION_PROFILE") != "1":
+            print("[allocation-profile] disabled in server process", flush=True)
+
+        trace_task = execution.start(
+            lambda: pump_trace_updates(
+                execution,
                 send_json,
-                peer_id=peer.peer_id,
-                scope_trace_id=peer.root_trace_id,
+                peer_id=pc.id,
+                scope_trace_id=execution.root_context.trace_id if execution.root_context else None,
             ),
-            name=f"ws:trace-pump-{peer.peer_id}",
+            name=f"ws:trace-pump-{pc.id}",
             kind="trace",
         )
         write_task: asyncio.Task[Any] | None = None
-
-        peer.start()
 
         await pc.add_transceiver_from_kind(
             RTPCodecKind.Video, RTPTransceiverDirection.Sendonly
         )
 
         def on_close():
-            trace_task.cancel()
+            # trace_task.cancel()
             print("WebSocket disconnected")
 
         async def start_media() -> None:
             nonlocal write_task
             if write_task and not write_task.done():
                 return
-            write_task = peer.spawn_app(
-                start_write_loop(pc, peer),
+            write_task = execution.start(
+                lambda: start_write_loop(pc, execution),
                 name="ws:av1-write-loop",
                 kind="media",
             )
@@ -344,7 +421,7 @@ async def ws_endpoint(ws: WebSocket):
             match msg.get("event"):
                 case "negotiate":
                     print("Start all webrtc")
-                    await pc.gatherer.dial()
+                    await pc.dial()
                     await start_media()
 
                 case "offer":
@@ -383,11 +460,11 @@ async def ws_endpoint(ws: WebSocket):
                     print(f"Set remote description desc:{desc}")
 
                     for ufrag, pwd in desc.get_media_credentials():
-                        await peer.set_remote_credentials(ufrag, pwd)
+                        await pc.gatherer.set_remote_credentials(ufrag, pwd)
 
-                    await peer.set_remote_description(desc_type, desc)
+                    await pc.set_remote_description(desc_type, desc)
                     if desc_type is SessionDescriptionType.Answer:
-                        await pc.gatherer.dial()
+                        await pc.dial()
 
                 case "trickle-ice":
                     # NOTE: In my current state I need know ufrag, pwd before adding the candidate, because all pair credentials is immutable
@@ -400,20 +477,16 @@ async def ws_endpoint(ws: WebSocket):
                     if not candidate_str:
                         continue
 
-                    await peer.add_remote_candidate(candidate_str)
+                    await pc.gatherer.add_remote_candidate(candidate_str)
 
                 case "trace:delete":
                     data = msg.get("data")
                     payload: dict[str, Any] = json.loads(data) if isinstance(data, str) else data or {}
-                    trace_id = payload.get("trace_id")
+                    task_id = payload.get("task_id")
                     scope = payload.get("scope")
 
-                    if isinstance(trace_id, str):
-                        runtime.delete_trace(trace_id, peer_id=peer.peer_id)
-                    elif scope == "failed":
-                        runtime.delete_traces(statuses={"failed"}, peer_id=peer.peer_id)
-                    elif scope == "completed":
-                        runtime.delete_traces(statuses={"completed", "cancelled"}, peer_id=peer.peer_id)
+                    if isinstance(task_id, str):
+                        execution.observability.cancel(task_id)
 
                 case _:
                     print("Unknown event")

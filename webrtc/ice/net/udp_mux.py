@@ -5,7 +5,7 @@ from typing import override, Any
 from webrtc.utils.types import impl_protocol
 from webrtc.logger import get_logger, Component
 from webrtc.config import get_config
-from webrtc.runtime import get_default_runtime
+from webrtc.performance import ObservedComponent, event_loop
 from webrtc.tracing import perf_mark
 
 from .interface import Interface
@@ -20,10 +20,19 @@ from .types import (
 
 
 class Interceptor:
-    def __init__(self):
-        self._queue = asyncio.Queue[Packet]()
+    def __init__(self, maxsize: int = 0, *, drop_oldest: bool = False):
+        self._queue = asyncio.Queue[Packet](maxsize=maxsize)
+        self._drop_oldest = drop_oldest
 
     def put_nowait(self, pkt: Packet):
+        if self._drop_oldest and self._queue.full():
+            # Datagram producers cannot apply backpressure. Keep the freshest
+            # traffic (especially RTP/RTCP) instead of retaining packets for
+            # the lifetime of a slow or stalled consumer.
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
         self._queue.put_nowait(pkt)
 
     async def put(self, pkt: Packet):
@@ -248,7 +257,7 @@ TODO: refactor muxer to work with multi peer connection
 """
 
 
-class MultiUDPMux:
+class MultiUDPMux(ObservedComponent):
     def __init__(
         self, interfaces: list[Interface], loop: asyncio.AbstractEventLoop
     ) -> None:
@@ -263,19 +272,16 @@ class MultiUDPMux:
 
         for interface in self._interfaces:
             coros.append(
-                get_default_runtime().trace_awaitable(
-                    self._loop.create_datagram_endpoint(
-                        lambda iface=interface: InterfaceMuxUDPHandler(iface, port),
-                        local_addr=(interface.address.value, port),
-                    ),
-                    name=f"udp:create-datagram-endpoint:{interface.address.value}",
-                    kind="network",
+                self._loop.create_datagram_endpoint(
+                    lambda iface=interface: InterfaceMuxUDPHandler(iface, port),
+                    local_addr=(interface.address.value, port),
                 )
             )
 
         for _, handler in await asyncio.gather(*coros):
             self._inbound_handlers[handler.addr_str()] = handler
 
+    @event_loop
     def bind(
         self, ufrag: str, handler: InterfaceMuxUDPHandler, candidate: CandidateProtocol
     ) -> UDPMux:
@@ -291,7 +297,17 @@ class MultiUDPMux:
 
         return mux
 
+    @event_loop
     def inbound_handlers(self) -> dict[str, InterfaceMuxUDPHandler]:
         if len(self._inbound_handlers) <= 0:
             raise RuntimeError("Inbound handlers not found accept connections first")
         return self._inbound_handlers
+
+    async def aclose(self) -> None:
+        handlers = tuple(self._inbound_handlers.values())
+        self._inbound_handlers.clear()
+        for handler in handlers:
+            transport = handler._transport
+            handler._transport = None
+            if transport is not None:
+                transport.close()

@@ -18,7 +18,6 @@
     "dtls.handshake.completed",
     "dtls.record.tx",
     "dtls.record.rx",
-    "srtp.keys.derived",
     "srtp.ready.completed"
   ],
   "forbidden_events": [

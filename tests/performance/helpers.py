@@ -8,7 +8,7 @@ from typing import Any, TypeVar
 
 from webrtc.lifecycle import PeerCondition
 from webrtc.peer_connection import PeerConnection
-from webrtc.peer_context import PeerContext
+from webrtc import Runtime
 from webrtc.session_description import SessionDescription, SessionDescriptionAttrKey
 from webrtc.tracing import (
     PerformanceRecorder,
@@ -119,7 +119,7 @@ class PeerDriver:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.close()
 
-    async def call(self, func: Callable[[PeerContext], Awaitable[T] | T]) -> T:
+    async def call(self, func: Callable[[PeerConnection], Awaitable[T] | T]) -> T:
         if self._task is None:
             raise RuntimeError("peer driver is not started")
         future: asyncio.Future[T] = asyncio.get_running_loop().create_future()
@@ -136,25 +136,28 @@ class PeerDriver:
         self.closed = True
 
     async def _run(self) -> None:
-        async with PeerContext(self.pc, peer_id=self.peer_id) as context:
-            while True:
-                func, future = await self._queue.get()
-                if func is None:
-                    await context.aclose("test-complete")
-                    if not future.done():
-                        future.set_result(context.active_routine_count())
-                    return
-                try:
-                    result = func(context)
-                    if asyncio.iscoroutine(result) or isinstance(result, Awaitable):
-                        result = await result
-                except BaseException as exc:
-                    if not future.done():
-                        future.set_exception(exc)
-                else:
-                    if not future.done():
-                        future.set_result(result)
+        close_future: asyncio.Future[int] | None = None
+        runtime = Runtime(scope_id=self.peer_id)
+        async with runtime:
+            async with self.pc:
+                while True:
+                    func, future = await self._queue.get()
+                    if func is None:
+                        close_future = future
+                        break
+                    try:
+                        result = func(self.pc)
+                        if asyncio.iscoroutine(result) or isinstance(result, Awaitable):
+                            result = await result
+                    except BaseException as exc:
+                        if not future.done():
+                            future.set_exception(exc)
+                    else:
+                        if not future.done():
+                            future.set_result(result)
+        if close_future is not None and not close_future.done():
+            close_future.set_result(len(runtime.task_registry.task_ids()))
 
 
-async def _noop(context: PeerContext) -> None:
+async def _noop(context: PeerConnection) -> None:
     return None

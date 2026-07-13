@@ -1,116 +1,44 @@
 import asyncio
 from typing import Any, Awaitable, Callable
 
-from webrtc.runtime import WebRTCRuntimeResources
+from webrtc import Runtime
 
 
 async def pump_trace_updates(
-    runtime: WebRTCRuntimeResources,
+    runtime: Runtime,
     send_json: Callable[[dict[str, Any]], Awaitable[None]],
     *,
     peer_id: str | None = None,
     scope_trace_id: str | None = None,
     heartbeat_interval: float = 0.25,
     heartbeat_keepalive_interval: float = 2.5,
-    update_flush_interval: float = 0.25,
 ) -> None:
     subscription = runtime.trace_subscribe(peer_id=peer_id)
     loop = asyncio.get_running_loop()
     next_heartbeat = loop.time() + heartbeat_interval
     last_heartbeat_emit = 0.0
     last_heartbeat_signature: tuple[tuple[str, str | None, str], ...] = ()
-    pending_events: list[dict[str, Any]] = []
-    pending_updates: dict[str, dict[str, Any]] = {}
-    pending_sequence = 0
-    next_batch_flush: float | None = None
-
-    def schedule_batch_flush() -> None:
-        nonlocal next_batch_flush
-        if next_batch_flush is None:
-            next_batch_flush = loop.time() + update_flush_interval
-
-    def update_batch_event() -> dict[str, Any] | None:
-        nonlocal pending_sequence
-        if not pending_updates:
-            return None
-
-        data: dict[str, Any] = {"traces": list(pending_updates.values())}
-        if pending_sequence:
-            data["sequence"] = pending_sequence
-        pending_updates.clear()
-        pending_sequence = 0
-        return {"event": "trace:update", "data": data}
-
-    def add_pending_event(event: dict[str, Any]) -> None:
-        pending_events.append(event)
-        schedule_batch_flush()
-
-    async def flush_pending_batch() -> None:
-        nonlocal next_batch_flush
-        events = pending_events.copy()
-        pending_events.clear()
-        update = update_batch_event()
-        if not events and update is None:
-            next_batch_flush = None
-            return
-        next_batch_flush = None
-        if events:
-            await send_trace_batch(send_json, events)
-        if update is not None:
-            await send_trace_batch(send_json, [update])
-
-    def add_pending_update_event(event: dict[str, Any]) -> None:
-        nonlocal pending_sequence
-        data = event.get("data")
-        if not isinstance(data, dict):
-            return
-
-        sequence = data.get("sequence")
-        if isinstance(sequence, int):
-            pending_sequence = max(pending_sequence, sequence)
-
-        traces = data.get("traces")
-        if isinstance(traces, list):
-            for trace in traces:
-                add_pending_trace(trace)
-
-        trace = data.get("trace")
-        add_pending_trace(trace)
-        if pending_updates:
-            schedule_batch_flush()
-
-    def add_pending_trace(trace: Any) -> None:
-        if not isinstance(trace, dict):
-            return
-        trace_id = trace.get("trace_id")
-        if not isinstance(trace_id, str):
-            return
-        pending_updates[trace_id] = compact_trace_update(trace)
-        schedule_batch_flush()
-
-    add_pending_event(
-        {
+    await send_trace_batch(
+        send_json,
+        [{
             "event": "trace:init",
             "data": {
-                "traces": runtime.trace_live_tree(scope_trace_id=scope_trace_id),
+                "trace_id": scope_trace_id,
+                "tasks": runtime.trace_live_tree(scope_trace_id=scope_trace_id),
+                "groups": runtime.trace_groups(scope_trace_id),
+                "snapshot": True,
                 **({"peer_id": peer_id} if peer_id is not None else {}),
             },
-        }
+        }],
     )
 
     try:
         while True:
-            deadline = next_heartbeat
-            if next_batch_flush is not None:
-                deadline = min(deadline, next_batch_flush)
-            timeout = max(0.0, deadline - loop.time())
+            timeout = max(0.0, next_heartbeat - loop.time())
             try:
                 event = await asyncio.wait_for(subscription.get(), timeout=timeout)
             except asyncio.TimeoutError:
                 now = loop.time()
-                if next_batch_flush is not None and now >= next_batch_flush:
-                    await flush_pending_batch()
-                    continue
                 if now < next_heartbeat:
                     continue
 
@@ -128,21 +56,22 @@ async def pump_trace_updates(
                         include_duration=heartbeat_due,
                         scope_trace_id=scope_trace_id,
                     )
-                    for trace in traces:
-                        add_pending_trace(trace)
+                    update = {
+                        "event": "trace:update",
+                        "data": {
+                            "tasks": [compact_trace_update(trace) for trace in traces],
+                            "groups": runtime.trace_groups(scope_trace_id),
+                        },
+                    }
+                    await send_trace_batch(send_json, [update])
                     last_heartbeat_emit = now
                     last_heartbeat_signature = signature
                 next_heartbeat = loop.time() + heartbeat_interval
             else:
-                for item in trace_events_from_subscription_event(event):
-                    if item.get("event") == "trace:update":
-                        add_pending_update_event(item)
-                    else:
-                        if pending_updates:
-                            await flush_pending_batch()
-                        add_pending_event(item)
+                events = trace_events_from_subscription_event(event)
+                attach_groups_once(events, runtime.trace_groups(scope_trace_id))
+                await send_trace_batch(send_json, events)
     finally:
-        await flush_pending_batch()
         subscription.close()
 
 
@@ -163,22 +92,22 @@ async def send_trace_batch(
     if not events:
         return
 
-    if len(events) == 1 and events[0].get("event") == "trace:update":
-        data = dict(events[0].get("data") or {})
-        await send_json(
-            {
-                "event": "trace:batch",
-                "data": data,
-            }
-        )
-        return
-
     await send_json(
         {
             "event": "trace:batch",
             "data": {"events": events},
         }
     )
+
+
+def attach_groups_once(events: list[dict[str, Any]], groups: list[dict[str, Any]]) -> None:
+    for event in reversed(events):
+        if event.get("event") not in {"trace:init", "trace:update", "trace:complete"}:
+            continue
+        data = event.get("data")
+        if isinstance(data, dict):
+            event["data"] = {**data, "groups": groups}
+        return
 
 
 def compact_trace_update(trace: dict[str, Any]) -> dict[str, Any]:

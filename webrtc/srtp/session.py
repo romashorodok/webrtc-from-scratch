@@ -8,6 +8,7 @@ This module provides the high-level Session interface that:
 """
 
 import asyncio
+import inspect
 from dataclasses import dataclass
 from typing import Optional, Callable, Awaitable
 
@@ -17,7 +18,8 @@ from webrtc_rs import SrtpContext
 # Import logger
 from webrtc.logger import get_logger, Component
 from webrtc.config import get_config
-from webrtc.tracing import measure_perf, perf_mark
+from webrtc.performance import ObservedComponent, event_loop, performance, worker
+from webrtc.domain_events import SrtpPacketDelivery, SrtpStreamCreated, emit_domain_event
 
 
 # Buffer limits
@@ -168,7 +170,7 @@ class SessionKeys:
     remote_master_salt: bytes
 
 
-class Session:
+class Session(ObservedComponent):
     """
     SRTP Session with bidirectional encryption and stream demuxing.
 
@@ -188,7 +190,6 @@ class Session:
             is_rtp: True for RTP session, False for RTCP session
         """
         self.is_rtp = is_rtp
-
         # Create Rust SRTP context
         # tx_key = local key + salt (for encryption)
         # rx_key = remote key + salt (for decryption)
@@ -209,6 +210,7 @@ class Session:
         self._ssrc_counters: dict[int, int] = {}
 
     @classmethod
+    @event_loop
     def from_keying_material(
         cls,
         tx_key: bytes,
@@ -237,6 +239,13 @@ class Session:
         )
         return cls(keys, is_rtp)
 
+    @performance(
+        name="srtp.encrypt", group="srtp.packet",
+        on_call=lambda call: {"input_bytes": len(call.args[1]), "packet_kind": "rtp" if call.args[0].is_rtp else "rtcp"},
+        on_success=lambda event: {"output_bytes": len(event.result)},
+        on_error=lambda event: {"exception": type(event.exception).__name__},
+    )
+    @worker
     def encrypt(self, plaintext: bytes) -> bytes:
         """
         Encrypt an outgoing packet (synchronous).
@@ -247,27 +256,15 @@ class Session:
         Returns:
             Encrypted SRTP or SRTCP packet
         """
-        packet_type = "rtp" if self.is_rtp else "rtcp"
-        phase = f"{packet_type}_encrypt"
-        metadata = _packet_metadata(plaintext, self.is_rtp, size_key="plaintext_size_bytes")
-        metadata["flow_direction"] = "tx"
-        with measure_perf("srtp", phase, metadata=metadata):
-            try:
-                encrypted = (
-                    self._context.encrypt_rtp(plaintext)
-                    if self.is_rtp
-                    else self._context.encrypt_rtcp(plaintext)
-                )
-            except BaseException:
-                metadata[f"counter.srtp.{packet_type}_encrypt_failed"] = 1
-                metadata["error_stage"] = "srtp_encrypt"
-                raise
-            # ``measure_perf`` retains this mapping until it emits completion,
-            # letting the completed event describe both sides of the boundary.
-            metadata["ciphertext_size_bytes"] = len(encrypted)
-            metadata[f"counter.srtp.{packet_type}_encrypted"] = 1
-            return encrypted
+        return self._context.encrypt_rtp(plaintext) if self.is_rtp else self._context.encrypt_rtcp(plaintext)
 
+    @performance(
+        name="srtp.decrypt", group="srtp.packet",
+        on_call=lambda call: {"input_bytes": len(call.args[1]), "packet_kind": "rtp" if call.args[0].is_rtp else "rtcp"},
+        on_success=lambda event: {"output_bytes": len(event.result)},
+        on_error=lambda event: {"exception": type(event.exception).__name__},
+    )
+    @worker
     def decrypt(self, ciphertext: bytes) -> bytes:
         """
         Decrypt an incoming packet (synchronous).
@@ -278,24 +275,7 @@ class Session:
         Returns:
             Decrypted RTP or RTCP packet
         """
-        packet_type = "rtp" if self.is_rtp else "rtcp"
-        phase = f"{packet_type}_decrypt"
-        metadata = _packet_metadata(ciphertext, self.is_rtp, size_key="ciphertext_size_bytes")
-        metadata["flow_direction"] = "rx"
-        with measure_perf("srtp", phase, metadata=metadata):
-            try:
-                decrypted = (
-                    self._context.decrypt_rtp(ciphertext)
-                    if self.is_rtp
-                    else self._context.decrypt_rtcp(ciphertext)
-                )
-            except BaseException:
-                metadata[f"counter.srtp.{packet_type}_decrypt_failed"] = 1
-                metadata["error_stage"] = "srtp_decrypt"
-                raise
-            metadata["plaintext_size_bytes"] = len(decrypted)
-            metadata[f"counter.srtp.{packet_type}_decrypted"] = 1
-            return decrypted
+        return self._context.decrypt_rtp(ciphertext) if self.is_rtp else self._context.decrypt_rtcp(ciphertext)
 
     async def encrypt_async(self, plaintext: bytes) -> bytes:
         """
@@ -307,7 +287,8 @@ class Session:
         Returns:
             Encrypted SRTP or SRTCP packet
         """
-        return self.encrypt(plaintext)
+        result = self.encrypt(plaintext)
+        return await result if inspect.isawaitable(result) else result
 
     async def decrypt_async(self, ciphertext: bytes) -> bytes:
         """
@@ -319,7 +300,8 @@ class Session:
         Returns:
             Decrypted RTP or RTCP packet
         """
-        return self.decrypt(ciphertext)
+        result = self.decrypt(ciphertext)
+        return await result if inspect.isawaitable(result) else result
 
     async def _get_or_create_stream(self, ssrc: int) -> tuple[Stream, bool]:
         """
@@ -338,18 +320,8 @@ class Session:
 
             stream = Stream(ssrc, self.is_rtp, on_close)
             self._streams[ssrc] = stream
-            perf_mark(
-                "srtp",
-                "stream",
-                "created",
-                metadata={
-                    "flow_direction": "rx",
-                    "packet_kind": "rtp" if self.is_rtp else "rtcp",
-                    "ssrc": ssrc,
-                    "is_new": True,
-                    "counter.srtp.streams_created": 1,
-                },
-            )
+            emit_domain_event(SrtpStreamCreated, ssrc=ssrc,
+                              protocol="rtp" if self.is_rtp else "rtcp")
             return stream, True
 
     async def write_incoming(self, ciphertext: bytes) -> None:
@@ -369,7 +341,7 @@ class Session:
 
         try:
             # Decrypt
-            decrypted = self.decrypt(ciphertext)
+            decrypted = await self.decrypt(ciphertext)
         except Exception as e:
             self._decrypt_errors += 1
             if config.log_srtp_decrypt_errors and (self._decrypt_errors <= 20 or self._decrypt_errors % 100 == 0):
@@ -408,32 +380,14 @@ class Session:
 
         # Check if write succeeded (could fail if stream queue is full).
         write_success = await stream.write(decrypted)
-        packet_metadata = _packet_metadata(decrypted, self.is_rtp, size_key="plaintext_size_bytes")
-        packet_metadata["flow_direction"] = "rx"
-        packet_metadata["ssrc"] = ssrc
         if not write_success:
             seq = int.from_bytes(decrypted[2:4], 'big') if len(decrypted) >= 4 else -1
-            perf_mark(
-                "srtp",
-                "stream",
-                "dropped",
-                metadata={
-                    **packet_metadata,
-                    "drop_reason": "stream_queue_full_or_closed",
-                    "counter.srtp.stream_packets_dropped": 1,
-                },
-            )
+            emit_domain_event(SrtpPacketDelivery, ssrc=ssrc,
+                              protocol="rtp" if self.is_rtp else "rtcp", delivered=False)
             logger.warn(Component.SRTP, f"Stream write FAILED - queue full", ssrc=ssrc, seq=seq)
         else:
-            perf_mark(
-                "srtp",
-                "stream",
-                "delivered",
-                metadata={
-                    **packet_metadata,
-                    "counter.srtp.stream_packets_delivered": 1,
-                },
-            )
+            emit_domain_event(SrtpPacketDelivery, ssrc=ssrc,
+                              protocol="rtp" if self.is_rtp else "rtcp", delivered=True)
 
     async def accept_stream(self) -> tuple[Stream, int]:
         """

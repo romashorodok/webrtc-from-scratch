@@ -6,13 +6,14 @@ Includes FFT spectrum computation, audio feature extraction, and threshold-based
 """
 
 import time
+import inspect
 from collections import deque
 from typing import Any, Dict, Optional
 
 import numpy as np
 
 from webrtc.logger import Component, get_logger
-from webrtc.runtime import get_default_runtime
+from webrtc.performance import ObservedComponent, worker
 
 logger = get_logger()
 
@@ -24,7 +25,7 @@ if TYPE_CHECKING:
     from .filters import FilterChain
 
 
-class AudioAnalyzer:
+class AudioAnalyzer(ObservedComponent):
     """
     Real-time audio analyzer for PCM frames.
 
@@ -66,6 +67,7 @@ class AudioAnalyzer:
             has_filters=filter_chain is not None,
         )
 
+    @worker
     def _compute_spectrum(self, pcm_bytes: bytes) -> tuple[np.ndarray, Optional[dict]]:
         """
         Compute FFT spectrum from PCM bytes.
@@ -111,6 +113,7 @@ class AudioAnalyzer:
 
         return downsampled, vad_features
 
+    @worker
     def _compute_features(self, pcm_bytes: bytes) -> Dict[str, float]:
         """
         Extract audio features from PCM bytes.
@@ -172,18 +175,13 @@ class AudioAnalyzer:
         self.frame_count += 1
 
         # Run CPU-intensive computation in thread pool
-        runtime = get_default_runtime()
-        spectrum, vad_features = await runtime.to_thread(
-            self._compute_spectrum,
-            pcm_bytes,
-            name="audio:compute-spectrum",
-            metadata={"timestamp": timestamp},
+        spectrum_result = self._compute_spectrum(pcm_bytes)
+        spectrum, vad_features = (
+            await spectrum_result if inspect.isawaitable(spectrum_result) else spectrum_result
         )
-        features = await runtime.to_thread(
-            self._compute_features,
-            pcm_bytes,
-            name="audio:compute-features",
-            metadata={"timestamp": timestamp},
+        features_result = self._compute_features(pcm_bytes)
+        features = (
+            await features_result if inspect.isawaitable(features_result) else features_result
         )
 
         # Merge VAD features into main features dict

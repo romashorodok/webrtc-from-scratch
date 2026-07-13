@@ -21,7 +21,8 @@ from webrtc.dtls.prf import SRTPKeyingMaterial
 from webrtc.srtp import Session as SrtpSession, Stream as SrtpStream
 from webrtc.logger import get_logger, Component
 from webrtc.config import get_config
-from webrtc.peer_context import spawn_peer_task
+from webrtc.performance import ObservedComponent, event_loop, task
+from webrtc.runtime_services import FailurePolicy
 from webrtc.lifecycle import (
     TransportCondition,
     require_timeout,
@@ -30,6 +31,7 @@ from webrtc.lifecycle import (
     wait_until,
 )
 from webrtc.tracing import measure_perf, perf_mark, perf_measured_async
+from webrtc.domain_events import SrtpKeysReady, SrtpSessionReady, emit_domain_event
 
 logger = logging.getLogger("webrtc.dtls.transport")
 
@@ -89,7 +91,7 @@ def _mark_dtls_records(direction: str, data: bytes) -> None:
         )
 
 
-class DTLSTransport:
+class DTLSTransport(ObservedComponent):
     """
     DTLS Transport using Python flight-based FSM.
 
@@ -126,12 +128,17 @@ class DTLSTransport:
         self.__handshake_complete = asyncio.Event()
         self.__handshake_failed: BaseException | None = None
         self._srtp_keying_material: SRTPKeyingMaterial | None = None
+        self._closed = False
+        self._handshake_task: asyncio.Task[Any] | None = None
+        self._rtp_task: asyncio.Task[Any] | None = None
+        self._rtcp_task: asyncio.Task[Any] | None = None
 
     @property
     def handshake_complete(self) -> asyncio.Event:
         """Event signaling handshake completion."""
         return self.__handshake_complete
 
+    @event_loop
     def get_srtp_keying_material(self) -> SRTPKeyingMaterial | None:
         """Get SRTP keying material after handshake completion."""
         return self._srtp_keying_material
@@ -140,6 +147,7 @@ class DTLSTransport:
         """Bind to ICE transport for sending/receiving DTLS packets."""
         self.__transport = transport
 
+    @event_loop
     def start(self, role: DTLSRole, transport: "ice.CandidatePairTransport | None" = None):
         """
         Start DTLS handshake using Python flight-based FSM.
@@ -206,16 +214,11 @@ class DTLSTransport:
         wlogger.info(Component.DTLS, f"Starting DTLS handshake as {'client' if is_client else 'server'}")
 
         # Start handshake processing
-        spawn_peer_task(
-            self._run_handshake(is_client),
-            name="dtls:handshake",
-            component="dtls",
-            kind="dtls",
-            bounded=True,
-        )
+        self._handshake_task = self._run_handshake(is_client)
         wlogger.debug(Component.DTLS, "Handshake task created")
         perf_mark("dtls", "start", "completed", metadata={"role": role.value})
 
+    @task(name="dtls:handshake", kind="dtls", failure=FailurePolicy.FAIL_CONNECTION)
     @perf_measured_async("dtls", "handshake")
     async def _run_handshake(self, is_client: bool):
         """Run the DTLS handshake using Python FSM."""
@@ -232,13 +235,7 @@ class DTLSTransport:
         try:
             # Start FSM processing
             wlogger.debug(Component.DTLS, "Creating handle_inbound_record_layers task")
-            spawn_peer_task(
-                self.__dtls_conn.handle_inbound_record_layers(),
-                name="dtls:handle-inbound-record-layers",
-                component="dtls",
-                kind="dtls",
-                metadata={"expected_long_running": True, "loop_role": "receive"},
-            )
+            self.__dtls_conn.handle_inbound_record_layers()
 
             # Dispatch initial state
             wlogger.debug(Component.DTLS, "Dispatching initial FSM state")
@@ -255,7 +252,7 @@ class DTLSTransport:
                 self._srtp_keying_material = self.__dtls_conn.get_srtp_keying_material()
 
                 if self._srtp_keying_material:
-                    perf_mark("srtp", "keys", "derived")
+                    emit_domain_event(SrtpKeysReady)
                     # Initialize Rust SRTP with Python-derived keys
                     await self._init_srtp(is_client)
 
@@ -311,7 +308,7 @@ class DTLSTransport:
                 is_rtp=True,
             )
             self.__srtp_rtp_lock.set()
-            perf_mark("srtp", "rtp_session", "ready")
+            emit_domain_event(SrtpSessionReady, protocol="rtp")
             wlogger.debug(Component.DTLS, "RTP SRTP session created")
 
             self._srtp_rtcp = SrtpSession.from_keying_material(
@@ -320,26 +317,14 @@ class DTLSTransport:
                 is_rtp=False,
             )
             self.__srtp_rtcp_lock.set()
-            perf_mark("srtp", "rtcp_session", "ready")
+            emit_domain_event(SrtpSessionReady, protocol="rtcp")
             wlogger.debug(Component.DTLS, "RTCP SRTP session created")
 
             wlogger.info(Component.DTLS, "SRTP sessions initialized")
 
             # Start internal receive loops to route incoming packets to streams
-            spawn_peer_task(
-                self._rtp_receive_loop(),
-                name="dtls:rtp-receive-loop",
-                component="dtls",
-                kind="dtls",
-                metadata={"expected_long_running": True, "loop_role": "receive"},
-            )
-            spawn_peer_task(
-                self._rtcp_receive_loop(),
-                name="dtls:rtcp-receive-loop",
-                component="dtls",
-                kind="dtls",
-                metadata={"expected_long_running": True, "loop_role": "receive"},
-            )
+            self._rtp_task = self._rtp_receive_loop()
+            self._rtcp_task = self._rtcp_receive_loop()
 
         except Exception as e:
             wlogger.error(Component.DTLS, "Failed to initialize SRTP", error=str(e))
@@ -455,6 +440,7 @@ class DTLSTransport:
         await asyncio.Event().wait()  # Never returns
         return bytes()
 
+    @event_loop
     def _srtp_ready(self) -> bool:
         return (
             self.__srtp_rtp_lock.is_set()
@@ -505,16 +491,16 @@ class DTLSTransport:
         except asyncio.TimeoutError:
             return False
 
-    def encrypt_rtp_bytes(self, data: bytes) -> bytes:
+    async def encrypt_rtp_bytes(self, data: bytes) -> bytes:
         """Encrypt RTP packet using SRTP (synchronous)."""
         if srtp := self._srtp_rtp:
-            return srtp.encrypt(data)
+            return await srtp.encrypt(data)
         raise ValueError("SRTP not initialized")
 
-    def encrypt_rtcp_bytes(self, data: bytes) -> bytes:
+    async def encrypt_rtcp_bytes(self, data: bytes) -> bytes:
         """Encrypt RTCP packet using SRTP (synchronous)."""
         if srtp := self._srtp_rtcp:
-            return srtp.encrypt(data)
+            return await srtp.encrypt(data)
         raise ValueError("SRTP not initialized")
 
     async def write_rtcp_bytes(self, data: bytes) -> int:
@@ -524,7 +510,7 @@ class DTLSTransport:
             return 0
         try:
             # Encrypt synchronously (Rust crypto is fast)
-            encrypted = self._srtp_rtcp.encrypt(data)
+            encrypted = await self._srtp_rtcp.encrypt(data)
             # Send via ICE transport
             self.__transport.sendto(encrypted)
             return len(encrypted)
@@ -543,7 +529,7 @@ class DTLSTransport:
             return 0
         try:
             # Encrypt synchronously (Rust crypto is fast)
-            encrypted = self._srtp_rtp.encrypt(data)
+            encrypted = await self._srtp_rtp.encrypt(data)
             # Send via ICE transport
             self.__transport.sendto(encrypted)
             return len(encrypted)
@@ -566,6 +552,12 @@ class DTLSTransport:
             raise ValueError("SRTP must be started to get the stream")
         return await self._srtp_rtcp.open_stream(ssrc)
 
+    @task(
+        name="dtls:rtp-receive-loop",
+        kind="dtls",
+        metadata={"expected_long_running": True, "loop_role": "receive"},
+        failure=FailurePolicy.FAIL_CONNECTION,
+    )
     async def _rtp_receive_loop(self):
         """Internal loop that reads RTP from ICE and routes to SRTP streams."""
         wlogger = get_logger()
@@ -628,6 +620,12 @@ class DTLSTransport:
                 wlogger.error(Component.DTLS, "RTP receive loop error", error=str(e))
                 await asyncio.sleep(0.1)
 
+    @task(
+        name="dtls:rtcp-receive-loop",
+        kind="dtls",
+        metadata={"expected_long_running": True, "loop_role": "receive"},
+        failure=FailurePolicy.FAIL_CONNECTION,
+    )
     async def _rtcp_receive_loop(self):
         """Internal loop that reads RTCP from ICE and routes to SRTP streams."""
         wlogger = get_logger()
@@ -644,3 +642,26 @@ class DTLSTransport:
             except Exception as e:
                 wlogger.error(Component.DTLS, "RTCP receive loop error", error=str(e))
                 await asyncio.sleep(0.1)
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        tasks = tuple(
+            task for task in (self._rtcp_task, self._rtp_task, self._handshake_task)
+            if task is not None and task is not asyncio.current_task()
+        )
+        for running in tasks:
+            if not running.done():
+                running.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        # SRTP is above DTLS in the dependency stack and therefore closes first.
+        if self._srtp_rtcp is not None:
+            await self._srtp_rtcp.close()
+            self._srtp_rtcp = None
+        if self._srtp_rtp is not None:
+            await self._srtp_rtp.close()
+            self._srtp_rtp = None
+        self.__dtls_conn = None
+        self.__transport = None

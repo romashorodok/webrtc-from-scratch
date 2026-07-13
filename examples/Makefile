@@ -2,6 +2,9 @@
 run:
 	uv run serve.py examples.ws:app
 
+profile:
+	uv run serve.py examples.ws:app --allocation-profile --allocation-profile-interval 15
+
 opus:
 	uv run serve.py examples.opus_ws:app --port 9001
 

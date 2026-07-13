@@ -6,9 +6,10 @@ from typing import Any
 
 
 @dataclass(slots=True)
-class TaskContext:
+class TaskTrace:
     trace_id: str
-    parent_id: str | None
+    task_id: str
+    parent_task_id: str | None
     name: str
     kind: str
     created_at: float = field(default_factory=time.time)
@@ -26,7 +27,8 @@ class TaskContext:
     def to_dict(self) -> dict[str, Any]:
         return {
             "trace_id": self.trace_id,
-            "parent_id": self.parent_id,
+            "task_id": self.task_id,
+            "parent_task_id": self.parent_task_id,
             "name": self.name,
             "kind": self.kind,
             "created_at": self.created_at,
@@ -43,7 +45,7 @@ class TaskContext:
 @dataclass(slots=True)
 class TraceNode:
     node_id: int
-    context: TaskContext
+    context: TaskTrace
     parent: int | None
     first_child: int | None = None
     last_child: int | None = None
@@ -53,5 +55,5 @@ class TraceNode:
     next_root: int | None = None
 
     @property
-    def trace_id(self) -> str:
-        return self.context.trace_id
+    def task_id(self) -> str:
+        return self.context.task_id

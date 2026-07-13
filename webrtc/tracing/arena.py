@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .models import TaskContext, TraceNode
+from .models import TaskTrace, TraceNode
 
 
 @dataclass(slots=True)
@@ -15,33 +15,33 @@ class TraceArena:
     def __init__(self) -> None:
         self.nodes: list[TraceNode | None] = []
         self.free_node_ids: list[int] = []
-        self.trace_to_node: dict[str, int] = {}
+        self.task_to_node: dict[str, int] = {}
         self.roots = RootLinks()
 
-    def get_node_id(self, trace_id: str) -> int | None:
-        return self.trace_to_node.get(trace_id)
+    def get_node_id(self, task_id: str) -> int | None:
+        return self.task_to_node.get(task_id)
 
     def get_node(self, node_id: int | None) -> TraceNode | None:
         if node_id is None or node_id < 0 or node_id >= len(self.nodes):
             return None
         return self.nodes[node_id]
 
-    def add(self, context: TaskContext, parent: int | None) -> TraceNode:
+    def add(self, context: TaskTrace, parent: int | None) -> TraceNode:
         node_id = self.free_node_ids.pop() if self.free_node_ids else len(self.nodes)
         node = TraceNode(node_id=node_id, context=context, parent=parent)
         if node_id == len(self.nodes):
             self.nodes.append(node)
         else:
             self.nodes[node_id] = node
-        self.trace_to_node[context.trace_id] = node_id
+        self.task_to_node[context.task_id] = node_id
         if parent is None:
             self._append_root(node)
         else:
             self._append_child(parent, node)
         return node
 
-    def remove(self, trace_id: str) -> TraceNode | None:
-        node_id = self.trace_to_node.pop(trace_id, None)
+    def remove(self, task_id: str) -> TraceNode | None:
+        node_id = self.task_to_node.pop(task_id, None)
         if node_id is None:
             return None
         node = self.nodes[node_id]
@@ -52,8 +52,8 @@ class TraceArena:
         self.free_node_ids.append(node_id)
         return node
 
-    def remove_and_promote_children(self, trace_id: str) -> list[str]:
-        node_id = self.trace_to_node.pop(trace_id, None)
+    def remove_and_promote_children(self, task_id: str) -> list[str]:
+        node_id = self.task_to_node.pop(task_id, None)
         if node_id is None:
             return []
         node = self.nodes[node_id]
@@ -66,7 +66,7 @@ class TraceArena:
             child_node = self.get_node(child)
             if child_node is None:
                 break
-            child_ids.append(child_node.trace_id)
+            child_ids.append(child_node.task_id)
             child = child_node.next_sibling
 
         if node.first_child is not None:

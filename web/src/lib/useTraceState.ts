@@ -12,11 +12,13 @@ type QueuedTraceEvent = {
 };
 
 type TraceUpdatePayload = {
-  trace?: TraceRecord;
-  traces?: TraceRecord[];
+  tasks?: TraceRecord[];
+  snapshot?: boolean;
+  task_id?: string;
+  task_ids?: string[];
 };
 
-const TRACE_FLUSH_INTERVAL_MS = 90;
+export const TERMINAL_TASK_RETENTION_MS = 5_000;
 
 export function useTraceState() {
   const [state, dispatch] = useReducer(
@@ -24,113 +26,109 @@ export function useTraceState() {
     undefined,
     createInitialTraceState,
   );
-  const queueRef = useRef<QueuedTraceEvent[]>([]);
-  const frameRef = useRef<number | null>(null);
-  const timeoutRef = useRef<number | null>(null);
+  const terminalDeleteTimers = useRef(new Map<string, number>());
 
-  const flush = useCallback(() => {
-    frameRef.current = null;
-    timeoutRef.current = null;
-    const queued = queueRef.current.splice(0);
-    if (queued.length === 0) {
-      return;
+  const cancelTerminalTimers = useCallback(() => {
+    for (const timer of terminalDeleteTimers.current.values()) {
+      window.clearTimeout(timer);
     }
-
-    dispatch({ type: "events", events: queued });
+    terminalDeleteTimers.current.clear();
   }, []);
 
+  const scheduleTerminalDelete = useCallback((taskId: string) => {
+    const previous = terminalDeleteTimers.current.get(taskId);
+    if (previous != null) {
+      window.clearTimeout(previous);
+    }
+    const timer = window.setTimeout(() => {
+      terminalDeleteTimers.current.delete(taskId);
+      dispatch({
+        type: "events",
+        events: [{ event: "trace:delete", data: { task_ids: [taskId], auto_prune: true } }],
+      });
+    }, TERMINAL_TASK_RETENTION_MS);
+    terminalDeleteTimers.current.set(taskId, timer);
+  }, []);
   const enqueueTraceEvent = useCallback(
     (event: string, data: unknown) => {
-      const previous = queueRef.current[queueRef.current.length - 1];
-      if (event === "trace:update" && previous?.event === "trace:update") {
-        previous.data = mergeTraceUpdatePayloads(previous.data, data);
-      } else {
-        queueRef.current.push({ event, data });
+      const payload = parseJson<TraceUpdatePayload>(data);
+      if (event === "trace:init" && payload?.snapshot === true) {
+        cancelTerminalTimers();
       }
-      if (frameRef.current != null || timeoutRef.current != null) {
-        return;
+      if (event === "trace:complete") {
+        for (const task of payload?.tasks ?? []) {
+          scheduleTerminalDelete(task.task_id);
+        }
       }
-
-      const flushOnNextFrame =
-        event === "trace:init" || event === "trace:delete" || event === "trace:delete_result";
-
-      if (flushOnNextFrame) {
-        frameRef.current = window.requestAnimationFrame(flush);
-        return;
+      if (event === "trace:delete") {
+        const taskIds = payload?.task_ids ?? (payload?.task_id ? [payload.task_id] : []);
+        const immediateTaskIds = taskIds.filter(
+          (taskId) => !terminalDeleteTimers.current.has(taskId),
+        );
+        if (taskIds.length > 0 && immediateTaskIds.length === 0) {
+          return;
+        }
+        if (immediateTaskIds.length !== taskIds.length) {
+          data = { ...payload, task_id: undefined, task_ids: immediateTaskIds };
+        }
       }
-
-      timeoutRef.current = window.setTimeout(() => {
-        frameRef.current = window.requestAnimationFrame(flush);
-      }, TRACE_FLUSH_INTERVAL_MS);
+      dispatch({ type: "events", events: [{ event, data }] });
     },
-    [flush],
+    [cancelTerminalTimers, scheduleTerminalDelete],
   );
 
   const enqueueTraceEvents = useCallback(
     (events: QueuedTraceEvent[]) => {
       for (const event of events) {
-        const previous = queueRef.current[queueRef.current.length - 1];
-        if (event.event === "trace:update" && previous?.event === "trace:update") {
-          previous.data = mergeTraceUpdatePayloads(previous.data, event.data);
-        } else {
-          queueRef.current.push(event);
-        }
+        enqueueTraceEvent(event.event, event.data);
       }
-      if (frameRef.current != null || timeoutRef.current != null) {
-        return;
-      }
-      frameRef.current = window.requestAnimationFrame(flush);
     },
-    [flush],
+    [enqueueTraceEvent],
   );
 
-  useEffect(
-    () => () => {
-      if (frameRef.current != null) {
-        window.cancelAnimationFrame(frameRef.current);
-      }
-      if (timeoutRef.current != null) {
-        window.clearTimeout(timeoutRef.current);
-      }
-    },
-    [],
-  );
+  useEffect(() => cancelTerminalTimers, [cancelTerminalTimers]);
 
   return {
     enqueueTraceEvent,
     enqueueTraceEvents,
     performanceEvents: state.performanceEvents,
+    groups: state.groups ?? [],
     summaries: state.summaries,
-    traces: state.traces,
+    tasks: state.tasks ?? [],
   };
 }
 
-function mergeTraceUpdatePayloads(previousData: unknown, nextData: unknown) {
+export function mergeTraceUpdatePayloads(previousData: unknown, nextData: unknown) {
   const previous = parseJson<TraceUpdatePayload>(previousData);
   const next = parseJson<TraceUpdatePayload>(nextData);
   if (!previous || !next) {
     return nextData;
   }
 
-  const traces = new Map<string, TraceRecord>();
-  for (const trace of traceRecordsForPayload(previous)) {
-    traces.set(trace.trace_id, trace);
+  const tasks = new Map<string, TraceRecord>();
+  for (const task of traceRecordsForPayload(previous)) {
+    tasks.set(task.task_id, task);
   }
-  for (const trace of traceRecordsForPayload(next)) {
-    traces.set(trace.trace_id, trace);
+  for (const task of traceRecordsForPayload(next)) {
+    tasks.set(task.task_id, task);
   }
 
   return {
     ...previous,
     ...next,
-    trace: undefined,
-    traces: [...traces.values()],
+    tasks: [...tasks.values()],
   };
 }
 
+export function traceEventsFromBatch(data: unknown): QueuedTraceEvent[] {
+  const payload = parseJson<{ events?: Array<{ event?: unknown; data?: unknown }> }>(data);
+  return (payload?.events ?? [])
+    .filter((event): event is { event: string; data: unknown } =>
+      typeof event.event === "string",
+    )
+    .map((event) => ({ event: event.event, data: event.data }));
+}
+
 function traceRecordsForPayload(payload: TraceUpdatePayload) {
-  return [
-    ...(payload.traces ?? []),
-    ...(payload.trace ? [payload.trace] : []),
-  ];
+  return payload.tasks ?? [];
 }

@@ -3,8 +3,10 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import wraps
+import inspect
 import secrets
 import string
+import uuid
 
 import webrtc_rs
 
@@ -23,7 +25,22 @@ from . import dtls
 
 import socket
 from .utils import AsyncEventEmitter, impl_protocol, current_ntp_time
-from .peer_context import get_active_peer_context, spawn_peer_task
+from .performance import ObservedComponent, event_loop, task
+from .runtime_services import (
+    FailurePolicy,
+    ScopeState,
+    TaskFailureEvent,
+    current_execution_scope,
+    reset_execution_context,
+    set_execution_context,
+)
+from .peer_components import (
+    AsyncLogDrain,
+    MediaSourceController,
+    PeerConnectionLogInbox,
+    PeerEventInbox,
+    SignalingController,
+)
 from .logger import Component, get_logger
 from .tracing import measure_perf_async, perf_mark, perf_measured_async
 
@@ -180,7 +197,7 @@ class ICEGatherer(AsyncEventEmitter):
         if not self.__agent:
             raise RuntimeError("ICE agent is not available")
 
-        self.__agent.add_remote_candidate(candidate_str)
+        await self.__agent.add_remote_candidate(candidate_str)
 
     async def __create_agent(
         self, port: int = 0, interfaces: list[net.Interface] = nic_interfaces
@@ -239,6 +256,17 @@ class ICEGatherer(AsyncEventEmitter):
             raise RuntimeError("ICE agent is not available")
 
         await self.__agent.wait(condition, timeout)
+
+    async def aclose(self) -> None:
+        agent = self.__agent
+        self.__agent = None
+        if agent is not None:
+            await agent.aclose()
+        await super().aclose()
+
+    async def aclose_controllers(self) -> None:
+        if self.__agent is not None:
+            await self.__agent.aclose_controllers()
 
     # def _set_state(self, state: ICEGatherState):
     #     # TODO: Make it reactive
@@ -354,6 +382,14 @@ class PeerConnectionEvent(StrEnum):
     SignalingStateChange = "signaling-state-change"
 
 
+@dataclass(frozen=True, slots=True)
+class PeerConnectionTaskFailed:
+    component: str
+    task_name: str
+    error: BaseException
+    generation: int
+
+
 async def dtls_ice_pair_queue_handshake_routine(
     pair_transport: ice.CandidatePairTransport, dtls_transport: dtls.DTLSTransport
 ):
@@ -370,11 +406,12 @@ async def dtls_ice_pair_queue_handshake_routine(
 
 
 # TODO: Watch into ORTC API
-class PeerConnection(AsyncEventEmitter):
+class PeerConnection(AsyncEventEmitter, ObservedComponent):
     def __init__(self) -> None:
         super().__init__()
 
         self.__loop = asyncio.get_running_loop()
+        self.id = uuid.uuid4().hex
         self.gatherer = ICEGatherer()
 
         self.__certificate = webrtc_rs.Certificate()
@@ -404,7 +441,22 @@ class PeerConnection(AsyncEventEmitter):
 
         self._transceivers = list[RTPTransceiver]()
 
+        self.state = "new"
+        self.generation = 0
         self._closed: bool = False
+        self._closing: bool = False
+        self._started: bool = False
+        self._role: str | None = None
+        self._close_lock = asyncio.Lock()
+        self._cleanup_completed: set[str] = set()
+        self._closed_event = asyncio.Event()
+        self.event_inbox = PeerEventInbox(maxsize=1024)
+        self.log_drain = AsyncLogDrain()
+        self.log_inbox: PeerConnectionLogInbox = self.log_drain.inbox
+        self.signaling = SignalingController()
+        self.media_sources = MediaSourceController()
+        self._execution_scope = None
+        self._failure_close_task: asyncio.Task[None] | None = None
         self._peer_connection_lock = asyncio.Lock()
         self._transport: ice.CandidatePairTransport | None = None
         self._transport_ready = asyncio.Event()
@@ -412,6 +464,202 @@ class PeerConnection(AsyncEventEmitter):
         # Keep public raw-media sends ordered.  In particular, a burst must not
         # interleave with another caller halfway through its RTP sequence.
         self._media_send_lock = asyncio.Lock()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    async def __aenter__(self) -> "PeerConnection":
+        if self._closed or self._closing:
+            raise RuntimeError("peer connection is closing")
+        scope = current_execution_scope()
+        if scope is None or scope.state is not ScopeState.ACTIVE:
+            raise RuntimeError("PeerConnection requires an active Runtime")
+        self._execution_scope = scope
+        if self.observe_task_failure not in scope.task_scheduler.failure_observers:
+            scope.task_scheduler.failure_observers.append(self.observe_task_failure)
+        await self.start()
+        self.signaling.start()
+        self.media_sources.start()
+        self.log_drain.start()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.aclose("error" if exc is not None else "closed", error=exc)
+
+    @event_loop
+    def _offer_event(self, event: object) -> None:
+        try:
+            self.event_inbox.offer_nowait(event)
+        except asyncio.QueueFull:
+            pass
+
+    def __aiter__(self):
+        return self.event_inbox.__aiter__()
+
+    async def wait_closed(self) -> None:
+        await self._closed_event.wait()
+
+    @event_loop
+    def attach_signaling(self, signaling: object) -> object:
+        attached = self.signaling.attach(signaling)
+        if self._started and not self._closing:
+            self.signaling.start()
+        return attached
+
+    @event_loop
+    def attach_media_source(self, source: object, *, kind: str | None = None) -> object:
+        attached = self.media_sources.attach(source)
+        if self._started and not self._closing:
+            self.media_sources.start()
+        return attached
+
+    async def dial(self) -> None:
+        if self._closing or self._closed:
+            raise RuntimeError("peer connection is closing")
+        self._role = "dial"
+        await self.gatherer.dial()
+
+    async def accept(self) -> None:
+        if self._closing or self._closed:
+            raise RuntimeError("peer connection is closing")
+        self._role = "accept"
+        await self.gatherer.accept()
+
+    @event_loop
+    def observe_task_failure(self, event: TaskFailureEvent) -> None:
+        if event.spec.failure is not FailurePolicy.FAIL_CONNECTION:
+            return
+        if self._closing or self._closed:
+            return
+        self.state = "error"
+        component = str(event.spec.metadata.get("component", event.spec.kind))
+        self._offer_event(PeerConnectionTaskFailed(
+            component, event.spec.name, event.exception, self.generation
+        ))
+        # Failure observation must not consume or replace the task exception.
+        # Schedule domain cleanup as a root-owned sibling after the failed task
+        # begins reconciling its own descendants.
+        self.__loop.call_soon(self._start_failure_cleanup, event.exception)
+
+    @event_loop
+    def _start_failure_cleanup(self, error: BaseException) -> None:
+        if self._closing or self._closed:
+            return
+        scope = self._execution_scope
+        root_context = getattr(scope, "root_context", None)
+        if scope is not None and scope.state is ScopeState.ACTIVE and root_context is not None:
+            token = set_execution_context(root_context)
+            try:
+                self._failure_close_task = scope.start(
+                    lambda: self.aclose("protocol-failure", error=error),
+                    name="peer:failure-cleanup",
+                    kind="lifecycle",
+                    failure=FailurePolicy.REPORT,
+                )
+            finally:
+                reset_execution_context(token)
+            return
+        self._failure_close_task = self.__loop.create_task(
+            self.aclose("protocol-failure", error=error),
+            name="peer:failure-cleanup",
+        )
+
+    async def aclose(
+        self, reason: str = "closed", error: BaseException | None = None
+    ) -> None:
+        if self._closed:
+            return
+        # Reject new application/protocol work before the first suspension.
+        self._closing = True
+        if error is not None:
+            self.state = "error"
+        elif self.state != "error":
+            self.state = "closing"
+
+        async with self._close_lock:
+            if self._closed:
+                return
+            cleanup_errors: list[BaseException] = []
+
+            async def attempt(key: str, operation) -> None:
+                if key in self._cleanup_completed:
+                    return
+                try:
+                    await operation()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                else:
+                    self._cleanup_completed.add(key)
+
+            # Producers first; transport cleanup remains inside the Runtime.
+            await attempt("signaling", self.signaling.aclose)
+            await attempt("media-sources", self.media_sources.aclose)
+
+            for transceiver in reversed(self._transceivers):
+                receiver = transceiver.receiver
+                if receiver is not None:
+                    async def stop_receiver(receiver=receiver) -> None:
+                        result = receiver.stop()
+                        if inspect.isawaitable(result):
+                            await result
+                    await attempt(f"receiver:{id(receiver)}", stop_receiver)
+                async def stop_transceiver(transceiver=transceiver) -> None:
+                    result = transceiver.stop()
+                    if inspect.isawaitable(result):
+                        await result
+                await attempt(f"transceiver:{id(transceiver)}", stop_transceiver)
+
+            # Candidate-pair controller tasks are cancelled and awaited before
+            # transport teardown, while ICE/UDP itself remains reverse-ordered.
+            controller_closer = getattr(self.gatherer, "aclose_controllers", None)
+            if controller_closer is not None:
+                await attempt("ice-controllers", controller_closer)
+            await attempt("dtls", lambda: self._close_resource(self._dtls_transport))
+            await attempt("gatherer", lambda: self._close_resource(self.gatherer))
+            if self._transport is not None:
+                await attempt("selected-transport", lambda: self._close_resource(self._transport))
+
+            # No domain producer can enqueue after this point. The worker lane
+            # is still active, so the last batch is observed and offloaded.
+            await attempt("log-drain", self.log_drain.aclose)
+            await attempt("event-emitter", lambda: AsyncEventEmitter.aclose(self))
+
+            if cleanup_errors:
+                self.state = "error"
+                errors = ([error] if error is not None else []) + cleanup_errors
+                raise BaseExceptionGroup("peer connection body and cleanup failures", errors)
+            self._closed = True
+            self._closing = False
+            if self.state != "error":
+                self.state = "closed"
+            self._offer_event({
+                "type": "closed",
+                "reason": reason,
+                "generation": self.generation,
+                "error": error,
+            })
+            self.event_inbox.close()
+            self._closed_event.set()
+            scope = self._execution_scope
+            if scope is not None:
+                try:
+                    scope.task_scheduler.failure_observers.remove(self.observe_task_failure)
+                except ValueError:
+                    pass
+
+    @staticmethod
+    async def _close_resource(resource: object) -> None:
+        closer = (
+            getattr(resource, "aclose", None)
+            or getattr(resource, "close", None)
+            or getattr(resource, "stop", None)
+        )
+        if closer is None:
+            return
+        result = closer()
+        if inspect.isawaitable(result):
+            await result
 
     async def _wait_for_media_send_ready(self) -> None:
         """Wait until the selected ICE transport and both SRTP sessions exist."""
@@ -424,6 +672,7 @@ class PeerConnection(AsyncEventEmitter):
         await self._dtls_transport.wait(TransportCondition.SRTP_READY, timeout=30.0)
 
     @staticmethod
+    @event_loop
     def _media_packet_bytes(packet: bytes | bytearray) -> bytes:
         if not isinstance(packet, (bytes, bytearray)):
             raise TypeError("media packet must be bytes or bytearray")
@@ -548,6 +797,7 @@ class PeerConnection(AsyncEventEmitter):
             )
         return feedback
 
+    @event_loop
     def build_twcc_feedback(self, media_ssrc: int, transport_sequences: Iterable[int]) -> bytes:
         """Build receiver-owned TWCC feedback for received transport sequences."""
         sequences = tuple(transport_sequences)
@@ -612,18 +862,11 @@ class PeerConnection(AsyncEventEmitter):
             self._transport = transport
             self._transport_ready.set()
             perf_mark("ice", "transport", "nominated")
-            if peer_context := get_active_peer_context():
-                peer_context._set_selected_transport(transport)
 
             # Start DTLS with the nominated transport
             self._dtls_transport.start(dtls_role, transport)
             get_logger().debug(Component.DTLS, "Starting DTLS ICE queue routine")
-            spawn_peer_task(
-                dtls_ice_pair_queue_handshake_routine(transport, self._dtls_transport),
-                name="dtls:ice-pair-queue-handshake",
-                component="dtls",
-                metadata={"expected_long_running": True, "loop_role": "receive"},
-            )
+            self._dtls_ice_pair_queue_handshake(transport)
 
             # OBSOLETE: This loop was stealing 50% of packets from DTLSTransport._rtp_receive_loop()
             # The DTLSTransport already has its own _rtp_receive_loop() that reads from
@@ -640,25 +883,38 @@ class PeerConnection(AsyncEventEmitter):
                 "Skipping obsolete RTP receive bridge",
             )
 
-        spawn_peer_task(
-            pair_ctrl.start(),
-            name="ice:candidate-pair-controller",
-            component="ice",
-            metadata={"expected_long_running": True, "loop_role": "controller"},
-        )
+        await pair_ctrl.start_managed()
 
         # self.dtls_transports.append(dtls_transport)
 
-    def start(self):
+    async def start(self):
+        if self._closing or self._closed:
+            raise RuntimeError("peer connection is closing")
+        if self._started:
+            return
+        self._started = True
+        self.generation += 1
+        self.state = "starting"
         self.gatherer.on(
             ICEGathererEvent.CANDIDATE_PAIR_CONTROLLER, self.__on_ice_pair_controller
         )
-        spawn_peer_task(
-            self.gatherer.start(),
-            name="ice:gatherer-start",
-            component="ice",
-            kind="lifecycle",
-        )
+        await self.gatherer.start()
+        if self._role == "dial":
+            await self.gatherer.dial()
+        elif self._role == "accept":
+            await self.gatherer.accept()
+        self.state = "active"
+
+    @task(
+        name="dtls:ice-pair-queue-handshake",
+        kind="dtls",
+        metadata={"expected_long_running": True, "loop_role": "receive"},
+        failure=FailurePolicy.FAIL_CONNECTION,
+    )
+    async def _dtls_ice_pair_queue_handshake(
+        self, transport: ice.CandidatePairTransport
+    ) -> None:
+        await dtls_ice_pair_queue_handshake_routine(transport, self._dtls_transport)
 
     async def wait(self, condition: PeerCondition, timeout: float) -> None:
         timeout = require_timeout(timeout)
@@ -1047,12 +1303,9 @@ class PeerConnection(AsyncEventEmitter):
         self.__media_fingerprints.extend(desc.get_media_fingerprints())
 
         for transceiver in self._transceivers:
-            spawn_peer_task(
-                transceiver.start_srtp_streams(),
-                name="srtp:start-streams",
-                component="srtp",
-            )
+            transceiver.start_srtp_streams()
 
+    @event_loop
     def __get_sdp_role(self) -> ConnectionRole:
         role = self.gatherer.get_role()
 
@@ -1066,6 +1319,7 @@ class PeerConnection(AsyncEventEmitter):
 
         return ConnectionRole.Actpass
 
+    @event_loop
     def __get_dtls_role(self) -> dtls.DTLSRole:
         remote_description = (
             self._current_remote_description or self._pending_remote_description

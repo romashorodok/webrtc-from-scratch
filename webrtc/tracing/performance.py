@@ -282,22 +282,16 @@ def perf_measured_async(
 
 def _metadata_with_task_context(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
     merged = dict(metadata or {})
-    try:
-        from webrtc.runtime import get_current_task_context
-    except ImportError:
-        return merged
+    from webrtc.runtime_services import current_execution_context
 
-    context = get_current_task_context()
+    context = current_execution_context()
     if context is None:
         return merged
 
-    task_metadata = context.metadata
     merged.setdefault("trace_id", context.trace_id)
-    if context.parent_id is not None:
-        merged.setdefault("parent_trace_id", context.parent_id)
-    merged.setdefault("task_name", context.name)
-    merged.setdefault("task_kind", context.kind)
-    for key in ("peer_id", "component", "bounded", "app_task"):
-        if key in task_metadata:
-            merged.setdefault(key, task_metadata[key])
+    merged.setdefault("task_id", context.task_id)
+    if context.parent_task_id is not None:
+        merged.setdefault("parent_task_id", context.parent_task_id)
+    if context.scope_id is not None:
+        merged.setdefault("peer_id", context.scope_id)
     return merged

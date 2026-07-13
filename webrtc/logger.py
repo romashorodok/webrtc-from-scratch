@@ -270,7 +270,7 @@ class WebRTCLogger:
             self._log_file = None
 
     def write_events_sync(self, events: list[Any]):
-        """Write pre-built lifecycle/log events from PeerContext queues."""
+        """Write pre-built lifecycle/log events from peer log-drain queues."""
         for event in events:
             component = getattr(event, "component", Component.PEER_CONNECTION)
             if isinstance(component, str):

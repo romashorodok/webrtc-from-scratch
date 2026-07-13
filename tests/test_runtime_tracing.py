@@ -1,439 +1,344 @@
 import asyncio
+import threading
 
 import pytest
 
-from webrtc.peer_context import PeerContext
-from webrtc.runtime import WebRTCRuntimeResources, get_current_task_context
-from webrtc.tracing import perf_mark
-from webrtc.tracing.metrics import MetricDelta, TraceMetricsAggregator
+from webrtc.performance import (
+    MetricEvent,
+    MetricGroupAggregator,
+    ObservedComponent,
+    worker,
+)
+from webrtc import Runtime
+from webrtc.runtime_services import (
+    Borrowed,
+    TaskScheduler,
+    current_execution_context,
+)
 
 
-def trace_batch_events(messages, event_name=None):
-    events = []
-    for message in messages:
-        if message.get("event") != "trace:batch":
-            continue
-        data = message.get("data", {})
-        batch_events = data.get("events") if isinstance(data, dict) else None
-        for event in batch_events or []:
-            if event_name is None or event.get("event") == event_name:
-                events.append(event)
-    return events
+def batch_events(message):
+    return message.get("data", {}).get("events", [])
 
 
-def test_peer_context_spawn_inherits_parent_task_context():
+def test_scheduler_works_without_tracing_and_cleans_registry():
     async def scenario():
-        runtime = WebRTCRuntimeResources(max_workers=1)
-        try:
-            async with PeerContext(object(), runtime=runtime, peer_id="peer-test") as peer:
-                parent = get_current_task_context()
-                assert parent is not None
+        scheduler = TaskScheduler()
+        seen = {}
 
-                seen = {}
+        async def work():
+            seen["context"] = current_execution_context()
 
+        await scheduler.run_factory(lambda: work(), trace_id="peer-trace")
+        assert seen["context"].trace_id == "peer-trace"
+        assert scheduler.registry.task_ids() == ()
+
+    asyncio.run(scenario())
+
+
+def test_runtime_tasks_share_trace_and_have_unique_parented_task_ids():
+    async def scenario():
+        seen = {}
+        async with Runtime(scope_id="peer", max_workers=1) as execution:
+            root = current_execution_context()
+
+            async def child():
+                seen["child"] = current_execution_context()
+
+            await execution.start(lambda: child(), name="child")
+            assert seen["child"].trace_id == root.trace_id
+            assert seen["child"].task_id != root.task_id
+            assert seen["child"].parent_task_id == root.task_id
+            assert seen["child"].scope_id == "peer"
+
+    asyncio.run(scenario())
+
+
+def test_terminal_task_emits_snapshot_then_is_pruned():
+    async def scenario():
+        async with Runtime(trace_subscriber_batch_interval=0.01) as execution:
+            sub = execution.observability.subscribe()
+            assert await execution.start(
+                lambda: asyncio.sleep(0, result=7), name="short"
+            ) == 7
+            message = await asyncio.wait_for(sub.get(), 1)
+            events = batch_events(message)
+            assert [item["event"] for item in events] == [
+                "trace:init",
+                "trace:complete",
+                "trace:delete",
+            ]
+            task = events[0]["data"]["tasks"][0]
+            assert task["trace_id"] and task["task_id"]
+            assert events[1]["data"]["tasks"][0]["status"] == "completed"
+            assert events[2]["data"]["task_ids"] == [task["task_id"]]
+            assert [node["name"] for node in execution.observability.live_tree()] == [
+                "execution.root"
+            ]
+            sub.close()
+
+    asyncio.run(scenario())
+
+
+def test_trace_groups_only_include_live_task_ids():
+    async def scenario():
+        async with Runtime() as execution:
+            root = current_execution_context()
+            execution.metric_sink.emit(MetricEvent(
+                root.trace_id, root.task_id, "live.operation", "success", 1.0,
+            ))
+            execution.metric_sink.emit(MetricEvent(
+                root.trace_id, "deleted-task", "stale.operation", "success", 1.0,
+            ))
+
+            groups = execution.trace_groups(root.trace_id)
+            assert [group["task_id"] for group in groups] == [root.task_id]
+
+    asyncio.run(scenario())
+
+
+def test_live_duration_and_signature_are_task_centric():
+    async def scenario():
+        gate = asyncio.Event()
+        async with Runtime() as execution:
+            task = execution.start(lambda: gate.wait(), name="heartbeat")
+            await asyncio.sleep(0)
+            snapshot = next(
+                item
+                for item in execution.observability.live_running(include_duration=True)
+                if item["name"] == "heartbeat"
+            )
+            assert snapshot["task_id"]
+            assert snapshot["duration_ms"] >= 0
+            assert (snapshot["task_id"], execution.root_context.task_id, "running") in (
+                execution.observability.running_signature()
+            )
+            gate.set()
+            await task
+
+    asyncio.run(scenario())
+
+
+def test_parent_completion_joins_managed_children():
+    async def scenario():
+        child_gate = asyncio.Event()
+        child_started = asyncio.Event()
+        async with Runtime() as execution:
+            async def parent():
                 async def child():
-                    seen["context"] = get_current_task_context()
+                    child_started.set()
+                    await child_gate.wait()
 
-                await peer.spawn(child(), name="child-task")
-                child_context = seen["context"]
-                assert not hasattr(child_context, "peer_id")
-                assert child_context.parent_id == parent.trace_id
-                assert child_context.name == "child-task"
-        finally:
-            await runtime.aclose()
+                execution.start(lambda: child(), name="child")
+                await child_started.wait()
 
-    asyncio.run(scenario())
-
-
-def test_terminal_traces_are_pruned_immediately_from_live_tree():
-    async def scenario():
-        runtime = WebRTCRuntimeResources(max_workers=1)
-        try:
-            async def ok():
-                await asyncio.sleep(0)
-                return 7
-
-            assert await runtime.trace_awaitable(ok(), name="ok-task") == 7
-            assert not [t for t in runtime.trace_live_tree() if t["name"] == "ok-task"]
-        finally:
-            await runtime.aclose()
+            parent_task = execution.start(lambda: parent(), name="parent")
+            await child_started.wait()
+            await asyncio.sleep(0)
+            assert not parent_task.done()
+            live_names = {item["name"] for item in execution.observability.live_tree()}
+            assert {"execution.root", "parent", "child"} <= live_names
+            child_gate.set()
+            await parent_task
 
     asyncio.run(scenario())
 
 
-def test_subscriber_sees_complete_then_auto_prune_delete():
+def test_cancel_uses_node_id_and_preserves_observer_owned_pruning():
+    class Waiting(ObservedComponent):
+        async def wait(self):
+            await asyncio.sleep(10)
+
     async def scenario():
-        runtime = WebRTCRuntimeResources(max_workers=1)
-        try:
-            sub = runtime.trace_subscribe()
-
-            async def ok():
-                return "done"
-
-            assert await runtime.trace_awaitable(ok(), name="ordered-task") == "done"
-            batch = await asyncio.wait_for(sub.get(), timeout=1)
-            events = [e["event"] for e in batch["data"]["events"]]
-            assert events == ["trace:init", "trace:update", "trace:complete", "trace:delete"]
-            sub.close()
-        finally:
-            await runtime.aclose()
-
-    asyncio.run(scenario())
-
-
-def test_runtime_aggregates_performance_events_onto_owning_trace():
-    async def scenario():
-        runtime = WebRTCRuntimeResources(max_workers=1, trace_subscriber_batch_interval=0.01)
-        try:
-            context = runtime.create_task_context(
-                name="rtp-receive-loop", metadata={"peer_id": "peer-performance"}
+        async with Runtime() as execution:
+            task = execution.start(lambda: Waiting().wait(), name="sleep")
+            await asyncio.sleep(0)
+            method = next(
+                node
+                for node in execution.observability.live_tree()
+                if node["metadata"].get("node_type") == "async-call"
             )
-            runtime.start_task_context(context)
-            runtime._tracing.performance_recorder.mark(
-                "udp", "datagram", "rx",
-                metadata={
-                    "trace_id": context.trace_id,
-                    "peer_id": "peer-performance",
-                    "packet_kind": "rtp",
-                    "size_bytes": 128,
-                },
+            assert execution.observability.cancel(method["task_id"]) is False
+            node_id = next(
+                node["task_id"]
+                for node in execution.observability.live_tree()
+                if node["name"] == "sleep"
             )
-            traces = runtime.trace_live_tree()
-            metric_trace = next(trace for trace in traces if trace["trace_id"] == context.trace_id)
-            metric = metric_trace["metadata"]["performance_metrics"]["udp.datagram.rx"]
-            assert metric["count"] == 1
-            assert metric["duration_count"] == 0
-            assert metric["metadata"] == {"packet_kind": "rtp", "size_bytes": 128}
-        finally:
-            await runtime.aclose()
-
-    asyncio.run(scenario())
-
-
-def test_completed_trace_metrics_are_coalesced_until_flush():
-    async def scenario():
-        runtime = WebRTCRuntimeResources(max_workers=1)
-        try:
-            parent = runtime.create_task_context(name="stream", kind="media")
-            runtime.start_task_context(parent)
-            for _ in range(10_000):
-                context = runtime.create_task_context(
-                    name="packet", kind="media", parent_id=parent.trace_id
-                )
-                runtime.start_task_context(context)
-                runtime.complete_task_context(context, status="completed", error=None)
-
-            assert len(runtime._tracing.metrics._totals) == 1
-            metrics = await runtime._tracing.flush_metrics()
-            metric = next(iter(metrics.values()))
-            assert metric["call_count"] == 10_000
-            assert metric["success_count"] == 10_000
-            assert runtime._tracing.metrics._totals == {}
-        finally:
-            await runtime.aclose()
-
-    asyncio.run(scenario())
-
-
-def test_trace_metrics_evict_oldest_keys_at_cardinality_limit():
-    aggregator = TraceMetricsAggregator(max_keys=2)
-    for root in ("old", "kept", "new"):
-        aggregator.enqueue(
-            MetricDelta((root, "packet", "packet", "media"), 1.0, "completed")
-        )
-
-    assert [key[0] for key in aggregator._totals] == ["kept", "new"]
-
-
-def test_trace_live_running_includes_transitions():
-    runtime = WebRTCRuntimeResources(max_workers=1)
-    try:
-        context = runtime.create_task_context(name="heartbeat")
-        runtime.start_task_context(context)
-        traces = runtime.trace_live_running(include_duration=True)
-        assert len(traces) == 1
-        assert traces[0]["trace_id"] == context.trace_id
-        assert traces[0]["status"] == "running"
-        assert "transitions" in traces[0]
-    finally:
-        runtime.shutdown()
-
-
-def test_running_trace_signature_avoids_snapshot_payloads():
-    runtime = WebRTCRuntimeResources(max_workers=1)
-    try:
-        context = runtime.create_task_context(name="signature")
-        runtime.start_task_context(context)
-
-        assert runtime.trace_running_signature() == ((context.trace_id, None, "running"),)
-    finally:
-        runtime.shutdown()
-
-
-def test_completed_parent_is_pruned_and_children_are_promoted():
-    runtime = WebRTCRuntimeResources(max_workers=1)
-    try:
-        root = runtime.create_task_context(name="root", kind="task")
-        runtime.start_task_context(root)
-        child = runtime.create_task_context(name="child", kind="task", parent=root)
-        runtime.start_task_context(child)
-
-        runtime.complete_task_context(root)
-        live = {t["trace_id"]: t for t in runtime.trace_live_tree()}
-        assert root.trace_id not in live
-        assert live[child.trace_id]["parent_id"] is None
-    finally:
-        runtime.shutdown()
-
-
-def test_delete_running_cancellable_trace_emits_success_and_removes_subtree():
-    async def scenario():
-        runtime = WebRTCRuntimeResources(max_workers=1)
-        try:
-            sub = runtime.trace_subscribe()
-            task = runtime.spawn_task(asyncio.sleep(10), name="sleep")
-            await asyncio.sleep(0.02)
-            trace = next(t for t in runtime.trace_live_tree() if t["name"] == "sleep")
-
-            assert runtime.delete_trace(trace["trace_id"])
-            assert not runtime.trace_live_tree()
-
-            messages = []
-            for _ in range(6):
-                messages.append(await asyncio.wait_for(sub.get(), timeout=1))
-                results = [e for e in trace_batch_events(messages, "trace:delete_result")]
-                if results:
-                    break
-            else:
-                results = []
-            assert results
-            assert results[-1]["data"]["success"] is True
-            sub.close()
-            task.cancel()
-        finally:
-            await runtime.aclose()
-
-    asyncio.run(scenario())
-
-
-def test_delete_fails_for_running_non_cancelable_thread_trace():
-    runtime = WebRTCRuntimeResources(max_workers=1)
-    try:
-        sub_events = []
-
-        async def scenario():
-            sub = runtime.trace_subscribe()
-            ctx = runtime.create_task_context(name="thread-loop", kind="thread")
-            runtime.start_task_context(ctx)
-            assert runtime.delete_trace(ctx.trace_id) is False
-            sub_events.append(await asyncio.wait_for(sub.get(), timeout=1))
-            sub.close()
-
-        asyncio.run(scenario())
-        still_live = [t for t in runtime.trace_live_tree() if t["trace_id"]]
-        assert still_live
-        results = trace_batch_events(sub_events, "trace:delete_result")
-        assert results
-        payload = results[-1]["data"]
-        assert payload["success"] is False
-        assert payload["reason"] == "non_cancelable_path"
-        assert payload["failed_trace_ids"]
-    finally:
-        runtime.shutdown()
-
-
-def test_delete_allows_running_trace_group_nodes():
-    runtime = WebRTCRuntimeResources(max_workers=1)
-    try:
-        ctx = runtime.create_task_context(
-            name="group-node",
-            kind="thread",
-            metadata={"trace_group": True},
-        )
-        runtime.start_task_context(ctx)
-        assert runtime.delete_trace(ctx.trace_id) is True
-        assert not runtime.trace_live_tree()
-    finally:
-        runtime.shutdown()
-
-
-def test_trace_subscription_is_runtime_stream_wide():
-    async def scenario():
-        runtime = WebRTCRuntimeResources(max_workers=1)
-        sub_a = runtime.trace_subscribe()
-        sub_b = runtime.trace_subscribe()
-
-        try:
-            runtime.create_task_context(name="a-task", kind="task")
-            runtime.create_task_context(name="b-task", kind="task")
-            batch_a = await asyncio.wait_for(sub_a.get(), timeout=1)
-            batch_b = await asyncio.wait_for(sub_b.get(), timeout=1)
-            names_a = [
-                event["data"]["trace"]["name"]
-                for event in batch_a["data"]["events"]
-                if event["event"] == "trace:init"
+            assert execution.observability.cancel(node_id)
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert [node["name"] for node in execution.observability.live_tree()] == [
+                "execution.root"
             ]
-            names_b = [
-                event["data"]["trace"]["name"]
-                for event in batch_b["data"]["events"]
-                if event["event"] == "trace:init"
-            ]
-            assert names_a == ["a-task", "b-task"]
-            assert names_b == ["a-task", "b-task"]
-        finally:
-            sub_a.close()
-            sub_b.close()
-            await runtime.aclose()
 
     asyncio.run(scenario())
 
 
-def test_trace_subscriber_coalesces_pending_updates_per_trace():
+def test_worker_context_propagates_and_metric_group_is_not_a_task():
+    class Worker(ObservedComponent):
+        @worker
+        def context(self):
+            return current_execution_context()
+
     async def scenario():
-        runtime = WebRTCRuntimeResources(max_workers=1, trace_subscriber_batch_interval=0.05)
-        sub = runtime.trace_subscribe()
-        try:
-            context = runtime.create_task_context(name="coalesced", kind="task")
-            for index in range(10):
-                context.metadata["index"] = index
-                runtime.start_task_context(context)
+        sink = MetricGroupAggregator()
+        async with Runtime(metric_sink=Borrowed(sink)) as execution:
+            seen = {}
 
-            batch = await asyncio.wait_for(sub.get(), timeout=1)
-            updates = [
-                event
-                for event in batch["data"]["events"]
-                if event["event"] == "trace:update" and event["data"]["trace"]["trace_id"] == context.trace_id
-            ]
-            assert len(updates) == 1
-            assert updates[0]["data"]["trace"]["metadata"]["index"] == 9
-        finally:
-            sub.close()
-            await runtime.aclose()
-
-    asyncio.run(scenario())
-
-
-def test_trace_subscriber_coalesces_updates_across_mixed_events_per_trace():
-    async def scenario():
-        runtime = WebRTCRuntimeResources(max_workers=1, trace_subscriber_batch_interval=0.05)
-        sub = runtime.trace_subscribe()
-        try:
-            first = runtime.create_task_context(name="first", kind="task")
-            runtime.start_task_context(first)
-
-            other = runtime.create_task_context(name="other", kind="task")
-
-            first.metadata["index"] = 1
-            runtime.start_task_context(first)
-
-            batch = await asyncio.wait_for(sub.get(), timeout=1)
-            updates = [
-                event
-                for event in batch["data"]["events"]
-                if event["event"] == "trace:update" and event["data"]["trace"]["trace_id"] == first.trace_id
-            ]
-            inits = [
-                event
-                for event in batch["data"]["events"]
-                if event["event"] == "trace:init" and event["data"]["trace"]["trace_id"] == other.trace_id
-            ]
-            assert len(updates) == 1
-            assert updates[0]["data"]["trace"]["metadata"]["index"] == 1
-            assert len(inits) == 1
-        finally:
-            sub.close()
-            await runtime.aclose()
-
-    asyncio.run(scenario())
-
-
-def test_trace_subscriber_filters_events_to_peer_id():
-    async def scenario():
-        runtime = WebRTCRuntimeResources(max_workers=1, trace_subscriber_batch_interval=0.01)
-        sub = runtime.trace_subscribe(peer_id="peer-a")
-        try:
-            async with PeerContext(object(), runtime=runtime, peer_id="peer-a") as peer_a:
-                runtime.create_task_context(
-                    name="peer-a-task",
-                    kind="task",
-                    parent_id=peer_a.root_trace_id,
-                    metadata={"peer_id": "peer-a"},
-                )
-                async with PeerContext(object(), runtime=runtime, peer_id="peer-b") as peer_b:
-                    runtime.create_task_context(
-                        name="peer-b-task",
-                        kind="task",
-                        parent_id=peer_b.root_trace_id,
-                        metadata={"peer_id": "peer-b"},
+            async def owner():
+                seen["event_loop"] = current_execution_context()
+                seen["worker"] = await Worker().context()
+                for duration in (1.0, 3.0):
+                    sink.emit(
+                        MetricEvent(
+                            seen["event_loop"].trace_id,
+                            seen["event_loop"].task_id,
+                            "packet",
+                            "success",
+                            duration,
+                            group="rtp",
+                        )
                     )
-                    batch = await asyncio.wait_for(sub.get(), timeout=1)
 
-            events = batch["data"]["events"]
-            assert events
-            for event in events:
-                data = event.get("data", {})
-                if event["event"] in {"trace:init", "trace:update", "trace:complete"}:
-                    traces = data.get("traces") if isinstance(data, dict) else None
-                    trace = data.get("trace") if isinstance(data, dict) else None
-                    payloads = list(traces or []) + ([trace] if isinstance(trace, dict) else [])
-                    assert payloads
-                    for payload in payloads:
-                        assert payload["metadata"].get("peer_id") == "peer-a"
-                elif event["event"] in {"trace:delete", "trace:delete_result"}:
-                    assert data.get("peer_id") == "peer-a"
-        finally:
-            sub.close()
-            await runtime.aclose()
+            await execution.start(lambda: owner(), name="owner")
+            assert seen["worker"].trace_id == seen["event_loop"].trace_id
+            assert seen["worker"].task_id == seen["event_loop"].task_id
+            group = next(item for item in sink.snapshots() if item.operation == "packet")
+            assert group.calls == 2 and group.average_duration_ms == 2.0
+            assert execution.task_registry.task_ids() == (execution.root_context.task_id,)
 
     asyncio.run(scenario())
 
 
-def test_trace_groups_are_recreated_after_close():
+def test_observer_failure_cannot_change_task_outcome():
+    class Broken:
+        def task_started(self, event):
+            raise RuntimeError("observer")
+
+        task_completed = task_started
+        task_failed = task_started
+        task_cancelled = task_started
+
     async def scenario():
-        runtime = WebRTCRuntimeResources(max_workers=1)
-        try:
-            first = runtime.get_or_create_trace_group(name="group", kind="thread", group_key="shared")
-            runtime.record_trace_group_call(first, duration_ms=12.0, force=True)
-            runtime.close_trace_groups()
-
-            second = runtime.get_or_create_trace_group(name="group", kind="thread", group_key="shared")
-
-            assert second.trace_id != first.trace_id
-            assert second.metadata["call_count"] == 0
-            assert runtime.trace_live_tree()
-        finally:
-            runtime.shutdown()
+        async with Runtime(task_observers=[Broken()]) as execution:
+            assert await execution.start(
+                lambda: asyncio.sleep(0, result="ok"), name="observed"
+            ) == "ok"
+            assert execution.task_scheduler.diagnostics["observer_failures"] >= 1
 
     asyncio.run(scenario())
 
 
-def test_trace_group_updates_emit_after_throttle_window_without_new_calls():
-    async def scenario():
-        runtime = WebRTCRuntimeResources(
-            max_workers=1,
-            trace_group_update_interval=0.05,
-            trace_subscriber_batch_interval=0.01,
+def test_metric_groups_are_bounded_under_packet_load():
+    aggregator = MetricGroupAggregator(max_groups=2)
+    for _ in range(10_000):
+        aggregator.emit(
+            MetricEvent("trace", "task", "packet", "success", 1.0, group="media")
         )
-        sub = runtime.trace_subscribe()
-        try:
-            group = runtime.get_or_create_trace_group(name="group", kind="thread", group_key="shared")
-            runtime.record_trace_group_call(group, duration_ms=10.0, force=True)
-            await asyncio.wait_for(sub.get(), timeout=1)
+    assert aggregator.snapshots()[0].calls == 10_000
+    aggregator.emit(MetricEvent("two", "task", "packet", "success", 1.0))
+    aggregator.emit(MetricEvent("three", "task", "packet", "success", 1.0))
+    assert len(aggregator.snapshots()) == 2
+    assert aggregator.diagnostics["evicted_groups"] == 1
 
-            runtime.record_trace_group_call(group, duration_ms=20.0)
 
-            batch = await asyncio.wait_for(sub.get(), timeout=1)
-            updates = [
-                event
-                for event in batch["data"]["events"]
-                if event["event"] == "trace:update" and event["data"]["trace"]["trace_id"] == group.trace_id
+def test_worker_queue_is_cancelable_but_running_worker_is_not():
+    release = threading.Event()
+    entered = threading.Event()
+
+    class Blocking(ObservedComponent):
+        @worker
+        def first(self):
+            entered.set()
+            release.wait(2)
+
+        @worker
+        def second(self):
+            return None
+
+    async def scenario():
+        subject = Blocking()
+        async with Runtime(max_workers=1, offload_capacity=1) as execution:
+            first = execution.start(lambda: subject.first(), name="first")
+            await asyncio.to_thread(entered.wait, 1)
+            second = execution.start(lambda: subject.second(), name="second")
+            await asyncio.sleep(0)
+            worker_nodes = [
+                item
+                for item in execution.observability.live_tree()
+                if item["metadata"].get("node_type") == "worker-call"
             ]
-            assert updates
-            payload = updates[-1]["data"]["trace"]
-            assert payload["metadata"]["call_count"] == 2
-            assert payload["metadata"]["last_duration_ms"] == 20.0
-        finally:
-            sub.close()
-            await runtime.aclose()
+            running = next(item for item in worker_nodes if item["name"].endswith("first"))
+            queued = next(item for item in worker_nodes if item["name"].endswith("second"))
+            assert execution.observability.cancel(running["task_id"]) is False
+            assert execution.observability.cancel(queued["task_id"]) is True
+            release.set()
+            await first
+            with pytest.raises(asyncio.CancelledError):
+                await second
+
+    asyncio.run(scenario())
+
+
+def test_trace_live_context_limit_rejects_admission_without_evicting_running_nodes():
+    class Subject(ObservedComponent):
+        async def wait(self, release):
+            await release.wait()
+
+    async def scenario():
+        release = asyncio.Event()
+        async with Runtime(trace_context_limit=1) as execution:
+            task = asyncio.create_task(Subject().wait(release))
+            await asyncio.sleep(0)
+            live = execution.observability.live_tree()
+            assert len(live) == 1
+            assert live[0]["name"] == "execution.root"
+            assert execution.trace_service.diagnostics["live_context_limit_rejections"] >= 1
+            assert execution.diagnostics["live_context_limit_rejections"] >= 1
+            release.set()
+            await task
+
+    asyncio.run(scenario())
+
+
+def test_queued_node_cancellation_does_not_cancel_its_managed_owner_task():
+    release = threading.Event()
+    entered = threading.Event()
+
+    class Blocking(ObservedComponent):
+        @worker
+        def first(self):
+            entered.set()
+            release.wait(2)
+
+        @worker
+        def queued(self):
+            return "unexpected"
+
+    async def scenario():
+        survived = asyncio.Event()
+        subject = Blocking()
+        async with Runtime(max_workers=1) as execution:
+            first = execution.start(lambda: subject.first(), name="first")
+            await asyncio.to_thread(entered.wait, 1)
+
+            async def owner():
+                try:
+                    await subject.queued()
+                except asyncio.CancelledError:
+                    survived.set()
+                return "owner-survived"
+
+            owner_task = execution.start(owner, name="queue-owner")
+            await asyncio.sleep(0)
+            node = next(
+                item for item in execution.observability.live_tree()
+                if item["name"].endswith("Blocking.queued")
+            )
+            assert execution.observability.cancel(node["task_id"])
+            assert await owner_task == "owner-survived"
+            assert survived.is_set()
+            release.set()
+            await first
 
     asyncio.run(scenario())

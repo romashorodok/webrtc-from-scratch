@@ -10,7 +10,8 @@ import webrtc_rs
 from webrtc.media.av1_payloader import AV1_PAYLOAD_TYPE, Av1Packetizer
 from webrtc.media.opus_payloader import OPUS_PAYLOAD_TYPE, OpusPacketizer
 from webrtc.media.vp8_payloader import VP8Payloader
-from webrtc.peer_context import spawn_peer_task
+from webrtc.performance import ObservedComponent, event_loop, task
+from webrtc.runtime_services import FailurePolicy
 from webrtc.srtp import Stream as SrtpStream
 from webrtc.tracing import measure_perf_async, perf_mark
 
@@ -582,7 +583,7 @@ async def _receive_task(
             await asyncio.sleep(0.1)
 
 
-class RTPReceiver:
+class RTPReceiver(ObservedComponent):
     def __init__(self, caps: MediaCaps, kind: RTPCodecKind) -> None:
         self._caps = caps
         self._kind = kind
@@ -590,9 +591,11 @@ class RTPReceiver:
         self._track: TrackRemote | None = None
         self._receive_task: asyncio.Task | None = None
 
+    @event_loop
     def bind(self, transport: dtls.DTLSTransport):
         self._dtls = transport
 
+    @event_loop
     def __rtp_reader(self) -> Callable[[], Coroutine[Any, Any, tuple[bytes, int]]]:
         async def read() -> tuple[bytes, int]:
             # Read from track's SRTP stream
@@ -609,6 +612,7 @@ class RTPReceiver:
 
         return read
 
+    @event_loop
     def receive(self, params: RTPDecodingParameters):
         """
         Start receiving RTP packets.
@@ -624,15 +628,23 @@ class RTPReceiver:
         self._track = TrackRemote(self._kind, params.ssrc, params.rtx.ssrc, params.rid)
 
         # Create async task to read from SRTP stream
-        self._receive_task = spawn_peer_task(
-            _receive_task(self.__rtp_reader(), self._track),
-            name=f"RTPReceiver-{self._track.ssrc}",
-            component="rtp",
-            kind="rtp",
-            metadata={"expected_long_running": True, "loop_role": "receive"},
-        )
+        self._receive_task = self._run_receive_loop(self.__rtp_reader(), self._track)
         print(f"[RTPReceiver.receive] Started _receive_task for SSRC={params.ssrc}")
 
+    @task(
+        name="rtp:receiver",
+        kind="rtp",
+        metadata={"expected_long_running": True, "loop_role": "receive"},
+        failure=FailurePolicy.FAIL_CONNECTION,
+    )
+    async def _run_receive_loop(
+        self,
+        reader: Callable[[], Coroutine[Any, Any, tuple[bytes, int]]],
+        track: TrackRemote,
+    ) -> None:
+        await _receive_task(reader, track)
+
+    @event_loop
     def stop(self):
         if self._receive_task:
             self._receive_task.cancel()
@@ -717,7 +729,7 @@ def codecs_params_fuzzy_search(
     return
 
 
-class RTPTransceiver:
+class RTPTransceiver(ObservedComponent):
     def __init__(
         self,
         dtls: dtls.DTLSTransport,
@@ -734,6 +746,11 @@ class RTPTransceiver:
         self._direction = direction
         self.__dtls = dtls
 
+    @task(
+        name="srtp:start-streams",
+        kind="srtp",
+        failure=FailurePolicy.FAIL_CONNECTION,
+    )
     async def start_srtp_streams(self):
         if self._sender:
             encoding = self._sender._track_encodings[0]
@@ -760,9 +777,11 @@ class RTPTransceiver:
         if self._receiver:
             self._receiver.bind(transport)
 
+    @event_loop
     def set_prefered_codec(self, codec: RTPCodecParameters):
         self._prefered_codecs.append(codec)
 
+    @event_loop
     def get_codecs(self) -> list[RTPCodecParameters] | None:
         codecs = self._caps.get_codecs_by_kind(self._kind)
 
@@ -776,9 +795,11 @@ class RTPTransceiver:
 
         return filtered_codecs
 
+    @event_loop
     def stop(self):
         print("TODO: stop transceiver")
 
+    @event_loop
     def track_local(self) -> TrackLocal | None:
         if not self.sender:
             return
@@ -797,6 +818,7 @@ class RTPTransceiver:
     def receiver(self) -> RTPReceiver | None:
         return self._receiver
 
+    @event_loop
     def set_receiver(self, receiver: RTPReceiver):
         if self.__dtls:
             receiver.bind(self.__dtls)
@@ -815,6 +837,7 @@ class RTPTransceiver:
     def mid(self) -> MID | None:
         return self._mid
 
+    @event_loop
     def set_mid(self, mid: int | str):
         self._mid = MID(mid)
 

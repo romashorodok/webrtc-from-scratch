@@ -43,12 +43,42 @@ if __name__ == "__main__":
         help="port to run the server on (default: 9000)",
     )
 
+    parser.add_argument(
+        "--allocation-profile",
+        action="store_true",
+        help="enable the ws.py runtime allocation profiler",
+    )
+
+    parser.add_argument(
+        "--allocation-profile-interval",
+        type=float,
+        default=15.0,
+        metavar="SECONDS",
+        help="allocation profiler reporting interval (default: 15)",
+    )
+
     args = parser.parse_args()
+
+    if args.allocation_profile_interval <= 0:
+        parser.error("--allocation-profile-interval must be greater than zero")
+
+    if args.allocation_profile:
+        # run_process starts the ASGI server in a child process, which inherits
+        # these variables before importing the selected application module.
+        os.environ["WEBRTC_ALLOCATION_PROFILE"] = "1"
+        os.environ["WEBRTC_ALLOCATION_PROFILE_INTERVAL"] = str(
+            args.allocation_profile_interval
+        )
 
     module_str, app_str = args.app.split(":", maxsplit=1)
 
     print(f"Watching for changes in ../packages and ../webrtc")
     print(f"Starting server on port {args.port}")
+    if args.allocation_profile:
+        print(
+            "Allocation profiling enabled "
+            f"(interval={args.allocation_profile_interval:g}s)"
+        )
 
     ROOT = os.path.dirname(__file__)
 

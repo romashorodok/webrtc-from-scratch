@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .performance import PerfEvent
+from webrtc.performance import MetricEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -14,7 +15,7 @@ class BaselineCheck:
 
 
 def build_performance_summary(
-    events: Iterable[PerfEvent | Mapping[str, Any]],
+    events: Iterable[PerfEvent | MetricEvent | Mapping[str, Any]],
     *,
     scenario: str | None = None,
     required_events: Iterable[str] = (),
@@ -119,7 +120,13 @@ def check_smoke_thresholds(
     return BaselineCheck(ok=not failures, failures=tuple(failures))
 
 
-def _event_dict(event: PerfEvent | Mapping[str, Any]) -> dict[str, Any]:
+def _event_dict(event: PerfEvent | MetricEvent | Mapping[str, Any]) -> dict[str, Any]:
+    if isinstance(event, MetricEvent):
+        component, _, phase = event.operation.partition(".")
+        return {"component": component, "phase": phase or component, "state": event.outcome,
+            "name": f"{event.operation}.{event.outcome}", "sequence": 0,
+            "monotonic_ns": int(event.timestamp * 1_000_000_000), "duration_ms": event.duration_ms,
+            "metadata": dict(event.attributes)}
     if isinstance(event, PerfEvent):
         data = event.to_dict()
     else:

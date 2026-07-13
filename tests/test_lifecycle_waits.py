@@ -7,7 +7,6 @@ from webrtc.dtls.dtlstransport import DTLSTransport
 from webrtc.ice.agent import Agent, CandidatePairState
 from webrtc.lifecycle import ICECondition, PeerCondition, TransportCondition
 from webrtc.peer_connection import ICEGatherer, PeerConnection
-from webrtc.peer_context import PeerContext
 
 
 class PairRegistry:
@@ -217,23 +216,28 @@ def test_peer_connection_wait_requires_explicit_timeout():
     asyncio.run(scenario())
 
 
-def test_peer_context_wait_srtp_ready_delegates_to_peer_connection():
+def test_peer_connection_wait_srtp_ready_delegates_to_dtls_transport():
     async def scenario():
-        pc = FakeWaiter()
-        peer = PeerContext(pc)
+        pc = PeerConnection.__new__(PeerConnection)
+        pc.gatherer = FakeWaiter()
+        pc._dtls_transport = FakeWaiter()
+        pc._transport_ready = asyncio.Event()
 
-        await peer.wait(PeerCondition.SRTP_READY, timeout=3.0)
+        await pc.wait(PeerCondition.SRTP_READY, timeout=3.0)
 
-        assert pc.calls == [(PeerCondition.SRTP_READY, 3.0)]
+        assert pc._dtls_transport.calls == [(TransportCondition.SRTP_READY, 3.0)]
 
     asyncio.run(scenario())
 
 
-def test_peer_context_wait_requires_explicit_timeout():
+def test_peer_connection_srtp_wait_requires_explicit_timeout():
     async def scenario():
-        peer = PeerContext(FakeWaiter())
+        pc = PeerConnection.__new__(PeerConnection)
+        pc.gatherer = FakeWaiter()
+        pc._dtls_transport = FakeWaiter()
+        pc._transport_ready = asyncio.Event()
 
         with pytest.raises(ValueError):
-            await peer.wait(PeerCondition.SRTP_READY, timeout=None)
+            await pc.wait(PeerCondition.SRTP_READY, timeout=None)
 
     asyncio.run(scenario())
