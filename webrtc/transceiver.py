@@ -7,6 +7,7 @@ from typing import Any, Callable, Coroutine, Protocol
 
 import webrtc_rs
 
+from webrtc.compiler.runtime import packetize_av1_frame
 from webrtc.media.av1_payloader import AV1_PAYLOAD_TYPE, Av1Packetizer
 from webrtc.media.opus_payloader import OPUS_PAYLOAD_TYPE, OpusPacketizer
 from webrtc.media.vp8_payloader import VP8Payloader
@@ -140,6 +141,9 @@ class TrackEncoding:
                 clock_rate=self.codec.clock_rate,
                 refresh_rate=self.codec.refresh_rate,
             )
+            # Kernel E owns complete RTP packet construction, including TWCC.
+            # Keep its caller-owned state next to the existing RTP sequencer.
+            self._twcc_sequence = 0
         elif self.codec.payload_type == OPUS_PAYLOAD_TYPE:
             # Opus audio - always use 20ms packet time (standard for Opus)
             self._packetizer: PacketizerBase = OpusPacketizer(
@@ -188,9 +192,26 @@ class TrackEncoding:
 
         pts, time_base = await self._packetizer.next_timestamp()
 
-        pkts = self._packetizer.packetize(
-            frame, self.convert_timebase(pts, time_base, time_base)
-        )
+        timestamp = self.convert_timebase(pts, time_base, time_base)
+
+        if isinstance(self._packetizer, Av1Packetizer):
+            packets, rtp_sequence, twcc_sequence = packetize_av1_frame(
+                frame,
+                self._packetizer.mtu,
+                timestamp,
+                self.ssrc,
+                self._packetizer.sequencer.sequence_number,
+                self._twcc_sequence,
+            )
+            self._packetizer.sequencer.sequence_number = rtp_sequence
+            self._twcc_sequence = twcc_sequence
+
+            n = 0
+            for packet in packets:
+                n += await self._dtls.write_rtp_bytes(packet)
+            return n
+
+        pkts = self._packetizer.packetize(frame, timestamp)
 
         n = 0
         for pkt in pkts:

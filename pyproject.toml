@@ -16,6 +16,9 @@ authors = [
     { name = "romashorodok", email = "108732029+romashorodok@users.noreply.github.com" }
 ]
 
+[project.scripts]
+wrtc-pymeta-compiler = "webrtc.compiler.module_compiler:main"
+
 [tool.uv.workspace]
 members = [
     "packages/*",
@@ -36,6 +39,13 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["webrtc*", "packages*"]
+
+[tool.setuptools.package-data]
+"webrtc.compiler" = [
+    "native_compiler/CMakeLists.txt",
+    "native_compiler/main.c",
+    "native_compiler/kernel_e_extension.c.in",
+]
 
 [tool.maturin]
 module-name = "builder"
