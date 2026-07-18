@@ -7,7 +7,6 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
-from threading import RLock
 from types import MappingProxyType
 from typing import Any, ParamSpec, TypeVar
 
@@ -86,7 +85,6 @@ class PerformanceRecorder:
         event_sink: Callable[[PerfEvent], None] | None = None,
         retain_events: bool = True,
     ) -> None:
-        self._lock = RLock()
         self._sequence = 0
         self._events: list[PerfEvent] = []
         self._event_sink = event_sink
@@ -102,19 +100,18 @@ class PerformanceRecorder:
         duration_ms: float | None = None,
     ) -> PerfEvent:
         event_metadata = _metadata_with_task_context(metadata)
-        with self._lock:
-            self._sequence += 1
-            event = PerfEvent(
-                component=component,
-                phase=phase,
-                state=state,
-                sequence=self._sequence,
-                monotonic_ns=time.monotonic_ns(),
-                duration_ms=duration_ms,
-                metadata=event_metadata,
-            )
-            if self._retain_events:
-                self._events.append(event)
+        self._sequence += 1
+        event = PerfEvent(
+            component=component,
+            phase=phase,
+            state=state,
+            sequence=self._sequence,
+            monotonic_ns=time.monotonic_ns(),
+            duration_ms=duration_ms,
+            metadata=event_metadata,
+        )
+        if self._retain_events:
+            self._events.append(event)
         # Streaming must never affect a media/protocol path.  In particular,
         # sinks may publish to a bounded UI subscriber queue.
         if self._event_sink is not None:
@@ -125,13 +122,11 @@ class PerformanceRecorder:
         return event
 
     def events(self) -> tuple[PerfEvent, ...]:
-        with self._lock:
-            return tuple(self._events)
+        return tuple(self._events)
 
     def clear(self) -> None:
-        with self._lock:
-            self._events.clear()
-            self._sequence = 0
+        self._events.clear()
+        self._sequence = 0
 
     def use(self) -> Iterator["PerformanceRecorder"]:
         return use_performance_recorder(self)

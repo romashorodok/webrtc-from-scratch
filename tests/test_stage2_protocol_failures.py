@@ -1,6 +1,7 @@
 import asyncio
 
 import pytest
+import webrtc_rs
 
 from webrtc.config import DebugConfig, LogLevel
 from webrtc.dtls.dtlstransport import DTLSTransport
@@ -9,6 +10,7 @@ from webrtc.logger import get_logger
 from webrtc.peer_connection import ICEGatherer, PeerConnection
 from webrtc.session_description import SessionDescription, SessionDescriptionType
 from webrtc.signaling import SignalingStateTransitionError
+from webrtc import Runtime
 
 
 @pytest.fixture(autouse=True)
@@ -57,15 +59,17 @@ def test_invalid_signaling_state_raises_immediately(capsys):
 
 def test_ice_gather_failure_raises(monkeypatch, capsys):
     async def scenario():
-        gatherer = ICEGatherer()
+        async with Runtime(scope_id="ice-gather-failure"):
+            gatherer = ICEGatherer()
 
-        async def fail_create_agent(*args, **kwargs):
-            raise RuntimeError("bind failed")
+            async def fail_create_agent(*args, **kwargs):
+                raise RuntimeError("bind failed")
 
-        monkeypatch.setattr(gatherer, "_ICEGatherer__create_agent", fail_create_agent)
+            monkeypatch.setattr(gatherer, "_ICEGatherer__create_agent", fail_create_agent)
 
-        with pytest.raises(RuntimeError, match="bind failed"):
-            await gatherer.gather()
+            with pytest.raises(RuntimeError, match="bind failed"):
+                await gatherer.gather()
+            await gatherer.aclose()
 
     asyncio.run(scenario())
 
@@ -81,6 +85,9 @@ def test_dtls_wait_handshake_raises_stored_failure():
         transport._DTLSTransport__handshake_complete = asyncio.Event()
         transport._DTLSTransport__handshake_complete.set()
         transport._DTLSTransport__handshake_failed = failure
+        transport._runner = type("Runner", (), {
+            "snapshot": lambda self: type("Snapshot", (), {"state": "failed"})()
+        })()
 
         with pytest.raises(RuntimeError, match="handshake failed"):
             await transport.wait(TransportCondition.HANDSHAKE_COMPLETE, timeout=0.05)
@@ -89,15 +96,13 @@ def test_dtls_wait_handshake_raises_stored_failure():
 
 
 def test_dtls_start_without_transport_raises(capsys):
-    transport = DTLSTransport.__new__(DTLSTransport)
-    transport._DTLSTransport__handshake_complete = asyncio.Event()
-    transport._DTLSTransport__dtls_conn = None
-    transport._DTLSTransport__transport = None
+    async def scenario():
+        transport = DTLSTransport(webrtc_rs.Certificate())
+        from webrtc.dtls import DTLSRole
+        with pytest.raises(RuntimeError, match="No transport bound"):
+            await transport.start(DTLSRole.Client)
 
-    from webrtc.dtls import DTLSRole
-
-    with pytest.raises(RuntimeError, match="No transport bound"):
-        transport.start(DTLSRole.Client)
+    asyncio.run(scenario())
 
     captured = capsys.readouterr()
     assert captured.out == ""

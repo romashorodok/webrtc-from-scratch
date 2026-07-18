@@ -9,10 +9,10 @@ This module provides the high-level Session interface that:
 
 import asyncio
 import hashlib
-import inspect
 import secrets
 from dataclasses import dataclass
-from typing import Optional, Callable, Awaitable
+from enum import StrEnum
+from typing import Optional, Callable, Awaitable, Any
 
 # Import Rust SRTP context
 from webrtc_rs import SrtpContext
@@ -20,13 +20,108 @@ from webrtc_rs import SrtpContext
 # Import logger
 from webrtc.logger import get_logger, Component
 from webrtc.config import get_config
-from webrtc.performance import ObservedComponent, event_loop, performance, worker
-from webrtc.domain_events import SrtpPacketDelivery, SrtpStreamCreated, emit_domain_event
+from webrtc.performance import (
+    ObservedComponent, TraceDetail, event_loop, observe, performance, worker,
+)
+from webrtc.runtime_services import FailurePolicy, OwnedTaskHandle, current_execution_scope
+from webrtc.machine_specs import MACHINE_SPECS
+from webrtc.observability import MachineTransitionOp
+from webrtc.state_machine import (
+    AsyncStateMachineRunner, MachineCommand, MachineSnapshot, PreparedTransition,
+    ReplyPort, TransitionCommit,
+)
 
 
 # Buffer limits
 SRTP_BUFFER_SIZE = 1_000_000  # 1MB for RTP
 SRTCP_BUFFER_SIZE = 100_000  # 100KB for RTCP
+MAX_SRTP_STREAMS = 128
+
+
+class _LifecycleCommand(StrEnum):
+    INITIALIZE = "initialize"
+    READY = "ready"
+    DRAIN = "drain"
+    CLOSE = "close"
+    ACTIVATE = "activate"
+
+
+class _LifecycleRunner(AsyncStateMachineRunner[MachineCommand[object, TransitionCommit]]):
+    def __init__(self, owner: Any, machine_type: str) -> None:
+        self.owner = owner
+        super().__init__(
+            MACHINE_SPECS[machine_type], entity_id=owner.observability_id,
+            mailbox_capacity=16,
+            controller=getattr(owner._runtime, "transition_controller", None),
+            transition_sink=owner._project_transition,
+        )
+
+    async def step(self, command):
+        proposed = {
+            _LifecycleCommand.INITIALIZE: "initializing",
+            _LifecycleCommand.READY: "ready", _LifecycleCommand.ACTIVATE: "active",
+            _LifecycleCommand.DRAIN: "draining", _LifecycleCommand.CLOSE: "closed",
+        }[command.kind]
+        return PreparedTransition(
+            self.state, proposed, command.payload, command.cause_id,
+            command.expected_epoch, command.expected_revision,
+        )
+
+    async def after_commit(self, commit, effects):
+        await self.owner._after_commit(commit)
+
+    async def reconcile_terminal(self, prepared):
+        await self.owner._reconcile_terminal()
+
+
+class _PacketQueueRunner(AsyncStateMachineRunner):
+    async def step(self, command):
+        proposed = {"close": "closing", "drain": "drained", "closed": "closed"}[
+            command.kind
+        ]
+        return PreparedTransition(
+            self.snapshot().state, proposed, command.payload, command.cause_id,
+            command.expected_epoch, command.expected_revision,
+        )
+
+
+class _LifecycleOwner:
+    def _init_lifecycle(self, machine_type: str) -> None:
+        self._runtime = current_execution_scope()
+        self._command_id = 0
+        self._runner = _LifecycleRunner(self, machine_type)
+        self._machine_handle: OwnedTaskHandle[None] | None = None
+        if self._runtime is not None:
+            self._runtime.projection.machines.register(self.observability_id, self._runner.spec)
+            self._runtime.register_owner(self.observability_id, epoch=self._runner.epoch)
+            self._machine_handle = self._runtime.start_machine(
+                self._runner, owner_entity_id=self.observability_id,
+                owner_epoch=self._runner.epoch, failure=FailurePolicy.FAIL_CONNECTION,
+            )
+            if isinstance(self, ObservedComponent):
+                self.__bind_worker_owner__(
+                    self._runtime, self.observability_id, self._runner.epoch
+                )
+
+    def _command(self, kind, reply=None):
+        self._command_id += 1
+        return MachineCommand(
+            kind, self._command_id, self._runner.epoch, None, reply,
+            cause_id=f"{self.observability_id}:{self._command_id}",
+        )
+
+    def _project_transition(self, commit):
+        if self._runtime is not None and self._runtime.tracing_enabled:
+            self._runtime.projection.machines.apply(MachineTransitionOp(
+                commit.entity_id, commit.machine_type, commit.from_state, commit.to_state,
+                commit.epoch, commit.revision, self._runtime.new_producer_dot(),
+                commit.cause, commit.monotonic_ns,
+            ))
+
+    async def _join_lifecycle(self):
+        if self._machine_handle is not None:
+            await self._machine_handle.wait()
+            self._runtime.remove_owner(self.observability_id, self._runner.epoch)
 
 
 def _packet_metadata(data: bytes, is_rtp: bool, *, size_key: str) -> dict[str, int | str]:
@@ -70,7 +165,7 @@ def parse_rtcp_ssrc(data: bytes) -> int:
     return int.from_bytes(data[8:12], 'big')
 
 
-class Stream:
+class Stream(_LifecycleOwner):
     """
     Stream handles decrypted packets for a single SSRC.
 
@@ -94,16 +189,88 @@ class Stream:
         self.ssrc = ssrc
         self.is_rtp = is_rtp
         self._on_close = on_close
-        self._closed = False
         self.observability_id = observability_id or f"stream-{secrets.token_hex(6)}"
 
         # Async queue for buffered packets
         # Use packet count limit rather than byte limit for simplicity
         self._queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1000)
+        self._init_lifecycle("srtp-stream")
+        self._queue_entity_id = f"{self.observability_id}:packet-queue"
+        self._queue_command_id = 0
+        self._queue_runner = _PacketQueueRunner(
+            MACHINE_SPECS["queue"], entity_id=self._queue_entity_id,
+            mailbox_capacity=8,
+            controller=getattr(self._runtime, "transition_controller", None),
+            transition_sink=self._project_queue_transition,
+        )
+        if self._runtime is not None:
+            self._runtime.projection.machines.register(
+                self._queue_entity_id, MACHINE_SPECS["queue"]
+            )
+            self._runtime.register_owner(
+                self._queue_entity_id, epoch=self._queue_runner.epoch
+            )
+            self._queue_handle = self._runtime.start_machine(
+                self._queue_runner, owner_entity_id=self._queue_entity_id,
+                owner_epoch=self._queue_runner.epoch,
+            )
+            self._publish_queue_facets()
+        else:
+            self._queue_handle = None
+        if self._machine_handle is not None:
+            self._runner.try_submit(self._command(_LifecycleCommand.ACTIVATE))
+
+    def _project_queue_transition(self, commit: TransitionCommit) -> None:
+        if self._runtime is None:
+            return
+        self._runtime.projection.machines.apply(MachineTransitionOp(
+            commit.entity_id, commit.machine_type, commit.from_state,
+            commit.to_state, commit.epoch, commit.revision,
+            self._runtime.new_producer_dot(), commit.cause, commit.monotonic_ns,
+        ))
+        self._publish_queue_facets(commit.revision)
+
+    def _publish_queue_facets(self, revision: int | None = None) -> None:
+        if self._runtime is None:
+            return
+        self._runtime.projection.merge_values(
+            self._queue_entity_id, self._runtime.new_producer_dot(), {
+                "depth": self._queue.qsize(), "capacity": self._queue.maxsize,
+                "queue_kind": "srtp-stream-packets",
+            },
+            observer_meta="exact", source_entity_id=self._queue_entity_id,
+            source_epoch=self._queue_runner.epoch,
+            source_revision=(self._queue_runner.revision if revision is None else revision),
+            source_order=self._runtime.projection.new_facet_source_order(),
+        )
+
+    def _submit_queue(self, kind: str, reply=None) -> None:
+        self._queue_command_id += 1
+        self._queue_runner.try_submit(MachineCommand(
+            kind, self._queue_command_id, self._queue_runner.epoch, None, reply,
+            expected_revision=None,
+            cause_id=f"{self._queue_entity_id}:{kind}:{self._queue_command_id}",
+        ))
+
+    async def _close_packet_queue(self) -> None:
+        if self._queue_handle is None or self._queue_runner.snapshot().terminal:
+            return
+        reply = ReplyPort[TransitionCommit]()
+        self._submit_queue("close", reply)
+        await reply.wait()
+        while not self._queue.empty():
+            self._queue.get_nowait()
+        self._publish_queue_facets()
+        for kind in ("drain", "closed"):
+            reply = ReplyPort[TransitionCommit]()
+            self._submit_queue(kind, reply)
+            await reply.wait()
+        await self._queue_handle.wait()
+        self._runtime.remove_owner(self._queue_entity_id, self._queue_runner.epoch)
 
     @property
     def closed(self) -> bool:
-        return self._closed
+        return self._runner.snapshot().terminal
 
     async def write(self, data: bytes) -> bool:
         """
@@ -117,7 +284,7 @@ class Stream:
         Returns:
             True if written, False if buffer full (packet dropped)
         """
-        if self._closed:
+        if self._runner.snapshot().state != "active":
             return False
 
         logger = get_logger()
@@ -125,6 +292,7 @@ class Stream:
 
         try:
             self._queue.put_nowait(data)
+            self._publish_queue_facets()
             queue_size = self._queue.qsize()
 
             # Log first N writes to see queue growth
@@ -152,18 +320,35 @@ class Stream:
         Raises:
             RuntimeError: If stream is closed
         """
-        if self._closed and self._queue.empty():
+        if self.closed and self._queue.empty():
             raise RuntimeError("Stream closed")
 
-        return await self._queue.get()
+        packet = await self._queue.get()
+        self._publish_queue_facets()
+        return packet
 
     async def close(self) -> None:
         """Close the stream."""
-        if self._closed:
+        if self.closed:
             return
+        if self._machine_handle is None:
+            await self._reconcile_terminal()
+            return
+        while self._runner.snapshot().state == "new":
+            await asyncio.sleep(0)
+        await self._close_packet_queue()
+        reply = ReplyPort[TransitionCommit]()
+        await self._runner.submit(self._command(_LifecycleCommand.DRAIN, reply))
+        await reply.wait()
+        while not self.closed:
+            await asyncio.sleep(0)
+        await self._join_lifecycle()
 
-        self._closed = True
+    async def _after_commit(self, commit: TransitionCommit) -> None:
+        if commit.to_state == "draining":
+            self._runner.try_submit(self._command(_LifecycleCommand.CLOSE))
 
+    async def _reconcile_terminal(self) -> None:
         if self._on_close:
             await self._on_close(self.ssrc)
 
@@ -177,7 +362,7 @@ class SessionKeys:
     remote_master_salt: bytes
 
 
-class Session(ObservedComponent):
+class Session(_LifecycleOwner, ObservedComponent):
     """
     SRTP Session with bidirectional encryption and stream demuxing.
 
@@ -215,15 +400,62 @@ class Session(ObservedComponent):
 
         # Stream management
         self._streams: dict[int, Stream] = {}
-        self._streams_lock = asyncio.Lock()
-
         # Channel for notifying about new streams
-        self._new_stream_queue: asyncio.Queue[tuple[Stream, int]] = asyncio.Queue()
+        self._new_stream_queue: asyncio.Queue[tuple[Stream, int]] = asyncio.Queue(
+            maxsize=MAX_SRTP_STREAMS
+        )
 
         # Debug counters
         self._decrypt_count = 0
         self._decrypt_errors = 0
         self._ssrc_counters: dict[int, int] = {}
+        self._inflight_operations = 0
+        # Rust replay/sequence state is mutable.  Calls are admitted on the
+        # owner loop and chained per session; separate Session instances still
+        # execute concurrently on the Runtime worker pool.
+        self._crypto_tail: asyncio.Future[None] | None = None
+        self._init_lifecycle("srtp-session")
+        if self._machine_handle is not None:
+            self._runner.try_submit(self._command(_LifecycleCommand.INITIALIZE))
+
+    @event_loop
+    def lifecycle_snapshot(self) -> MachineSnapshot:
+        return self._runner.snapshot()
+
+    async def wait_ready(self) -> None:
+        while self._runner.snapshot().state in {"new", "initializing"}:
+            await asyncio.sleep(0)
+        if self._runner.snapshot().state != "ready":
+            raise RuntimeError("SRTP session failed to become ready")
+
+    async def _after_commit(self, commit: TransitionCommit) -> None:
+        if self._runtime is not None and self._runtime.tracing_enabled:
+            self._runtime.projection.merge_values(
+                self.observability_id, self._runtime.new_producer_dot(), {
+                    "keys_ready": commit.to_state in {"ready", "draining"},
+                    "protocol": "rtp" if self.is_rtp else "rtcp",
+                },
+                observer_meta="exact", source_entity_id=commit.entity_id,
+                source_epoch=commit.epoch, source_revision=commit.revision,
+                source_order=self._runtime.projection.new_facet_source_order(),
+            )
+        if commit.to_state == "initializing":
+            self._runner.try_submit(self._command(_LifecycleCommand.READY))
+        elif commit.to_state == "draining":
+            for stream in tuple(self._streams.values()):
+                await stream.close()
+            self._streams.clear()
+            while not self._new_stream_queue.empty():
+                self._new_stream_queue.get_nowait()
+            self._runner.try_submit(self._command(_LifecycleCommand.CLOSE))
+
+    async def _reconcile_terminal(self) -> None:
+        while self._inflight_operations:
+            await asyncio.sleep(0)
+        if self._runtime is not None:
+            await self._runtime.join_owner_children(
+                self.observability_id, self._runner.epoch
+            )
 
     @classmethod
     @event_loop
@@ -255,14 +487,50 @@ class Session(ObservedComponent):
         )
         return cls(keys, is_rtp)
 
+    @observe(detail=TraceDetail.OFF)
+    async def _ordered_crypto(self, operation, packet: bytes) -> bytes:
+        loop = asyncio.get_running_loop()
+        predecessor = self._crypto_tail
+        turn = loop.create_future()
+        self._crypto_tail = turn
+        if predecessor is not None:
+            await asyncio.shield(predecessor)
+        try:
+            return await operation(packet)
+        finally:
+            if not turn.done():
+                turn.set_result(None)
+            if self._crypto_tail is turn:
+                self._crypto_tail = None
+
+    @worker
     @performance(
         name="srtp.encrypt", group="srtp.packet",
-        on_call=lambda call: {"input_bytes": len(call.args[1]), "packet_kind": "rtp" if call.args[0].is_rtp else "rtcp"},
+        on_call=lambda call: {"input_bytes": len(call.args[1])},
         on_success=lambda event: {"output_bytes": len(event.result)},
         on_error=lambda event: {"exception": type(event.exception).__name__},
     )
+    def _encrypt_crypto(self, plaintext: bytes) -> bytes:
+        return (
+            self._context.encrypt_rtp(plaintext)
+            if self.is_rtp else self._context.encrypt_rtcp(plaintext)
+        )
+
     @worker
-    def encrypt(self, plaintext: bytes) -> bytes:
+    @performance(
+        name="srtp.decrypt", group="srtp.packet",
+        on_call=lambda call: {"input_bytes": len(call.args[1])},
+        on_success=lambda event: {"output_bytes": len(event.result)},
+        on_error=lambda event: {"exception": type(event.exception).__name__},
+    )
+    def _decrypt_crypto(self, ciphertext: bytes) -> bytes:
+        return (
+            self._context.decrypt_rtp(ciphertext)
+            if self.is_rtp else self._context.decrypt_rtcp(ciphertext)
+        )
+
+    @observe(detail=TraceDetail.OFF)
+    async def encrypt(self, plaintext: bytes) -> bytes:
         """
         Encrypt an outgoing packet (synchronous).
 
@@ -272,16 +540,10 @@ class Session(ObservedComponent):
         Returns:
             Encrypted SRTP or SRTCP packet
         """
-        return self._context.encrypt_rtp(plaintext) if self.is_rtp else self._context.encrypt_rtcp(plaintext)
+        return await self._ordered_crypto(self._encrypt_crypto, plaintext)
 
-    @performance(
-        name="srtp.decrypt", group="srtp.packet",
-        on_call=lambda call: {"input_bytes": len(call.args[1]), "packet_kind": "rtp" if call.args[0].is_rtp else "rtcp"},
-        on_success=lambda event: {"output_bytes": len(event.result)},
-        on_error=lambda event: {"exception": type(event.exception).__name__},
-    )
-    @worker
-    def decrypt(self, ciphertext: bytes) -> bytes:
+    @observe(detail=TraceDetail.OFF)
+    async def decrypt(self, ciphertext: bytes) -> bytes:
         """
         Decrypt an incoming packet (synchronous).
 
@@ -291,33 +553,7 @@ class Session(ObservedComponent):
         Returns:
             Decrypted RTP or RTCP packet
         """
-        return self._context.decrypt_rtp(ciphertext) if self.is_rtp else self._context.decrypt_rtcp(ciphertext)
-
-    async def encrypt_async(self, plaintext: bytes) -> bytes:
-        """
-        Encrypt an outgoing packet (async wrapper).
-
-        Args:
-            plaintext: RTP or RTCP packet to encrypt
-
-        Returns:
-            Encrypted SRTP or SRTCP packet
-        """
-        result = self.encrypt(plaintext)
-        return await result if inspect.isawaitable(result) else result
-
-    async def decrypt_async(self, ciphertext: bytes) -> bytes:
-        """
-        Decrypt an incoming packet (async wrapper).
-
-        Args:
-            ciphertext: SRTP or SRTCP packet to decrypt
-
-        Returns:
-            Decrypted RTP or RTCP packet
-        """
-        result = self.decrypt(ciphertext)
-        return await result if inspect.isawaitable(result) else result
+        return await self._ordered_crypto(self._decrypt_crypto, ciphertext)
 
     async def _get_or_create_stream(self, ssrc: int) -> tuple[Stream, bool]:
         """
@@ -326,31 +562,36 @@ class Session(ObservedComponent):
         Returns:
             Tuple of (stream, is_new)
         """
-        async with self._streams_lock:
-            if ssrc in self._streams:
-                return self._streams[ssrc], False
-
-            async def on_close(closed_ssrc: int) -> None:
-                async with self._streams_lock:
-                    self._streams.pop(closed_ssrc, None)
-
-            self._stream_sequence += 1
-            stream_id = f"{self.observability_id}:stream:{self._stream_sequence}"
-            stream = Stream(
-                ssrc, self.is_rtp, on_close, observability_id=stream_id,
+        if self._runner.snapshot().state != "ready":
+            raise RuntimeError(
+                f"SRTP stream admission rejected while {self._runner.snapshot().state}"
             )
-            self._streams[ssrc] = stream
-            protocol = "rtp" if self.is_rtp else "rtcp"
-            ssrc_id = "ssrc-" + hashlib.blake2s(
-                ssrc.to_bytes(4, "big"), key=self._observability_key,
-                digest_size=6,
-            ).hexdigest()
-            emit_domain_event(
-                SrtpStreamCreated, ssrc=ssrc, protocol=protocol,
-                session_id=self.observability_id, stream_id=stream_id,
-                ssrc_id=ssrc_id, stream_count=len(self._streams),
+        if ssrc in self._streams:
+            return self._streams[ssrc], False
+        if len(self._streams) >= MAX_SRTP_STREAMS:
+            raise RuntimeError("SRTP SSRC admission limit exceeded")
+
+        async def on_close(closed_ssrc: int) -> None:
+            self._streams.pop(closed_ssrc, None)
+
+        self._stream_sequence += 1
+        stream_id = f"{self.observability_id}:stream:{self._stream_sequence}"
+        stream = Stream(
+            ssrc, self.is_rtp, on_close, observability_id=stream_id,
+        )
+        self._streams[ssrc] = stream
+        protocol = "rtp" if self.is_rtp else "rtcp"
+        ssrc_id = "ssrc-" + hashlib.blake2s(
+            ssrc.to_bytes(4, "big"), key=self._observability_key,
+            digest_size=6,
+        ).hexdigest()
+        if self._runtime is not None:
+            self._runtime.record_srtp_stream(
+                protocol=protocol, session_id=self.observability_id,
+                stream_id=stream_id, ssrc_id=ssrc_id,
+                stream_count=len(self._streams),
             )
-            return stream, True
+        return stream, True
 
     async def write_incoming(self, ciphertext: bytes) -> None:
         """
@@ -365,6 +606,11 @@ class Session(ObservedComponent):
         logger = get_logger()
         config = get_config()
 
+        if self._runner.snapshot().state != "ready":
+            raise RuntimeError(
+                f"SRTP packet admission rejected while {self._runner.snapshot().state}"
+            )
+        self._inflight_operations += 1
         self._decrypt_count += 1
 
         try:
@@ -382,6 +628,8 @@ class Session(ObservedComponent):
                     logger.error(Component.SRTP, f"Decrypt error #{self._decrypt_errors}/{self._decrypt_count}",
                                error=str(e))
             raise  # Re-raise so caller can handle
+        finally:
+            self._inflight_operations -= 1
 
         # Get SSRC from decrypted packet
         if self.is_rtp:
@@ -410,21 +658,18 @@ class Session(ObservedComponent):
         write_success = await stream.write(decrypted)
         if not write_success:
             seq = int.from_bytes(decrypted[2:4], 'big') if len(decrypted) >= 4 else -1
-            emit_domain_event(
-                SrtpPacketDelivery, ssrc=ssrc,
-                protocol="rtp" if self.is_rtp else "rtcp", delivered=False,
-                failure_reason="stream_queue_full",
-                session_id=self.observability_id,
-                stream_id=stream.observability_id,
-            )
+            if self._runtime is not None:
+                self._runtime.record_srtp_delivery(
+                    protocol="rtp" if self.is_rtp else "rtcp", delivered=False,
+                    failure_reason="stream_queue_full", stream_id=stream.observability_id,
+                )
             logger.warn(Component.SRTP, f"Stream write FAILED - queue full", ssrc=ssrc, seq=seq)
         else:
-            emit_domain_event(
-                SrtpPacketDelivery, ssrc=ssrc,
-                protocol="rtp" if self.is_rtp else "rtcp", delivered=True,
-                session_id=self.observability_id,
-                stream_id=stream.observability_id,
-            )
+            if self._runtime is not None:
+                self._runtime.record_srtp_delivery(
+                    protocol="rtp" if self.is_rtp else "rtcp", delivered=True,
+                    stream_id=stream.observability_id,
+                )
 
     async def accept_stream(self) -> tuple[Stream, int]:
         """
@@ -449,6 +694,10 @@ class Session(ObservedComponent):
         Returns:
             Stream for the SSRC
         """
+        state = self._runner.snapshot().state
+        if state not in {"new", "initializing", "ready"}:
+            raise RuntimeError(f"SRTP stream admission rejected while {state}")
+        await self.wait_ready()
         stream, _ = await self._get_or_create_stream(ssrc)
         return stream
 
@@ -459,16 +708,19 @@ class Session(ObservedComponent):
         Returns:
             Stream if exists, None otherwise
         """
-        async with self._streams_lock:
-            return self._streams.get(ssrc)
+        return self._streams.get(ssrc)
 
     async def close(self) -> None:
         """Close all streams and the session."""
-        async with self._streams_lock:
-            streams = list(self._streams.values())
-            self._streams.clear()
-
-        # Stream.close invokes the session's on_close callback, which also
-        # acquires _streams_lock.  Close outside that lock to avoid deadlock.
-        for stream in streams:
-            await stream.close()
+        if self._runner.snapshot().terminal:
+            return
+        if self._machine_handle is None:
+            await self._reconcile_terminal()
+            return
+        await self.wait_ready()
+        reply = ReplyPort[TransitionCommit]()
+        await self._runner.submit(self._command(_LifecycleCommand.DRAIN, reply))
+        await reply.wait()
+        while not self._runner.snapshot().terminal:
+            await asyncio.sleep(0)
+        await self._join_lifecycle()

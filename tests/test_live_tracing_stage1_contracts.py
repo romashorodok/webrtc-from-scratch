@@ -44,7 +44,7 @@ def test_policy_is_compiled_for_every_eligible_method_at_class_creation():
         async def helper(self):
             return None
 
-        @task(name="ice-controller", state="ice")
+        @task(name="ice-controller")
         async def controller(self):
             return None
 
@@ -70,7 +70,7 @@ def test_policy_is_compiled_for_every_eligible_method_at_class_creation():
     assert policies["worker_call"].operation == "named"
     assert policies["worker_call"].group == "legacy-group"
     assert policies["helper"].detail is TraceDetail.OFF
-    assert policies["controller"].detail is TraceDetail.STATE
+    assert policies["controller"].detail is TraceDetail.OFF
     assert policies["diagnostic"].detail is TraceDetail.EXACT
     assert policies["diagnostic"].slow_ms == 12.5
     assert policies["diagnostic"].capture_failures is False
@@ -104,7 +104,7 @@ def test_inherited_policy_is_reused_and_override_gets_a_new_interned_id():
             == Child.__observations__["local"].operation_id)
 
 
-def test_marker_validation_includes_observe_and_bounded_task_owner_mapping():
+def test_marker_validation_includes_observe_and_rejects_removed_task_state_mapping():
     with pytest.raises(TypeError, match="unobserved cannot"):
         class Invalid(ObservedComponent):
             @unobserved
@@ -112,19 +112,28 @@ def test_marker_validation_includes_observe_and_bounded_task_owner_mapping():
             def call(self):
                 pass
 
-    with pytest.raises(ValueError, match="unknown observable task state owner"):
+    with pytest.raises(TypeError, match="unexpected keyword argument 'state'"):
         task(state="per-packet")
 
 
 def test_machine_specs_are_bounded_and_cover_required_owners():
-    assert set(MACHINE_SPECS) == {
-        "peer", "ice", "dtls", "transport", "worker", "transceiver", "media"
-    }
+    assert {
+        "runtime", "peer", "signaling", "ice-gatherer", "ice-agent",
+        "candidate-pair", "candidate-pair-controller", "dtls-transport",
+        "dtls-handshake-phase", "srtp-session", "srtp-stream", "transport",
+        "worker-lane",
+        "transceiver", "rtp-sender", "rtp-receiver", "media-track",
+        "media-send", "attachment", "attachment-registry", "log-drain",
+        "queue", "observability",
+    } <= set(MACHINE_SPECS)
+    assert {"dtls", "ice", "ice-candidate-pair", "ice-controller", "worker"}.isdisjoint(
+        MACHINE_SPECS
+    )
     for name, spec in MACHINE_SPECS.items():
         assert spec.machine_type == name
         assert spec.initial in spec.states
         assert spec.terminal <= spec.states
-        assert len(spec.states) <= 8
+        assert len(spec.states) <= 10
 
 
 class _Runner(AsyncStateMachineRunner[str]):
@@ -141,9 +150,12 @@ def test_runner_commits_once_and_test_controller_pauses_only_at_safe_points():
         controller = TransitionController(timeout=1)
         controller.pause_at("test", to_state="running", phase="before_commit")
         commits = []
-        runner = _Runner(spec, entity_id="owner", controller=controller, projector=commits.append)
-        await runner.commands.put("running")
-        await runner.commands.put("done")
+        runner = _Runner(
+            spec, entity_id="owner", controller=controller,
+            transition_sink=commits.append,
+        )
+        await runner.submit("running")
+        await runner.submit("done")
         running = asyncio.create_task(runner.run())
         reached = await controller.wait_until("test", "running")
         assert runner.state == "idle"
@@ -164,8 +176,8 @@ def test_runner_rejects_invalid_edge_before_checkpoint_or_projection():
             "test", "idle", {"idle": {"done"}, "done": set()}, frozenset({"done"})
         )
         commits = []
-        runner = _Runner(spec, entity_id="owner", projector=commits.append)
-        await runner.commands.put("missing")
+        runner = _Runner(spec, entity_id="owner", transition_sink=commits.append)
+        await runner.submit("missing")
         with pytest.raises(InvalidTransition):
             await runner.run()
         assert runner.state == "idle"
@@ -175,9 +187,12 @@ def test_runner_rejects_invalid_edge_before_checkpoint_or_projection():
 
 
 def test_runtime_uses_null_controller_and_shutdown_releases_borrowed_test_controller():
-    runtime = Runtime()
-    assert type(runtime.transition_controller).__name__ == "NullTransitionController"
-    runtime.shutdown()
+    async def scenario():
+        runtime = Runtime()
+        assert type(runtime.transition_controller).__name__ == "NullTransitionController"
+        await runtime.aclose()
+
+    asyncio.run(scenario())
 
     async def scenario():
         controller = TransitionController(timeout=1)

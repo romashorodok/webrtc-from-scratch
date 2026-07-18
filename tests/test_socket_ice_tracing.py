@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from webrtc.ice.agent import CandidatePairController, CandidatePairTransport
+from webrtc.ice.agent import CandidatePair, CandidatePairController, CandidatePairTransport
 from webrtc import Runtime
 from webrtc.ice.net.types import Address, Packet
 from webrtc.ice.net.udp_mux import InterfaceMuxUDPHandler, Interceptor, UDPMuxConn
@@ -21,6 +21,12 @@ class _DatagramTransport:
 
     def sendto(self, data, address):
         self.sent.append((bytes(data), address))
+
+
+def _pair(entity_id: str) -> CandidatePair:
+    pair = CandidatePair.__new__(CandidatePair)
+    pair.entity_id = entity_id
+    return pair
 
 
 def _events(recorder):
@@ -60,11 +66,18 @@ def test_udp_bound_rx_tx_and_unbound_drop_are_traced():
     assert events["udp.datagram.tx"].metadata["counter.udp.datagrams_tx"] == 1
     assert events["udp.datagram.rx"].metadata["counter.udp.datagrams_rx"] == 1
     assert events["udp.datagram.unbound_dropped"].metadata["drop_reason"] == "unbound"
+    assert not any(
+        "address" in key or key.endswith("_port")
+        for event in events.values() for key in event.metadata
+    )
 
 
 def test_ice_demux_emits_each_route_and_records_malformed_failure():
     recorder = PerformanceRecorder()
-    transport = CandidatePairTransport(type("Conn", (), {"sendto": lambda *_: None})(), pair_id="pair-1")
+    pair = _pair("candidate-pair:pair-1")
+    transport = CandidatePairTransport(
+        type("Conn", (), {"sendto": lambda *_: None})(), pair,
+    )
 
     with use_performance_recorder(recorder):
         transport.pipe(Packet(Address("127.0.0.2", 6000), b"\x16" + b"x" * 12))
@@ -75,7 +88,7 @@ def test_ice_demux_emits_each_route_and_records_malformed_failure():
 
     events = _events(recorder)
     for name in ("ice.packet_demux.dtls", "ice.packet_demux.rtp", "ice.packet_demux.rtcp"):
-        assert events[name].metadata["pair_id"] == "pair-1"
+        assert events[name].metadata["pair_id"] == pair.entity_id
     assert events["ice.packet_demux.failed"].metadata["demux_reason"] == "empty"
 
 
@@ -97,21 +110,21 @@ def test_controller_traces_packet_before_branch_and_after_routing():
         async def recvfrom(self):
             return await self.queue.get()
 
-    class Pair:
-        def get_pair_id(self):
-            return "pair-1"
-
     async def scenario():
         conn = Conn()
         controller = CandidatePairController.__new__(CandidatePairController)
-        controller._pair = Pair()
+        controller._pair = _pair("candidate-pair:pair-1")
         controller._CandidatePairController__selector = Selector()
         controller._CandidatePairController__conn = conn
-        controller._CandidatePairController__transport = CandidatePairTransport(conn, pair_id="pair-1")
+        controller._CandidatePairController__transport = CandidatePairTransport(
+            conn, controller._pair,
+        )
         recorder = PerformanceRecorder()
         async with Runtime(scope_id="socket-ice"):
             with use_performance_recorder(recorder):
-                task = controller.start()
+                # Exercise the loop body directly; production starts this
+                # pump only through CandidatePairController.start_managed().
+                task = asyncio.create_task(controller._receive_loop())
                 await conn.queue.put(Packet(Address("127.0.0.2", 6000), b"\x80\x60" + b"x" * 10))
                 await asyncio.sleep(0)
                 task.cancel()

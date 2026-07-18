@@ -4,7 +4,6 @@ import asyncio
 from collections import Counter, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from threading import RLock
 from typing import Any
 import json
 import weakref
@@ -52,235 +51,6 @@ class ObservableDiagnostics(Counter[str]):
             self._dirty_callback()
 
 
-@dataclass(eq=False)
-class TraceSubscriber:
-    queue: asyncio.Queue[dict[str, Any]]
-    loop: asyncio.AbstractEventLoop
-    peer_id: str | None = None
-    pending_events: list[dict[str, Any]] = field(default_factory=list)
-    flush_handle: asyncio.TimerHandle | None = None
-
-
-class TraceEventBus:
-    def __init__(self, *, batch_interval: float = 1.0, max_pending_events: int = 2048) -> None:
-        self._lock = RLock()
-        self._subscribers: set[TraceSubscriber] = weakref.WeakSet()
-        self._sequence = 0
-        self._batch_interval = batch_interval
-        self._max_pending_events = max_pending_events
-
-    def publish(self, event_name: str, data: dict[str, Any]) -> None:
-        event = {"event": event_name, "data": {"sequence": 0, **data}}
-        with self._lock:
-            self._sequence += 1
-            event["data"]["sequence"] = self._sequence
-            subs = list(self._subscribers)
-        for sub in subs:
-            self._deliver(sub, event)
-
-    def subscribe(
-        self,
-        *,
-        maxsize: int = 1024,
-        peer_id: str | None = None,
-    ) -> TraceSubscriber:
-        loop = asyncio.get_running_loop()
-        sub = TraceSubscriber(asyncio.Queue(maxsize=maxsize), loop, peer_id=peer_id)
-        with self._lock:
-            self._subscribers.add(sub)
-        return sub
-
-    def unsubscribe(self, sub: TraceSubscriber) -> None:
-        with self._lock:
-            self._subscribers.discard(sub)
-            handle = sub.flush_handle
-            sub.flush_handle = None
-            sub.pending_events.clear()
-        if handle is not None:
-            handle.cancel()
-
-    def close(self) -> None:
-        """Detach subscribers and cancel all owned batching timers."""
-        with self._lock:
-            subscribers = list(self._subscribers)
-        for subscriber in subscribers:
-            self.unsubscribe(subscriber)
-
-    def batch_event(self, events: list[dict[str, Any]]) -> dict[str, Any]:
-        return {"event": "trace:batch", "data": {"events": events}}
-
-    def _deliver(self, sub: TraceSubscriber, event: dict[str, Any]) -> None:
-        if sub.peer_id is not None and self._event_peer_id(event) != sub.peer_id:
-            return
-
-        def offer() -> None:
-            self._append_pending(sub, event)
-            if sub.flush_handle is None:
-                sub.flush_handle = sub.loop.call_later(self._batch_interval, self._flush, sub)
-
-        try:
-            running_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            running_loop = None
-        if running_loop is sub.loop:
-            offer()
-        elif not sub.loop.is_closed():
-            sub.loop.call_soon_threadsafe(offer)
-
-    def _flush(self, sub: TraceSubscriber) -> None:
-        events = self._coalesce(sub.pending_events)
-        sub.pending_events = []
-        sub.flush_handle = None
-        if not events:
-            return
-        self._offer(sub.queue, self.batch_event(events))
-
-    def _append_pending(self, sub: TraceSubscriber, event: dict[str, Any]) -> None:
-        sub.pending_events.append(event)
-        self._trim_pending_events(sub)
-
-    def _trim_pending_events(self, sub: TraceSubscriber) -> None:
-        overflow = len(sub.pending_events) - self._max_pending_events
-        if overflow <= 0:
-            return
-
-        del sub.pending_events[:overflow]
-    @classmethod
-    def _coalesce(cls, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Coalesce updates without crossing task lifecycle boundaries."""
-        output: list[dict[str, Any]] = []
-        segment: list[dict[str, Any]] = []
-
-        def flush_segment() -> None:
-            if not segment:
-                return
-            output.extend(cls._coalesce_segment(segment))
-            segment.clear()
-
-        for event in events:
-            if event.get("event") in {"trace:init", "trace:complete", "trace:delete"}:
-                flush_segment()
-                if output and cls._event_signature(output[-1]) == cls._event_signature(event):
-                    cls._retain_highest_sequence(output[-1], event)
-                else:
-                    output.append(event)
-            else:
-                segment.append(event)
-        flush_segment()
-        return output
-
-    @classmethod
-    def _coalesce_segment(cls, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        output: list[dict[str, Any]] = []
-        update_position: int | None = None
-        update_tasks: dict[str, dict[str, Any]] = {}
-        update_data: dict[str, Any] = {}
-
-        for event in events:
-            if event.get("event") != "trace:update":
-                cls._append_distinct(output, event)
-                continue
-            data = event.get("data")
-            if not isinstance(data, dict):
-                cls._append_distinct(output, event)
-                continue
-            if update_position is None:
-                update_position = len(output)
-                output.append({"event": "trace:update", "data": {}})
-            sequence = data.get("sequence")
-            previous_sequence = update_data.get("sequence")
-            if isinstance(sequence, int) and (
-                not isinstance(previous_sequence, int) or sequence > previous_sequence
-            ):
-                update_data["sequence"] = sequence
-            for key, value in data.items():
-                if key not in {"tasks", "sequence", "groups"}:
-                    update_data[key] = value
-            if "groups" in data:
-                update_data["groups"] = data["groups"]
-            tasks = data.get("tasks")
-            if isinstance(tasks, list):
-                for task in tasks:
-                    task_id = task.get("task_id") if isinstance(task, dict) else None
-                    if isinstance(task_id, str):
-                        update_tasks[task_id] = task
-
-        if update_position is not None:
-            output[update_position] = {
-                "event": "trace:update",
-                "data": {**update_data, "tasks": list(update_tasks.values())},
-            }
-        return output
-
-    @staticmethod
-    def _append_distinct(output: list[dict[str, Any]], event: dict[str, Any]) -> None:
-        signature = TraceEventBus._event_signature(event)
-        for existing in reversed(output):
-            if existing.get("event") in {"trace:init", "trace:complete", "trace:delete"}:
-                break
-            if TraceEventBus._event_signature(existing) == signature:
-                TraceEventBus._retain_highest_sequence(existing, event)
-                return
-        output.append(event)
-
-    @staticmethod
-    def _event_signature(event: dict[str, Any]) -> str:
-        data = event.get("data")
-        normalized = {key: value for key, value in data.items() if key != "sequence"} if isinstance(data, dict) else data
-        return json.dumps({"event": event.get("event"), "data": normalized}, sort_keys=True, default=str)
-
-    @staticmethod
-    def _retain_highest_sequence(existing: dict[str, Any], incoming: dict[str, Any]) -> None:
-        existing_data = existing.get("data")
-        incoming_data = incoming.get("data")
-        if not isinstance(existing_data, dict) or not isinstance(incoming_data, dict):
-            return
-        current = existing_data.get("sequence")
-        candidate = incoming_data.get("sequence")
-        if isinstance(candidate, int) and (not isinstance(current, int) or candidate > current):
-            existing_data["sequence"] = candidate
-
-    @staticmethod
-    def _event_peer_id(event: dict[str, Any]) -> str | None:
-        data = event.get("data")
-        if not isinstance(data, dict):
-            return None
-
-        peer_id = data.get("peer_id")
-        if isinstance(peer_id, str):
-            return peer_id
-
-        if event.get("event") not in {"trace:init", "trace:update", "trace:complete"}:
-            return None
-
-        for trace in TraceEventBus._event_traces(event):
-            metadata = trace.get("metadata")
-            if isinstance(metadata, dict):
-                trace_peer_id = metadata.get("peer_id")
-                if isinstance(trace_peer_id, str):
-                    return trace_peer_id
-
-        return None
-
-    @staticmethod
-    def _event_traces(event: dict[str, Any]) -> list[dict[str, Any]]:
-        data = event.get("data")
-        if not isinstance(data, dict):
-            return []
-
-        tasks = data.get("tasks")
-        return [item for item in tasks if isinstance(item, dict)] if isinstance(tasks, list) else []
-
-    @staticmethod
-    def _offer(queue: asyncio.Queue[dict[str, Any]], event: dict[str, Any]) -> None:
-        try:
-            if queue.full():
-                queue.get_nowait()
-            queue.put_nowait(event)
-        except Exception:
-            return
-
-
 @dataclass(eq=False, slots=True, weakref_slot=True)
 class JournalSubscriber:
     """A bounded replica cursor over the runtime's shared change journal."""
@@ -307,6 +77,8 @@ class JournalSubscription:
             self.transport._enqueue_fresh_snapshot(self.subscriber)
         else:
             self.transport._acknowledge(self.subscriber, item)
+        if item.get("event") == "trace:terminal":
+            self.transport.unsubscribe(self.subscriber)
         return item
 
     def close(self) -> None:
@@ -339,7 +111,7 @@ class TracePatchTransport:
         journal_limit: int = 128,
         max_batch_records: int = 256,
         max_batch_bytes: int = 256 * 1024,
-        health_callback=None,
+        health_callback=None, timer_factory=None,
     ) -> None:
         from collections import Counter
 
@@ -354,6 +126,8 @@ class TracePatchTransport:
         self._journal: deque[tuple[int, dict[str, Any]]] = deque()
         self._subscribers: weakref.WeakSet[JournalSubscriber] = weakref.WeakSet()
         self._sequence = 0
+        self._generated_patch_records = 0
+        self._generated_patch_bytes = 0
         self._published_removal_checkpoint = 0
         self._removal_checkpoint_by_sequence: dict[int, int] = {}
         self._machine_revisions: dict[str, tuple[int, int]] = {}
@@ -361,9 +135,11 @@ class TracePatchTransport:
         self._facet_revisions: dict[str, tuple[int, int]] = {}
         self._control_signatures: dict[str, tuple[Any, ...]] = {}
         self._control_revisions: dict[str, int] = {}
-        self._flush_handle: asyncio.TimerHandle | None = None
+        self._flush_handle = None
+        self._timer_factory = timer_factory
         self._health_callback = health_callback
         self._published_diagnostics: dict[str, int] = dict(self.diagnostics)
+        self._closed = False
 
     def _publish_health(self, admitted: bool = True) -> None:
         if self._health_callback is not None:
@@ -381,7 +157,17 @@ class TracePatchTransport:
     def viewer_count(self) -> int:
         return len(self._subscribers)
 
+    @property
+    def generated_patch_records(self) -> int:
+        return self._generated_patch_records
+
+    @property
+    def generated_patch_bytes(self) -> int:
+        return self._generated_patch_bytes
+
     def subscribe(self, *, maxsize: int = 16, peer_id: str | None = None) -> JournalSubscription:
+        if self._closed:
+            raise RuntimeError("trace transport is closed")
         had_viewers = bool(self._subscribers)
         subscriber = JournalSubscriber(
             asyncio.Queue(maxsize=max(1, maxsize)), self._sequence,
@@ -415,9 +201,37 @@ class TracePatchTransport:
         self._publish_health()
 
     def close(self) -> None:
-        for subscriber in tuple(self._subscribers):
-            self.unsubscribe(subscriber)
+        # Final subscriber queues are durable until their terminal snapshot is
+        # consumed (or the subscription is explicitly closed).  In
+        # particular, do not erase a slow replica's final state here.
+        self._closed = True
+        if self._flush_handle is not None:
+            self._flush_handle.cancel()
+            self._flush_handle = None
         self._publish_health(False)
+
+    def finalize(self) -> dict[str, Any]:
+        """Retain one acknowledged terminal schema-2 snapshot per replica."""
+        snapshot = self.snapshot()
+        terminal = {
+            "event": "trace:terminal",
+            "data": {**snapshot["data"], "terminal": True,
+                     "sequence": self._sequence},
+        }
+        for subscriber in tuple(self._subscribers):
+            if subscriber.closed:
+                continue
+            while not subscriber.queue.empty():
+                subscriber.queue.get_nowait()
+                self.diagnostics["trace_subscriber_drops"] += 1
+            subscriber.needs_snapshot = False
+            subscriber.cursor = self._sequence
+            subscriber.queue.put_nowait(terminal)
+        return terminal
+
+    def seal_health(self) -> None:
+        """Prevent close fan-out after the observability terminal barrier."""
+        self._health_callback = None
 
     def dirty(self) -> None:
         """Schedule one source-side coalescing drain when viewers are present."""
@@ -428,11 +242,9 @@ class TracePatchTransport:
             return
         if self._flush_handle is not None:
             return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
+        if self._closed or self._timer_factory is None:
             return
-        self._flush_handle = loop.call_later(self.cadence, self.flush)
+        self._flush_handle = self._timer_factory(self.cadence, self.flush)
 
     def flush(self) -> tuple[dict[str, Any], ...]:
         if self._flush_handle is not None:
@@ -569,6 +381,14 @@ class TracePatchTransport:
                 "events": events,
             },
         }
+        self._generated_patch_records += sum(
+            len(event.get("records", ())) + len(event.get("ids", ()))
+            if isinstance(event, dict) else 0
+            for event in events
+        )
+        self._generated_patch_bytes += len(
+            json.dumps(batch, separators=(",", ":"), default=str).encode()
+        )
         self._journal.append((self._sequence, batch))
         while len(self._journal) > self.journal_limit:
             self._journal.popleft()
@@ -604,6 +424,8 @@ class TracePatchTransport:
             },
         })
         self.diagnostics["trace_resync_required"] += 1
+        self.diagnostics["trace_subscriber_drops"] += 1
+        self._publish_health(False)
         self._gc_acknowledged_tombstones()
 
     def _enqueue_fresh_snapshot(self, subscriber: JournalSubscriber) -> None:
@@ -624,6 +446,7 @@ class TracePatchTransport:
         if isinstance(sequence, int):
             subscriber.acknowledged = max(subscriber.acknowledged, sequence)
             self._gc_acknowledged_tombstones()
+            self._publish_health(True)
 
     def _gc_acknowledged_tombstones(self) -> None:
         subscribers = tuple(
@@ -771,6 +594,11 @@ class TracePatchTransport:
             "facet_id": item.facet_id, "owner_entity_id": item.owner_entity_id,
             "owner_epoch": item.owner_epoch, "value": item.value,
             "revision": item.revision,
+            "observer_meta": item.observer_meta,
+            "source_entity_id": item.source_entity_id,
+            "source_epoch": item.source_epoch,
+            "source_revision": item.source_revision,
+            "source_order": item.source_order,
         }
 
     @staticmethod

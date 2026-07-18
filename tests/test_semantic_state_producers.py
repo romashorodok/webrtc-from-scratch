@@ -17,6 +17,13 @@ def _facets(runtime: Runtime, owner: str) -> dict[str, object]:
     }
 
 
+def _facet_snapshots(runtime: Runtime, owner: str):
+    return [
+        item for item in runtime.projection.facets.snapshots()
+        if item.owner_entity_id == owner
+    ]
+
+
 def test_production_worker_lane_and_packet_queue_publish_live_state():
     async def scenario():
         async with Runtime(scope_id="scope", max_workers=1) as runtime:
@@ -32,26 +39,32 @@ def test_production_worker_lane_and_packet_queue_publish_live_state():
             waiting = asyncio.create_task(runtime.worker_lane.run(lambda: None))
             await asyncio.sleep(0)
 
-            lane_owner = f"worker:scope:{runtime.worker_lane.observability_id}"
+            lane_owner = runtime._worker_entity_id
             lane = _facets(runtime, lane_owner)
-            assert lane == {
-                "queued": 1, "running": True, "lane_kind": "serialized",
-            }
+            assert lane["queued"] == 0
+            assert lane["running"] >= 1
+            assert lane["lane_kind"] == "concurrent"
+            assert {item.observer_meta for item in _facet_snapshots(runtime, lane_owner)} == {"exact"}
 
             queue = Interceptor(maxsize=2, queue_id="test-packets")
             queue.put_nowait(Packet(Address("127.0.0.1", 9), b"one"))
             queue.put_nowait(Packet(Address("127.0.0.1", 9), b"two"))
             await queue.get()
             queue_owner = f"queue:scope:{queue.observability_id}"
-            assert _facets(runtime, queue_owner) == {
-                "depth": 1, "high_water": 2, "queue_kind": "test-packets",
-            }
+            queue_facets = _facets(runtime, queue_owner)
+            assert queue_facets["depth"] == 1
+            assert queue_facets["high_water"] == 2
+            assert queue_facets["queue_kind"] == "test-packets"
+            assert {item.observer_meta for item in _facet_snapshots(runtime, queue_owner)} == {"exact"}
 
             release.set()
             await asyncio.gather(running, waiting)
-            assert _facets(runtime, lane_owner) == {
-                "queued": 0, "running": False, "lane_kind": "serialized",
-            }
+            while _facets(runtime, lane_owner).get("running") != 0:
+                await asyncio.sleep(0)
+            lane = _facets(runtime, lane_owner)
+            assert lane["queued"] == lane["running"] == 0
+            assert lane["lane_kind"] == "concurrent"
+            await queue.aclose()
 
     asyncio.run(scenario())
 
@@ -129,31 +142,26 @@ def test_peer_sendonly_transceiver_and_tracing_health_use_production_paths():
     async def scenario():
         async with Runtime(scope_id="scope", trace_patch_cadence=60) as runtime:
             peer = PeerConnection()
-            initial = _facets(runtime, "peer:scope")
-            assert initial == {
-                "lifecycle": "new", "signaling": "stable", "connection": "new",
-            }
+            assert runtime.projection.machines.get("peer:scope") is None
+            assert peer._peer_runner.snapshot().state == "new"
 
             transceiver = await peer.add_transceiver_from_kind(
                 RTPCodecKind.Audio, RTPTransceiverDirection.Sendonly
             )
-            owner = f"transceiver:scope:{transceiver.observability_id}"
-            assert _facets(runtime, owner) == {
-                "direction": "sendonly", "active": True, "lifecycle": "active",
-            }
-            media_owner = f"media:scope:{transceiver.observability_id}"
-            assert _facets(runtime, media_owner)["direction"] == "sendonly"
+            owner = transceiver.entity_id
+            facets = _facets(runtime, owner)
+            assert facets["direction"] == "sendonly"
+            assert facets["active"] is True
+            assert {item.observer_meta for item in _facet_snapshots(runtime, owner)} == {"exact"}
 
             second = await peer.add_transceiver_from_kind(
                 RTPCodecKind.Audio, RTPTransceiverDirection.Sendonly
             )
-            second_owner = f"transceiver:scope:{second.observability_id}"
-            second_media_owner = f"media:scope:{second.observability_id}"
+            second_owner = second.entity_id
             assert transceiver.observability_id.endswith(":transceiver-1")
             assert second.observability_id.endswith(":transceiver-2")
             assert second_owner != owner
             assert _facets(runtime, second_owner)["direction"] == "sendonly"
-            assert _facets(runtime, second_media_owner)["active"] is True
 
             another_peer = PeerConnection()
             cross_peer = await another_peer.add_transceiver_from_kind(
@@ -162,32 +170,34 @@ def test_peer_sendonly_transceiver_and_tracing_health_use_production_paths():
             assert cross_peer.observability_id.endswith(":transceiver-1")
             assert cross_peer.observability_id != transceiver.observability_id
             assert _facets(
-                runtime, f"transceiver:scope:{cross_peer.observability_id}"
+                runtime, cross_peer.entity_id
             )["active"] is True
 
             subscription = runtime.trace_patch_subscribe(maxsize=4)
             await subscription.get()
-            assert _facets(runtime, "tracing:scope") == {
-                "admitted": True, "subscriber_count": 1, "journal_depth": 0,
-                "dispatcher_drops": 0, "dispatcher_observer_failures": 0,
-            }
+            assert _facets(runtime, runtime._observability_entity_id)[
+                "subscriber_count"
+            ] == 1
             subscription.close()
-            assert _facets(runtime, "tracing:scope")["subscriber_count"] == 0
+            assert _facets(runtime, runtime._observability_entity_id)[
+                "subscriber_count"
+            ] == 0
 
             transceiver.stop()
-            assert _facets(runtime, owner)["lifecycle"] == "stopped"
-            assert _facets(runtime, media_owner)["lifecycle"] == "ended"
-            assert _facets(runtime, second_owner)["lifecycle"] == "active"
+            while transceiver._runner.snapshot().state != "stopped":
+                await asyncio.sleep(0)
+            assert runtime.projection.machines.get(owner).state == "stopped"
+            assert runtime.projection.machines.get(second_owner).state == "active"
             stopped_revisions = {
                 item.facet_id: item.revision
                 for item in runtime.projection.facets.snapshots()
-                if item.owner_entity_id in {owner, media_owner}
+                if item.owner_entity_id == owner
             }
             transceiver.stop()
             assert {
                 item.facet_id: item.revision
                 for item in runtime.projection.facets.snapshots()
-                if item.owner_entity_id in {owner, media_owner}
+                if item.owner_entity_id == owner
             } == stopped_revisions
 
     asyncio.run(scenario())

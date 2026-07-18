@@ -50,7 +50,6 @@ def make_agent_wait_subject(*, gathering_complete=False, pair_state=None, nomina
 @pytest.mark.parametrize(
     "condition,kwargs",
     [
-        (ICECondition.GATHERING_COMPLETE, {"gathering_complete": True}),
         (
             ICECondition.CANDIDATE_PAIR_SUCCEEDED,
             {"pair_state": CandidatePairState.SUCCEEDED},
@@ -63,6 +62,15 @@ def test_agent_wait_conditions(condition, kwargs):
     async def scenario():
         agent = make_agent_wait_subject(**kwargs)
         await agent.wait(condition, timeout=0.05)
+
+    asyncio.run(scenario())
+
+
+def test_agent_rejects_gatherer_owned_completion_condition():
+    async def scenario():
+        agent = make_agent_wait_subject(gathering_complete=True)
+        with pytest.raises(ValueError, match="owned by ICEGatherer"):
+            await agent.wait(ICECondition.GATHERING_COMPLETE, timeout=0.05)
 
     asyncio.run(scenario())
 
@@ -117,6 +125,10 @@ def make_dtls_wait_subject(*, handshake=False, rtp=False, rtcp=False):
     transport._DTLSTransport__srtp_rtcp_lock = asyncio.Event()
     transport._srtp_rtp = object() if rtp else None
     transport._srtp_rtcp = object() if rtcp else None
+    state = "connected" if handshake else "connecting"
+    transport._runner = SimpleNamespace(
+        snapshot=lambda: SimpleNamespace(state=state)
+    )
     if handshake:
         transport._DTLSTransport__handshake_complete.set()
     if rtp:
@@ -195,9 +207,9 @@ def test_peer_connection_wait_nominated_transport_ready():
         pc = PeerConnection.__new__(PeerConnection)
         pc.gatherer = FakeWaiter()
         pc._dtls_transport = FakeWaiter()
-        pc._transport_ready = asyncio.Event()
-
-        pc._transport_ready.set()
+        pc._ice_transport = SimpleNamespace(
+            selected_snapshot=lambda: (1, object(), None)
+        )
         await pc.wait(PeerCondition.NOMINATED_TRANSPORT_READY, timeout=0.05)
 
     asyncio.run(scenario())

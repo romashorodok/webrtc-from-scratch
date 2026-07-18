@@ -114,7 +114,6 @@ class Flight6(FlightTransition):
 
             # Use Python PRF implementation instead of native
             verifying_data = verify_data_server(state.master_secret, verify)
-            print(f"[Flight6] server verifying_data: {binascii.hexlify(verifying_data).decode()}")
         except Exception as e:
             print(f"[Flight6] generate error: {e}")
             import traceback

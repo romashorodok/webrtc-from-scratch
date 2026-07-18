@@ -100,8 +100,8 @@ def test_owner_epoch_cleanup_is_indexed_and_tombstones_are_checkpoint_bounded():
 
 def test_facets_are_epoch_revisioned_and_controls_are_explicit():
     facets = FacetStore(runtime_epoch=99)
-    newest = FacetOp("queue", "peer", 2, 5, 2, ProducerDot(99, 1, 2))
-    stale = FacetOp("queue", "peer", 2, 4, 1, ProducerDot(99, 1, 1))
+    newest = FacetOp("queue", "peer", 2, 5, 2, ProducerDot(99, 1, 2), "aggregate", "peer", 2, 2, 2)
+    stale = FacetOp("queue", "peer", 2, 4, 1, ProducerDot(99, 1, 1), "aggregate", "peer", 2, 1, 1)
     assert facets.apply(newest)
     assert not facets.apply(stale)
     assert facets.snapshots()[0].value == 5
@@ -159,10 +159,12 @@ def test_removed_facet_and_control_owner_epochs_reject_late_resurrection():
     facets = FacetStore(runtime_epoch=99)
     facets.remove_owner("peer", 2)
     assert not facets.apply(FacetOp(
-        "peer.ready", "peer", 2, True, 1, ProducerDot(99, 1, 1)
+        "peer.ready", "peer", 2, True, 1, ProducerDot(99, 1, 1),
+        "aggregate", "peer", 2, 1, 1,
     ))
     assert facets.apply(FacetOp(
-        "peer.ready", "peer", 3, True, 1, ProducerDot(99, 1, 2)
+        "peer.ready", "peer", 3, True, 1, ProducerDot(99, 1, 2),
+        "aggregate", "peer", 3, 1, 1,
     ))
 
     controls = ControlHandleStore()

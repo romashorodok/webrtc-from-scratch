@@ -30,7 +30,6 @@ from .performance_summary import (
     check_required_events,
     check_smoke_thresholds,
 )
-from .service import TraceService, TraceSubscription
 from .events import JournalSubscription, JournalSubscriber, TracePatchTransport
 from webrtc.performance import (
     CallInfo, CaptureMetricSink, ErrorInfo, MetricEvent,
@@ -64,8 +63,6 @@ __all__ = [
     "PerformanceRecorder",
     "TaskTrace",
     "TraceNode",
-    "TraceService",
-    "TraceSubscription",
     "JournalSubscription",
     "JournalSubscriber",
     "TracePatchTransport",

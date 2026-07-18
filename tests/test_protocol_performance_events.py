@@ -1,8 +1,10 @@
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 import webrtc_rs
 
+from webrtc import Runtime
 from webrtc.dtls.dtlstransport import DTLSLocal, DTLSTransport, DTLSRole
 from webrtc.ice.agent import Agent, AgentOptions
 from webrtc.ice.candidate_base import CandidateBase
@@ -31,7 +33,11 @@ class _FakeTransport:
 
 
 class _FakeSrtpSession:
-    pass
+    async def wait_ready(self):
+        return None
+
+    async def close(self):
+        return None
 
 
 def _event_names(recorder: PerformanceRecorder) -> list[str]:
@@ -48,9 +54,20 @@ def test_sdp_create_and_set_description_events_are_decorated(monkeypatch):
 
         monkeypatch.setattr(pc, "_generate_unmatched_sdp", generate_unmatched_sdp)
 
-        with use_performance_recorder(recorder):
-            desc = await pc.create_offer()
-            await pc.set_local_description(SessionDescriptionType.Offer, desc)
+        async with Runtime(scope_id="sdp-performance") as runtime:
+            pc._execution_scope = runtime
+            pc._ensure_machine_owners(runtime)
+            with use_performance_recorder(recorder):
+                desc = await pc.create_offer()
+                await pc.set_local_description(SessionDescriptionType.Offer, desc)
+            # This decorator-only subject never starts peer resources. Stop the
+            # two explicitly owned runners without invoking protocol cleanup.
+            for handle in pc._machine_handles:
+                handle.cancel()
+            await asyncio.gather(
+                *(handle.wait() for handle in pc._machine_handles),
+                return_exceptions=True,
+            )
 
         assert _event_names(recorder) == [
             "sdp.create_offer.started",
@@ -64,7 +81,7 @@ def test_sdp_create_and_set_description_events_are_decorated(monkeypatch):
 
 def test_ice_gather_and_candidate_events_are_emitted():
     async def scenario():
-        agent = Agent(AgentOptions([], _FakeUDP(), []))
+        agent = Agent(AgentOptions([], _FakeUDP(), []), owner=SimpleNamespace())
         candidate = CandidateBase()
         candidate.set_address("127.0.0.1")
         candidate.set_port(5000)
@@ -94,7 +111,7 @@ def test_dtls_start_failure_and_record_tx_events_are_emitted():
         with use_performance_recorder(recorder):
             transport = DTLSTransport(certificate=webrtc_rs.Certificate())
             with pytest.raises(RuntimeError):
-                transport.start(DTLSRole.Client)
+                await transport.start(DTLSRole.Client)
             await DTLSLocal(_FakeTransport()).sendto(b"not-a-dtls-record")
 
         names = _event_names(recorder)
@@ -112,7 +129,6 @@ def test_dtls_start_failure_and_record_tx_events_are_emitted():
 
 def test_srtp_ready_events_are_decorated(monkeypatch):
     async def scenario():
-        transport = DTLSTransport(certificate=webrtc_rs.Certificate())
         keys = type(
             "Keys",
             (),
@@ -123,39 +139,35 @@ def test_srtp_ready_events_are_decorated(monkeypatch):
                 "server_write_salt": b"s" * 14,
             },
         )()
-        transport._srtp_keying_material = keys
         recorder = PerformanceRecorder()
-        from webrtc.domain_events import SrtpSessionReady, get_domain_event_dispatcher
-        captured = []
-        observer = type("Observer", (), {"on_domain_event": lambda self, event: captured.append(event)})()
-        dispatcher = get_domain_event_dispatcher()
-        dispatcher.observers.append(observer)
-
         monkeypatch.setattr(
             "webrtc.dtls.dtlstransport.SrtpSession.from_keying_material",
             lambda **kwargs: _FakeSrtpSession(),
         )
 
-        try:
-            with use_performance_recorder(recorder):
-                from webrtc import Runtime
-                async with Runtime(scope_id="protocol-performance"):
-                    await transport._init_srtp(is_client=True)
-        finally:
-            dispatcher.observers.remove(observer)
+        with use_performance_recorder(recorder):
+            async with Runtime(scope_id="protocol-performance"):
+                transport = DTLSTransport(certificate=webrtc_rs.Certificate())
+                transport._srtp_keying_material = keys
+                await transport._init_srtp(is_client=True)
+                assert transport._srtp_rtp is not None
+                assert transport._srtp_rtcp is not None
+                await transport.aclose()
 
         assert _event_names(recorder)[:2] == [
             "srtp.ready.started",
             "srtp.ready.completed",
         ]
-        assert [event.protocol for event in captured if isinstance(event, SrtpSessionReady)] == ["rtp", "rtcp"]
 
     asyncio.run(scenario())
 
 
 def test_peer_connection_public_media_send_helpers_wait_trace_and_preserve_order(monkeypatch):
     async def scenario():
+        runtime = Runtime(scope_id="protocol-media-send")
+        await runtime.__aenter__()
         pc = PeerConnection()
+        pc._ensure_machine_owners(runtime)
         sent: list[tuple[str, bytes]] = []
         readiness_waits = 0
 
@@ -171,7 +183,10 @@ def test_peer_connection_public_media_send_helpers_wait_trace_and_preserve_order
             sent.append(("rtcp", data))
             return len(data)
 
-        pc._transport_ready.set()
+        monkeypatch.setattr(
+            pc._ice_transport, "selected_snapshot",
+            lambda: (1, object(), None),
+        )
         monkeypatch.setattr(pc._dtls_transport, "wait", wait_for_srtp)
         monkeypatch.setattr(pc._dtls_transport, "write_rtp_bytes", write_rtp)
         monkeypatch.setattr(pc._dtls_transport, "write_rtcp_bytes", write_rtcp)
@@ -190,7 +205,7 @@ def test_peer_connection_public_media_send_helpers_wait_trace_and_preserve_order
             ("rtp", b"third"),
             ("rtcp", b"rtcp"),
         ]
-        # A burst waits once, then keeps its lock for the ordered send sequence.
+        # Each request waits once; packets within one immutable burst stay ordered.
         assert readiness_waits == 3
         assert _event_names(recorder) == [
             "rtp.packet.send.started",
@@ -204,7 +219,14 @@ def test_peer_connection_public_media_send_helpers_wait_trace_and_preserve_order
         ]
         completed = [event for event in recorder.events() if event.name.endswith(".completed")]
         assert completed[0].metadata["counter.rtp.packets_sent"] == 1
-        assert dict(completed[-1].metadata) == {
+        assert {
+            key: completed[-1].metadata[key]
+            for key in (
+                "flow_direction", "packet_kind", "plaintext_size_bytes",
+                "packet_count", "feedback_type", "counter.rtcp.feedback_sent",
+                "operation_id",
+            )
+        } == {
             "flow_direction": "tx",
             "packet_kind": "rtcp",
             "plaintext_size_bytes": 4,
@@ -213,13 +235,18 @@ def test_peer_connection_public_media_send_helpers_wait_trace_and_preserve_order
             "counter.rtcp.feedback_sent": 1,
             "operation_id": completed[-1].metadata["operation_id"],
         }
+        await pc.aclose()
+        await runtime.__aexit__(None, None, None)
 
     asyncio.run(scenario())
 
 
 def test_peer_connection_public_media_send_reports_failures(monkeypatch):
     async def scenario():
+        runtime = Runtime(scope_id="protocol-media-send-failure")
+        await runtime.__aenter__()
         pc = PeerConnection()
+        pc._ensure_machine_owners(runtime)
 
         async def ready(*_args, **_kwargs):
             return None
@@ -227,7 +254,10 @@ def test_peer_connection_public_media_send_reports_failures(monkeypatch):
         async def failed_send(_data):
             return 0
 
-        pc._transport_ready.set()
+        monkeypatch.setattr(
+            pc._ice_transport, "selected_snapshot",
+            lambda: (1, object(), None),
+        )
         monkeypatch.setattr(pc._dtls_transport, "wait", ready)
         monkeypatch.setattr(pc._dtls_transport, "write_rtp_bytes", failed_send)
         recorder = PerformanceRecorder()
@@ -242,5 +272,7 @@ def test_peer_connection_public_media_send_reports_failures(monkeypatch):
         failure = recorder.events()[-1]
         assert failure.metadata["counter.rtp.packets_send_failed"] == 1
         assert failure.metadata["exception_class"] == "RuntimeError"
+        await pc.aclose()
+        await runtime.__aexit__(None, None, None)
 
     asyncio.run(scenario())

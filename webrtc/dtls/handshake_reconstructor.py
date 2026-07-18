@@ -10,6 +10,14 @@ from webrtc.dtls.dtls_record import (
     RecordLayer,
 )
 
+MAX_FRAGMENTED_HANDSHAKES = 32
+MAX_FRAGMENT_BYTES = 256 * 1024
+MAX_HANDSHAKE_MESSAGE_BYTES = 64 * 1024
+
+
+class HandshakeReconstructionOverflow(RuntimeError):
+    """Hostile or malformed fragmentation exceeded a fixed ingress budget."""
+
 
 class _RawHandshakeContent:
     content_type = ContentType.HANDSHAKE
@@ -34,6 +42,7 @@ class HandshakeReconstructor:
             tuple[HandshakeMessageType, int, int],
             dict[int, bytes],
         ] = {}
+        self._fragment_bytes = 0
 
     def complete(
         self, record: RecordLayer, raw: bytes
@@ -88,14 +97,37 @@ class HandshakeReconstructor:
     def _complete_fragmented(
         self, record: RecordLayer, handshake: Handshake
     ) -> tuple[RecordLayer, bytes] | None:
-        fragments = self._fragments.setdefault(self._key(handshake), {})
-        fragments[handshake.header.fragment_offset] = handshake.message.marshal()
+        header = handshake.header
+        payload = handshake.message.marshal()
+        if header.length > MAX_HANDSHAKE_MESSAGE_BYTES:
+            raise HandshakeReconstructionOverflow(
+                "DTLS handshake message exceeds reconstruction limit"
+            )
+        if header.fragment_offset < 0 or header.fragment_offset + len(payload) > header.length:
+            raise ValueError("DTLS handshake fragment lies outside declared message")
+        key = self._key(handshake)
+        if key not in self._fragments and len(self._fragments) >= MAX_FRAGMENTED_HANDSHAKES:
+            raise HandshakeReconstructionOverflow(
+                "too many fragmented DTLS handshakes are pending"
+            )
+        fragments = self._fragments.setdefault(key, {})
+        previous = fragments.get(header.fragment_offset)
+        if previous is not None and previous != payload:
+            raise ValueError("conflicting DTLS handshake fragment retransmission")
+        added = 0 if previous is not None else len(payload)
+        if self._fragment_bytes + added > MAX_FRAGMENT_BYTES:
+            raise HandshakeReconstructionOverflow(
+                "DTLS handshake fragment byte budget exceeded"
+            )
+        fragments[header.fragment_offset] = payload
+        self._fragment_bytes += added
 
         payload = self._assemble(handshake, fragments)
         if payload is None:
             return None
 
-        del self._fragments[self._key(handshake)]
+        del self._fragments[key]
+        self._fragment_bytes -= sum(len(fragment) for fragment in fragments.values())
         return self._record_from_handshake(
             record,
             Handshake(

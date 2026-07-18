@@ -17,6 +17,11 @@ from typing import Any
 from .state_machine import MachineSpec
 
 _REJECTED = object()
+_FACET_PROVENANCE_KEYS = frozenset({
+    "observer_meta", "source_entity_id", "source_epoch", "source_revision",
+    "source_order", "observerMeta", "source_machine_entity_id",
+    "source_machine_epoch", "source_machine_revision",
+})
 MAX_TRANSITION_JOURNAL_LIMIT = 4096
 
 
@@ -133,6 +138,7 @@ class MachineStore(_LoopOwned):
         self._seen: set[ProducerDot] = set()
         self._seen_order: deque[ProducerDot] = deque()
         self._pending: dict[str, dict[int, MachineTransitionOp]] = defaultdict(dict)
+        self._removed_owner_epochs: OrderedDict[str, int] = OrderedDict()
         self._invalid_exemplar: MachineTransitionOp | None = None
         self._transitions: deque[MachineTransitionRecord] = deque(
             maxlen=self.transition_limit
@@ -141,6 +147,12 @@ class MachineStore(_LoopOwned):
 
     def register(self, entity_id: str, spec: MachineSpec, *, epoch: int = 1) -> MachineSnapshot:
         self._assert_owner()
+        removed_epoch = self._removed_owner_epochs.get(entity_id, -1)
+        if epoch <= removed_epoch:
+            self.diagnostics["stale_machine_epoch"] += 1
+            raise ValueError(
+                f"machine {entity_id}@{epoch} was already observed-removed"
+            )
         existing = self._records.get(entity_id)
         if existing is None or epoch > existing.epoch:
             existing = _MachineRecord(spec, spec.initial, epoch)
@@ -155,6 +167,10 @@ class MachineStore(_LoopOwned):
             return False
         if op.dot in self._seen:
             self.diagnostics["duplicate_projection_ops"] += 1
+            return False
+        if op.machine_epoch <= self._removed_owner_epochs.get(op.entity_id, -1):
+            self._remember(op.dot)
+            self.diagnostics["stale_machine_epoch"] += 1
             return False
         record = self._records.get(op.entity_id)
         if record is None:
@@ -225,6 +241,22 @@ class MachineStore(_LoopOwned):
         self._changed()
         return True
 
+    def remove_owner(self, entity_id: str, epoch: int) -> bool:
+        """Observed-remove one machine epoch and retain a bounded tombstone."""
+        self._assert_owner()
+        record = self._records.get(entity_id)
+        removed = record is not None and record.epoch == epoch
+        if removed:
+            self._records.pop(entity_id, None)
+        self._pending.pop(entity_id, None)
+        previous = self._removed_owner_epochs.pop(entity_id, -1)
+        self._removed_owner_epochs[entity_id] = max(previous, epoch)
+        while len(self._removed_owner_epochs) > self.seen_limit:
+            self._removed_owner_epochs.popitem(last=False)
+        if removed:
+            self._changed()
+        return removed
+
     def _remember(self, dot: ProducerDot) -> None:
         if dot in self._seen:
             return
@@ -289,6 +321,11 @@ class FacetOp:
     value: str | int | float | bool | None
     revision: int
     dot: ProducerDot
+    observer_meta: str
+    source_entity_id: str
+    source_epoch: int
+    source_revision: int
+    source_order: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,6 +335,11 @@ class FacetSnapshot:
     owner_epoch: int
     value: str | int | float | bool | None
     revision: int
+    observer_meta: str
+    source_entity_id: str
+    source_epoch: int
+    source_revision: int
+    source_order: int
 
 
 class FacetStore(_LoopOwned):
@@ -316,11 +358,27 @@ class FacetStore(_LoopOwned):
 
     def apply(self, op: FacetOp) -> bool:
         self._assert_owner()
-        if self.runtime_epoch is not None and op.dot.runtime_epoch != self.runtime_epoch:
-            self.diagnostics["facet_epoch_mismatch"] += 1
-            return False
         if op.owner_epoch <= self._removed_owner_epochs.get(op.owner_entity_id, -1):
             self.diagnostics["stale_facet_owner_epoch"] += 1
+            return False
+        if op.observer_meta not in {"exact", "coalesced", "aggregate"}:
+            self.diagnostics["invalid_facet_observer_meta"] += 1
+            return False
+        if not isinstance(op.source_order, int) or op.source_order < 1:
+            self.diagnostics["invalid_facet_source_order"] += 1
+            return False
+        if (
+            not isinstance(op.source_entity_id, str) or not op.source_entity_id
+            or not isinstance(op.source_epoch, int) or op.source_epoch < 1
+            or not isinstance(op.source_revision, int) or op.source_revision < 0
+        ):
+            self.diagnostics["invalid_facet_source"] += 1
+            return False
+        if op.observer_meta == "exact" and op.source_revision < 0:
+            self.diagnostics["invalid_exact_facet_source"] += 1
+            return False
+        if self.runtime_epoch is not None and op.dot.runtime_epoch != self.runtime_epoch:
+            self.diagnostics["facet_epoch_mismatch"] += 1
             return False
         value = self._bounded_value(op.facet_id, op.value)
         if value is _REJECTED:
@@ -330,7 +388,9 @@ class FacetStore(_LoopOwned):
             return False
         if value != op.value:
             op = FacetOp(op.facet_id, op.owner_entity_id, op.owner_epoch,
-                         value, op.revision, op.dot)
+                         value, op.revision, op.dot, op.observer_meta,
+                         op.source_entity_id, op.source_epoch,
+                         op.source_revision, op.source_order)
         previous = self._records.get(op.facet_id)
         if previous is not None:
             prior_op, prior = previous
@@ -347,8 +407,11 @@ class FacetStore(_LoopOwned):
                 self.diagnostics["duplicate_projection_ops"] += 1
                 return False
             self._owner_index[(prior.owner_entity_id, prior.owner_epoch)].discard(op.facet_id)
-        snapshot = FacetSnapshot(op.facet_id, op.owner_entity_id, op.owner_epoch,
-                                 op.value, op.revision)
+        snapshot = FacetSnapshot(
+            op.facet_id, op.owner_entity_id, op.owner_epoch, op.value, op.revision,
+            op.observer_meta, op.source_entity_id, op.source_epoch,
+            op.source_revision, op.source_order,
+        )
         self._records[op.facet_id] = (op, snapshot)
         self._owner_index[(op.owner_entity_id, op.owner_epoch)].add(op.facet_id)
         self._changed()
@@ -359,7 +422,7 @@ class FacetStore(_LoopOwned):
         # Readiness is a boolean state, not key material.  The previous broad
         # substring check silently dropped the `srtp_keys_ready` facet and
         # reported a false redaction on every successful DTLS handshake.
-        safe_key_state = key == "srtp_keys_ready" and isinstance(value, bool)
+        safe_key_state = key.endswith("keys_ready") and isinstance(value, bool)
         if not safe_key_state and any(word in key for word in (
             "payload", "sdp", "key", "certificate", "password", "secret",
             "address", "exception", "traceback",
@@ -492,18 +555,93 @@ class ObservabilityService:
         self.controls = ControlHandleStore(diagnostics=self.diagnostics)
         self.activity_groups = activity_groups
         self._facet_revisions: dict[str, int] = defaultdict(int)
+        self._facet_source_order = 0
+        self._pending_facets: dict[
+            str, list[tuple[ProducerDot, dict[str, Any], str, str, int, int, int]]
+        ] = defaultdict(list)
+
+    def new_facet_source_order(self) -> int:
+        """Allocate an order only when a producer explicitly requests one."""
+        self._facet_source_order += 1
+        return self._facet_source_order
 
     def transition(self, operation: MachineTransitionOp) -> None:
         self.machines.apply(operation)
+        machine = self.machines.get(operation.entity_id)
+        if machine is None:
+            return
+        pending = self._pending_facets.get(operation.entity_id, [])
+        self._pending_facets[operation.entity_id] = []
+        for dot, values, meta, source_entity, source_epoch, source_revision, source_order in pending:
+            if source_revision > machine.revision:
+                self._pending_facets[operation.entity_id].append(
+                    (dot, values, meta, source_entity, source_epoch,
+                     source_revision, source_order)
+                )
+            else:
+                self.merge_values(
+                    operation.entity_id, dot, values,
+                    observer_meta=meta, source_entity_id=source_entity,
+                    source_epoch=source_epoch, source_revision=source_revision,
+                    source_order=source_order,
+                )
+        if not self._pending_facets[operation.entity_id]:
+            self._pending_facets.pop(operation.entity_id, None)
 
-    def merge_values(self, entity_id: str, dot: ProducerDot, values) -> None:
+    def merge_values(
+        self, entity_id: str, dot: ProducerDot, values, *,
+        observer_meta: str, source_entity_id: str, source_epoch: int,
+        source_revision: int, source_order: int,
+    ) -> None:
         """Merge a bounded value set as independently revisioned scalar facets."""
+        machine = self.machines.get(entity_id)
+        if observer_meta not in {"exact", "coalesced", "aggregate"}:
+            self.diagnostics["invalid_facet_observer_meta"] += 1
+            return
+        if (
+            not isinstance(source_entity_id, str) or not source_entity_id
+            or not isinstance(source_epoch, int) or source_epoch < 1
+            or not isinstance(source_revision, int) or source_revision < 0
+            or not isinstance(source_order, int) or source_order < 1
+        ):
+            self.diagnostics["invalid_facet_source"] += 1
+            return
+        if observer_meta == "exact" and source_entity_id != entity_id:
+            self.diagnostics["facet_source_entity_mismatch"] += 1
+            return
+        if observer_meta == "exact" and machine is None:
+            self.diagnostics["facet_source_revision_mismatch"] += 1
+            return
+        if machine is not None and source_entity_id == entity_id:
+            if source_epoch != machine.machine_epoch:
+                self.diagnostics["facet_source_epoch_mismatch"] += 1
+                return
+            if source_revision > machine.revision:
+                pending = self._pending_facets[entity_id]
+                if len(pending) >= 64:
+                    pending.pop(0)
+                    self.diagnostics["facet_pending_overflow"] += 1
+                pending.append((
+                    dot, dict(values), observer_meta, source_entity_id,
+                    source_epoch, source_revision, source_order,
+                ))
+                self.diagnostics["facet_future_gap_withheld"] += 1
+                return
+            if observer_meta == "exact" and source_revision < machine.revision:
+                self.diagnostics["facet_stale_source_revision"] += 1
+                return
+        owner_epoch = machine.machine_epoch if machine is not None else 1
         for name, value in values.items():
+            if name in _FACET_PROVENANCE_KEYS:
+                self.diagnostics["facet_provenance_value_rejections"] += 1
+                continue
             facet_id = f"{entity_id}:{name}"
             self._facet_revisions[facet_id] += 1
             self.facets.apply(FacetOp(
-                facet_id, entity_id, 1, value,
+                facet_id, entity_id, owner_epoch, value,
                 self._facet_revisions[facet_id], dot,
+                observer_meta, source_entity_id, source_epoch,
+                source_revision, source_order,
             ))
 
     def remove(self, entity_id: str, epoch: int, dot: ProducerDot) -> None:
@@ -518,14 +656,18 @@ class ObservabilityService:
         self.facets.set_dirty_callback(callback)
         self.controls.set_dirty_callback(callback)
 
-    def terminate_entity_epoch(self, entity_id: str, epoch: int):
+    def terminate_entity_epoch(
+        self, entity_id: str, epoch: int, *, preserve_activity: bool = False
+    ):
         """Snapshot dirty final groups, then remove only directly indexed state."""
         final_groups = ()
         removed_groups = ()
-        if self.activity_groups is not None:
+        if self.activity_groups is not None and not preserve_activity:
             final_groups, removed_groups = self.activity_groups.remove_owner_epoch(
                 entity_id, epoch, flush=True
             )
         removed_facets = self.facets.remove_owner(entity_id, epoch)
         removed_controls = self.controls.remove_owner(entity_id, epoch)
-        return final_groups, removed_groups, removed_facets, removed_controls
+        removed_machine = self.machines.remove_owner(entity_id, epoch)
+        self._pending_facets.pop(entity_id, None)
+        return final_groups, removed_groups, removed_facets, removed_controls, removed_machine

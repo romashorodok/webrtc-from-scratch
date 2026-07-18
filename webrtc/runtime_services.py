@@ -12,7 +12,6 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from threading import RLock
 from types import MappingProxyType
 from typing import Any, Generic, Protocol, TypeAlias, TypeVar, cast, runtime_checkable
 
@@ -30,7 +29,9 @@ class StateFacetSink(Protocol):
 
     def transition(self, operation: Any) -> None: ...
     def merge_values(
-        self, entity_id: str, dot: ProducerDot, values: Mapping[str, Scalar]
+        self, entity_id: str, dot: ProducerDot, values: Mapping[str, Scalar], *,
+        observer_meta: str, source_entity_id: str, source_epoch: int,
+        source_revision: int, source_order: int,
     ) -> None: ...
     def remove(self, entity_id: str, epoch: int, dot: ProducerDot) -> None: ...
 
@@ -61,6 +62,18 @@ class ScopeNotActive(ExecutionScopeError):
 
 
 class ScopeShutdownTimeout(ExecutionScopeError):
+    pass
+
+
+class WrongRuntimeLoop(ExecutionScopeError):
+    pass
+
+
+class UntrackedRuntimeTask(AssertionError):
+    pass
+
+
+class StaleOwnerEpoch(ExecutionScopeError):
     pass
 
 
@@ -168,17 +181,6 @@ class WorkerCallCompleted:
 
 
 @runtime_checkable
-class TraceServiceProtocol(Protocol):
-    def task_started(self, event: TaskStarted) -> None: ...
-    def task_completed(self, event: TaskCompleted) -> None: ...
-    def task_failed(self, event: TaskFailed) -> None: ...
-    def task_cancelled(self, event: TaskCancelled) -> None: ...
-    def node_started(self, event: TraceNodeStarted) -> None: ...
-    def node_completed(self, event: TraceNodeCompleted) -> None: ...
-    def node_cancelability_changed(self, event: TraceNodeCancelabilityChanged) -> None: ...
-
-
-@runtime_checkable
 class MetricSinkProtocol(Protocol):
     def emit(self, event: Any) -> None: ...
 
@@ -188,8 +190,7 @@ class ExecutionScope(Protocol):
     task_scheduler: TaskScheduler
     task_registry: TaskRegistry
     sync_offloader: SyncOffloader
-    worker_lane: SerializedWorkerLane
-    trace_service: TraceServiceProtocol
+    worker_lane: ConcurrentWorkerLane
     metric_sink: MetricSinkProtocol
     activity_groups: Any
     capture_manager: Any
@@ -197,10 +198,12 @@ class ExecutionScope(Protocol):
     transition_controller: Any
     runtime_epoch: int
     observability_epoch: int
+    tracing_enabled: bool
     state: ScopeState
 
     def observe_task_failure(self, event: TaskFailureEvent) -> None: ...
     def new_producer_dot(self) -> ProducerDot: ...
+    def start(self, factory: Callable[[], Awaitable[T]], **kwargs: Any) -> OwnedTaskHandle[T]: ...
 
 
 _execution_context: contextvars.ContextVar[ExecutionContext | None] = contextvars.ContextVar(
@@ -291,73 +294,197 @@ class TaskEntry:
     started_at: float = field(default_factory=time.time)
 
 
+class OwnedTaskHandle(Generic[T]):
+    """Opaque component-facing view of one Runtime-owned task."""
+
+    __slots__ = ("_task", "owner_entity_id", "owner_epoch")
+
+    def __init__(
+        self, task: asyncio.Task[T], *, owner_entity_id: str, owner_epoch: int
+    ) -> None:
+        self._task = task
+        self.owner_entity_id = owner_entity_id
+        self.owner_epoch = owner_epoch
+
+    def cancel(self) -> bool:
+        if self._task.done():
+            return False
+        return self._task.cancel()
+
+    def done(self) -> bool:
+        return self._task.done()
+
+    def cancelled(self) -> bool:
+        return self._task.cancelled()
+
+    @property
+    def status(self) -> str:
+        if not self._task.done():
+            return "running"
+        if self._task.cancelled():
+            return "cancelled"
+        return "failed" if self._task.exception() is not None else "completed"
+
+    async def wait(self) -> T:
+        return await asyncio.shield(self._task)
+
+    def __await__(self):
+        return self.wait().__await__()
+
+
+class OwnedTimerHandle:
+    """Opaque timer handle tied to one entity epoch."""
+
+    __slots__ = ("_handle", "_fired", "owner_entity_id", "owner_epoch")
+
+    def __init__(
+        self, handle: asyncio.TimerHandle, fired: asyncio.Future[bool],
+        *, owner_entity_id: str, owner_epoch: int,
+    ) -> None:
+        self._handle = handle
+        self._fired = fired
+        self.owner_entity_id = owner_entity_id
+        self.owner_epoch = owner_epoch
+
+    def cancel(self) -> bool:
+        if self._handle.cancelled() or self._fired.done():
+            return False
+        self._handle.cancel()
+        self._fired.set_result(False)
+        return True
+
+    def done(self) -> bool:
+        return self._fired.done()
+
+    async def wait(self) -> bool:
+        return await asyncio.shield(self._fired)
+
+
+class OwnedResourceHandle:
+    """Opaque handle for a Runtime-owned resource and its close barrier."""
+
+    __slots__ = (
+        "_close", "_wait_closed", "_closed", "_closing",
+        "owner_entity_id", "owner_epoch", "name",
+    )
+
+    def __init__(
+        self, close: Callable[[], Any], wait_closed: Callable[[], Awaitable[Any]],
+        *, owner_entity_id: str, owner_epoch: int, name: str,
+    ) -> None:
+        self._close = close
+        self._wait_closed = wait_closed
+        self._closed = asyncio.get_running_loop().create_future()
+        self._closing = False
+        self.owner_entity_id = owner_entity_id
+        self.owner_epoch = owner_epoch
+        self.name = name
+
+    def done(self) -> bool:
+        return self._closed.done()
+
+    @property
+    def status(self) -> str:
+        if not self._closing:
+            return "open"
+        if not self._closed.done():
+            return "closing"
+        return "failed" if self._closed.exception() is not None else "closed"
+
+    async def aclose(self) -> None:
+        if self._closing:
+            await asyncio.shield(self._closed)
+            return
+        self._closing = True
+        try:
+            self._close()
+            await self._wait_closed()
+        except BaseException as error:
+            if not self._closed.done():
+                self._closed.set_exception(error)
+                # The active closer raises directly; consume the retained
+                # future exception unless another closer is already awaiting it.
+                self._closed.exception()
+            raise
+        else:
+            if not self._closed.done():
+                self._closed.set_result(None)
+
+    async def wait_closed(self) -> None:
+        await asyncio.shield(self._closed)
+
+
+@dataclass(frozen=True, slots=True)
+class ImmutableWorkerResult(Generic[T]):
+    submission_id: int
+    owner_entity_id: str
+    owner_epoch: int
+    outcome: str
+    value: T | None = None
+    exception: BaseException | None = None
+
+
 class TaskRegistry:
+    """Event-loop-owned task and reconciliation index."""
+
     def __init__(self) -> None:
         self._entries: dict[str, TaskEntry] = {}
         self._children: dict[str, set[str]] = {}
         self._barriers: dict[str, set[asyncio.Future[Any]]] = {}
         self._cancel_blocks: dict[str, tuple[bool, int]] = {}
         self._node_cancellers: dict[str, Callable[[], bool]] = {}
-        self._lock = RLock()
 
     def add(self, entry: TaskEntry) -> None:
-        with self._lock:
-            task_id = entry.context.task_id
-            if task_id in self._entries:
-                raise ValueError(f"task {task_id} is already registered")
-            self._entries[task_id] = entry
-            parent_id = entry.context.parent_task_id
-            if parent_id is not None:
-                self._children.setdefault(parent_id, set()).add(task_id)
+        task_id = entry.context.task_id
+        if task_id in self._entries:
+            raise ValueError(f"task {task_id} is already registered")
+        self._entries[task_id] = entry
+        parent_id = entry.context.parent_task_id
+        if parent_id is not None:
+            self._children.setdefault(parent_id, set()).add(task_id)
 
     def remove(self, task_id: str) -> None:
-        with self._lock:
-            entry = self._entries.pop(task_id, None)
-            if entry is not None and entry.context.parent_task_id is not None:
-                children = self._children.get(entry.context.parent_task_id)
-                if children is not None:
-                    children.discard(task_id)
-                    if not children:
-                        self._children.pop(entry.context.parent_task_id, None)
-            if not self._children.get(task_id):
-                self._children.pop(task_id, None)
-            self._cancel_blocks.pop(task_id, None)
+        entry = self._entries.pop(task_id, None)
+        if entry is not None and entry.context.parent_task_id is not None:
+            children = self._children.get(entry.context.parent_task_id)
+            if children is not None:
+                children.discard(task_id)
+                if not children:
+                    self._children.pop(entry.context.parent_task_id, None)
+        if not self._children.get(task_id):
+            self._children.pop(task_id, None)
+        self._cancel_blocks.pop(task_id, None)
 
     def get(self, task_id: str) -> TaskEntry | None:
-        with self._lock:
-            return self._entries.get(task_id)
+        return self._entries.get(task_id)
 
     def task_ids(self) -> tuple[str, ...]:
-        with self._lock:
-            return tuple(self._entries)
+        return tuple(self._entries)
 
     def child_entries(self, task_id: str) -> tuple[TaskEntry, ...]:
-        with self._lock:
-            return tuple(
-                self._entries[child_id]
-                for child_id in self._children.get(task_id, ())
-                if child_id in self._entries
-            )
+        return tuple(
+            self._entries[child_id]
+            for child_id in self._children.get(task_id, ())
+            if child_id in self._entries
+        )
 
     def descendants(self, task_id: str) -> tuple[TaskEntry, ...]:
         result: list[TaskEntry] = []
         pending = [task_id]
-        with self._lock:
-            while pending:
-                parent_id = pending.pop()
-                for child_id in self._children.get(parent_id, ()):
-                    entry = self._entries.get(child_id)
-                    if entry is not None:
-                        result.append(entry)
-                        pending.append(child_id)
+        while pending:
+            parent_id = pending.pop()
+            for child_id in self._children.get(parent_id, ()):
+                entry = self._entries.get(child_id)
+                if entry is not None:
+                    result.append(entry)
+                    pending.append(child_id)
         return tuple(result)
 
     def can_cancel(self, task_ids: list[str]) -> bool:
-        with self._lock:
-            return all(
-                (entry := self._entries.get(task_id)) is not None and entry.cancelable
-                for task_id in task_ids
-            )
+        return all(
+            (entry := self._entries.get(task_id)) is not None and entry.cancelable
+            for task_id in task_ids
+        )
 
     def cancel(self, task_id: str) -> bool:
         entry = self.get(task_id)
@@ -368,62 +495,53 @@ class TaskRegistry:
         return True
 
     def set_cancelable(self, task_id: str, cancelable: bool) -> None:
-        with self._lock:
-            entry = self._entries.get(task_id)
-            if entry is not None:
-                entry.cancelable = cancelable
+        entry = self._entries.get(task_id)
+        if entry is not None:
+            entry.cancelable = cancelable
 
     def block_cancel(self, task_id: str) -> None:
         """Temporarily make a task non-cancelable, preserving its exact base state."""
-        with self._lock:
-            entry = self._entries.get(task_id)
-            if entry is None:
-                return
-            base, count = self._cancel_blocks.get(task_id, (entry.cancelable, 0))
-            self._cancel_blocks[task_id] = (base, count + 1)
-            entry.cancelable = False
+        entry = self._entries.get(task_id)
+        if entry is None:
+            return
+        base, count = self._cancel_blocks.get(task_id, (entry.cancelable, 0))
+        self._cancel_blocks[task_id] = (base, count + 1)
+        entry.cancelable = False
 
     def unblock_cancel(self, task_id: str) -> None:
-        with self._lock:
-            state = self._cancel_blocks.get(task_id)
-            entry = self._entries.get(task_id)
-            if state is None or entry is None:
-                return
-            base, count = state
-            if count <= 1:
-                self._cancel_blocks.pop(task_id, None)
-                entry.cancelable = base
-            else:
-                self._cancel_blocks[task_id] = (base, count - 1)
+        state = self._cancel_blocks.get(task_id)
+        entry = self._entries.get(task_id)
+        if state is None or entry is None:
+            return
+        base, count = state
+        if count <= 1:
+            self._cancel_blocks.pop(task_id, None)
+            entry.cancelable = base
+        else:
+            self._cancel_blocks[task_id] = (base, count - 1)
 
     def add_barrier(self, task_id: str, barrier: asyncio.Future[Any]) -> None:
-        with self._lock:
-            self._barriers.setdefault(task_id, set()).add(barrier)
+        self._barriers.setdefault(task_id, set()).add(barrier)
         barrier.add_done_callback(lambda done: self.remove_barrier(task_id, done))
 
     def remove_barrier(self, task_id: str, barrier: asyncio.Future[Any]) -> None:
-        with self._lock:
-            barriers = self._barriers.get(task_id)
-            if barriers is not None:
-                barriers.discard(barrier)
-                if not barriers:
-                    self._barriers.pop(task_id, None)
+        barriers = self._barriers.get(task_id)
+        if barriers is not None:
+            barriers.discard(barrier)
+            if not barriers:
+                self._barriers.pop(task_id, None)
 
     def barriers(self, task_id: str) -> tuple[asyncio.Future[Any], ...]:
-        with self._lock:
-            return tuple(self._barriers.get(task_id, ()))
+        return tuple(self._barriers.get(task_id, ()))
 
     def register_node_canceller(self, node_id: str, cancel: Callable[[], bool]) -> None:
-        with self._lock:
-            self._node_cancellers[node_id] = cancel
+        self._node_cancellers[node_id] = cancel
 
     def unregister_node_canceller(self, node_id: str) -> None:
-        with self._lock:
-            self._node_cancellers.pop(node_id, None)
+        self._node_cancellers.pop(node_id, None)
 
     def cancel_node(self, node_id: str) -> bool:
-        with self._lock:
-            cancel = self._node_cancellers.get(node_id)
+        cancel = self._node_cancellers.get(node_id)
         return cancel() if cancel is not None else False
 
 
@@ -443,14 +561,16 @@ class SyncOffloader:
         )
         self.owns_executor = executor is None if owns_executor is None else owns_executor
         self.capacity = max(1, capacity)
-        self._limiter: asyncio.Semaphore | None = None
+        self._credits: asyncio.Queue[None] | None = None
         self._dispatched: set[asyncio.Future[Any]] = set()
         self.closed = False
 
-    def _semaphore(self) -> asyncio.Semaphore:
-        if self._limiter is None:
-            self._limiter = asyncio.Semaphore(self.capacity)
-        return self._limiter
+    def _credit_queue(self) -> asyncio.Queue[None]:
+        if self._credits is None:
+            self._credits = asyncio.Queue(self.capacity)
+            for _ in range(self.capacity):
+                self._credits.put_nowait(None)
+        return self._credits
 
     @property
     def dispatched_count(self) -> int:
@@ -474,8 +594,8 @@ class SyncOffloader:
         loop = asyncio.get_running_loop()
         copied = contextvars.copy_context()
         queued = time.monotonic_ns()
-        limiter = self._semaphore()
-        await limiter.acquire()
+        credits = self._credit_queue()
+        await credits.get()
         future: asyncio.Future[Any] | None = None
         try:
             if self.closed:
@@ -535,15 +655,15 @@ class SyncOffloader:
             )
         except asyncio.CancelledError:
             if future is None or future.done():
-                limiter.release()
+                credits.put_nowait(None)
             else:
-                future.add_done_callback(lambda _future: limiter.release())
+                future.add_done_callback(lambda _future: credits.put_nowait(None))
             raise
         except BaseException:
-            limiter.release()
+            credits.put_nowait(None)
             raise
         else:
-            limiter.release()
+            credits.put_nowait(None)
             return observed
 
     async def wait_for_dispatched(self, timeout: float | None = None) -> None:
@@ -567,33 +687,38 @@ _worker_lane_context: contextvars.ContextVar[object | None] = contextvars.Contex
 )
 
 
-class SerializedWorkerLane:
-    """One logical serialized lane layered over a possibly shared executor."""
+class ConcurrentWorkerLane:
+    """Bounded concurrent Runtime worker lane."""
 
     def __init__(self, offloader: SyncOffloader) -> None:
         self.offloader = offloader
         self._identity = object()
-        self._observability_id = f"serialized:{secrets.token_hex(6)}"
-        self._semaphore = asyncio.Semaphore(1)
-        self._queued: set[asyncio.Task[Any]] = set()
-        self._running = False
+        self._observability_id = f"concurrent:{secrets.token_hex(6)}"
+        self._queued = 0
+        self._running = 0
         self._high_water = 0
-        self.state = ScopeState.ACTIVE
+        self._lifecycle_state: Callable[[], str] = lambda: "idle"
+        self._state_publisher: Callable[..., None] | None = None
+
+    def set_lifecycle_state(self, state: Callable[[], str]) -> None:
+        self._lifecycle_state = state
+
+    def set_state_publisher(self, publisher: Callable[..., None]) -> None:
+        self._state_publisher = publisher
 
     def _publish_state(self) -> None:
-        # Imported lazily because domain_events defines its immutable context
-        # contract in terms of this module.
-        from .domain_events import WorkerLaneStateChanged, emit_domain_event
-
-        emit_domain_event(
-            WorkerLaneStateChanged, lane_id="serialized",
-            lane_instance_id=self._observability_id,
-            queued=len(self._queued), running=self._running,
-        )
+        if self._state_publisher is not None:
+            self._state_publisher(
+                queued=self._queued, running=self._running,
+                high_water=self._high_water,
+            )
 
     @property
     def observability_id(self) -> str:
         return self._observability_id
+
+    def load_snapshot(self) -> tuple[int, int, int]:
+        return self._queued, self._running, self._high_water
 
     def is_current_worker_context(self) -> bool:
         return _worker_lane_context.get() is self._identity
@@ -614,70 +739,35 @@ class SerializedWorkerLane:
         if self.is_current_worker_context():
             started = time.monotonic()
             return fn(*args, **kwargs), 0.0, (time.monotonic() - started) * 1000
-        if self.state is not ScopeState.ACTIVE:
-            raise ScopeNotActive(f"worker lane is {self.state.value}")
+        lifecycle = self._lifecycle_state()
+        if lifecycle in {"closing", "closed"}:
+            raise ScopeNotActive(f"worker lane is {lifecycle}")
 
-        owner = asyncio.current_task()
-        if owner is not None:
-            self._queued.add(owner)
-            self._high_water = max(self._high_water, len(self._queued))
-            self._publish_state()
-        try:
-            await self._semaphore.acquire()
-        finally:
-            if owner is not None:
-                self._queued.discard(owner)
-            self._publish_state()
-        self._running = True
+        self._queued += 1
+        self._high_water = max(self._high_water, self._queued)
         self._publish_state()
-
-        if self.state is not ScopeState.ACTIVE:
-            self._running = False
-            self._publish_state()
-            self._semaphore.release()
-            raise ScopeNotActive(f"worker lane is {self.state.value}")
-
-        async def dispatch() -> tuple[T, float, float]:
-            token = _worker_lane_context.set(self._identity)
-            try:
-                return await self.offloader.run_observed(
-                    fn, *args, on_dispatch=on_dispatch, on_future=on_future,
-                    on_complete=on_complete, **kwargs
-                )
-            finally:
-                _worker_lane_context.reset(token)
-
-        dispatched = asyncio.create_task(dispatch())
         try:
-            result = await asyncio.shield(dispatched)
-        except asyncio.CancelledError:
-            async def release_when_finished() -> None:
-                try:
-                    await dispatched
-                except BaseException:
-                    pass
-                finally:
-                    self._running = False
-                    self._publish_state()
-                    self._semaphore.release()
-
-            asyncio.create_task(release_when_finished())
-            raise
-        else:
-            self._running = False
+            token = _worker_lane_context.set(self._identity)
+            self._queued -= 1
+            self._running += 1
             self._publish_state()
-            self._semaphore.release()
-            return result
+            return await self.offloader.run_observed(
+                fn, *args, on_dispatch=on_dispatch, on_future=on_future,
+                on_complete=on_complete, **kwargs
+            )
+        finally:
+            if 'token' in locals():
+                _worker_lane_context.reset(token)
+                self._running -= 1
+            else:
+                self._queued -= 1
+            self._publish_state()
 
     async def aclose(self, timeout: float | None = None) -> None:
-        if self.state is ScopeState.CLOSED:
+        if self._lifecycle_state() == "closed":
             return
-        self.state = ScopeState.CLOSING
-        for task in tuple(self._queued):
-            task.cancel()
         await self.offloader.wait_for_dispatched(timeout)
-        self.state = ScopeState.CLOSED
-        self._running = False
+        self._running = 0
         self._publish_state()
 
 
@@ -750,7 +840,7 @@ class TaskScheduler:
         cancelable: bool = True,
         failure: FailurePolicy = FailurePolicy.REPORT,
     ) -> asyncio.Task[T]:
-        if self.closed:
+        if self.closed and kind != "reconciliation":
             raise ScopeNotActive("execution scope is closing")
         if not callable(factory):
             raise TypeError("spawn_factory requires a callable coroutine factory")
@@ -847,9 +937,8 @@ class TaskScheduler:
         else:
             outcome = "completed"
 
-        reconciliation = asyncio.create_task(
-            self._reconcile_children(context.task_id, cancel=outcome != "completed"),
-            name=f"{spec.name}:reconcile-children",
+        reconciliation = self._spawn_reconciliation(
+            context, spec, cancel=outcome != "completed"
         )
         try:
             while True:
@@ -883,6 +972,42 @@ class TaskScheduler:
             raise error
         return cast(T, result)
 
+    def _spawn_reconciliation(
+        self, parent: ExecutionContext, parent_spec: TaskSpec, *, cancel: bool
+    ) -> asyncio.Task[None]:
+        """Register the terminal barrier before its coroutine can execute."""
+        context = ExecutionContext(
+            parent.trace_id, uuid.uuid4().hex, parent.task_id, parent.scope_id
+        )
+        spec = TaskSpec(
+            f"{parent_spec.name}:reconcile-children", "reconciliation", {}, False
+        )
+
+        async def reconcile() -> None:
+            token = _execution_context.set(context)
+            self._notify(
+                "task_started",
+                TaskStarted(context, spec.name, spec.kind, {}, False),
+            )
+            try:
+                await self._reconcile_children(parent.task_id, cancel=cancel)
+            except BaseException as error:
+                self._notify("task_failed", TaskFailed(context, error))
+                raise
+            else:
+                self._notify("task_completed", TaskCompleted(context))
+            finally:
+                self.registry.remove(context.task_id)
+                _execution_context.reset(token)
+
+        task = asyncio.get_running_loop().create_task(reconcile(), name=spec.name)
+        try:
+            self.registry.add(TaskEntry(context, task, False, spec))
+        except BaseException:
+            task.cancel()
+            raise
+        return task
+
     def _cancel_descendants(self, task_id: str) -> None:
         for entry in self.registry.descendants(task_id):
             if entry.cancelable and entry.task is not None and not entry.task.done():
@@ -890,7 +1015,11 @@ class TaskScheduler:
 
     async def _reconcile_children(self, task_id: str, *, cancel: bool) -> None:
         while True:
-            children = self.registry.child_entries(task_id)
+            current = asyncio.current_task()
+            children = tuple(
+                entry for entry in self.registry.child_entries(task_id)
+                if entry.task is not current
+            )
             barriers = self.registry.barriers(task_id)
             if not children and not barriers:
                 return

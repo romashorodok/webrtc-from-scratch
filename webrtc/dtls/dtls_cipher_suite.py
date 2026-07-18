@@ -171,15 +171,6 @@ class CipherSuite_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:
 
         self._is_client = client
 
-        print(f"[CipherSuite] client_random={client_random.hex()}")
-        print(f"[CipherSuite] server_random={server_random.hex()}")
-        print(f"[CipherSuite] master_secret={master_secret.hex()}")
-        print(f"[CipherSuite] client_write_key={keys.client_write_key.hex()}")
-        print(f"[CipherSuite] client_write_iv={keys.client_write_iv.hex()}")
-        print(f"[CipherSuite] server_write_key={keys.server_write_key.hex()}")
-        print(f"[CipherSuite] server_write_iv={keys.server_write_iv.hex()}")
-        print(f"[CipherSuite] is_client={client}")
-
         # Use Rust AesGcmCipher - it handles local/remote key assignment internally
         self.gcm = AesGcmCipher(
             keys.client_write_key,
@@ -336,10 +327,7 @@ def prf_verify_data(master_secret: bytes, handshake_bodies: bytes, label: bytes)
     # TODO: dynamic hashfunc
     digest = hashlib.sha256(handshake_bodies).digest()
     seed = label + digest
-    print(f"[prf_verify_data] label={label}, digest={digest.hex()}")
-    print(f"[prf_verify_data] master_secret_len={len(master_secret)}, handshake_bodies_len={len(handshake_bodies)}")
     result = p_hash(master_secret, seed, 12, hashlib.sha256)
-    print(f"[prf_verify_data] result={result.hex()}")
     return result
 
 

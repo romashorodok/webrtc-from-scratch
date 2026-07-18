@@ -1,11 +1,11 @@
 import socket
 import re
 import asyncio
-import inspect
 import hashlib
 import secrets
 import queue
 from datetime import datetime, timedelta
+import time
 
 from dataclasses import dataclass
 from enum import Enum, StrEnum
@@ -26,14 +26,21 @@ from .net.types import (
 )
 from .net.udp_mux import Interceptor, MultiUDPMux
 from .stun_message import stun_message_parse_attrs, stun_message_parse_header
-from webrtc.utils import impl_protocol, AsyncEventEmitter, Handler_T
+from webrtc.utils import impl_protocol
 from webrtc.logger import get_logger, Component
 from webrtc.config import get_config
 from webrtc.performance import ObservedComponent, event_loop, task
-from webrtc.runtime_services import FailurePolicy
-from webrtc.lifecycle import ICECondition, require_timeout, wait_for_event, wait_until
+from webrtc.runtime_services import (
+    FailurePolicy, OwnedTaskHandle, current_execution_scope,
+)
+from webrtc.machine_specs import MACHINE_SPECS
+from webrtc.observability import MachineTransitionOp
+from webrtc.state_machine import (
+    AsyncStateMachineRunner, MachineCommand, PreparedTransition, ReplyPort,
+    TransitionCommit,
+)
+from webrtc.lifecycle import ICECondition, require_timeout, wait_until
 from webrtc.tracing import perf_mark, perf_measured_async
-from webrtc.domain_events import IcePairNominated, emit_domain_event
 
 from .candidate_base import (
     CandidateBase,
@@ -55,7 +62,7 @@ def _observable_pair_id_value(pair_id: str) -> str:
 
 def _observable_pair_id(pair: "CandidatePair") -> str:
     """Return stable nomination identity without exposing candidate addresses."""
-    return _observable_pair_id_value(pair.get_pair_id())
+    return _observable_pair_id_value(pair.entity_id)
 
 
 @dataclass
@@ -71,6 +78,32 @@ class CandidatePairState(Enum):
     INPROGRESS = 2
     FAILED = 3
     SUCCEEDED = 4
+
+
+class _PairCommand(StrEnum):
+    WAIT = "wait"
+    CHECK = "check"
+    SUCCEED = "succeed"
+    NOMINATE = "nominate"
+    FAIL = "fail"
+    CLOSE = "close"
+
+
+class _CandidatePairRunner(
+    AsyncStateMachineRunner[MachineCommand[object, TransitionCommit]]
+):
+    async def step(self, command: MachineCommand[object, TransitionCommit]):
+        proposed = {
+            _PairCommand.WAIT: "waiting", _PairCommand.CHECK: "in-progress",
+            _PairCommand.SUCCEED: "succeeded", _PairCommand.NOMINATE: "nominated",
+            _PairCommand.FAIL: "failed", _PairCommand.CLOSE: "closed",
+        }.get(command.kind)
+        if proposed is None:
+            raise ValueError(f"unsupported candidate-pair command: {command.kind}")
+        return PreparedTransition(
+            self.snapshot().state, proposed, command.payload, command.cause_id,
+            command.expected_epoch, command.expected_revision,
+        )
 
 
 class CandidatePair:
@@ -92,7 +125,64 @@ class CandidatePair:
         self._local = local
         self._remote = remote
         self._nominate_on_binding = nominate_on_binding
-        self._state = CandidatePairState.UNSET
+        self._success_commit: TransitionCommit | None = None
+        self._nomination_commit: TransitionCommit | None = None
+        self._runtime = current_execution_scope()
+        root = getattr(self._runtime, "root_context", None)
+        identity = getattr(self._runtime, "scope_id", None) or getattr(root, "trace_id", None)
+        raw_pair_key = (
+            f"{self.local_candidate.unwrap.to_ice_str()}:"
+            f"{self.remote_candidate.unwrap.to_ice_str()}"
+        )
+        self.entity_id = (
+            f"candidate-pair:{identity or id(self)}:"
+            f"{_observable_pair_id_value(raw_pair_key)}"
+        )
+        self._command_id = 0
+        self._runner = _CandidatePairRunner(
+            MACHINE_SPECS["candidate-pair"], entity_id=self.entity_id,
+            mailbox_capacity=8,
+            controller=getattr(self._runtime, "transition_controller", None),
+            transition_sink=self._project_transition,
+        )
+        projection = getattr(self._runtime, "projection", None)
+        if projection is not None:
+            projection.machines.register(
+                self.entity_id, MACHINE_SPECS["candidate-pair"]
+            )
+        if hasattr(self._runtime, "start_machine"):
+            self._runtime.register_owner(self.entity_id, epoch=self._runner.epoch)
+            self._machine_handle = self._runtime.start_machine(
+                self._runner, owner_entity_id=self.entity_id,
+                owner_epoch=self._runner.epoch,
+            )
+            self._submit(_PairCommand.WAIT)
+        else:
+            self._machine_handle = None
+
+    def _project_transition(self, commit: TransitionCommit) -> None:
+        if commit.to_state == "succeeded":
+            self._success_commit = commit
+        elif commit.to_state == "nominated":
+            self._nomination_commit = commit
+        if self._runtime is None or not getattr(self._runtime, "tracing_enabled", True):
+            return
+        self._runtime.projection.machines.apply(MachineTransitionOp(
+            commit.entity_id, commit.machine_type, commit.from_state, commit.to_state,
+            commit.epoch, commit.revision, self._runtime.new_producer_dot(),
+            commit.cause, commit.monotonic_ns,
+        ))
+
+    def _submit(
+        self, kind: _PairCommand, *, cause_id: object | None = None,
+        reply: ReplyPort[TransitionCommit] | None = None,
+    ) -> None:
+        self._command_id += 1
+        self._runner.try_submit(MachineCommand(
+            kind, self._command_id, self._runner.epoch, None, reply,
+            expected_revision=None,
+            cause_id=cause_id or f"{self.entity_id}:{self._command_id}",
+        ))
 
     # TODO: this should handle two candidate stun/rtp|rtcp inbound/outbound
     # But connection to send must be in remote candidate may be introduce:
@@ -116,21 +206,58 @@ class CandidatePair:
 
         return (1 << 32 - 1) * min(g, d) + 2 * max(g, d) + cmp(g, d)
 
-    def get_pair_id(self) -> str:
-        return (
-            f"{self.local_candidate.unwrap.to_ice_str()}"
-            ":"
-            f"{self.remote_candidate.unwrap.to_ice_str()}"
-        )
-
     @property
     def state(self) -> CandidatePairState:
-        """The state property."""
-        return self._state
+        """Compatibility projection of the authoritative runner snapshot."""
+        return {
+            "frozen": CandidatePairState.UNSET,
+            "waiting": CandidatePairState.WAITING,
+            "in-progress": CandidatePairState.INPROGRESS,
+            "succeeded": CandidatePairState.SUCCEEDED,
+            "nominated": CandidatePairState.SUCCEEDED,
+            "failed": CandidatePairState.FAILED,
+            "closed": CandidatePairState.FAILED,
+        }[self._runner.snapshot().state]
 
-    @state.setter
-    def state(self, value: CandidatePairState):
-        self._state = value
+    async def mark_succeeded(self, cause_id: object) -> TransitionCommit:
+        state = self._runner.snapshot().state
+        if state == "succeeded":
+            if self._success_commit is None:
+                raise RuntimeError("pair success provenance is unavailable")
+            return self._success_commit
+        if state in {"frozen", "waiting"}:
+            checked = ReplyPort[TransitionCommit]()
+            self._submit(_PairCommand.CHECK, cause_id=cause_id, reply=checked)
+            await checked.wait()
+        reply = ReplyPort[TransitionCommit]()
+        self._submit(_PairCommand.SUCCEED, cause_id=cause_id, reply=reply)
+        return await reply.wait()
+
+    async def mark_nominated(self, success: TransitionCommit) -> TransitionCommit:
+        if (
+            success.entity_id != self.entity_id
+            or success.machine_type != "candidate-pair"
+            or success.to_state != "succeeded"
+            or success.revision != self._runner.snapshot().revision
+        ):
+            raise RuntimeError("nomination requires the exact current pair success commit")
+        reply = ReplyPort[TransitionCommit]()
+        self._submit(_PairCommand.NOMINATE, cause_id=success.cause, reply=reply)
+        return await reply.wait()
+
+    async def mark_failed(self, cause_id: object) -> TransitionCommit:
+        reply = ReplyPort[TransitionCommit]()
+        self._submit(_PairCommand.FAIL, cause_id=cause_id, reply=reply)
+        return await reply.wait()
+
+    async def aclose(self) -> None:
+        if self._machine_handle is None or self._runner.snapshot().terminal:
+            return
+        reply = ReplyPort[TransitionCommit]()
+        self._submit(_PairCommand.CLOSE, reply=reply)
+        await reply.wait()
+        await self._machine_handle.wait()
+        self._runtime.remove_owner(self.entity_id, self._runner.epoch)
 
     @property
     def local_candidate(self) -> LocalCandidate:
@@ -159,8 +286,9 @@ class CandidatePair:
 
 def _candidate_metadata(candidate: CandidateProtocol) -> dict[str, object]:
     return {
-        "address": candidate.address,
-        "port": candidate.port,
+        "candidate_id": "candidate:" + _observable_pair_id_value(
+            candidate.to_ice_str()
+        ),
         "network_type": candidate.get_network_type().value,
         "candidate_type": getattr(candidate, "candidate_type", None),
         "priority": candidate.priority,
@@ -169,13 +297,7 @@ def _candidate_metadata(candidate: CandidateProtocol) -> dict[str, object]:
 
 def _pair_metadata(pair: CandidatePair) -> dict[str, object]:
     return {
-        "pair_id": pair.get_pair_id(),
-        "local_address": pair.local_candidate.unwrap.address,
-        "local_port": pair.local_candidate.unwrap.port,
-        "remote_address": pair.remote_candidate.unwrap.address,
-        "remote_port": pair.remote_candidate.unwrap.port,
-        "local_ufrag": pair.local_ufrag,
-        "remote_ufrag": pair.remote_ufrag,
+        "pair_id": pair.entity_id,
     }
 
 
@@ -184,13 +306,13 @@ class CandidatePairRegistry:
         self._check_list = dict[str, CandidatePair]()
 
     def append(self, pair: CandidatePair):
-        self._check_list[pair.get_pair_id()] = pair
+        self._check_list[pair.entity_id] = pair
 
     def best_pair_priority(self, controlling: bool) -> CandidatePair | None:
         best: CandidatePair | None = None
 
         for _, pair in self._check_list.items():
-            if pair._state != CandidatePairState.SUCCEEDED:
+            if pair.state != CandidatePairState.SUCCEEDED:
                 continue
 
             if best is None:
@@ -211,6 +333,7 @@ class BindingCachedMessage:
     message: stun.Message
     destination: tuple[str, int]
     timestamp: datetime
+    monotonic_timestamp: float = 0.0
     use_candidate_attr: bool = False
 
 
@@ -220,7 +343,6 @@ MAX_BINDING_REQUEST_TIMEOUT = timedelta(milliseconds=4000)
 class BindingRequestCacheRegistry:
     def __init__(self) -> None:
         self._registry = dict[bytes, BindingCachedMessage]()
-        self._lock = asyncio.Lock()
 
     def invalidate_pending_binding_requests(self, filter_time: datetime):
         initial_size = len(self._registry)
@@ -242,15 +364,13 @@ class BindingRequestCacheRegistry:
             )
 
     async def cache_message(self, msg: stun.Message, dst: tuple[str, int]):
-        async with self._lock:
-            self.invalidate_pending_binding_requests(datetime.now())
-
-            cache = BindingCachedMessage(msg, dst, datetime.now())
-
-            if msg.get_attribute(stun.UseCandidate):
-                cache.use_candidate_attr = True
-
-            self._registry[msg.transaction_id] = cache
+        """Cache on the ICE controller loop; no competing writer is permitted."""
+        now = datetime.now()
+        self.invalidate_pending_binding_requests(now)
+        cache = BindingCachedMessage(msg, dst, now, time.monotonic())
+        if msg.get_attribute(stun.UseCandidate):
+            cache.use_candidate_attr = True
+        self._registry[msg.transaction_id] = cache
 
     def get_cache_message(self, transaction_id: bytes) -> BindingCachedMessage | None:
         return self._registry.get(transaction_id)
@@ -295,39 +415,39 @@ class SelectorProtocol(Protocol):
         self, pair: CandidatePair, conn: MuxConnProtocol
     ): ...
 
-    # Part of event emitter
-    def on(
-        self, event: str, f: Handler_T | None = None
-    ) -> Handler_T | Callable[[Handler_T], Handler_T]: ...
-
-    def remove_all_listeners(self, event: str | None = None): ...
+    async def aclose(self): ...
 
 
-@impl_protocol(SelectorProtocol)
-class ControllingSelector(AsyncEventEmitter):
-    def __init__(self, pair_registry: CandidatePairRegistry, tie_breaker: int) -> None:
-        super().__init__()
+class ControllingSelector:
+    def __init__(
+        self, pair_registry: CandidatePairRegistry, tie_breaker: int,
+        nominate: Callable[[CandidatePair], Any] | None = None,
+    ) -> None:
 
         self._nominated_pair: CandidatePair | None = None
         self._start_time: datetime | None = None
         self._pair_registry = pair_registry
         self._tie_breaker = tie_breaker
         self._local_binding_cache = BindingRequestCacheRegistry()
+        self._nominate = nominate
+
+    async def aclose(self) -> None:
+        return None
 
     def start(self):
         self._start_time = datetime.now()
         self._nominated_pair = None
         get_logger().debug(Component.ICE, "Started controlling ICE selector")
 
-    def _set_nominate_pair(self, pair: CandidatePair):
+    async def _set_nominate_pair(self, pair: CandidatePair):
         get_logger().debug(
             Component.ICE,
             "Nominating candidate pair",
-            pair_id=pair.get_pair_id(),
+            pair_id=pair.entity_id,
         )
-        emit_domain_event(IcePairNominated, pair_id=_observable_pair_id(pair))
         self._nominated_pair = pair
-        self.emit(SelectorEvent.NOMINATE, pair)
+        if self._nominate is not None:
+            await self._nominate(pair)
 
     async def _stun_nominate_pair(self, pair: CandidatePair, conn: MuxConnProtocol):
         msg = stun.Message(
@@ -349,8 +469,7 @@ class ControllingSelector(AsyncEventEmitter):
         get_logger().trace(
             Component.ICE,
             "Sending STUN nomination request",
-            local_ufrag=pair.local_ufrag,
-            remote_ufrag=pair.remote_ufrag,
+            pair_id=pair.entity_id,
         )
 
         perf_mark(
@@ -405,11 +524,10 @@ class ControllingSelector(AsyncEventEmitter):
             get_logger().warn(
                 Component.ICE,
                 "Discarding STUN success response with unknown transaction ID",
-                remote_ufrag=pair.remote_ufrag,
-                transaction_id=msg.transaction_id,
+                pair_id=pair.entity_id,
             )
             raise ValueError(
-                f"Discard message from ({pair.remote_ufrag}), unknown transaction_id: {msg.transaction_id}"
+                f"discarded STUN response for {pair.entity_id}: unknown transaction"
             )
 
         transaction_addr, transaction_port = binding_request.destination
@@ -422,20 +540,20 @@ class ControllingSelector(AsyncEventEmitter):
             get_logger().warn(
                 Component.ICE,
                 "Discarding STUN success response from unexpected source",
-                remote_ufrag=pair.remote_ufrag,
-                expected=f"{transaction_addr}:{transaction_port}",
-                actual=f"{source_addr}:{source_port}",
+                pair_id=pair.entity_id,
             )
             raise ValueError(
-                f"Discard message from ({pair.remote_ufrag}), source and transaction does not match expected({transaction_addr}:{transaction_port}), actual({source_addr}:{source_port})"
+                f"discarded STUN response for {pair.entity_id}: unexpected source"
             )
 
-        pair.state = CandidatePairState.SUCCEEDED
+        success = await pair.mark_succeeded(
+            f"{pair.entity_id}:stun-success:{bytes(msg.transaction_id).hex()}"
+        )
         perf_mark("ice", "candidate_pair", "succeeded", metadata=_pair_metadata(pair))
         perf_mark("ice", "stun", "success", metadata={**_pair_metadata(pair), "counter.ice.stun_success": 1})
 
         if binding_request.use_candidate_attr and self._nominated_pair is None:
-            self._set_nominate_pair(pair)
+            await self._set_nominate_pair(pair)
 
     async def send_ping_stun_message(self, pair: CandidatePair, conn: MuxConnProtocol):
         msg = stun.Message(
@@ -462,15 +580,20 @@ class ControllingSelector(AsyncEventEmitter):
         conn.sendto(msg.encode(pair.remote_pwd))
 
 
-@impl_protocol(SelectorProtocol)
-class ControlledSelector(AsyncEventEmitter):
-    def __init__(self, pair_registry: CandidatePairRegistry, tie_breaker: int) -> None:
-        super().__init__()
+class ControlledSelector:
+    def __init__(
+        self, pair_registry: CandidatePairRegistry, tie_breaker: int,
+        nominate: Callable[[CandidatePair], Any] | None = None,
+    ) -> None:
 
         self._pair_registry = pair_registry
         self._tie_breaker = tie_breaker
         self._selected_pair: CandidatePair | None = None
         self._local_binding_cache = BindingRequestCacheRegistry()
+        self._nominate = nominate
+
+    async def aclose(self) -> None:
+        return None
 
     def start(self):
         get_logger().debug(Component.ICE, "Started controlled ICE selector")
@@ -490,7 +613,7 @@ class ControlledSelector(AsyncEventEmitter):
                 get_logger().debug(
                     Component.ICE,
                     "Nominating candidate pair via UseCandidate",
-                    pair_id=pair.get_pair_id(),
+                    pair_id=pair.entity_id,
                 )
                 perf_mark(
                     "ice",
@@ -498,15 +621,18 @@ class ControlledSelector(AsyncEventEmitter):
                     "nominated",
                     metadata=_pair_metadata(pair),
                 )
+                success = await pair.mark_succeeded(
+                    f"{pair.entity_id}:use-candidate:{bytes(msg.transaction_id).hex()}"
+                )
                 self._selected_pair = pair
-                # Emit NOMINATE event to trigger DTLS transport setup
-                self.emit(SelectorEvent.NOMINATE, pair)
+                if self._nominate is not None:
+                    await self._nominate(pair, success)
             elif self._selected_pair != pair:
                 get_logger().debug(
                     Component.ICE,
                     "Ignoring lower-priority nominated candidate pair",
-                    pair_id=pair.get_pair_id(),
-                    selected_pair_id=self._selected_pair.get_pair_id(),
+                    pair_id=pair.entity_id,
+                    selected_pair_id=self._selected_pair.entity_id,
                 )
         else:
             # If the received Binding request triggered a new check to be
@@ -549,7 +675,9 @@ class ControlledSelector(AsyncEventEmitter):
         msg: stun.Message,
         source: Address,
     ):
-        pair.state = CandidatePairState.SUCCEEDED
+        success = await pair.mark_succeeded(
+            f"{pair.entity_id}:stun-success:{bytes(msg.transaction_id).hex()}"
+        )
         perf_mark("ice", "candidate_pair", "succeeded", metadata=_pair_metadata(pair))
         perf_mark("ice", "stun", "success", metadata={**_pair_metadata(pair), "counter.ice.stun_success": 1})
 
@@ -560,7 +688,7 @@ class ControlledSelector(AsyncEventEmitter):
                 get_logger().debug(
                     Component.ICE,
                     "Nominating candidate pair",
-                    pair_id=pair.get_pair_id(),
+                    pair_id=pair.entity_id,
                 )
                 perf_mark(
                     "ice",
@@ -569,14 +697,14 @@ class ControlledSelector(AsyncEventEmitter):
                     metadata=_pair_metadata(pair),
                 )
                 self._selected_pair = pair
-                # Emit NOMINATE event to trigger DTLS transport setup
-                self.emit(SelectorEvent.NOMINATE, pair)
+                if self._nominate is not None:
+                    await self._nominate(pair, success)
             elif self._selected_pair != pair:
                 get_logger().debug(
                     Component.ICE,
                     "Ignoring lower-priority nominated candidate pair",
-                    pair_id=pair.get_pair_id(),
-                    selected_pair_id=self._selected_pair.get_pair_id(),
+                    pair_id=pair.entity_id,
+                    selected_pair_id=self._selected_pair.entity_id,
                 )
 
     async def send_ping_stun_message(self, pair: CandidatePair, conn: MuxConnProtocol):
@@ -614,16 +742,15 @@ async def ping_routine(
 
 
 class CandidatePairTransport:
-    def __init__(self, conn: MuxConnProtocol, *, pair_id: str | None = None) -> None:
+    def __init__(self, conn: MuxConnProtocol, pair: CandidatePair) -> None:
+        if not isinstance(pair, CandidatePair):
+            raise TypeError("pair must be a CandidatePair")
         self._conn: MuxConnProtocol = conn
-        self._pair_id = pair_id
-        self._observability_id = (
-            _observable_pair_id_value(pair_id) if pair_id is not None else None
-        )
-        if pair_id is not None:
-            set_trace_pair_id = getattr(conn, "set_trace_pair_id", None)
-            if set_trace_pair_id is not None:
-                set_trace_pair_id(pair_id)
+        self.pair = pair
+        self.entity_id = pair.entity_id
+        set_trace_pair_id = getattr(conn, "set_trace_pair_id", None)
+        if set_trace_pair_id is not None:
+            set_trace_pair_id(self.entity_id)
 
         # self._rtp = queue.Queue[Packet]()
         # self._rtcp = queue.Queue[Packet]()
@@ -637,17 +764,12 @@ class CandidatePairTransport:
         self._rtcp_count = 0
         self._rtp_count = 0
 
-    @property
-    def observability_id(self) -> str | None:
-        return self._observability_id
-
     def _demux_metadata(self, packet_kind: str, pkt: Packet) -> dict[str, object]:
         metadata: dict[str, object] = {
             "flow_direction": "rx", "packet_kind": packet_kind,
             "size_bytes": len(pkt.data),
         }
-        if self._pair_id is not None:
-            metadata["pair_id"] = self._pair_id
+        metadata["pair_id"] = self.entity_id
         return metadata
 
     def pipe(self, pkt: Packet):
@@ -764,56 +886,217 @@ class CandidatePairTransport:
         # Debug: log first byte to distinguish packet types (RTP starts with 0x80-0x8f)
         self._conn.sendto(data)
 
+    async def aclose(self) -> None:
+        for queue in (self._rtp, self._rtcp, self._dtls):
+            await queue.aclose()
+        closer = getattr(self._conn, "aclose", None)
+        if closer is not None:
+            await closer()
+
 
 class CandidatePairControllerEvent(StrEnum):
     NOMINATE_TRANSPORT = "nominate-transport"
 
 
-class CandidatePairController(AsyncEventEmitter, ObservedComponent):
+class _ControllerCommand(StrEnum):
+    START = "start"
+    CHECK = "check"
+    NOMINATE = "nominate"
+    FORWARD = "forward"
+    FAIL = "fail"
+    CLOSE = "close"
+    STOPPED = "stopped"
+
+
+class _CandidatePairControllerRunner(
+    AsyncStateMachineRunner[MachineCommand[object, TransitionCommit]]
+):
+    def __init__(self, owner: "CandidatePairController", **kwargs: Any) -> None:
+        super().__init__(MACHINE_SPECS["candidate-pair-controller"], **kwargs)
+        self.owner = owner
+
+    async def step(self, command: MachineCommand[object, TransitionCommit]):
+        state = self.snapshot().state
+        if command.kind == _ControllerCommand.START:
+            proposed = "starting"
+        elif command.kind == _ControllerCommand.CHECK:
+            proposed = "checking"
+        elif command.kind == _ControllerCommand.NOMINATE:
+            if state == "nominated":
+                raise RuntimeError("candidate pair controller is already nominated")
+            proposed = "nominated"
+        elif command.kind == _ControllerCommand.FORWARD:
+            proposed = "forwarding"
+        elif command.kind == _ControllerCommand.FAIL:
+            proposed = "failed"
+        elif command.kind == _ControllerCommand.CLOSE:
+            proposed = "stopping"
+        elif command.kind == _ControllerCommand.STOPPED:
+            proposed = "stopped"
+        else:
+            raise ValueError(f"unsupported controller command: {command.kind}")
+        return PreparedTransition(
+            state, proposed, command.payload, command.cause_id,
+            command.expected_epoch, command.expected_revision,
+        )
+
+    async def after_commit(self, commit: TransitionCommit, effects: Any) -> None:
+        if commit.to_state == "starting":
+            self.owner._runner.try_submit(self.owner._command(_ControllerCommand.CHECK))
+        elif commit.to_state == "checking":
+            self.owner._launch_receive_pump()
+        elif commit.to_state == "nominated":
+            await self.owner._publish_nomination(commit, effects)
+            self.owner._runner.try_submit(self.owner._command(
+                _ControllerCommand.FORWARD, cause_id=commit.cause,
+            ))
+        elif commit.to_state == "stopping":
+            await self.owner._reconcile_controller()
+            self.owner._runner.try_submit(self.owner._command(_ControllerCommand.STOPPED))
+        elif commit.to_state == "failed":
+            await self.owner._publish_failure(commit, effects)
+            self.owner._runner.try_submit(self.owner._command(
+                _ControllerCommand.CLOSE, cause_id=commit.cause,
+            ))
+
+
+class CandidatePairController(ObservedComponent):
     def __init__(
-        self, pair: CandidatePair, selector: SelectorProtocol, tie_breaker: int
+        self, pair: CandidatePair, selector: SelectorProtocol, tie_breaker: int,
+        *, owner: "Agent",
     ) -> None:
-        super().__init__()
-
         self._pair = pair
-
         self.__selector = selector
         self.__tie_breaker = tie_breaker
         self.__conn = pair.local_candidate.mux.intercept(
             self._pair.remote_candidate.unwrap
         )
-        self.__transport = CandidatePairTransport(self.__conn, pair_id=pair.get_pair_id())
-        self.__nominated = asyncio.Event()
-        self._task_handle: asyncio.Task[None] | None = None
-        self._close_task: asyncio.Task[None] | None = None
-        self._closing = False
-        self._closed = False
+        self.__transport = CandidatePairTransport(
+            self.__conn, pair,
+        )
+        self._owner = owner
+        self._receive_handle: OwnedTaskHandle[None] | None = None
+        self._command_id = 0
+        scope = current_execution_scope()
+        root = getattr(scope, "root_context", None)
+        identity = (
+            getattr(owner, "entity_id", None)
+            or getattr(scope, "scope_id", None)
+            or getattr(root, "trace_id", None)
+        )
+        self.entity_id = f"candidate-pair-controller:{identity or id(self)}:{_observable_pair_id(pair)}"
+        self._runtime = scope if hasattr(scope, "start_machine") else None
+        self._runner = _CandidatePairControllerRunner(
+            self, entity_id=self.entity_id, mailbox_capacity=32,
+            controller=getattr(scope, "transition_controller", None),
+            transition_sink=self._project_transition,
+        )
+        projection = getattr(scope, "projection", None)
+        if projection is not None:
+            projection.machines.register(
+                self.entity_id, MACHINE_SPECS["candidate-pair-controller"]
+            )
+        if self._runtime is not None:
+            self._runtime.register_owner(self.entity_id, epoch=self._runner.epoch)
+            self._machine_handle = self._runtime.start_machine(
+                self._runner, owner_entity_id=self.entity_id,
+                owner_epoch=self._runner.epoch,
+            )
+            self._owner_removed = False
+        else:
+            self._machine_handle = None
+            self._owner_removed = True
 
     @event_loop
-    def __pair_nominate(self, _: CandidatePair):
-        get_logger().debug(
-            Component.ICE,
-            "Emitting nominated transport",
-            pair_id=self._pair.get_pair_id(),
+    def _project_transition(self, commit: TransitionCommit) -> None:
+        if self._runtime is None or not getattr(self._runtime, "tracing_enabled", True):
+            return
+        self._runtime.projection.machines.apply(MachineTransitionOp(
+            commit.entity_id, commit.machine_type, commit.from_state, commit.to_state,
+            commit.epoch, commit.revision, self._runtime.new_producer_dot(),
+            commit.cause, commit.monotonic_ns,
+        ))
+        self._runtime.projection.merge_values(
+            self.entity_id, self._runtime.new_producer_dot(), {},
+            observer_meta="exact", source_entity_id=commit.entity_id,
+            source_epoch=commit.epoch, source_revision=commit.revision,
+            source_order=self._runtime.projection.new_facet_source_order(),
         )
-        self.__nominated.set()
-        emit_domain_event(
-            IcePairNominated, pair_id=_observable_pair_id(self._pair)
-        )
-        self.emit(CandidatePairControllerEvent.NOMINATE_TRANSPORT, self.__transport)
 
-    @task(
-        name="ice:candidate-pair-controller",
-        kind="ice",
-        state="ice",
-        metadata={"expected_long_running": True, "loop_role": "controller"},
-        failure=FailurePolicy.FAIL_CONNECTION,
-    )
-    async def start(self):
+    async def __pair_nominate(
+        self, pair: CandidatePair, success: TransitionCommit | None = None,
+    ) -> None:
+        if pair is not self._pair or self._runner.snapshot().state != "checking":
+            return
+        if success is None:
+            success = await pair.mark_succeeded(
+                f"{self.entity_id}:connectivity-success"
+            )
+        pair_commit = await pair.mark_nominated(success)
+        self._runner.try_submit(self._command(
+            _ControllerCommand.NOMINATE, pair_commit, cause_id=pair_commit.cause,
+        ))
+
+    async def _publish_nomination(
+        self, commit: TransitionCommit, pair_commit: object,
+    ) -> None:
+        get_logger().debug(
+            Component.ICE, "Committed nominated transport",
+            pair_id=self._pair.entity_id,
+        )
+        if not isinstance(pair_commit, TransitionCommit) or (
+            pair_commit.entity_id != self._pair.entity_id
+            or pair_commit.machine_type != "candidate-pair"
+            or pair_commit.to_state != "nominated"
+            or pair_commit.revision != self._pair._runner.snapshot().revision
+            or pair_commit.cause != commit.cause
+        ):
+            raise RuntimeError("controller nomination lost its exact pair origin")
+        if self._runtime is not None and getattr(self._runtime, "tracing_enabled", True):
+            self._runtime.projection.merge_values(
+                self.entity_id, self._runtime.new_producer_dot(), {
+                    "nominated": True,
+                    "selected_pair_id": self.__transport.entity_id,
+                    "nomination_entity_id": pair_commit.entity_id,
+                    "nomination_revision": pair_commit.revision,
+                },
+                observer_meta="exact", source_entity_id=commit.entity_id,
+                source_epoch=commit.epoch, source_revision=commit.revision,
+                source_order=self._runtime.projection.new_facet_source_order(),
+            )
+        await self._owner._controller_nominated(self.__transport, pair_commit)
+
+    async def _publish_failure(
+        self, commit: TransitionCommit, error: object,
+    ) -> None:
+        # Pair state is a sibling publication.  Its rejection must not prevent
+        # the authoritative controller/agent/public-ICE failure chain.
+        try:
+            await self._pair.mark_failed(commit.cause)
+        except Exception:
+            pass
+        failure = error if isinstance(error, BaseException) else RuntimeError(
+            "candidate pair controller failed"
+        )
+        await self._owner._controller_failed(failure, commit)
+
+    @event_loop
+    def _command(
+        self, kind: _ControllerCommand, payload: object = None,
+        reply: ReplyPort[TransitionCommit] | None = None,
+        cause_id: object | None = None,
+    ) -> MachineCommand[object, TransitionCommit]:
+        self._command_id += 1
+        return MachineCommand(
+            kind, self._command_id, self._runner.epoch, payload, reply,
+            expected_revision=None,
+            cause_id=cause_id or f"{self.entity_id}:{self._command_id}",
+        )
+
+    async def _receive_loop(self):
         self.__selector.start()
-        self.__selector.on(SelectorEvent.NOMINATE, self.__pair_nominate)
         controller_metadata = {
-            "pair_id": self._pair.get_pair_id(), "flow_direction": "rx",
+            "pair_id": self._pair.entity_id, "flow_direction": "rx",
         }
         perf_mark(
             "ice", "controller", "loop_started",
@@ -824,7 +1107,7 @@ class CandidatePairController(AsyncEventEmitter, ObservedComponent):
         get_logger().debug(
             Component.ICE,
             "Started candidate pair selector",
-            pair_id=self._pair.get_pair_id(),
+            pair_id=self._pair.entity_id,
         )
         while True:
             pkt: Packet | None = None
@@ -851,6 +1134,8 @@ class CandidatePairController(AsyncEventEmitter, ObservedComponent):
                     "ice", "controller", "packet_routed",
                     metadata={**packet_metadata, "route": route, "counter.ice.controller_packets_routed": 1},
                 )
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 metadata = dict(controller_metadata)
                 if pkt is not None:
@@ -863,40 +1148,79 @@ class CandidatePairController(AsyncEventEmitter, ObservedComponent):
                         "counter.ice.controller_packets_failed": 1,
                     },
                 )
-                raise
+                if not self._runner.snapshot().terminal:
+                    try:
+                        self._runner.try_submit(self._command(
+                            _ControllerCommand.FAIL, exc,
+                            cause_id=f"{self.entity_id}:receive-failure",
+                        ))
+                    except Exception:
+                        pass
+                return
 
-    async def start_managed(self) -> asyncio.Task[None]:
-        """Atomically start and retain the controller's managed task."""
-        if self._closing or self._closed:
-            raise RuntimeError("candidate pair controller is closing")
-        if self._task_handle is None:
-            self._task_handle = cast(asyncio.Task[None], self.start())
-        return cast(asyncio.Task[None], self._task_handle)
+    @event_loop
+    def _launch_receive_pump(self) -> None:
+        if self._runtime is None:
+            raise RuntimeError("candidate pair controller requires an active Runtime")
+        if self._receive_handle is None:
+            self._receive_handle = self._runtime.start_pump(
+                self._receive_loop, owner_entity_id=self.entity_id,
+                owner_epoch=self._runner.epoch,
+                name="ice:candidate-pair-receive", kind="ice",
+                failure=FailurePolicy.FAIL_CONNECTION,
+                metadata={"expected_long_running": True, "loop_role": "receive"},
+            )
 
-    async def _close(self) -> None:
-        task_handle = self._task_handle
-        if task_handle is not None and not task_handle.done():
-            task_handle.cancel()
-        if task_handle is not None:
-            await asyncio.gather(task_handle, return_exceptions=True)
-        self._task_handle = None
-        self.remove_all_listeners()
+    async def start_managed(self) -> OwnedTaskHandle[None]:
+        state = self._runner.snapshot().state
+        if state in {"checking", "nominated", "forwarding"} and self._receive_handle is not None:
+            return self._receive_handle
+        if state != "new":
+            raise RuntimeError(f"candidate pair controller cannot start from {state}")
+        # Selector outcomes are typed ingress into this controller; they never
+        # execute peer callbacks from packet parsing code.
+        self.__selector._nominate = self.__pair_nominate
+        reply = ReplyPort[TransitionCommit]()
+        self._runner.try_submit(self._command(_ControllerCommand.START, reply=reply))
+        await reply.wait()
+        while self._receive_handle is None and self._runner.snapshot().state in {
+            "starting", "checking",
+        }:
+            await asyncio.sleep(0)
+        assert self._receive_handle is not None
+        return self._receive_handle
+
+    async def _reconcile_controller(self) -> None:
+        if self._receive_handle is not None:
+            self._receive_handle.cancel()
+            try:
+                await self._receive_handle.wait()
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._receive_handle = None
         await self.__selector.aclose()
-        await super().aclose()
-        self._closed = True
 
     async def aclose(self) -> None:
-        if self._closed:
+        if self._runner.snapshot().terminal:
+            if self._runtime is not None and not self._owner_removed:
+                assert self._machine_handle is not None
+                await self._machine_handle.wait()
+                self._runtime.remove_owner(self.entity_id, self._runner.epoch)
+                self._owner_removed = True
             return
-        self._closing = True
-        if self._close_task is None or (
-            self._close_task.done()
-            and (self._close_task.cancelled() or self._close_task.exception() is not None)
-        ):
-            self._close_task = asyncio.create_task(
-                self._close(), name="ice:candidate-pair-controller-close"
-            )
-        await asyncio.shield(self._close_task)
+        state = self._runner.snapshot().state
+        if state == "failed":
+            pass
+        reply = ReplyPort[TransitionCommit]()
+        self._runner.try_submit(self._command(_ControllerCommand.CLOSE, reply=reply))
+        stopping = await reply.wait()
+        while not self._runner.snapshot().terminal:
+            await asyncio.sleep(0)
+        if self._runtime is not None:
+            assert self._machine_handle is not None
+            await self._machine_handle.wait()
+            self._runtime.remove_owner(self.entity_id, self._runner.epoch)
+            self._owner_removed = True
 
     async def _on_inbound_pkt(self, pkt: Packet):
         self.__transport.pipe(pkt)
@@ -959,7 +1283,7 @@ class CandidatePairController(AsyncEventEmitter, ObservedComponent):
 
     @property
     def nominated(self) -> bool:
-        return self.__nominated.is_set()
+        return self._runner.snapshot().state in {"nominated", "forwarding"}
 
 
 class CandidatePairControllerRegistry:
@@ -968,7 +1292,7 @@ class CandidatePairControllerRegistry:
 
     def append(self, controller: CandidatePairController):
         pair = controller._pair
-        self._check_list[pair.get_pair_id()] = controller
+        self._check_list[pair.entity_id] = controller
 
     def get(self, pair_id: str) -> CandidatePairController | None:
         return self._check_list.get(pair_id)
@@ -993,10 +1317,38 @@ class AgentEvent:
 mdns_pattern = re.compile(r"\b(?:[a-zA-Z0-9_-]+\.)*local\.?\b")
 
 
+class _AgentCommand(StrEnum):
+    WAIT_REMOTE = "wait-remote"
+    CHECK = "check"
+    CONNECT = "connect"
+    COMPLETE = "complete"
+    DISCONNECT = "disconnect"
+    FAIL = "fail"
+    CLOSE = "close"
+
+
+class _AgentRunner(AsyncStateMachineRunner[MachineCommand[object, TransitionCommit]]):
+    async def step(self, command: MachineCommand[object, TransitionCommit]):
+        proposed = {
+            _AgentCommand.WAIT_REMOTE: "waiting-remote",
+            _AgentCommand.CHECK: "checking", _AgentCommand.CONNECT: "connected",
+            _AgentCommand.COMPLETE: "completed",
+            _AgentCommand.DISCONNECT: "disconnected",
+            _AgentCommand.FAIL: "failed", _AgentCommand.CLOSE: "closed",
+        }.get(command.kind)
+        if proposed is None:
+            raise ValueError(f"unsupported ICE-agent command: {command.kind}")
+        return PreparedTransition(
+            self.snapshot().state, proposed, command.payload, command.cause_id,
+            command.expected_epoch, command.expected_revision,
+        )
+
+
 # Controlling agent must know remote user credentials
-class Agent(AsyncEventEmitter, ObservedComponent):
-    def __init__(self, options: AgentOptions) -> None:
-        super().__init__()
+class Agent(ObservedComponent):
+    def __init__(
+        self, options: AgentOptions, *, owner: Any,
+    ) -> None:
 
         self._tie_breaker = generate_tie_breaker()
         self._local_ufrag = generate_ufrag()
@@ -1017,19 +1369,77 @@ class Agent(AsyncEventEmitter, ObservedComponent):
         self._controller_registry = CandidatePairControllerRegistry()
 
         self._candidate_pair_transports = list[CandidatePairTransport]()
-        self._gathering_complete = asyncio.Event()
+        self._owner = owner
+        scope = current_execution_scope()
+        root = getattr(scope, "root_context", None)
+        identity = (
+            getattr(owner, "entity_id", None)
+            or getattr(scope, "scope_id", None)
+            or getattr(root, "trace_id", None)
+        )
+        self.entity_id = f"ice-agent:{identity or id(self)}"
+        self._runtime = scope if hasattr(scope, "start_machine") else None
+        self._projection = getattr(scope, "projection", None)
+        self._command_id = 0
+        self._runner = _AgentRunner(
+            MACHINE_SPECS["ice-agent"], entity_id=self.entity_id,
+            mailbox_capacity=32,
+            controller=getattr(scope, "transition_controller", None),
+            transition_sink=self._project_lifecycle,
+        )
+        if self._projection is not None:
+            self._projection.machines.register(self.entity_id, MACHINE_SPECS["ice-agent"])
+        if self._runtime is not None:
+            self._runtime.register_owner(self.entity_id, epoch=self._runner.epoch)
+            self._machine_handle = self._runtime.start_machine(
+                self._runner, owner_entity_id=self.entity_id,
+                owner_epoch=self._runner.epoch,
+            )
+            self._submit_lifecycle(_AgentCommand.WAIT_REMOTE)
+        else:
+            self._machine_handle = None
+
+    @event_loop
+    def _project_lifecycle(self, commit: TransitionCommit) -> None:
+        if self._projection is not None and self._runtime is not None:
+            self._projection.machines.apply(MachineTransitionOp(
+                commit.entity_id, commit.machine_type, commit.from_state,
+                commit.to_state, commit.epoch, commit.revision,
+                self._runtime.new_producer_dot(), commit.cause, commit.monotonic_ns,
+            ))
+
+    @event_loop
+    def _submit_lifecycle(
+        self, kind: _AgentCommand, *, cause_id: object | None = None,
+        reply: ReplyPort[TransitionCommit] | None = None,
+    ) -> None:
+        if self._machine_handle is None:
+            return
+        self._command_id += 1
+        self._runner.try_submit(MachineCommand(
+            kind, self._command_id, self._runner.epoch, None, reply,
+            expected_revision=None,
+            cause_id=cause_id or f"{self.entity_id}:{self._command_id}",
+        ))
 
     async def aclose(self) -> None:
         await self.aclose_controllers()
         for transport in reversed(self._candidate_pair_transports):
-            closer = getattr(transport, "aclose", None) or getattr(transport, "close", None)
-            if closer is not None:
-                result = closer()
-                if inspect.isawaitable(result):
-                    await result
+            async_closer = getattr(transport, "aclose", None)
+            if async_closer is not None:
+                await async_closer()
+            elif (closer := getattr(transport, "close", None)) is not None:
+                closer()
         self._candidate_pair_transports.clear()
+        for pair in reversed(list(self._pair_registry.get_pair_list().values())):
+            await pair.aclose()
         await self._udp.aclose()
-        await super().aclose()
+        if self._machine_handle is not None and not self._runner.snapshot().terminal:
+            reply = ReplyPort[TransitionCommit]()
+            self._submit_lifecycle(_AgentCommand.CLOSE, reply=reply)
+            await reply.wait()
+            await self._machine_handle.wait()
+            self._runtime.remove_owner(self.entity_id, self._runner.epoch)
 
     async def aclose_controllers(self) -> None:
         for controller in reversed(self._controller_registry.controllers()):
@@ -1061,14 +1471,13 @@ class Agent(AsyncEventEmitter, ObservedComponent):
                 case _:
                     pass
         await asyncio.gather(*coros)
-        self._gathering_complete.set()
 
     @event_loop
     def _on_nominate_pair(self, pair: CandidatePair):
         get_logger().debug(
             Component.ICE,
             "Candidate pair nominated",
-            pair_id=pair.get_pair_id(),
+            pair_id=pair.entity_id,
         )
 
     @event_loop
@@ -1079,18 +1488,65 @@ class Agent(AsyncEventEmitter, ObservedComponent):
             selector = ControlledSelector(self._pair_registry, self._tie_breaker)
 
         # Create controller and register it to prevent duplicates
-        pair_controller = CandidatePairController(pair, selector, self._tie_breaker)
+        pair_controller = CandidatePairController(
+            pair, selector, self._tie_breaker, owner=self,
+        )
         self._controller_registry.append(pair_controller)
 
         get_logger().debug(
             Component.ICE,
             "Emitting candidate pair controller",
-            pair_id=pair.get_pair_id(),
+            pair_id=pair.entity_id,
         )
-        self.emit(
-            AgentEvent.CANDIDATE_PAIR_CONTROLLER,
-            pair_controller,
+        self._owner._on_controller(pair_controller)
+
+    async def _controller_nominated(
+        self, transport: CandidatePairTransport, commit: TransitionCommit,
+    ) -> None:
+        if (
+            commit.machine_type != "candidate-pair"
+            or commit.to_state != "nominated"
+            or transport.entity_id != commit.entity_id
+            or commit.entity_id not in {
+                pair.entity_id for pair in self._pair_registry.get_pair_list().values()
+            }
+        ):
+            raise RuntimeError("agent requires an exact registered pair nomination")
+        if transport not in self._candidate_pair_transports:
+            self._candidate_pair_transports.append(transport)
+        reply = ReplyPort[TransitionCommit]()
+        self._submit_lifecycle(
+            _AgentCommand.CONNECT, cause_id=commit.cause, reply=reply,
         )
+        if self._machine_handle is not None:
+            await reply.wait()
+        await self._owner._on_nominated(transport, commit)
+
+    async def _controller_failed(
+        self, error: BaseException, commit: TransitionCommit,
+    ) -> None:
+        if self._machine_handle is None or self._runner.snapshot().state in {"failed", "closed"}:
+            return
+        reply = ReplyPort[TransitionCommit]()
+        self._submit_lifecycle(
+            _AgentCommand.FAIL, cause_id=commit.cause, reply=reply,
+        )
+        agent_commit = await reply.wait()
+        await self._owner._on_agent_failure(error, agent_commit)
+
+    async def fail(
+        self, error: BaseException, *, cause_id: object | None = None,
+    ) -> TransitionCommit | None:
+        """Commit the sole public ICE failure and notify the peer owner once."""
+        if self._machine_handle is None:
+            return None
+        if self._runner.snapshot().state in {"failed", "closed"}:
+            return None
+        reply = ReplyPort[TransitionCommit]()
+        self._submit_lifecycle(_AgentCommand.FAIL, cause_id=cause_id, reply=reply)
+        commit = await reply.wait()
+        await self._owner._on_agent_failure(error, commit)
+        return commit
 
     # Look at func (s *controllingSelector) ContactCandidates() to know more
     @event_loop
@@ -1102,6 +1558,7 @@ class Agent(AsyncEventEmitter, ObservedComponent):
             self._role = AgentRole.Controlling
         else:
             self._role = AgentRole.Controlled
+        self._submit_lifecycle(_AgentCommand.CHECK)
 
         get_logger().debug(
             Component.ICE,
@@ -1136,6 +1593,21 @@ class Agent(AsyncEventEmitter, ObservedComponent):
         self._role = AgentRole.Controlled
         self.connect(False)
 
+    @event_loop
+    def mark_completed(self) -> None:
+        if self._runner.snapshot().state == "connected":
+            self._submit_lifecycle(_AgentCommand.COMPLETE)
+
+    @event_loop
+    def mark_disconnected(self) -> None:
+        if self._runner.snapshot().state in {"connected", "completed"}:
+            self._submit_lifecycle(_AgentCommand.DISCONNECT)
+
+    @event_loop
+    def recheck(self) -> None:
+        if self._runner.snapshot().state == "disconnected":
+            self._submit_lifecycle(_AgentCommand.CHECK)
+
     async def get_local_candidates(self):
         # async with self._candidate_lock:
         buf = list[LocalCandidate]()
@@ -1154,12 +1626,11 @@ class Agent(AsyncEventEmitter, ObservedComponent):
 
         if mdns_pattern.search(remote.address):
             try:
-                ip = socket.gethostbyname(remote.address)
+                ip = await self._resolve_mdns(remote.address)
                 get_logger().debug(
                     Component.ICE,
                     "Resolved mDNS candidate address",
-                    hostname=remote.address,
-                    address=ip,
+                    candidate_id=_candidate_metadata(remote)["candidate_id"],
                 )
                 remote.set_address(ip)
             except socket.gaierror as exc:
@@ -1184,7 +1655,7 @@ class Agent(AsyncEventEmitter, ObservedComponent):
         get_logger().debug(
             Component.ICE,
             "Added candidate pair",
-            pair_id=pair.get_pair_id(),
+            pair_id=pair.entity_id,
         )
 
         self._pair_registry.append(pair)
@@ -1192,14 +1663,38 @@ class Agent(AsyncEventEmitter, ObservedComponent):
 
         # If role is already set (connect() was called), start controller for this new pair
         if self._role != AgentRole.Unknown:
-            controller = self._controller_registry.get(pair.get_pair_id())
+            controller = self._controller_registry.get(pair.entity_id)
             if not controller:
                 get_logger().debug(
                     Component.ICE,
                     "Starting controller for late-added candidate pair",
-                    pair_id=pair.get_pair_id(),
+                    pair_id=pair.entity_id,
                 )
                 self._start_controller(pair)
+
+    async def _resolve_mdns(self, hostname: str, *, timeout: float = 2.0) -> str:
+        scope = current_execution_scope()
+        if scope is not self._runtime or self._runtime is None:
+            raise RuntimeError("mDNS resolution requires an active owning Runtime")
+        handle = scope.call_worker(
+            socket.gethostbyname, hostname,
+            owner_entity_id=self.entity_id, owner_epoch=self._runner.epoch,
+            name="ice:resolve-mdns",
+        )
+        try:
+            async with asyncio.timeout(timeout):
+                result = await handle.wait()
+        except TimeoutError:
+            handle.cancel()
+            try:
+                await handle.wait()
+            except BaseException:
+                pass
+            raise TimeoutError(f"mDNS resolution timed out: {hostname}")
+        if result.outcome != "success":
+            assert result.exception is not None
+            raise result.exception
+        return cast(str, result.value)
 
     async def _add_local_candidate(self, local: LocalCandidate):
         # async with self._candidate_lock:
@@ -1237,8 +1732,7 @@ class Agent(AsyncEventEmitter, ObservedComponent):
         get_logger().debug(
             Component.ICE,
             "Adding remote candidate",
-            address=remote.address,
-            port=remote.port,
+            candidate_id=_candidate_metadata(remote)["candidate_id"],
         )
         net_type = remote.get_network_type()
         pool = self._remote_candidates.get(net_type)
@@ -1283,7 +1777,7 @@ class Agent(AsyncEventEmitter, ObservedComponent):
             "ice",
             "remote_credentials",
             "set",
-            metadata={"remote_ufrag": ufrag, "password_length": len(pwd)},
+            metadata={},
         )
 
     @event_loop
@@ -1312,7 +1806,9 @@ class Agent(AsyncEventEmitter, ObservedComponent):
         timeout = require_timeout(timeout)
         match condition:
             case ICECondition.GATHERING_COMPLETE:
-                await wait_for_event(self._gathering_complete, timeout=timeout)
+                raise ValueError(
+                    "gathering completion is owned by ICEGatherer"
+                )
             case ICECondition.CANDIDATE_PAIR_SUCCEEDED:
                 await wait_until(
                     self._has_succeeded_candidate_pair,

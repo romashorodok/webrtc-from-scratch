@@ -54,10 +54,6 @@ class Flight5(FlightTransition):
                     "Unsupported cipher suite in key_server_exchange.signature_hash_algorithm"
                 )
 
-        print(
-            "Flight 5 pre master secret",
-            binascii.hexlify(state.pre_master_secret),
-        )
 
         # Compute master secret - use Extended Master Secret (RFC 7627) if negotiated
         if state.use_extended_master_secret and session_hash_for_ems is not None:
@@ -66,7 +62,6 @@ class Flight5(FlightTransition):
             session_hash_digest = hashlib.sha256(session_hash_for_ems).digest()
             print(f"Flight 5: Using Extended Master Secret (RFC 7627)")
             print(f"Flight 5: session_hash_for_ems length={len(session_hash_for_ems)}")
-            print(f"Flight 5: session_hash_digest={session_hash_digest.hex()}")
             state.master_secret = prf_extended_master_secret(
                 state.pre_master_secret,
                 session_hash_digest,
@@ -82,7 +77,6 @@ class Flight5(FlightTransition):
                 hashlib.sha256,
             )
 
-        print("Flight 5 master secret", binascii.hexlify(state.master_secret))
 
         # TODO: Certificate signature verification should be done via Rust
         # For now, skip verification (server certificate is trusted)
@@ -98,7 +92,7 @@ class Flight5(FlightTransition):
         )
 
         # Signal that cipher suite is ready for decryption
-        state.cipher_suite_ready.set()
+        state.cipher_suite_ready = True
         print("Flight 5 cipher suite started")
 
     def generate(
@@ -286,7 +280,6 @@ class Flight5(FlightTransition):
         # Certificate
         # ClientKeyExchange
 
-        print("Flight 5 fingerprint", binascii.hexlify(cache_fingerprint))
         # Sign the handshake fingerprint using the certificate's private key
         signature = state.local_certificate.sign(cache_fingerprint)
         layer_certificate_verify_signature = self.__msg.certificate_verify(
@@ -324,12 +317,10 @@ class Flight5(FlightTransition):
         if not state.master_secret:
             raise ValueError("Flight 5 master_secret must be defined by cipher suite")
 
-        print(f"Flight 5: fingerprint for verify_data ({len(cache_fingerprint)} bytes): {binascii.hexlify(cache_fingerprint[:100]).decode()}...")
 
         # Compute client verify_data for Finished message
         # This is PRF(master_secret, "client finished", Hash(handshake_messages))[0..11]
         verifying_data = verify_data_client(state.master_secret, cache_fingerprint)
-        print(f"Flight 5: client verifying_data: {binascii.hexlify(verifying_data).decode()}")
 
         layer_finished = self.__msg.finished(verifying_data)
         if isinstance(layer_finished.content, Handshake):

@@ -147,8 +147,8 @@ class TestSession:
             0xDE, 0xAD, 0xBE, 0xEF,
         ])
 
-        encrypted = await session.encrypt_async(packet)
-        decrypted = await session.decrypt_async(encrypted)
+        encrypted = await session.encrypt(packet)
+        decrypted = await session.decrypt(encrypted)
         assert decrypted == packet
 
 

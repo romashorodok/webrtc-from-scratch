@@ -3,11 +3,13 @@ import json
 import os
 import time
 import tracemalloc
+import uuid
 from collections import deque
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 from webrtc.srtp import Session as SrtpSession
 
 from webrtc import media
@@ -22,8 +24,9 @@ from webrtc.media.rtp_extensions import DEFAULT_EXT_MAP
 from webrtc.peer_connection import (
     PeerConnection,
 )
-from webrtc.performance import ObservedComponent, worker
 from webrtc import Runtime
+from webrtc.runtime_services import OwnedTaskHandle
+from webrtc.state_machine import BoundedMailbox, ReplyPort
 from webrtc.session_description import (
     SessionDescription,
     SessionDescriptionType,
@@ -35,19 +38,40 @@ app = FastAPI()
 VIDEO_FILE = Path(__file__).resolve().parents[1] / "output_av1.ivf"
 
 
-class WebSocketMediaWorker(ObservedComponent):
-    @worker
-    def invoke(self, function: Callable[..., Any], *args: Any) -> Any:
-        return function(*args)
+class WebSocketMediaWorker:
+    """Worker facade whose submissions and failures belong to the media lane."""
+
+    def __init__(self, runtime: Runtime, owner_entity_id: str, owner_epoch: int) -> None:
+        self._runtime = runtime
+        self.entity_id = owner_entity_id
+        self.epoch = owner_epoch
+
+    async def invoke(self, function: Callable[..., Any], *args: Any) -> Any:
+        handle = self._runtime.call_worker(
+            function, *args, owner_entity_id=self.entity_id,
+            owner_epoch=self.epoch, name="websocket-media-worker",
+        )
+        result = await handle.wait()
+        if result.exception is not None:
+            raise result.exception
+        return result.value
 
 
-async def on_recv(ws: WebSocket, on_close: Callable | None = None):
+async def on_recv(
+    ws: WebSocket,
+    on_close: Callable[[], Awaitable[None]] | None = None,
+):
     try:
-        while True:
+        while (
+            ws.client_state is WebSocketState.CONNECTED
+            and ws.application_state is WebSocketState.CONNECTED
+        ):
             yield await ws.receive_text()
     except WebSocketDisconnect:
-        if _on_close := on_close:
-            _on_close()
+        pass
+    finally:
+        if on_close is not None:
+            await on_close()
 
 
 def loop_frames(file_path: str):
@@ -98,15 +122,11 @@ FRAME_PERIOD = 1 / TARGET_FPS
 _allocation_profiler_started = False
 
 
-def _allocation_profiler_finished(task: asyncio.Task[Any]) -> None:
+def _allocation_profiler_finished(error: BaseException | None = None) -> None:
     global _allocation_profiler_started
     _allocation_profiler_started = False
     if tracemalloc.is_tracing():
         tracemalloc.stop()
-    if task.cancelled():
-        print("[allocation-profile] task stopped with WebSocket", flush=True)
-        return
-    error = task.exception()
     if error is not None:
         print(
             "[allocation-profile] task failed: "
@@ -184,7 +204,9 @@ async def start_write_loop(
     pc: PeerConnection,
     execution: Runtime,
 ):
-    worker = WebSocketMediaWorker()
+    worker = WebSocketMediaWorker(
+        execution, pc.media_send_entity_id, pc._media_send_runner.epoch,
+    )
     sender = pc._transceivers[0].sender
     if not sender:
         raise ValueError("Not found the sender")
@@ -312,9 +334,11 @@ async def start_write_loop(
                 pkts = await worker.invoke(RtcpPacket.parse, rtcp)
                 await worker.invoke(print_rtcp, pkts, smoothed_gradient)
 
-            except Exception as e:
-                print("rtcp error", e)
-                await asyncio.sleep(1)
+            except Exception:
+                # Runtime observes the original exception and owns connection
+                # failure propagation; this worker must not become a second
+                # mutable retry/failure authority.
+                raise
 
 
     async def encode():
@@ -357,16 +381,39 @@ async def start_write_loop(
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
-    pc = PeerConnection()
-    runtime = Runtime(scope_id=pc.id)
-    send_lock = asyncio.Lock()
-
-    async def send_json(message: dict[str, Any]) -> None:
-        async with send_lock:
-            await ws.send_json(message)
-
+    peer_id = uuid.uuid4().hex
+    runtime = Runtime(scope_id=peer_id)
     async with runtime as execution:
+      # Runtime-bound components capture their execution scope while they are
+      # constructed.  Creating the peer before entering Runtime leaves its
+      # ICE/DTLS child machines unbound and makes peer startup wait forever.
+      pc = PeerConnection(peer_id=peer_id)
       async with pc:
+        send_mailbox = BoundedMailbox[
+            tuple[dict[str, Any], ReplyPort[None]]
+        ](64)
+
+        async def send_pump() -> None:
+            while True:
+                message, reply = await send_mailbox.receive()
+                try:
+                    await ws.send_json(message)
+                except BaseException as error:
+                    reply.reject(error)
+                    raise
+                else:
+                    reply.resolve(None)
+
+        send_pump_task = execution.start_pump(
+            send_pump, owner_entity_id=pc.entity_id,
+            owner_epoch=pc._peer_runner.epoch, name="ws:send-mailbox",
+        )
+
+        async def send_json(message: dict[str, Any]) -> None:
+            reply = ReplyPort[None]()
+            await send_mailbox.submit((message, reply))
+            await reply.wait()
+
         global _allocation_profiler_started
         if (
             os.getenv("WEBRTC_ALLOCATION_PROFILE") == "1"
@@ -375,12 +422,23 @@ async def ws_endpoint(ws: WebSocket):
             # tracemalloc is process-global. Keep a single sampler for this
             # explicitly profiled server process instead of competing peers.
             _allocation_profiler_started = True
-            profiler_task = execution.start(
-                lambda: profile_allocations(pc, runtime),
+            async def run_allocation_profiler() -> None:
+                error = None
+                try:
+                    await profile_allocations(pc, runtime)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as caught:
+                    error = caught
+                    raise
+                finally:
+                    _allocation_profiler_finished(error)
+
+            execution.start(
+                run_allocation_profiler,
                 name="ws:allocation-profile",
                 kind="diagnostic",
             )
-            profiler_task.add_done_callback(_allocation_profiler_finished)
             print("[allocation-profile] task scheduled", flush=True)
         elif os.getenv("WEBRTC_ALLOCATION_PROFILE") != "1":
             print("[allocation-profile] disabled in server process", flush=True)
@@ -395,15 +453,33 @@ async def ws_endpoint(ws: WebSocket):
             name=f"ws:trace-pump-{pc.id}",
             kind="trace",
         )
-        write_task: asyncio.Task[Any] | None = None
+        write_task: OwnedTaskHandle[Any] | None = None
 
         await pc.add_transceiver_from_kind(
             RTPCodecKind.Video, RTPTransceiverDirection.Sendonly
         )
 
-        def on_close():
-            # trace_task.cancel()
+        async def on_close() -> None:
             print("WebSocket disconnected")
+            handles = [trace_task]
+            if write_task is not None:
+                handles.append(write_task)
+            for handle in handles:
+                handle.cancel()
+            for handle in handles:
+                try:
+                    await handle.wait()
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            closed_error = WebSocketDisconnect()
+            for _message, reply in send_mailbox.close():
+                reply.reject(closed_error)
+            send_pump_task.cancel()
+            try:
+                await send_pump_task.wait()
+            except (asyncio.CancelledError, Exception):
+                pass
 
         async def start_media() -> None:
             nonlocal write_task

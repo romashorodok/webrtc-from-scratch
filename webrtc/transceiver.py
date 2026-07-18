@@ -1,8 +1,8 @@
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import fractions
 import secrets
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Any, Callable, Coroutine, Protocol
 
 import webrtc_rs
@@ -11,12 +11,15 @@ from webrtc.media.av1_payloader import AV1_PAYLOAD_TYPE, Av1Packetizer
 from webrtc.media.opus_payloader import OPUS_PAYLOAD_TYPE, OpusPacketizer
 from webrtc.media.vp8_payloader import VP8Payloader
 from webrtc.performance import ObservedComponent, event_loop, task
-from webrtc.runtime_services import FailurePolicy
+from webrtc.runtime_services import FailurePolicy, OwnedTaskHandle, StaleOwnerEpoch, current_execution_scope
+from webrtc.machine_specs import MACHINE_SPECS
+from webrtc.observability import MachineTransitionOp
+from webrtc.state_machine import (
+    AsyncStateMachineRunner, BoundedMailbox, MachineCommand, MailboxClosed,
+    MailboxFull, PreparedTransition, ReplyPort, TransitionCommit,
+)
 from webrtc.srtp import Stream as SrtpStream
 from webrtc.tracing import measure_perf_async, perf_mark
-from webrtc.domain_events import (
-    MediaStateChanged, TransceiverStateChanged, emit_domain_event,
-)
 
 from . import media
 from .utils import impl_protocol
@@ -73,7 +76,147 @@ class RTPWriterProtocol(Protocol):
     async def write_rtp_bytes(self, rtp_packet: media.RtpPacket) -> int: ...
 
 
-class TrackLocal:
+class _LifecycleCommand(StrEnum):
+    BIND = "bind"
+    ACTIVATE = "activate"
+    PAUSE = "pause"
+    RESUME = "resume"
+    LIVE = "live"
+    MUTE = "mute"
+    FAIL = "fail"
+    STOP = "stop"
+    FINISH = "finish"
+
+
+class _ComponentRunner(AsyncStateMachineRunner[MachineCommand[object, TransitionCommit]]):
+    def __init__(self, owner: "_MachineComponent", machine_type: str) -> None:
+        self.owner = owner
+        super().__init__(
+            MACHINE_SPECS[machine_type], entity_id=owner.entity_id,
+            mailbox_capacity=16,
+            controller=getattr(owner._runtime, "transition_controller", None),
+            transition_sink=owner._project_transition,
+        )
+
+    async def step(self, command):
+        state = self.snapshot().state
+        if self.spec.machine_type == "media-track":
+            proposed = {
+                _LifecycleCommand.LIVE: "live", _LifecycleCommand.RESUME: "live",
+                _LifecycleCommand.MUTE: "muted", _LifecycleCommand.FAIL: "failed",
+                _LifecycleCommand.STOP: "ended",
+            }.get(command.kind)
+        else:
+            proposed = {
+                _LifecycleCommand.BIND: "bound", _LifecycleCommand.ACTIVATE: "active",
+                _LifecycleCommand.PAUSE: "paused", _LifecycleCommand.RESUME: "active",
+                _LifecycleCommand.FAIL: "failed", _LifecycleCommand.STOP: "stopping",
+                _LifecycleCommand.FINISH: "stopped",
+            }.get(command.kind)
+        if proposed is None:
+            raise ValueError(f"unsupported {self.spec.machine_type} command: {command.kind}")
+        return PreparedTransition(
+            state, proposed, command.payload, command.cause_id,
+            command.expected_epoch, command.expected_revision,
+        )
+
+    async def reconcile_terminal(self, prepared):
+        await self.owner._reconcile_terminal()
+
+    async def after_commit(self, commit, effects):
+        self.owner._after_lifecycle_commit(commit)
+
+
+class _MachineComponent:
+    """Small Runtime-owned lifecycle used by Stage-5 media entities."""
+
+    def _init_machine(self, machine_type: str, entity_id: str) -> None:
+        self.entity_id = entity_id
+        self._runtime = current_execution_scope()
+        self._command_id = 0
+        self._machine_handle: OwnedTaskHandle[None] | None = None
+        self._terminal_reply: ReplyPort[TransitionCommit] | None = None
+        self._runner = _ComponentRunner(self, machine_type)
+        if self._runtime is None:
+            return
+        self._runtime.projection.machines.register(self.entity_id, self._runner.spec)
+        self._runtime.register_owner(self.entity_id, epoch=self._runner.epoch)
+        self._machine_handle = self._runtime.start_machine(
+            self._runner, owner_entity_id=self.entity_id, owner_epoch=self._runner.epoch,
+        )
+
+    def _command(self, kind, payload=None, *, reply=None, expected_revision=None):
+        self._command_id += 1
+        return MachineCommand(
+            kind, self._command_id, self._runner.epoch, payload, reply,
+            expected_revision=expected_revision,
+            cause_id=f"{self.entity_id}:{self._command_id}",
+        )
+
+    async def _transition(self, kind, payload=None, *, expected_revision=None):
+        if self._machine_handle is None:
+            raise RuntimeError(f"{self.entity_id} requires an active Runtime")
+        reply = ReplyPort[TransitionCommit]()
+        await self._runner.submit(self._command(
+            kind, payload, reply=reply, expected_revision=expected_revision,
+        ))
+        return await reply.wait()
+
+    def _try_transition(self, kind, payload=None) -> None:
+        if self._machine_handle is not None:
+            self._runner.try_submit(self._command(kind, payload))
+
+    def _project_transition(self, commit: TransitionCommit) -> None:
+        runtime = self._runtime
+        if runtime is None or not getattr(runtime, "tracing_enabled", True):
+            return
+        runtime.projection.machines.apply(MachineTransitionOp(
+            commit.entity_id, commit.machine_type, commit.from_state, commit.to_state,
+            commit.epoch, commit.revision, runtime.new_producer_dot(), commit.cause,
+            commit.monotonic_ns,
+        ))
+
+    def _after_lifecycle_commit(self, commit: TransitionCommit) -> None:
+        if commit.to_state == "stopping":
+            self._runner.try_submit(self._command(
+                _LifecycleCommand.FINISH, reply=self._terminal_reply,
+            ))
+
+    async def _reconcile_terminal(self) -> None:
+        return None
+
+    async def pause(self) -> TransitionCommit:
+        return await self._transition(_LifecycleCommand.PAUSE)
+
+    async def resume(self) -> TransitionCommit:
+        return await self._transition(_LifecycleCommand.RESUME)
+
+    async def aclose(self) -> None:
+        if self._machine_handle is None:
+            await self._reconcile_terminal()
+            return
+        state = self._runner.snapshot().state
+        if not self._runner.snapshot().terminal:
+            if self._terminal_reply is None:
+                self._terminal_reply = ReplyPort[TransitionCommit]()
+            if state != "stopping":
+                await self._runner.submit(self._command(
+                    _LifecycleCommand.STOP,
+                    reply=(self._terminal_reply
+                           if self._runner.spec.machine_type == "media-track"
+                           else None),
+                ))
+            await self._terminal_reply.wait()
+        if not self._machine_handle.done():
+            await self._machine_handle.wait()
+        if self._runtime is not None:
+            try:
+                self._runtime.remove_owner(self.entity_id, self._runner.epoch)
+            except (KeyError, StaleOwnerEpoch):
+                pass
+
+
+class TrackLocal(_MachineComponent):
     def __init__(
         self,
         id: str,
@@ -87,6 +230,7 @@ class TrackLocal:
         self._rtp_codec_params = rtp_codec_params
         self._kind = kind
         self._writer: RTPWriterProtocol | None = None
+        self._init_machine("media-track", f"track-local:{id}")
 
     async def write_frame(self, frame: bytes) -> int:
         if not self._writer:
@@ -100,6 +244,17 @@ class TrackLocal:
 
     def bind(self, writer: RTPWriterProtocol):
         self._writer = writer
+        if self._runner.snapshot().state == "new":
+            self._try_transition(_LifecycleCommand.LIVE)
+
+    async def mute(self) -> TransitionCommit:
+        return await self._transition(_LifecycleCommand.MUTE)
+
+    async def unmute(self) -> TransitionCommit:
+        return await self._transition(_LifecycleCommand.RESUME)
+
+    async def _reconcile_terminal(self) -> None:
+        self._writer = None
 
     @property
     def kind(self) -> RTPCodecKind:
@@ -403,28 +558,33 @@ class MediaCaps:
         return RTPParameters(header_extensions, codecs)
 
 
-class RTPSender:
-    def __init__(self, caps: MediaCaps) -> None:
+class RTPSender(_MachineComponent):
+    def __init__(self, caps: MediaCaps, *, observability_id: str | None = None) -> None:
         self._track_encodings = list[TrackEncoding]()
         self._payload_type: int = 0
         self._caps = caps
         self._track: TrackLocal | None = None
         self.__transport: dtls.DTLSTransport | None = None
-        self.__transport_lock = asyncio.Lock()
         self._rtcp_stream: SrtpStream | None = None
+        self._init_machine(
+            "rtp-sender", observability_id or f"rtp-sender:{secrets.token_hex(6)}",
+        )
 
     async def bind(self, transport: dtls.DTLSTransport):
-        async with self.__transport_lock:
-            self.__transport = transport
-            for enc in self._track_encodings:
-                enc.bind(transport)
+        self.__transport = transport
+        for enc in self._track_encodings:
+            enc.bind(transport)
+        state = self._runner.snapshot().state
+        if state == "new":
+            await self._transition(_LifecycleCommand.BIND)
+        if self._track is not None and self._runner.snapshot().state == "bound":
+            await self._transition(_LifecycleCommand.ACTIVATE)
 
     async def add_encoding(self, track: TrackLocal):
-        async with self.__transport_lock:
-            enc = TrackEncoding(ssrc=secrets.randbits(32), track=track)
-            if self.__transport:
-                enc.bind(self.__transport)
-            self._track_encodings.append(enc)
+        enc = TrackEncoding(ssrc=secrets.randbits(32), track=track)
+        if self.__transport:
+            enc.bind(self.__transport)
+        self._track_encodings.append(enc)
 
         await self.replace_track(track)
 
@@ -435,6 +595,8 @@ class RTPSender:
 
             track.bind(encoding)
         self._track = track
+        if self._runner.snapshot().state == "bound":
+            await self._transition(_LifecycleCommand.ACTIVATE)
 
     @property
     def kind(self) -> RTPCodecKind | None:
@@ -469,17 +631,25 @@ class RTPSender:
     def track(self) -> TrackLocal | None:
         return self._track
 
-    def negotiate(self):
-        print("TODO: Add negotiate in RTPSender")
+    def negotiate(self) -> None:
+        """Compatibility hook; RTPTransceiver owns negotiated state."""
+
+    async def _reconcile_terminal(self) -> None:
+        for encoding in self._track_encodings:
+            encoding._dtls = None
+        self.__transport = None
+        self._rtcp_stream = None
+        if self._track is not None:
+            await self._track.aclose()
 
 
-class TrackRemote:
+class TrackRemote(_MachineComponent):
     def __init__(
         self,
         kind: RTPCodecKind,
         ssrc: int,  # uint32
         rtx_ssrc: int,  # uint32
-        rid: str,
+        rid: str, *, observability_id: str | None = None,
     ) -> None:
         self.kind = kind
         self.ssrc = ssrc
@@ -487,7 +657,11 @@ class TrackRemote:
         self.rid = rid
 
         self.__stream: SrtpStream | None = None
-        self.__queue = asyncio.Queue[bytes](maxsize=1000)
+        self.__queue = BoundedMailbox[bytes](1000)
+        self._init_machine(
+            "media-track",
+            observability_id or f"track-remote:{ssrc}:{secrets.token_hex(4)}",
+        )
 
     async def recv(self) -> bytes:
         """
@@ -512,11 +686,13 @@ class TrackRemote:
     @stream.setter
     def stream(self, value: SrtpStream):
         self.__stream = value
+        if self._runner.snapshot().state == "new":
+            self._try_transition(_LifecycleCommand.LIVE)
 
     async def write_rtp_bytes(self, data: bytes) -> bool:
         """Make a decrypted RTP packet visible to the application queue."""
         try:
-            self.__queue.put_nowait(data)
+            self.__queue.try_submit(bytes(data))
             metadata: dict[str, int | str] = {
                 "flow_direction": "rx",
                 "packet_kind": "rtp",
@@ -528,7 +704,7 @@ class TrackRemote:
                 metadata["sequence_number"] = int.from_bytes(data[2:4], "big")
             perf_mark("rtp", "packet.receive", "completed", metadata=metadata)
             return True
-        except asyncio.QueueFull:
+        except (MailboxFull, MailboxClosed):
             perf_mark(
                 "rtp",
                 "packet.receive",
@@ -547,7 +723,17 @@ class TrackRemote:
 
     async def recv_rtp_pkt_sync(self):
         """Read RTP bytes from queue (async)."""
-        return await self.__queue.get()
+        return await self.__queue.receive()
+
+    async def mute(self) -> TransitionCommit:
+        return await self._transition(_LifecycleCommand.MUTE)
+
+    async def unmute(self) -> TransitionCommit:
+        return await self._transition(_LifecycleCommand.RESUME)
+
+    async def _reconcile_terminal(self) -> None:
+        self.__stream = None
+        self.__queue.close()
 
 
 async def _receive_task(
@@ -586,17 +772,27 @@ async def _receive_task(
             await asyncio.sleep(0.1)
 
 
-class RTPReceiver(ObservedComponent):
-    def __init__(self, caps: MediaCaps, kind: RTPCodecKind) -> None:
+class RTPReceiver(ObservedComponent, _MachineComponent):
+    def __init__(
+        self, caps: MediaCaps, kind: RTPCodecKind, *, observability_id: str | None = None,
+    ) -> None:
         self._caps = caps
         self._kind = kind
         self._dtls: dtls.DTLSTransport | None = None
         self._track: TrackRemote | None = None
-        self._receive_task: asyncio.Task | None = None
+        self._receive_handle: OwnedTaskHandle[None] | None = None
+        self._pending_receive = False
+        self._init_machine(
+            "rtp-receiver", observability_id or f"rtp-receiver:{secrets.token_hex(6)}",
+        )
 
     @event_loop
     def bind(self, transport: dtls.DTLSTransport):
         self._dtls = transport
+        if self._runner.snapshot().state == "new":
+            self._try_transition(_LifecycleCommand.BIND)
+        if self._pending_receive:
+            self._try_transition(_LifecycleCommand.ACTIVATE)
 
     @event_loop
     def __rtp_reader(self) -> Callable[[], Coroutine[Any, Any, tuple[bytes, int]]]:
@@ -623,35 +819,51 @@ class RTPReceiver(ObservedComponent):
         Args:
             params: RTP decoding parameters
         """
-        print(f"[RTPReceiver.receive] CALLED for SSRC={params.ssrc}, existing_task={self._receive_task is not None}")
-        if self._receive_task:
+        print(f"[RTPReceiver.receive] CALLED for SSRC={params.ssrc}, existing_task={self._receive_handle is not None}")
+        if self._receive_handle:
             print(f"[RTPReceiver.receive] Receiver already started for SSRC={params.ssrc}, SKIPPING")
             return
 
-        self._track = TrackRemote(self._kind, params.ssrc, params.rtx.ssrc, params.rid)
+        self._track = TrackRemote(
+            self._kind, params.ssrc, params.rtx.ssrc, params.rid,
+            observability_id=f"{self.entity_id}:track",
+        )
+        self._pending_receive = True
+        if self._runner.snapshot().state == "bound":
+            self._try_transition(_LifecycleCommand.ACTIVATE)
 
         # Create async task to read from SRTP stream
-        self._receive_task = self._run_receive_loop(self.__rtp_reader(), self._track)
+        if self._runtime is None:
+            raise RuntimeError("RTPReceiver requires an active Runtime")
+        reader = self.__rtp_reader()
+        track = self._track
+        self._receive_handle = self._runtime.start_pump(
+            lambda: _receive_task(reader, track),
+            owner_entity_id=self.entity_id, owner_epoch=self._runner.epoch,
+            name="rtp:receiver", kind="rtp", failure=FailurePolicy.FAIL_CONNECTION,
+            metadata={"expected_long_running": True, "loop_role": "receive"},
+        )
         print(f"[RTPReceiver.receive] Started _receive_task for SSRC={params.ssrc}")
-
-    @task(
-        name="rtp:receiver",
-        kind="rtp",
-        state="transceiver",
-        metadata={"expected_long_running": True, "loop_role": "receive"},
-        failure=FailurePolicy.FAIL_CONNECTION,
-    )
-    async def _run_receive_loop(
-        self,
-        reader: Callable[[], Coroutine[Any, Any, tuple[bytes, int]]],
-        track: TrackRemote,
-    ) -> None:
-        await _receive_task(reader, track)
 
     @event_loop
     def stop(self):
-        if self._receive_task:
-            self._receive_task.cancel()
+        # Compatibility entry point: teardown is completed and joined by aclose().
+        if self._machine_handle is not None and not self._runner.snapshot().terminal:
+            if self._terminal_reply is None:
+                self._terminal_reply = ReplyPort[TransitionCommit]()
+                self._try_transition(_LifecycleCommand.STOP)
+
+    async def _reconcile_terminal(self) -> None:
+        if self._receive_handle is not None and not self._receive_handle.done():
+            self._receive_handle.cancel()
+            try:
+                await self._receive_handle.wait()
+            except asyncio.CancelledError:
+                pass
+        self._receive_handle = None
+        if self._track is not None:
+            await self._track.aclose()
+        self._dtls = None
 
     @property
     def track(self) -> TrackRemote | None:
@@ -733,6 +945,79 @@ def codecs_params_fuzzy_search(
     return
 
 
+class _TransceiverCommand(Enum):
+    NEGOTIATE = "negotiate"
+    ACTIVATE = "activate"
+    SET_MID = "set-mid"
+    SET_CODEC = "set-codec"
+    SET_SENDER = "set-sender"
+    SET_RECEIVER = "set-receiver"
+    SET_SNAPSHOT = "set-snapshot"
+    STOP = "stop"
+    FINISH = "finish"
+    FAIL = "fail"
+
+
+@dataclass(frozen=True, slots=True)
+class NegotiatedTransceiverSnapshot:
+    direction: RTPTransceiverDirection
+    mid: str | None
+    codecs: tuple[RTPCodecParameters, ...]
+    sender_id: str | None
+    receiver_id: str | None
+    sender_config: tuple[tuple[str, object], ...]
+    receiver_config: tuple[tuple[str, object], ...]
+
+
+class _TransceiverRunner(
+    AsyncStateMachineRunner[MachineCommand[object, TransitionCommit]]
+):
+    def __init__(self, owner: "RTPTransceiver", **kwargs) -> None:
+        super().__init__(MACHINE_SPECS["transceiver"], **kwargs)
+        self.owner = owner
+
+    async def step(self, command):
+        state = self.snapshot().state
+        proposed = {
+            _TransceiverCommand.NEGOTIATE: "negotiating",
+            _TransceiverCommand.ACTIVATE: "active",
+            _TransceiverCommand.SET_MID: "active",
+            _TransceiverCommand.SET_CODEC: "active",
+            _TransceiverCommand.SET_SENDER: "active",
+            _TransceiverCommand.SET_RECEIVER: "active",
+            _TransceiverCommand.SET_SNAPSHOT: "active",
+            _TransceiverCommand.STOP: "stopping",
+            _TransceiverCommand.FINISH: "stopped",
+            _TransceiverCommand.FAIL: "failed",
+        }.get(command.kind)
+        if proposed is None:
+            raise ValueError(f"unsupported transceiver command: {command.kind}")
+        if command.kind in {
+            _TransceiverCommand.SET_MID, _TransceiverCommand.SET_CODEC,
+            _TransceiverCommand.SET_SENDER, _TransceiverCommand.SET_RECEIVER,
+        } and state != "negotiating":
+            raise RuntimeError("transceiver configuration requires negotiating ownership")
+        if command.kind is _TransceiverCommand.SET_SNAPSHOT and state != "active":
+            raise RuntimeError("negotiated snapshot replacement requires active ownership")
+        return PreparedTransition(
+            state, proposed, (command.kind, command.payload), command.cause_id,
+            command.expected_epoch, command.expected_revision,
+        )
+
+    def commit(self, proposed, cause=None):
+        commit = super().commit(proposed, cause)
+        if isinstance(proposed, PreparedTransition):
+            kind, payload = proposed.effects
+            self.owner._commit_configuration(kind, payload)
+        return commit
+
+    async def reconcile_terminal(self, prepared):
+        await self.owner._reconcile_terminal()
+
+    async def after_commit(self, commit, effects):
+        self.owner._after_commit(commit)
+
+
 class RTPTransceiver(ObservedComponent):
     def __init__(
         self,
@@ -749,11 +1034,132 @@ class RTPTransceiver(ObservedComponent):
         self._kind: RTPCodecKind = kind
         self._prefered_codecs = list[RTPCodecParameters]()
         self._direction = direction
+        self._negotiated = NegotiatedTransceiverSnapshot(
+            direction, None, (), None, None, (), (),
+        )
         self.__dtls = dtls
         self._observability_id = (
             observability_id or f"transceiver-{secrets.token_hex(6)}"
         )
-        self._stopped = False
+        self.entity_id = self._observability_id
+        self._runtime = current_execution_scope()
+        self._command_id = 0
+        self._machine_handle: OwnedTaskHandle[None] | None = None
+        self._activation: ReplyPort[TransitionCommit] | None = None
+        self._terminal: ReplyPort[TransitionCommit] | None = None
+        self._runner = _TransceiverRunner(
+            self, entity_id=self.entity_id, mailbox_capacity=16,
+            controller=getattr(self._runtime, "transition_controller", None),
+            transition_sink=self._project_transition,
+        )
+        if self._runtime is not None and hasattr(self._runtime, "start_machine"):
+            self._runtime.projection.machines.register(
+                self.entity_id, MACHINE_SPECS["transceiver"],
+            )
+            self._runtime.register_owner(self.entity_id, epoch=self._runner.epoch)
+            self._machine_handle = self._runtime.start_machine(
+                self._runner, owner_entity_id=self.entity_id,
+                owner_epoch=self._runner.epoch,
+            )
+            self._activation = ReplyPort[TransitionCommit]()
+            self._runner.try_submit(self._command(
+                _TransceiverCommand.NEGOTIATE,
+                cause_id=f"{self.entity_id}:activate",
+            ))
+            self._runner.try_submit(self._command(
+                _TransceiverCommand.ACTIVATE, reply=self._activation,
+                cause_id=f"{self.entity_id}:activate",
+            ))
+
+    @event_loop
+    def _command(
+        self, kind, payload=None, *, reply=None, cause_id=None,
+        expected_revision=None, expected_epoch=None,
+    ):
+        self._command_id += 1
+        return MachineCommand(
+            kind, self._command_id,
+            self._runner.epoch if expected_epoch is None else expected_epoch,
+            payload, reply,
+            expected_revision=expected_revision,
+            cause_id=cause_id or f"{self.entity_id}:{self._command_id}",
+        )
+
+    @event_loop
+    def _project_transition(self, commit: TransitionCommit) -> None:
+        runtime = self._runtime
+        if runtime is None or not getattr(runtime, "tracing_enabled", True):
+            return
+        runtime.projection.machines.apply(MachineTransitionOp(
+            commit.entity_id, commit.machine_type, commit.from_state, commit.to_state,
+            commit.epoch, commit.revision, runtime.new_producer_dot(),
+            commit.cause, commit.monotonic_ns,
+        ))
+        runtime.projection.merge_values(
+            commit.entity_id, runtime.new_producer_dot(), {
+                "direction": self._negotiated.direction.value,
+                "kind": self._kind.value,
+                "active": commit.to_state == "active",
+                "mid": self._negotiated.mid,
+                "codecs": ",".join(codec.mime_type for codec in self._negotiated.codecs),
+                "sender_id": self._negotiated.sender_id,
+                "receiver_id": self._negotiated.receiver_id,
+            },
+            observer_meta="exact", source_entity_id=commit.entity_id,
+            source_epoch=commit.epoch, source_revision=commit.revision,
+            source_order=runtime.projection.new_facet_source_order(),
+        )
+
+    @event_loop
+    def _commit_configuration(self, kind, payload) -> None:
+        if kind is _TransceiverCommand.SET_MID:
+            self._mid = MID(payload)
+            self._negotiated = replace(self._negotiated, mid=self._mid.value)
+        elif kind is _TransceiverCommand.SET_CODEC:
+            self._prefered_codecs.append(payload)
+            self._negotiated = replace(
+                self._negotiated, codecs=tuple(self._prefered_codecs),
+            )
+        elif kind is _TransceiverCommand.SET_SENDER:
+            self._sender = payload
+            parameters = payload.get_parameters()
+            self._negotiated = replace(
+                self._negotiated, sender_id=payload.entity_id,
+                sender_config=(("encoding_count", len(payload._track_encodings)),
+                               ("has_parameters", parameters is not None)),
+            )
+        elif kind is _TransceiverCommand.SET_RECEIVER:
+            self._receiver = payload
+            self._negotiated = replace(
+                self._negotiated, receiver_id=payload.entity_id,
+                receiver_config=(("kind", payload._kind.value),
+                                 ("has_track", payload.track is not None)),
+            )
+        elif kind is _TransceiverCommand.SET_SNAPSHOT:
+            self._negotiated = payload
+            self._direction = payload.direction
+            self._mid = MID(payload.mid) if payload.mid is not None else None
+            self._prefered_codecs = list(payload.codecs)
+
+    @event_loop
+    def _after_commit(self, commit: TransitionCommit) -> None:
+        if commit.to_state == "stopping":
+            self._runner.try_submit(self._command(
+                _TransceiverCommand.FINISH,
+                cause_id=str(commit.cause) if commit.cause is not None else None,
+                reply=self._terminal,
+            ))
+
+    async def _reconcile_terminal(self) -> None:
+        if self._receiver is not None:
+            await self._receiver.aclose()
+        if self._sender is not None:
+            await self._sender.aclose()
+
+    async def wait_active(self) -> TransitionCommit:
+        if self._activation is None:
+            raise RuntimeError("transceiver requires an active Runtime")
+        return await self._activation.wait()
 
     @task(
         name="srtp:start-streams",
@@ -786,9 +1192,22 @@ class RTPTransceiver(ObservedComponent):
         if self._receiver:
             self._receiver.bind(transport)
 
-    @event_loop
-    def set_prefered_codec(self, codec: RTPCodecParameters):
-        self._prefered_codecs.append(codec)
+    async def set_prefered_codec(self, codec: RTPCodecParameters):
+        await self.wait_active()
+        await self._begin_negotiation()
+        reply = ReplyPort[TransitionCommit]()
+        await self._runner.submit(self._command(
+            _TransceiverCommand.SET_CODEC, codec, reply=reply,
+        ))
+        await reply.wait()
+
+    async def _begin_negotiation(self) -> TransitionCommit:
+        reply = ReplyPort[TransitionCommit]()
+        await self._runner.submit(self._command(
+            _TransceiverCommand.NEGOTIATE, reply=reply,
+            expected_revision=self._runner.revision,
+        ))
+        return await reply.wait()
 
     @event_loop
     def get_codecs(self) -> list[RTPCodecParameters] | None:
@@ -806,19 +1225,26 @@ class RTPTransceiver(ObservedComponent):
 
     @event_loop
     def stop(self):
-        if self._stopped:
-            return
-        self._stopped = True
-        if self._receiver is not None:
-            self._receiver.stop()
-        emit_domain_event(
-            TransceiverStateChanged, transceiver_id=self._observability_id,
-            direction=self._direction.value, active=False, lifecycle="stopped",
-        )
-        emit_domain_event(
-            MediaStateChanged, media_id=self._observability_id,
-            direction=self._direction.value, active=False, lifecycle="ended",
-        )
+        if self._runner.snapshot().state in {"stopping", "stopped"}:
+            return self._terminal
+        self._terminal = ReplyPort[TransitionCommit]()
+        self._runner.try_submit(self._command(
+            _TransceiverCommand.STOP, reply=None,
+            cause_id=f"{self.entity_id}:stop",
+        ))
+        return self._terminal
+
+    async def aclose(self) -> None:
+        terminal = self.stop()
+        if terminal is not None:
+            await terminal.wait()
+        if self._machine_handle is not None and not self._machine_handle.done():
+            await self._machine_handle.wait()
+        if self._runtime is not None:
+            try:
+                self._runtime.remove_owner(self.entity_id, self._runner.epoch)
+            except (KeyError, StaleOwnerEpoch):
+                pass
 
     @event_loop
     def track_local(self) -> TrackLocal | None:
@@ -831,20 +1257,30 @@ class RTPTransceiver(ObservedComponent):
         return self._sender
 
     async def set_sender(self, sender: RTPSender):
+        await self.wait_active()
         if self.__dtls:
             await sender.bind(self.__dtls)
-        self._sender = sender
+        await self._begin_negotiation()
+        reply = ReplyPort[TransitionCommit]()
+        await self._runner.submit(self._command(
+            _TransceiverCommand.SET_SENDER, sender, reply=reply,
+        ))
+        await reply.wait()
 
     @property
     def receiver(self) -> RTPReceiver | None:
         return self._receiver
 
-    @event_loop
-    def set_receiver(self, receiver: RTPReceiver):
+    async def set_receiver(self, receiver: RTPReceiver):
+        await self.wait_active()
         if self.__dtls:
             receiver.bind(self.__dtls)
-
-        self._receiver = receiver
+        await self._begin_negotiation()
+        reply = ReplyPort[TransitionCommit]()
+        await self._runner.submit(self._command(
+            _TransceiverCommand.SET_RECEIVER, receiver, reply=reply,
+        ))
+        await reply.wait()
 
     @property
     def direction(self) -> RTPTransceiverDirection:
@@ -862,9 +1298,30 @@ class RTPTransceiver(ObservedComponent):
     def mid(self) -> MID | None:
         return self._mid
 
-    @event_loop
-    def set_mid(self, mid: int | str):
-        self._mid = MID(mid)
+    async def set_mid(self, mid: int | str):
+        await self.wait_active()
+        await self._begin_negotiation()
+        reply = ReplyPort[TransitionCommit]()
+        await self._runner.submit(self._command(
+            _TransceiverCommand.SET_MID, mid, reply=reply,
+        ))
+        await reply.wait()
+
+    @property
+    def negotiated_snapshot(self) -> NegotiatedTransceiverSnapshot:
+        return self._negotiated
+
+    async def apply_negotiated_snapshot(
+        self, snapshot: NegotiatedTransceiverSnapshot, *, expected_epoch: int,
+        expected_revision: int,
+    ) -> TransitionCommit:
+        """Atomically replace the complete negotiation snapshot under CAS guards."""
+        reply = ReplyPort[TransitionCommit]()
+        await self._runner.submit(self._command(
+            _TransceiverCommand.SET_SNAPSHOT, snapshot, reply=reply,
+            expected_epoch=expected_epoch, expected_revision=expected_revision,
+        ))
+        return await reply.wait()
 
 
 def find_transceiver_by_mid(

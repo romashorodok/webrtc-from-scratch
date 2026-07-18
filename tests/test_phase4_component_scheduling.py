@@ -13,16 +13,13 @@ from webrtc.runtime_services import FailurePolicy
 
 def test_peer_start_is_an_ordinary_structured_async_method() -> None:
     async def scenario() -> None:
-        peer = PeerConnection()
-
-        async def start_gatherer() -> None:
-            return None
-
-        peer.gatherer.start = start_gatherer
-        await peer.start()
-        peer._started = False
-
         async with Runtime(scope_id="phase-4"):
+            peer = PeerConnection()
+
+            async def start_gatherer() -> None:
+                return None
+
+            peer.gatherer.start = start_gatherer
             started = peer.start()
             assert inspect.isawaitable(started)
             assert not isinstance(started, asyncio.Task)
@@ -31,33 +28,20 @@ def test_peer_start_is_an_ordinary_structured_async_method() -> None:
     asyncio.run(scenario())
 
 
-def test_dtls_inbound_runner_cancels_and_awaits_its_fsm_child() -> None:
-    stopped = asyncio.Event()
-
-    class FakeFSM(ObservedComponent):
-        @task(
-            name="test:dtls-fsm",
-            kind="dtls",
-            failure=FailurePolicy.FAIL_CONNECTION,
-        )
-        async def run(self) -> None:
-            try:
-                await asyncio.Future()
-            finally:
-                stopped.set()
-
+def test_dtls_inbound_runner_is_runtime_owned_and_cancelable() -> None:
     async def scenario() -> None:
         connection = DTLSConn.__new__(DTLSConn)
         connection.record_layer_chan = asyncio.Queue()
-        connection.fsm = FakeFSM()
 
-        async with Runtime(scope_id="phase-4"):
-            inbound = connection.handle_inbound_record_layers()
+        async with Runtime(scope_id="phase-4") as runtime:
+            inbound = runtime.start(
+                connection.handle_inbound_record_layers,
+                name="test:dtls-inbound",
+            )
             await asyncio.sleep(0)
             inbound.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await inbound
-            await asyncio.wait_for(stopped.wait(), timeout=1)
 
     asyncio.run(scenario())
 

@@ -106,14 +106,11 @@ class Flight4(FlightTransition):
             client_key_exchange.pubkey
         )
 
-        logger.debug(f"__setup_cipher_suite: pre_master_secret={binascii.hexlify(pre_master_secret).decode()}")
 
         if not state.remote_random:
             logger.error("__setup_cipher_suite: remote_random is missing")
             raise ValueError("Flight 4 not found remote random")
 
-        logger.debug(f"__setup_cipher_suite: remote_random={binascii.hexlify(state.remote_random).decode()}")
-        logger.debug(f"__setup_cipher_suite: local_random={binascii.hexlify(state.local_random.marshal_fixed()).decode()}")
 
         # Compute master secret - use Extended Master Secret (RFC 7627) if negotiated
         if state.use_extended_master_secret and session_hash_for_ems is not None:
@@ -122,7 +119,6 @@ class Flight4(FlightTransition):
             session_hash_digest = hashlib.sha256(session_hash_for_ems).digest()
             logger.info("__setup_cipher_suite: Using Extended Master Secret (RFC 7627)")
             logger.debug(f"__setup_cipher_suite: session_hash_for_ems length={len(session_hash_for_ems)}")
-            logger.debug(f"__setup_cipher_suite: session_hash_digest={session_hash_digest.hex()}")
             state.master_secret = prf_extended_master_secret(
                 pre_master_secret,
                 session_hash_digest,
@@ -137,7 +133,6 @@ class Flight4(FlightTransition):
                 state.local_random.marshal_fixed(),
             )
 
-        logger.debug(f"__setup_cipher_suite: master_secret={binascii.hexlify(state.master_secret).decode()}")
 
         state.pending_cipher_suite.start(
             state.master_secret,
@@ -148,7 +143,7 @@ class Flight4(FlightTransition):
 
         logger.info("__setup_cipher_suite: cipher suite started, signaling ready")
         # Signal that cipher suite is ready for decryption
-        state.cipher_suite_ready.set()
+        state.cipher_suite_ready = True
         logger.info("__setup_cipher_suite: cipher_suite_ready event set")
 
     def __validate_client_certificate(

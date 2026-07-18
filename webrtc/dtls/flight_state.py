@@ -115,13 +115,16 @@ class HandshakeCache:
         # Quick lookup dict: key -> highest message_sequence item
         self._cache: dict[HandshakeCacheKey, bytes] = {}
 
-        self.__subscribers: list[tuple[list[HandshakeCacheKey], asyncio.Event]] = []
+        self.__subscribers: list[
+            tuple[list[HandshakeCacheKey], asyncio.Future[None]]
+        ] = []
 
     def __emit_ready_at_once(self):
         to_remove = []
         for cache_keys, event in self.__subscribers:
             if all(key in self._cache for key in cache_keys):
-                event.set()
+                if not event.done():
+                    event.set_result(None)
                 to_remove.append((cache_keys, event))
 
         for item in to_remove:
@@ -129,10 +132,10 @@ class HandshakeCache:
 
     async def once(self, cache_keys: list[HandshakeCacheKey]):
         logger.info(f"cache.once: waiting for keys={[str(k) for k in cache_keys]}")
-        event = asyncio.Event()
+        event: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self.__subscribers.append((cache_keys, event))
         self.__emit_ready_at_once()
-        await event.wait()
+        await asyncio.shield(event)
         logger.info(f"cache.once: all keys received!")
 
     def put_and_notify_once(
@@ -270,7 +273,7 @@ class State:
         self.use_extended_master_secret: bool = False
 
         # Event to signal when cipher suite is initialized (pending_cipher_suite.start() called)
-        self.cipher_suite_ready = asyncio.Event()
+        self.cipher_suite_ready = False
 
         # self.pending_local_handshake_layers: list[RecordLayer] | None = None
         # self.pending_remote_handshake_messages: list[Message] | None = None

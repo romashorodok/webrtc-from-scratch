@@ -8,12 +8,15 @@ from enum import IntEnum
 from typing import Protocol
 
 from webrtc.dtls.certificate import Certificate
-from webrtc.performance import ObservedComponent, event_loop, task
+from webrtc.performance import ObservedComponent, event_loop
+from webrtc.queue_machine import RuntimeOwnedQueue
 from webrtc.runtime_services import FailurePolicy, current_execution_scope
 from webrtc.machine_specs import MACHINE_SPECS
 from webrtc.observability import MachineTransitionOp
-from webrtc.state_machine import MachineSpec, TransitionCommit, TransitionCheckpoint
-from webrtc.domain_events import DtlsStateChanged, emit_domain_event
+from webrtc.state_machine import (
+    AsyncStateMachineRunner, BoundedMailbox, PreparedTransition,
+    TransitionCommit,
+)
 from webrtc.tracing import measure_perf_async
 
 # Structured logging for DTLS handshake
@@ -47,6 +50,7 @@ INITIAL_RETRANSMIT_TIMEOUT = 1.0  # 1 second initial timeout
 MAX_RETRANSMIT_TIMEOUT = 60.0     # Maximum 60 seconds
 MAX_RETRANSMISSIONS = 5           # Maximum retransmission attempts
 HANDSHAKE_TIMEOUT = 30.0          # Total handshake timeout
+MAX_PENDING_ENCRYPTED_RECORDS = 64
 
 
 class DTLSRemote(Protocol):
@@ -73,15 +77,38 @@ class WakeHandshake:
 
 FSMCommand = StartHandshake | WakeHandshake
 
-DTLS_PHASE_SPEC = MachineSpec(
-    "dtls", "Preparing", {
-        "Preparing": frozenset({"Sending", "Errored"}),
-        "Sending": frozenset({"Sending", "Waiting", "Finished", "Errored"}),
-        "Waiting": frozenset({"Preparing", "Waiting", "Finished", "Errored"}),
-        "Errored": frozenset({"Preparing"}),
-        "Finished": frozenset(),
-    }, frozenset({"Finished"}), frozenset({"cancel_owner", "inject_failure"}),
-)
+DTLS_PHASE_SPEC = MACHINE_SPECS["dtls-handshake-phase"]
+
+
+class _HandshakePhaseRunner(AsyncStateMachineRunner[FSMCommand]):
+    """Generic single-writer runner for protocol-internal flight phases."""
+
+    def __init__(self, owner: "FSM", **kwargs) -> None:
+        self.owner = owner
+        super().__init__(DTLS_PHASE_SPEC, **kwargs)
+
+    async def step(self, cause: FSMCommand) -> PreparedTransition[SRTPKeyingMaterial | None]:
+        current = FSMState[self._state.capitalize()]
+        proposed = await self.owner._step(current)
+        keying_material = (
+            self.owner.state.get_srtp_keying_material()
+            if proposed is FSMState.Finished else None
+        )
+        if proposed is FSMState.Finished and keying_material is None:
+            raise RuntimeError("DTLS finished without SRTP keying material")
+        return PreparedTransition(
+            self._state, proposed.name.lower(), keying_material, cause,
+            self.epoch, self._revision,
+        )
+
+    async def after_commit(
+        self, commit: TransitionCommit, effects: SRTPKeyingMaterial | None
+    ) -> None:
+        if commit.to_state == "finished":
+            assert effects is not None
+            self.owner._complete_handshake(effects)
+            return
+        self.try_submit(WakeHandshake("phase-advance"))
 
 
 FLIGHT_TRANSITIONS: dict[Flight, FlightTransition] = {
@@ -102,7 +129,7 @@ class FSM(ObservedComponent):
         self,
         remote: DTLSRemote,
         certificate: Certificate,
-        handshake_messages_chan: asyncio.Queue[Message],
+        handshake_messages_chan: RuntimeOwnedQueue[Message],
         flight: Flight = Flight.FLIGHT0,
     ) -> None:
         if flight == Flight.FLIGHT0:
@@ -117,9 +144,6 @@ class FSM(ObservedComponent):
 
         self.state = State(remote, certificate, Keypair.generate_P256(), is_server=self.is_server)
 
-        self.commands: asyncio.Queue[FSMCommand] = asyncio.Queue()
-        self.handshake_state: FSMState = FSMState.Preparing
-        self.transition_revision = 0
         self.flight: Flight = flight
 
         scope = current_execution_scope()
@@ -127,14 +151,27 @@ class FSM(ObservedComponent):
         self._projection = getattr(scope, "projection", None)
         root = getattr(scope, "root_context", None)
         identity = getattr(scope, "scope_id", None) or getattr(root, "trace_id", None)
-        self.entity_id = f"dtls:{identity or id(self)}"
+        self.entity_id = f"dtls-handshake-phase:{identity or id(self)}"
+        self._runner = _HandshakePhaseRunner(
+            self, entity_id=self.entity_id, mailbox_capacity=16,
+            controller=self._transition_controller,
+            transition_sink=self._project_transition,
+        )
+        self.commands: BoundedMailbox[FSMCommand] = self._runner.commands
         if self._projection is not None:
             self._projection.machines.register(self.entity_id, DTLS_PHASE_SPEC)
+        self._runtime = scope if hasattr(scope, "start_machine") else None
+        if self._runtime is not None:
+            self._runtime.register_owner(self.entity_id, epoch=self._runner.epoch)
+            self._runner_handle = self._runtime.start_machine(
+                self._runner, owner_entity_id=self.entity_id,
+                owner_epoch=self._runner.epoch,
+            )
+        else:
+            self._runner_handle = None
 
         self.pending_record_layers: list[RecordLayer] | None = None
 
-        # Handshake completion signaling
-        self.handshake_complete = asyncio.Event()
         self._srtp_keying_material: SRTPKeyingMaterial | None = None
 
         # Retransmission state (RFC 6347 Section 4.2.4)
@@ -143,6 +180,27 @@ class FSM(ObservedComponent):
         self._last_sent_flight: bytes | None = None
         self._last_received_flight: Flight | None = None
         self._handshake_start_time: float | None = None
+
+    @property
+    def handshake_state(self) -> FSMState:
+        return FSMState[self._runner.snapshot().state.capitalize()]
+
+    @property
+    def transition_revision(self) -> int:
+        return self._runner.snapshot().revision
+
+    @event_loop
+    def _project_transition(self, committed: TransitionCommit) -> None:
+        scope = current_execution_scope()
+        if (self._projection is None or scope is None
+                or not getattr(scope, "tracing_enabled", True)):
+            return
+        self._projection.machines.apply(MachineTransitionOp(
+            committed.entity_id, committed.machine_type,
+            committed.from_state, committed.to_state, committed.epoch,
+            committed.revision, scope.new_producer_dot(), committed.cause,
+            committed.monotonic_ns,
+        ))
 
     @event_loop
     def get_srtp_keying_material(self) -> SRTPKeyingMaterial | None:
@@ -164,10 +222,16 @@ class FSM(ObservedComponent):
             True if handshake completed, False on timeout
         """
         try:
-            await asyncio.wait_for(self.handshake_complete.wait(), timeout)
+            await asyncio.wait_for(
+                self._wait_for_terminal_snapshot(), timeout
+            )
             return True
         except asyncio.TimeoutError:
             return False
+
+    async def _wait_for_terminal_snapshot(self) -> None:
+        while self._runner.snapshot().state != "finished":
+            await asyncio.sleep(0.001)
 
     @event_loop
     def _reset_retransmit_state(self) -> None:
@@ -227,7 +291,7 @@ class FSM(ObservedComponent):
             metadata=metadata,
         ):
             try:
-                await self.commands.put(StartHandshake())
+                await self._runner.submit(StartHandshake())
             except Exception:
                 metadata.update(
                     error_stage="state_transition_enqueue",
@@ -327,12 +391,10 @@ class FSM(ObservedComponent):
 
                     logger.debug(f"Send seq number: {layer.header.sequence_number}")
                     print(f"[FSM] send: encrypting layer content_type={layer.header.content_type}, epoch={layer.header.epoch}")
-                    print(f"[FSM] send: plaintext payload ({len(data[layer.header_size():])} bytes): {data[layer.header_size():].hex()}")
 
                     data = self.state.pending_cipher_suite.encrypt(layer)
                     if not data:
                         raise ValueError("None data after encrypt,")
-                    print(f"[FSM] send: encrypted result ({len(data)} bytes): {data.hex()}")
 
                 if len(data) > MAX_MTU and len(send_batch) > MAX_MTU:
                     raise ValueError(
@@ -347,7 +409,6 @@ class FSM(ObservedComponent):
                 await asyncio.sleep(10)
                 return FSMState.Sending
 
-        print(f"[FSM] send: total send_batch ({len(send_batch)} bytes): {send_batch.hex()}")
         await self.remote.sendto(send_batch)
 
         # Store last sent flight for retransmission
@@ -359,23 +420,14 @@ class FSM(ObservedComponent):
         return FSMState.Waiting
 
     @event_loop
-    def _complete_handshake(self) -> None:
+    def _complete_handshake(self, keying_material: SRTPKeyingMaterial) -> None:
         """
         Complete the handshake and derive SRTP keying material.
 
         Called after Flight6 (server Finished) is sent.
         """
-        try:
-            # Derive SRTP keying material
-            self._srtp_keying_material = self.state.get_srtp_keying_material()
-            logger.info(f"SRTP keys derived: client_key={len(self._srtp_keying_material.client_write_key)}B, "
-                        f"server_key={len(self._srtp_keying_material.server_write_key)}B, "
-                        f"client_salt={len(self._srtp_keying_material.client_write_salt)}B, "
-                        f"server_salt={len(self._srtp_keying_material.server_write_salt)}B")
-
-            logger.info("DTLS handshake complete!")
-        except Exception as e:
-            logger.error(f"Error deriving SRTP keys: {e}")
+        self._srtp_keying_material = keying_material
+        logger.info("DTLS handshake complete with SRTP keying material")
 
     async def wait(self) -> FSMState:
         flight = FLIGHT_TRANSITIONS.get(self.flight)
@@ -389,10 +441,39 @@ class FSM(ObservedComponent):
 
         # Wait for next flight with retransmission timeout
         try:
-            new_flight = await asyncio.wait_for(
-                flight.parse(self.state, self.handshake_message_chan),
-                timeout=self._retransmit_timeout
-            )
+            if self._runtime is None:
+                new_flight = await asyncio.wait_for(
+                    flight.parse(self.state, self.handshake_message_chan),
+                    timeout=self._retransmit_timeout,
+                )
+            else:
+                timed_out = False
+                parse_handle = self._runtime.start_pump(
+                    lambda: flight.parse(self.state, self.handshake_message_chan),
+                    owner_entity_id=self.entity_id,
+                    owner_epoch=self._runner.epoch,
+                    name=f"dtls:parse:{self.flight.name}", kind="dtls",
+                    failure=FailurePolicy.FAIL_CONNECTION,
+                )
+
+                def expire() -> None:
+                    nonlocal timed_out
+                    timed_out = True
+                    parse_handle.cancel()
+
+                timer = self._runtime.call_later_owned(
+                    self._retransmit_timeout, expire,
+                    owner_entity_id=self.entity_id,
+                    owner_epoch=self._runner.epoch,
+                )
+                try:
+                    new_flight = await parse_handle
+                except asyncio.CancelledError:
+                    if not timed_out:
+                        raise
+                    raise asyncio.TimeoutError from None
+                finally:
+                    timer.cancel()
 
             # Check for duplicate flight (peer retransmission)
             if self._is_duplicate_flight(new_flight):
@@ -436,16 +517,20 @@ class FSM(ObservedComponent):
 
             return FSMState.Waiting
 
-        except Exception as e:
-            logger.error(f"transition Flight{flight} error: {e}")
-            return FSMState.Errored
+        except Exception:
+            # Retransmission timeouts are handled above. Parse/programming
+            # failures are terminal task failures and must reach the public
+            # DTLS/peer failure path instead of entering an endless retry
+            # cycle that hides the original exception.
+            logger.exception("transition Flight%s failed", flight)
+            raise
 
         return FSMState.Preparing
 
     async def finish(self) -> FSMState: ...
 
-    async def _step(self) -> FSMState:
-        match self.handshake_state:
+    async def _step(self, current: FSMState) -> FSMState:
+        match current:
             case FSMState.Preparing:
                 return await self.prepare()
             case FSMState.Sending:
@@ -458,81 +543,52 @@ class FSM(ObservedComponent):
                 return FSMState.Preparing
             case FSMState.Finished:
                 return FSMState.Finished
-        raise RuntimeError(f"unknown DTLS state {self.handshake_state!r}")
-
-    @event_loop
-    def _checkpoint(
-        self, previous: FSMState, proposed: FSMState, revision: int, phase: str
-    ) -> TransitionCheckpoint:
-        factory = getattr(self._transition_controller, "checkpoint", None)
-        values = dict(
-            entity_id=self.entity_id, machine_type="dtls",
-            from_state=previous.name, to_state=proposed.name,
-            revision=revision, phase=phase,
-            allowed_actions=DTLS_PHASE_SPEC.test_actions,
-        )
-        if factory is not None:
-            return factory(**values)
-        return TransitionCheckpoint(0, **values)
-
-    @event_loop
-    def _commit(self, proposed: FSMState, command: FSMCommand) -> TransitionCommit:
-        previous = self.handshake_state
-        DTLS_PHASE_SPEC.validate(previous.name, proposed.name)
-        self.handshake_state = proposed
-        self.transition_revision += 1
-        committed = TransitionCommit(
-            self.entity_id, "dtls", previous.name, proposed.name,
-            self.transition_revision, command, time.monotonic_ns(),
-        )
-        if self._projection is not None:
-            scope = current_execution_scope()
-            self._projection.machines.apply(MachineTransitionOp(
-                self.entity_id, "dtls", previous.name, proposed.name, 1,
-                committed.revision, scope.new_producer_dot(), None,
-                committed.monotonic_ns,
-            ))
-        emit_domain_event(
-            DtlsStateChanged, state=proposed.name, revision=committed.revision
-        )
-        return committed
+        raise RuntimeError(f"unknown DTLS state {current!r}")
 
     async def _transition(self, proposed: FSMState, command: FSMCommand) -> None:
-        previous = self.handshake_state
-        DTLS_PHASE_SPEC.validate(previous.name, proposed.name)
-        checkpoint = self._checkpoint(
-            previous, proposed, self.transition_revision + 1, "before_commit"
+        effects = (
+            self.state.get_srtp_keying_material()
+            if proposed is FSMState.Finished else None
         )
-        if self._transition_controller is not None:
-            await self._transition_controller.before_commit(checkpoint)
-        committed = self._commit(proposed, command)
-        if self._transition_controller is not None:
-            await self._transition_controller.after_commit(self._checkpoint(
-                previous, proposed, committed.revision, "after_commit"
-            ))
+        if proposed is FSMState.Finished and effects is None:
+            raise RuntimeError("DTLS finished without SRTP keying material")
+        prepared = PreparedTransition(
+            self._runner.state, proposed.name.lower(), effects, command,
+            self._runner.epoch, self._runner.revision,
+        )
+        preview = TransitionCommit(
+            self.entity_id, DTLS_PHASE_SPEC.machine_type, self._runner.state,
+            proposed.name.lower(), self._runner.revision + 1, command,
+            0, self._runner.epoch,
+        )
+        await self._runner.controller.before_commit(
+            self._runner._checkpoint(preview, "before_commit")
+        )
+        committed = self._runner.commit(prepared, command)
+        self._project_transition(committed)
+        await self._runner.controller.after_commit(
+            self._runner._checkpoint(committed, "after_commit")
+        )
+        await self._runner.after_commit(committed, effects)
         if proposed is FSMState.Finished:
-            # One terminal commit owns completion: projected state, after-commit,
-            # key derivation/event, then the terminal checkpoint.
-            self._complete_handshake()
-            self.handshake_complete.set()
-            if self._transition_controller is not None:
-                await self._transition_controller.terminal(self._checkpoint(
-                    previous, proposed, committed.revision, "terminal"
-                ))
+            await self._runner.controller.terminal(
+                self._runner._checkpoint(committed, "terminal")
+            )
 
-    @task(
-        name="dtls:fsm",
-        kind="dtls",
-        state="dtls",
-        metadata={"expected_long_running": True, "loop_role": "fsm"},
-        failure=FailurePolicy.FAIL_CONNECTION,
-    )
     async def run(self):
-        command = await self.commands.get()
-        while self.handshake_state is not FSMState.Finished:
-            proposed = await self._step()
-            await self._transition(proposed, command)
+        await self._runner.run()
         logger.info("FSM: Handshake finished successfully!")
+
+    async def aclose(self) -> None:
+        self._runner.close_mailbox(RuntimeError("DTLS handshake closed"))
+        handle = self._runner_handle
+        if handle is not None and not handle.done():
+            handle.cancel()
+            with suppress(asyncio.CancelledError):
+                await handle.wait()
+        if handle is not None and self._runtime is not None:
+            self._runtime.remove_owner(self.entity_id, self._runner.epoch)
+            self._runner_handle = None
 
 
 # TODO: Validate epoch
@@ -548,14 +604,13 @@ class DTLSConn(ObservedComponent):
     ) -> None:
         self.record_layer_chan = layer_chan
 
-        self.handshake_message_chan = asyncio.Queue[Message]()
+        scope = current_execution_scope()
+        identity = getattr(scope, "scope_id", None) or id(self)
+        self.handshake_message_chan: RuntimeOwnedQueue[Message] = RuntimeOwnedQueue(
+            64, entity_id=f"dtls-handshake-messages:{identity}:{id(self)}",
+            queue_kind="dtls-handshake-messages",
+        )
         self.fsm = FSM(remote, certificate, self.handshake_message_chan, flight)
-        self.recv_lock = asyncio.Lock()
-
-    @property
-    def handshake_complete(self) -> asyncio.Event:
-        """Event signaling handshake completion."""
-        return self.fsm.handshake_complete
 
     @event_loop
     def get_srtp_keying_material(self) -> SRTPKeyingMaterial | None:
@@ -607,17 +662,9 @@ class DTLSConn(ObservedComponent):
 
         logger.warning(f"__handle_encrypted_message: decrypt returned None/empty")
 
-    @task(
-        name="dtls:handle-inbound-record-layers",
-        kind="dtls",
-        metadata={"expected_long_running": True, "loop_role": "receive"},
-        failure=FailurePolicy.FAIL_CONNECTION,
-    )
     async def handle_inbound_record_layers(self):
         print("[FSM] handle_inbound_record_layers: STARTED")
         logger.info("handle_inbound_record_layers: starting inbound message handler")
-        fsm_runnable = self.fsm.run()
-
         # Queue for encrypted messages that arrive before cipher suite is ready
         pending_encrypted: list[tuple[RecordLayer, bytes, EncryptedHandshakeMessage]] = []
 
@@ -633,13 +680,12 @@ class DTLSConn(ObservedComponent):
                         logger.info("handle_inbound: CHANGE_CIPHER_SPEC received")
                         # Wait for cipher suite to be ready (Flight4 must call __setup_cipher_suite first)
                         # This ensures pending_cipher_suite.start() has been called
-                        logger.info("handle_inbound: waiting for cipher_suite_ready event...")
+                        logger.info("handle_inbound: waiting for cipher suite readiness...")
                         try:
                             await asyncio.wait_for(
-                                self.fsm.state.cipher_suite_ready.wait(),
-                                timeout=5.0  # 5 second timeout
+                                self._wait_for_cipher_suite(), timeout=5.0
                             )
-                            logger.info("handle_inbound: cipher_suite_ready event received")
+                            logger.info("handle_inbound: cipher suite is ready")
                         except asyncio.TimeoutError:
                             logger.error("handle_inbound: TIMEOUT waiting for cipher_suite_ready (5s)")
                             continue
@@ -671,6 +717,14 @@ class DTLSConn(ObservedComponent):
                                 else:
                                     # Queue for later processing
                                     logger.info("handle_inbound: cipher suite NOT ready, queueing encrypted message")
+                                    if len(pending_encrypted) >= MAX_PENDING_ENCRYPTED_RECORDS:
+                                        scope = current_execution_scope()
+                                        diagnostics = getattr(scope, "diagnostics", None)
+                                        if diagnostics is not None:
+                                            diagnostics["dtls_pending_encrypted_overflow"] += 1
+                                        raise RuntimeError(
+                                            "DTLS pending encrypted record limit exceeded"
+                                        )
                                     pending_encrypted.append((record_layer, raw, record_layer.content))
                                 continue
                         else:
@@ -744,7 +798,12 @@ class DTLSConn(ObservedComponent):
 
         except Exception as e:
             logger.error(f"DTLS handle inbound record layers error: {e}")
-        finally:
-            fsm_runnable.cancel()
-            with suppress(asyncio.CancelledError):
-                await fsm_runnable
+            raise
+
+    async def _wait_for_cipher_suite(self) -> None:
+        while not self.fsm.state.cipher_suite_ready:
+            await asyncio.sleep(0.001)
+
+    async def aclose(self) -> None:
+        await self.fsm.aclose()
+        await self.handshake_message_chan.close()

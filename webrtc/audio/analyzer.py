@@ -6,7 +6,6 @@ Includes FFT spectrum computation, audio feature extraction, and threshold-based
 """
 
 import time
-import inspect
 from collections import deque
 from typing import Any, Dict, Optional
 
@@ -175,14 +174,8 @@ class AudioAnalyzer(ObservedComponent):
         self.frame_count += 1
 
         # Run CPU-intensive computation in thread pool
-        spectrum_result = self._compute_spectrum(pcm_bytes)
-        spectrum, vad_features = (
-            await spectrum_result if inspect.isawaitable(spectrum_result) else spectrum_result
-        )
-        features_result = self._compute_features(pcm_bytes)
-        features = (
-            await features_result if inspect.isawaitable(features_result) else features_result
-        )
+        spectrum, vad_features = await self._compute_spectrum(pcm_bytes)
+        features = await self._compute_features(pcm_bytes)
 
         # Merge VAD features into main features dict
         if vad_features:

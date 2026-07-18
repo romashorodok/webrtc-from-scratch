@@ -10,16 +10,195 @@ from __future__ import annotations
 import asyncio
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
+from collections import deque
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 C = TypeVar("C")
+P = TypeVar("P")
+E = TypeVar("E")
+R = TypeVar("R")
 
 
 class InvalidTransition(ValueError):
     pass
+
+
+class StaleMachineAccess(RuntimeError):
+    pass
+
+
+class WrongEventLoop(RuntimeError):
+    pass
+
+
+class MailboxClosed(RuntimeError):
+    pass
+
+
+class MailboxFull(RuntimeError):
+    pass
+
+
+class TerminalChildrenAlive(AssertionError):
+    pass
+
+
+class ReplyPort(Generic[R]):
+    """Loop-owned, write-once reply used by retryable machine commands."""
+
+    __slots__ = ("_future",)
+
+    def __init__(self) -> None:
+        self._future: asyncio.Future[R] = asyncio.get_running_loop().create_future()
+
+    @property
+    def done(self) -> bool:
+        return self._future.done()
+
+    def resolve(self, value: R) -> bool:
+        if self._future.done():
+            return False
+        self._future.set_result(value)
+        return True
+
+    def reject(self, error: BaseException) -> bool:
+        if self._future.done():
+            return False
+        self._future.set_exception(error)
+        return True
+
+    async def wait(self) -> R:
+        return await asyncio.shield(self._future)
+
+
+@dataclass(frozen=True, slots=True)
+class MachineCommand(Generic[P, R]):
+    kind: object
+    command_id: int
+    expected_epoch: int
+    payload: P
+    reply: ReplyPort[R] | None = None
+    expected_revision: int | None = None
+    producer_id: int | None = None
+    producer_seq: int | None = None
+    cause_id: int | str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.producer_id is None) != (self.producer_seq is None):
+            raise ValueError("producer_id and producer_seq must be supplied together")
+
+    @property
+    def deduplication_key(self) -> tuple[int, int, int]:
+        if self.producer_id is None:
+            # Commands without retry metadata retain the original command-id
+            # identity used by pre-Stage-1 callers.
+            return (self.expected_epoch, 0, self.command_id)
+        return (self.expected_epoch, self.producer_id, self.producer_seq)
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedFailure:
+    """Traceback-free duplicate-command failure evidence."""
+
+    error_type: type[BaseException]
+    args: tuple[object, ...]
+    text: str
+
+    @classmethod
+    def from_error(cls, error: BaseException) -> _CachedFailure:
+        return cls(type(error), error.args, str(error))
+
+    def materialize(self) -> BaseException:
+        try:
+            return self.error_type(*self.args)
+        except Exception:
+            return RuntimeError(self.text)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedTransition(Generic[E]):
+    expected_state: str
+    proposed_state: str
+    effects: E
+    cause_id: int | str | None = None
+    expected_epoch: int | None = None
+    expected_revision: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MachineSnapshot:
+    entity_id: str
+    machine_type: str
+    epoch: int
+    revision: int
+    state: str
+    terminal: bool
+
+
+class BoundedMailbox(Generic[C]):
+    """A close-aware bounded mailbox whose blocked producers are always woken."""
+
+    def __init__(self, capacity: int) -> None:
+        if capacity < 1:
+            raise ValueError("mailbox capacity must be positive")
+        self.capacity = capacity
+        self._items: deque[C] = deque()
+        self._closed = False
+        self._changed = asyncio.Event()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def depth(self) -> int:
+        return len(self._items)
+
+    def _signal(self) -> None:
+        changed, self._changed = self._changed, asyncio.Event()
+        changed.set()
+
+    async def submit(self, item: C) -> None:
+        while True:
+            if self._closed:
+                raise MailboxClosed("mailbox is closed")
+            if len(self._items) < self.capacity:
+                self._items.append(item)
+                self._signal()
+                return
+            changed = self._changed
+            await changed.wait()
+
+    def try_submit(self, item: C) -> None:
+        if self._closed:
+            raise MailboxClosed("mailbox is closed")
+        if len(self._items) >= self.capacity:
+            raise MailboxFull(f"mailbox capacity {self.capacity} exceeded")
+        self._items.append(item)
+        self._signal()
+
+    async def receive(self) -> C:
+        while True:
+            if self._items:
+                item = self._items.popleft()
+                self._signal()
+                return item
+            if self._closed:
+                raise MailboxClosed("mailbox is closed")
+            changed = self._changed
+            await changed.wait()
+
+    def close(self) -> tuple[C, ...]:
+        if self._closed:
+            return ()
+        self._closed = True
+        rejected = tuple(self._items)
+        self._items.clear()
+        self._signal()
+        return rejected
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +246,7 @@ class TransitionCommit:
     revision: int
     cause: object | None
     monotonic_ns: int
+    epoch: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,33 +431,111 @@ class AsyncStateMachineRunner(ABC, Generic[C]):
         spec: MachineSpec,
         *,
         entity_id: str,
+        epoch: int = 1,
+        mailbox_capacity: int = 32,
+        dedupe_capacity: int = 128,
         controller: NullTransitionController | None = None,
-        projector: Callable[[TransitionCommit], None] | None = None,
+        transition_sink: Callable[[TransitionCommit], None] | None = None,
     ) -> None:
         self.spec = spec
         self.entity_id = entity_id
-        self.state = spec.initial
-        self.revision = 0
-        self.commands: asyncio.Queue[C] = asyncio.Queue()
+        if epoch < 1:
+            raise ValueError("machine epoch must be positive")
+        if dedupe_capacity < 1:
+            raise ValueError("dedupe capacity must be positive")
+        self.epoch = epoch
+        self._state = spec.initial
+        self._revision = 0
+        self.commands: BoundedMailbox[C] = BoundedMailbox(mailbox_capacity)
         self.controller = controller or NullTransitionController()
-        self.projector = projector
+        self._transition_sink = transition_sink
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._dedupe_capacity = dedupe_capacity
+        self._seen: dict[tuple[int, int, int], TransitionCommit | _CachedFailure] = {}
+        self._seen_order: deque[tuple[int, int, int]] = deque()
+        self._running = False
+
+    def _assert_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        if self._loop is None:
+            self._loop = loop
+        elif loop is not self._loop:
+            raise WrongEventLoop(f"{self.entity_id} is owned by a different event loop")
+
+    @property
+    def state(self) -> str:
+        self._assert_loop()
+        return self._state
+
+    @property
+    def revision(self) -> int:
+        self._assert_loop()
+        return self._revision
+
+    def snapshot(self, *, expected_epoch: int | None = None) -> MachineSnapshot:
+        self._assert_loop()
+        if expected_epoch is not None and expected_epoch != self.epoch:
+            raise StaleMachineAccess(
+                f"{self.entity_id} epoch {expected_epoch} is stale; current epoch is {self.epoch}"
+            )
+        return MachineSnapshot(
+            self.entity_id, self.spec.machine_type, self.epoch, self._revision,
+            self._state, self._state in self.spec.terminal,
+        )
+
+    async def submit(self, command: C) -> None:
+        self._assert_loop()
+        await self.commands.submit(command)
+
+    def try_submit(self, command: C) -> None:
+        self._assert_loop()
+        self.commands.try_submit(command)
 
     async def next_cause(self) -> C:
-        return await self.commands.get()
+        return await self.commands.receive()
 
     @abstractmethod
-    async def step(self, cause: C) -> str:
-        """Handle one command and propose, but do not publish, the next state."""
+    async def step(self, cause: C) -> str | PreparedTransition[Any]:
+        """Prepare one transition. Public state cannot be mutated from here."""
 
-    def commit(self, proposed: str, cause: C | None) -> TransitionCommit:
+    async def prepare(self, cause: C) -> PreparedTransition[Any]:
+        before = (self._state, self._revision, self.epoch)
+        proposed = await self.step(cause)
+        if before != (self._state, self._revision, self.epoch):
+            raise AssertionError("step() mutated authoritative machine state")
+        if isinstance(proposed, PreparedTransition):
+            return proposed
+        command = cause if isinstance(cause, MachineCommand) else None
+        return PreparedTransition(
+            before[0], proposed, None,
+            command.cause_id if command is not None else cause,
+            command.expected_epoch if command is not None else self.epoch,
+            command.expected_revision if command is not None else before[1],
+        )
+
+    def commit(
+        self, proposed: str | PreparedTransition[Any], cause: C | None = None
+    ) -> TransitionCommit:
         """Validate and mutate synchronously in one event-loop turn."""
-        previous = self.state
-        self.spec.validate(previous, proposed)
-        self.state = proposed
-        self.revision += 1
+        self._assert_loop()
+        prepared = proposed if isinstance(proposed, PreparedTransition) else PreparedTransition(
+            self._state, proposed, None,
+            cause.cause_id if isinstance(cause, MachineCommand) else cause,
+            self.epoch, self._revision,
+        )
+        if prepared.expected_epoch not in (None, self.epoch):
+            raise StaleMachineAccess("prepared transition belongs to a stale epoch")
+        if prepared.expected_revision not in (None, self._revision):
+            raise StaleMachineAccess("prepared transition has a stale or future revision")
+        if prepared.expected_state != self._state:
+            raise StaleMachineAccess("prepared transition source state is stale")
+        previous = self._state
+        self.spec.validate(previous, prepared.proposed_state)
+        self._state = prepared.proposed_state
+        self._revision += 1
         return TransitionCommit(
-            self.entity_id, self.spec.machine_type, previous, proposed,
-            self.revision, cause, time.monotonic_ns(),
+            self.entity_id, self.spec.machine_type, previous, prepared.proposed_state,
+            self._revision, prepared.cause_id, time.monotonic_ns(), self.epoch,
         )
 
     def _checkpoint(self, commit: TransitionCommit, phase: str) -> TransitionCheckpoint:
@@ -294,24 +552,131 @@ class AsyncStateMachineRunner(ABC, Generic[C]):
             commit.to_state, commit.revision, phase, self.spec.test_actions,
         )
 
-    async def reconcile_terminal(self, committed: TransitionCommit) -> None:
-        """Join owned children/barriers before exposing a terminal checkpoint."""
+    async def reconcile_terminal(self, prepared: PreparedTransition[Any]) -> None:
+        """Join owned children/barriers before committing a terminal state."""
         return None
 
+    async def after_commit(self, commit: TransitionCommit, effects: Any) -> None:
+        return None
+
+    def _reply(self, cause: C, result: TransitionCommit | BaseException) -> None:
+        if not isinstance(cause, MachineCommand) or cause.reply is None:
+            return
+        if isinstance(result, BaseException):
+            cause.reply.reject(result)
+        else:
+            cause.reply.resolve(result)
+
+    def _remember(
+        self, command: MachineCommand[Any, Any], result: TransitionCommit | BaseException
+    ) -> None:
+        key = command.deduplication_key
+        cached: TransitionCommit | _CachedFailure = (
+            _CachedFailure.from_error(result) if isinstance(result, BaseException) else result
+        )
+        if key not in self._seen:
+            self._seen_order.append(key)
+        self._seen[key] = cached
+        while len(self._seen_order) > self._dedupe_capacity:
+            self._seen.pop(self._seen_order.popleft(), None)
+
+    def _reply_cached(
+        self, cause: C, cached: TransitionCommit | _CachedFailure
+    ) -> None:
+        self._reply(cause, cached.materialize() if isinstance(cached, _CachedFailure) else cached)
+
+    def close_mailbox(self, error: BaseException | None = None) -> None:
+        rejected = self.commands.close()
+        failure = error or MailboxClosed("machine mailbox is closed")
+        for command in rejected:
+            self._reply(command, failure)
+
     async def run(self) -> None:
-        while self.state not in self.spec.terminal:
-            cause = await self.next_cause()
-            proposed = await self.step(cause)
-            preview = TransitionCommit(
-                self.entity_id, self.spec.machine_type, self.state, proposed,
-                self.revision + 1, cause, 0,
-            )
-            self.spec.validate(self.state, proposed)
-            await self.controller.before_commit(self._checkpoint(preview, "before_commit"))
-            committed = self.commit(proposed, cause)
-            if self.projector is not None:
-                self.projector(committed)
-            await self.controller.after_commit(self._checkpoint(committed, "after_commit"))
-            if committed.to_state in self.spec.terminal:
-                await self.reconcile_terminal(committed)
-                await self.controller.terminal(self._checkpoint(committed, "terminal"))
+        self._assert_loop()
+        if self._running:
+            raise RuntimeError("machine runner already has an owner task")
+        self._running = True
+        cause: C | None = None
+        try:
+            # A restartable lifecycle may use the same public ``stopped``
+            # state for its pristine and reconciled terminal snapshots.  The
+            # initial revision is not terminal evidence: accept the first
+            # command and only stop the pump after a committed terminal edge.
+            while self._state not in self.spec.terminal or self._revision == 0:
+                cause = await self.next_cause()
+                command = cause if isinstance(cause, MachineCommand) else None
+                if command is not None:
+                    if command.expected_epoch != self.epoch:
+                        error = StaleMachineAccess("command belongs to a stale epoch")
+                        self._reply(cause, error)
+                        continue
+                    cached = self._seen.get(command.deduplication_key)
+                    if cached is not None:
+                        self._reply_cached(cause, cached)
+                        continue
+                try:
+                    prepared = await self.prepare(cause)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as error:
+                    if command is not None:
+                        self._remember(command, error)
+                        self._reply(cause, error)
+                        continue
+                    raise
+                preview = TransitionCommit(
+                    self.entity_id, self.spec.machine_type, self._state,
+                    prepared.proposed_state, self._revision + 1, prepared.cause_id, 0,
+                    self.epoch,
+                )
+                try:
+                    self.spec.validate(self._state, prepared.proposed_state)
+                    await self.controller.before_commit(
+                        self._checkpoint(preview, "before_commit")
+                    )
+                    if prepared.proposed_state in self.spec.terminal:
+                        await self.reconcile_terminal(prepared)
+                    committed = self.commit(prepared, cause)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as error:
+                    if command is not None:
+                        self._remember(command, error)
+                        self._reply(cause, error)
+                        continue
+                    raise
+
+                # From this point the edge is authoritative. Downstream
+                # failures terminate the runner, but the active command still
+                # observes the commit and queued/subsequent commands reject.
+                if committed.to_state in self.spec.terminal:
+                    self.close_mailbox()
+                try:
+                    if self._transition_sink is not None:
+                        self._transition_sink(committed)
+                    await self.controller.after_commit(
+                        self._checkpoint(committed, "after_commit")
+                    )
+                    await self.after_commit(committed, prepared.effects)
+                    if committed.to_state in self.spec.terminal:
+                        await self.controller.terminal(
+                            self._checkpoint(committed, "terminal")
+                        )
+                except BaseException as error:
+                    if command is not None:
+                        self._remember(command, committed)
+                    self._reply(cause, committed)
+                    self.close_mailbox(error)
+                    raise
+                if command is not None:
+                    self._remember(command, committed)
+                self._reply(cause, committed)
+        except asyncio.CancelledError as error:
+            if cause is not None:
+                self._reply(cause, error)
+            self.close_mailbox(error)
+            raise
+        finally:
+            if self._state in self.spec.terminal:
+                self.close_mailbox()
+            self._running = False

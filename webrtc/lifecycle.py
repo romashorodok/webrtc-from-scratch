@@ -45,15 +45,6 @@ async def wait_until(
     await asyncio.wait_for(poll(), deadline_timeout)
 
 
-async def wait_for_event(
-    event: asyncio.Event,
-    *,
-    timeout: float | None,
-) -> None:
-    deadline_timeout = require_timeout(timeout)
-    await asyncio.wait_for(event.wait(), deadline_timeout)
-
-
 async def wait_for_all(
     awaitables: list[Awaitable[object]],
     *,

@@ -135,10 +135,10 @@ def test_sync_decorator_records_events():
 
 
 def test_perf_events_attach_task_context_peer_metadata():
-    runtime = Runtime(scope_id="peer-a", max_workers=1)
     recorder = PerformanceRecorder()
-    try:
-        async def scenario():
+    async def scenario():
+        runtime = Runtime(scope_id="peer-a", max_workers=1)
+        try:
             with use_performance_recorder(recorder):
               async with runtime:
                 await runtime.start(
@@ -147,9 +147,10 @@ def test_perf_events_attach_task_context_peer_metadata():
                     kind="protocol",
                 )
 
-        asyncio.run(scenario())
-    finally:
-        runtime.shutdown()
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(scenario())
 
     event = recorder.events()[0]
     assert event.metadata["trace_id"]

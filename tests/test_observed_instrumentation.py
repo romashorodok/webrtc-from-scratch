@@ -17,6 +17,7 @@ from webrtc import Runtime
 from webrtc.runtime_services import (
     Borrowed,
     MissingExecutionScope,
+    OwnedTaskHandle,
     current_execution_context,
     use_execution_scope,
 )
@@ -45,35 +46,36 @@ class Work(ObservedComponent):
 
 
 async def run_owned(runtime, factory):
-    with use_execution_scope(runtime):
-        return await runtime.task_scheduler.run_factory(factory, trace_id="trace", scope_id="scope")
+    async with runtime:
+        return await runtime.start(factory, name="test-owner")
 
 
 def test_automatic_sync_async_worker_and_inline_contracts():
     async def scenario():
         runtime = Runtime()
         work = Work()
-        assert work.sync(1) == 2
+        with pytest.raises(MissingExecutionScope):
+            work.sync(1)
         assert inspect.iscoroutinefunction(work.async_work)
 
         async def owner():
             assert await work.async_work() == "ok"
             parent = current_execution_context()
             worker_context = await work.blocking()
-            assert worker_context.task_id == parent.task_id
-            assert worker_context.node_id == parent.node_id
+            assert worker_context.trace_id == parent.trace_id
+            assert worker_context.task_id != parent.task_id
             assert work.inline() == threading.get_ident()
 
         await run_owned(runtime, owner)
         operations = {group.operation for group in runtime.activity_groups.snapshots()}
         assert {"work.async", "work.worker"} <= operations
-        assert runtime.trace_live_tree() == []
+        assert runtime.trace_live_running() == []
         await runtime.aclose()
 
     asyncio.run(scenario())
 
 
-def test_task_is_immediate_native_task_and_preserves_result_error_and_cancellation():
+def test_task_returns_opaque_handle_and_preserves_result_error_and_cancellation():
     class Tasks(ObservedComponent):
         @task(name="result")
         async def result(self):
@@ -89,11 +91,11 @@ def test_task_is_immediate_native_task_and_preserves_result_error_and_cancellati
             await asyncio.Event().wait()
 
     async def scenario():
-        runtime = Runtime()
-        subject = Tasks()
-        with use_execution_scope(runtime):
+        async with Runtime() as runtime:
+            subject = Tasks()
             result = subject.result()
-            assert isinstance(result, asyncio.Task)
+            assert isinstance(result, OwnedTaskHandle)
+            assert not isinstance(result, asyncio.Task)
             assert await result == 7
 
             error = ValueError("original")
@@ -101,7 +103,6 @@ def test_task_is_immediate_native_task_and_preserves_result_error_and_cancellati
             with pytest.raises(ValueError) as caught:
                 await failed
             assert caught.value is error
-            assert failed.exception() is error
 
             started = asyncio.Event()
             waiting = subject.waiting(started)
@@ -110,7 +111,6 @@ def test_task_is_immediate_native_task_and_preserves_result_error_and_cancellati
             with pytest.raises(asyncio.CancelledError):
                 await waiting
             assert waiting.cancelled()
-        await runtime.aclose()
 
     asyncio.run(scenario())
 
@@ -129,7 +129,7 @@ def test_task_rejects_missing_scope_before_factory_or_coroutine_creation():
     assert calls == 0
 
 
-def test_performance_and_all_ordinary_calls_work_without_scope_without_recording():
+def test_worker_calls_require_scope_while_unobserved_async_calls_remain_ordinary():
     class Subject(ObservedComponent):
         @worker
         @performance(name="outside")
@@ -139,11 +139,9 @@ def test_performance_and_all_ordinary_calls_work_without_scope_without_recording
         async def async_call(self):
             return 4
 
-    runtime = Runtime()
-    assert Subject().call() == 3
+    with pytest.raises(MissingExecutionScope):
+        Subject().call()
     assert asyncio.run(Subject().async_call()) == 4
-    assert runtime.activity_groups.snapshots() == ()
-    runtime.shutdown()
 
 
 def test_nested_worker_calls_execute_inline_without_redispatch():
@@ -234,7 +232,9 @@ def test_dispatched_cancellation_holds_lane_and_live_node_until_physical_complet
 
             second = asyncio.create_task(subject.second())
             await asyncio.sleep(0.03)
-            assert not second_started.is_set()
+            # The worker lane is concurrent; cancellation retains the first
+            # physical child/barrier but does not serialize unrelated work.
+            assert second_started.is_set()
             release.set()
             await second
             await asyncio.sleep(0)
@@ -272,15 +272,15 @@ def test_descriptors_properties_dunders_and_unobserved_are_preserved():
         def raw(self):
             return 9
 
-    runtime = Runtime()
-    with use_execution_scope(runtime):
-        assert Descriptors.static(3) == 3
-        assert Descriptors.class_method() is Descriptors
-        assert Descriptors().value == 8
-        assert str(Descriptors()) == "descriptor"
-        assert Descriptors().raw() == 9
-    assert runtime.trace_live_tree() == []
-    runtime.shutdown()
+    async def scenario():
+        async with Runtime() as runtime:
+            assert Descriptors.static(3) == 3
+            assert Descriptors.class_method() is Descriptors
+            assert Descriptors().value == 8
+            assert str(Descriptors()) == "descriptor"
+            assert Descriptors().raw() == 9
+
+    asyncio.run(scenario())
 
 
 def test_marker_combinations_and_affinity_classification_are_validated_at_creation():
@@ -304,10 +304,9 @@ def test_marker_combinations_and_affinity_classification_are_validated_at_creati
             def call(self):
                 pass
 
-    with pytest.raises(TypeError, match="ambiguous synchronous affinity"):
-        class Dynamic(ObservedComponent):
-            def call(self):
-                return getattr(self, "value", None)
+    class Dynamic(ObservedComponent):
+        def call(self):
+            return getattr(self, "value", None)
 
     class Resolved(ObservedComponent):
         @worker
@@ -315,16 +314,21 @@ def test_marker_combinations_and_affinity_classification_are_validated_at_creati
             return getattr(self, "value", None)
 
     class DirectLoopHit(ObservedComponent):
+        @event_loop
         def call(self):
             return self._loop.call_soon(lambda: None)
 
     assert Resolved.call.__wrapped__ is not None
-    runtime = Runtime()
-    with use_execution_scope(runtime):
-        direct = DirectLoopHit.__new__(DirectLoopHit)
-        direct._loop = type("Loop", (), {"call_soon": lambda self, callback: callback()})()
-        assert not inspect.isawaitable(direct.call())
-    runtime.shutdown()
+    async def scenario():
+        async with Runtime():
+            dynamic = Dynamic()
+            dynamic.value = 4
+            assert await dynamic.call() == 4
+            direct = DirectLoopHit.__new__(DirectLoopHit)
+            direct._loop = type("Loop", (), {"call_soon": lambda self, callback: callback()})()
+            assert not inspect.isawaitable(direct.call())
+
+    asyncio.run(scenario())
 
 
 def test_extractor_and_sink_failures_do_not_change_results():
@@ -398,14 +402,11 @@ def test_worker_failure_records_queue_worker_and_total_metrics():
     asyncio.run(scenario())
 
 
-def test_async_worker_method_exposes_awaitable_static_application_contract():
-    from webrtc.performance import async_worker_method
-
-    method = async_worker_method(Work().sync)
-    assert hasattr(Work.sync, "__runtime_result_annotation__")
-
+def test_worker_method_exposes_awaitable_runtime_contract():
     async def scenario():
         async with Runtime():
-            assert await method(2) == 3
+            result = Work().sync(2)
+            assert inspect.isawaitable(result)
+            assert await result == 3
 
     asyncio.run(scenario())

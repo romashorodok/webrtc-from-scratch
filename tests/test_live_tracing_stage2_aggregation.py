@@ -15,7 +15,7 @@ from webrtc.performance import (
 )
 
 
-def test_repeated_aggregate_calls_reuse_one_compact_group_without_trace_events(monkeypatch):
+def test_repeated_aggregate_calls_reuse_one_compact_group_without_trace_events():
     class Subject(ObservedComponent):
         @event_loop
         def call(self, value):
@@ -23,27 +23,25 @@ def test_repeated_aggregate_calls_reuse_one_compact_group_without_trace_events(m
 
     async def scenario():
         async with Runtime() as runtime:
-            published = []
-            original = runtime.trace_service.events.publish
-            runtime.trace_service.events.publish = lambda *event: published.append(event)
-            monkeypatch.setattr(
-                "webrtc.performance.uuid.uuid4",
-                lambda: (_ for _ in ()).throw(AssertionError("aggregate UUID allocation")),
-            )
+            before = runtime.trace_snapshot()
             subject = Subject()
             for value in range(100):
                 assert subject.call(value) == value + 1
             snapshots = runtime.activity_groups.snapshots()
-            runtime.trace_service.events.publish = original
             assert len(snapshots) == 1
             assert snapshots[0].calls == snapshots[0].successes == 100
             assert snapshots[0].in_flight == 0
-            assert published == []
+            assert len({item.group_id for item in snapshots}) == 1
+            assert (
+                runtime.trace_snapshot()["data"]["schema"]
+                == before["data"]["schema"]
+                == 2
+            )
 
     asyncio.run(scenario())
 
 
-def test_runtime_registers_peer_root_and_top_level_aggregate_owns_it():
+def test_runtime_registers_root_and_top_level_aggregate_owns_it():
     class Subject(ObservedComponent):
         @event_loop
         def call(self):
@@ -51,50 +49,45 @@ def test_runtime_registers_peer_root_and_top_level_aggregate_owns_it():
 
     async def scenario():
         async with Runtime(scope_id="scope") as runtime:
-            peer = runtime.projection.machines.get("peer:scope")
-            assert peer is not None
-            assert peer.machine_type == "peer"
-            assert peer.state == "new"
+            owner = runtime.projection.machines.get("runtime:scope")
+            assert owner is not None
+            assert owner.machine_type == "runtime"
+            assert owner.state == "active"
 
             assert Subject().call() == 1
             group = next(
                 item for item in runtime.activity_groups.snapshots()
                 if item.operation.endswith("Subject.call")
             )
-            assert group.owner_entity_id == peer.entity_id
-            assert runtime.projection.machines.get(group.owner_entity_id) == peer
+            assert group.owner_entity_id == owner.entity_id
+            assert runtime.projection.machines.get(group.owner_entity_id) == owner
 
     asyncio.run(scenario())
 
 
-def test_aggregate_calls_in_selected_machine_task_inherit_machine_owner():
+def test_worker_aggregate_calls_are_owned_by_runtime_and_worker_lane_is_projected():
     class Subject(ObservedComponent):
         @event_loop
         def step(self):
             return 1
 
-        @task(state="worker")
-        async def serve(self):
-            return await self.child()
-
-        @task()
-        async def child(self):
-            # This operation runs under a distinct scheduled task context. It
-            # must retain the selected worker owner inherited from ``serve``.
+        @worker
+        def serve(self):
             return self.step()
 
     async def scenario():
         async with Runtime(scope_id="scope") as runtime:
             assert await Subject().serve() == 1
-            worker_machine = runtime.projection.machines.get("worker:scope")
+            worker_machine = runtime.projection.machines.get(runtime._worker_entity_id)
             assert worker_machine is not None
+            assert worker_machine.machine_type == "worker-lane"
             owned = {
                 item.operation: item.owner_entity_id
                 for item in runtime.activity_groups.snapshots()
                 if item.operation.endswith("Subject.step")
             }
             assert len(owned) == 1
-            assert set(owned.values()) == {worker_machine.entity_id}
+            assert set(owned.values()) == {runtime._runtime_entity_id}
 
     asyncio.run(scenario())
 

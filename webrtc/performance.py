@@ -11,7 +11,6 @@ from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from threading import Lock, RLock
 from types import MappingProxyType
 from typing import Any, Generic, ParamSpec, Protocol, TypeVar, cast
 
@@ -24,6 +23,7 @@ from .activity import (
 
 from .runtime_services import (
     FailurePolicy,
+    MissingExecutionScope,
     TraceNodeCompleted,
     TraceNodeCancelabilityChanged,
     TraceNodeDescriptor,
@@ -38,9 +38,17 @@ from .runtime_services import (
 )
 
 T = TypeVar("T")
-T_co = TypeVar("T_co", covariant=True)
 P = ParamSpec("P")
 Scalar = str | int | float | bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerOwnerBinding:
+    """Authoritative Runtime entity epoch for a component's worker descendants."""
+
+    runtime: Any
+    entity_id: str
+    epoch: int
 
 
 def _attributes(values: Mapping[str, Any] | None, limit: int = 32) -> Mapping[str, Scalar]:
@@ -78,16 +86,13 @@ class CaptureMetricSink:
     def __init__(self, limit: int = 100_000) -> None:
         self.limit = max(0, limit)
         self._events: list[MetricEvent] = []
-        self._lock = RLock()
 
     def emit(self, event: MetricEvent) -> None:
-        with self._lock:
-            if len(self._events) < self.limit:
-                self._events.append(event)
+        if len(self._events) < self.limit:
+            self._events.append(event)
 
     def events(self) -> tuple[MetricEvent, ...]:
-        with self._lock:
-            return tuple(self._events)
+        return tuple(self._events)
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,24 +148,21 @@ class ObservationSpec:
 _operation_ids = itertools.count(1)
 _operation_ids_by_name: dict[str, int] = {}
 _operation_names_by_id: dict[int, str] = {}
-_operation_ids_lock = Lock()
 
 
 def _intern_operation(operation: str) -> int:
     # This runs only while a class is created, never on an observed call.
-    with _operation_ids_lock:
-        operation_id = _operation_ids_by_name.get(operation)
-        if operation_id is None:
-            operation_id = next(_operation_ids)
-            _operation_ids_by_name[operation] = operation_id
-            _operation_names_by_id[operation_id] = operation
-        return operation_id
+    operation_id = _operation_ids_by_name.get(operation)
+    if operation_id is None:
+        operation_id = next(_operation_ids)
+        _operation_ids_by_name[operation] = operation_id
+        _operation_names_by_id[operation_id] = operation
+    return operation_id
 
 
 def compiled_operation_strings() -> Mapping[int, str]:
     """Snapshot the intern table for a future schema-2 snapshot/patch."""
-    with _operation_ids_lock:
-        return MappingProxyType(dict(_operation_names_by_id))
+    return MappingProxyType(dict(_operation_names_by_id))
 
 
 def observe(
@@ -197,7 +199,6 @@ class TaskSpec:
     kind: str = "task"
     metadata: Callable[[CallInfo], Mapping[str, Any]] | Mapping[str, Any] | None = None
     failure: FailurePolicy = FailurePolicy.REPORT
-    state: str | None = None
 
 
 class MethodPolicy(str, Enum):
@@ -206,12 +207,8 @@ class MethodPolicy(str, Enum):
 
 
 def task(*, name: str | None = None, kind: str = "task", metadata=None,
-         failure: FailurePolicy = FailurePolicy.REPORT, state: str | None = None):
-    if state is not None:
-        from .machine_specs import TASK_STATE_MACHINE_MAP
-        if state not in TASK_STATE_MACHINE_MAP:
-            raise ValueError(f"unknown observable task state owner: {state}")
-    spec = TaskSpec(name, kind, metadata, FailurePolicy(failure), state)
+         failure: FailurePolicy = FailurePolicy.REPORT):
+    spec = TaskSpec(name, kind, metadata, FailurePolicy(failure))
     def mark(fn):
         if not inspect.iscoroutinefunction(fn):
             raise TypeError("@task requires an async method")
@@ -280,20 +277,30 @@ _worker_observation_delta: contextvars.ContextVar[WorkerObservationDelta | None]
 )
 
 
-def _aggregate_identity(scope):
+def _worker_owner(scope, args) -> WorkerOwnerBinding:
+    subject = args[0] if args and isinstance(args[0], ObservedComponent) else None
+    if subject is not None:
+        binding = getattr(subject, "__worker_owner_binding__", None)
+        if binding is not None:
+            if binding.runtime is not scope:
+                raise MissingExecutionScope("component worker owner belongs to another Runtime")
+            scope.assert_owner_epoch(binding.entity_id, binding.epoch)
+            return binding
+        if not getattr(subject, "__runtime_root_worker_utility__", False):
+            raise MissingExecutionScope(
+                f"{type(subject).__name__} has no authoritative worker owner binding"
+            )
+    entity_id = getattr(scope, "_runtime_entity_id", None)
+    epoch = getattr(getattr(scope, "_runtime_runner", None), "epoch", None)
+    if entity_id is None or epoch is None:
+        raise MissingExecutionScope("worker submission requires a Runtime owner")
+    return WorkerOwnerBinding(scope, entity_id, epoch)
+
+
+def _aggregate_identity(scope, binding: WorkerOwnerBinding | None = None):
     context = current_execution_context()
     root = getattr(scope, "root_context", None)
-    projection = getattr(scope, "_state_task_projection", None)
-    owner = (
-        projection.owner_entity_id(context.task_id)
-        if projection is not None and context is not None
-        else None
-    )
-    if owner is None:
-        identity = getattr(scope, "scope_id", None) or (
-            root.trace_id if root is not None else (context.trace_id if context is not None else "")
-        )
-        owner = f"peer:{identity}" if identity else ""
+    owner = binding.entity_id if binding is not None else getattr(scope, "_runtime_entity_id", "")
     if context is not None:
         return context.trace_id, owner
     if root is not None:
@@ -301,14 +308,15 @@ def _aggregate_identity(scope):
     return "", getattr(scope, "scope_id", None) or ""
 
 
-def _aggregate_record(scope, policy) -> ActivityGroupRecord:
-    trace_id, owner_id = _aggregate_identity(scope)
+def _aggregate_record(scope, policy, binding: WorkerOwnerBinding | None = None) -> ActivityGroupRecord:
+    trace_id, owner_id = _aggregate_identity(scope, binding)
     return scope.activity_groups.resolve(
         policy,
         trace_id=trace_id,
         owner_entity_id=owner_id,
         parent_ref_id=_current_activity_group.get(),
-        owner_epoch=getattr(scope, "observability_epoch", 1),
+        owner_epoch=(binding.epoch if binding is not None
+                     else getattr(scope, "observability_epoch", 1)),
     )
 
 
@@ -505,133 +513,32 @@ def _run_inline_call(scope, fn, args, kwargs, spec):
             reset_execution_context(token)
 
 
-async def _run_worker_call(scope, fn, args, kwargs, spec):
-    call = CallInfo(args, MappingProxyType(dict(kwargs)))
-    descriptor, owner_context, nested = _start_node(
-        scope, fn, TraceNodeType.WORKER_CALL, cancelable=True
-    )
-    started = time.monotonic_ns()
-    attributes = _extract_attributes(spec.on_call if spec else None, call, scope.diagnostics)
-    dispatched = False
-    caller_cancelled = False
-    physical_completed = False
-    completed_event = None
-    terminal_recorded = False
-    loop = asyncio.get_running_loop()
-    queue_cancelled: asyncio.Future[bool] = loop.create_future()
-    lane_task = None
-
-    def cancel_queued() -> bool:
-        if dispatched or queue_cancelled.done():
-            return False
-        queue_cancelled.set_result(True)
-        return True
-
-    scope.task_registry.register_node_canceller(descriptor.node_id, cancel_queued)
-
-    def record_terminal(event: WorkerCallCompleted, outcome: str) -> None:
-        nonlocal terminal_recorded
-        if terminal_recorded:
-            return
-        terminal_recorded = True
-        operation = _operation(fn, spec)
-        group = (spec.group if spec else None) or operation
-        if event.exception is not None:
-            attributes.setdefault("exception", type(event.exception).__name__)
-        for suffix, duration in (
-            ("queue", event.queue_ms),
-            ("worker", event.worker_ms),
-            (None, event.total_ms),
-        ):
-            metric_operation = operation if suffix is None else f"{operation}.{suffix}"
-            _record_metric(scope, owner_context, metric_operation, group,
-                           outcome, started, attributes, duration_ms=duration)
-        _finish_node(scope, descriptor, outcome, started, event.exception)
-
-    def on_dispatch():
-        nonlocal dispatched
-        dispatched = True
-        scope.task_registry.unregister_node_canceller(descriptor.node_id)
-        _notify_trace(scope, "node_cancelability_changed",
-                      TraceNodeCancelabilityChanged(descriptor.node_id, False))
-        if owner_context is not None:
-            scope.task_registry.block_cancel(owner_context.task_id)
-
-    def on_complete(event: WorkerCallCompleted):
-        nonlocal physical_completed, completed_event
-        physical_completed = True
-        completed_event = event
-        if caller_cancelled:
-            record_terminal(event, "completed_after_cancellation")
-        if owner_context is not None:
-            scope.task_registry.unblock_cancel(owner_context.task_id)
-
-    def on_future(future):
-        if owner_context is not None:
-            scope.task_registry.add_barrier(owner_context.task_id, future)
-
-    token = set_execution_context(nested) if nested is not None else None
-    try:
-        lane_task = asyncio.create_task(
-            scope.worker_lane.run_observed(
-                fn, *args, on_dispatch=on_dispatch, on_future=on_future,
-                on_complete=on_complete, **kwargs
-            )
-        )
-        done, _ = await asyncio.wait(
-            (lane_task, queue_cancelled), return_when=asyncio.FIRST_COMPLETED
-        )
-        if queue_cancelled in done and not dispatched:
-            lane_task.cancel()
-            await asyncio.gather(lane_task, return_exceptions=True)
-            raise asyncio.CancelledError
-        result, queue_ms, worker_ms = await lane_task
-    except asyncio.CancelledError:
-        caller_cancelled = True
-        if lane_task is not None and not lane_task.done():
-            lane_task.cancel()
-            await asyncio.gather(lane_task, return_exceptions=True)
-        if not dispatched or physical_completed:
-            elapsed = time.monotonic_ns() - started
-            record_terminal(WorkerCallCompleted("cancelled", elapsed, 0, elapsed), "cancelled")
-        raise
-    except BaseException as error:
-        attributes.update(_extract_attributes(spec.on_error if spec else None,
-                                              ErrorInfo(call, error), scope.diagnostics))
-        attributes.setdefault("exception", type(error).__name__)
-        if not terminal_recorded:
-            event = completed_event
-            if event is None:
-                elapsed = time.monotonic_ns() - started
-                event = WorkerCallCompleted("error", elapsed, 0, elapsed, error)
-            record_terminal(event, "error")
-        raise
-    else:
-        attributes.update(_extract_attributes(spec.on_success if spec else None,
-                                              SuccessInfo(call, result), scope.diagnostics))
-        if not terminal_recorded:
-            total_ns = time.monotonic_ns() - started
-            event = completed_event or WorkerCallCompleted(
-                "success", int(queue_ms * 1_000_000), int(worker_ms * 1_000_000), total_ns
-            )
-            record_terminal(event, "success")
-        return result
-    finally:
-        scope.task_registry.unregister_node_canceller(descriptor.node_id)
-        if token is not None:
-            reset_execution_context(token)
+async def _call_owned_worker(scope, fn, args, kwargs, *, name: str):
+    binding = _worker_owner(scope, args)
+    result = await scope.call_worker(
+        fn, *args, owner_entity_id=binding.entity_id, owner_epoch=binding.epoch,
+        name=name, **kwargs,
+    ).wait()
+    if result.outcome == "success":
+        return result.value
+    if result.exception is not None:
+        raise result.exception
+    raise RuntimeError(f"worker submission {result.outcome}")
 
 
 async def _run_aggregate_worker(scope, fn, args, kwargs, spec, policy):
     started = time.monotonic_ns()
+    binding = _worker_owner(scope, args)
     try:
-        record = _aggregate_record(scope, policy)
+        record = _aggregate_record(scope, policy, binding)
         scope.activity_groups.begin(record, started)
     except Exception:
         _activity_failed(scope)
-        return await scope.worker_lane.run(fn, *args, **kwargs)
+        return await _call_owned_worker(
+            scope, fn, args, kwargs, name=f"worker:{policy.operation}"
+        )
     parent_token = _current_activity_group.set(record.group_id)
-    trace_id, owner_id = _aggregate_identity(scope)
+    trace_id, owner_id = _aggregate_identity(scope, binding)
     call = _aggregate_call_info(args, kwargs, spec)
     if call is not None:
         _extract_attributes(spec.on_call, call, scope.diagnostics)
@@ -661,7 +568,7 @@ async def _run_aggregate_worker(scope, fn, args, kwargs, spec, policy):
             scope.activity_groups.merge_worker_delta(
                 event.observation_delta, trace_id=trace_id,
                 owner_entity_id=owner_id,
-                owner_epoch=getattr(scope, "observability_epoch", 1),
+                owner_epoch=binding.epoch,
             )
             failure = type(event.exception).__name__ if event.exception is not None else None
             scope.activity_groups.end(
@@ -693,12 +600,22 @@ async def _run_aggregate_worker(scope, fn, args, kwargs, spec, policy):
             scope.task_registry.add_barrier(owner_context.task_id, future)
 
     try:
-        result, queue_ms, worker_ms = await scope.worker_lane.run_observed(
-            invoke_in_worker,
+        handle = scope.call_worker(
+            invoke_in_worker, owner_entity_id=binding.entity_id,
+            owner_epoch=binding.epoch, name=f"worker:{policy.operation}",
             on_dispatch=on_dispatch,
             on_future=on_future,
             on_complete=on_complete,
         )
+        immutable = await handle.wait()
+        if immutable.outcome == "success":
+            result = immutable.value
+            queue_ms = worker_ms = 0.0
+        else:
+            error = immutable.exception
+            if error is None:
+                error = RuntimeError(f"worker submission {immutable.outcome}")
+            raise error
     except asyncio.CancelledError:
         caller_cancelled = True
         if not dispatched or physically_completed:
@@ -766,18 +683,10 @@ def _classify_sync_affinity(fn):
         return MethodPolicy.EVENT_LOOP
     if getattr(fn, "__worker__", False):
         return MethodPolicy.WORKER
-    names = set(fn.__code__.co_names)
-    if names & _AMBIGUOUS_NAMES:
-        raise TypeError(
-            f"ambiguous synchronous affinity for {fn.__qualname__}; "
-            "mark it @event_loop or @worker"
-        )
-    if names & _LOOP_AFFINE_NAMES:
-        return MethodPolicy.EVENT_LOOP
-    raise TypeError(
-        f"ambiguous synchronous affinity for {fn.__qualname__}; "
-        "mark it @event_loop or @worker"
-    )
+    # Automatic offload is the class contract.  Merely referring to an
+    # asyncio-looking name cannot grant loop affinity: loop callbacks and
+    # accessors must opt in explicitly with @event_loop.
+    return MethodPolicy.WORKER
 
 
 def _begin_capture(scope, policy):
@@ -788,14 +697,8 @@ def _begin_capture(scope, policy):
         return None
     _, owner_id = _aggregate_identity(scope)
     try:
-        projection = getattr(scope, "_state_task_projection", None)
-        context = current_execution_context()
-        entity_alias = (
-            projection.owner_entity_id(context.task_id)
-            if projection is not None and context is not None else None
-        )
         return manager.begin(
-            policy, owner_id, getattr(scope, "scope_id", None), entity_alias
+            policy, owner_id, getattr(scope, "scope_id", None), None
         )
     except Exception:
         scope.diagnostics["capture_failures"] += 1
@@ -856,7 +759,7 @@ def _compile_async_call(fn, spec, observation):
     @functools.wraps(fn)
     async def observed(*args, **kwargs):
         scope = current_execution_scope()
-        if scope is None:
+        if scope is None or not getattr(scope, "tracing_enabled", True):
             return await fn(*args, **kwargs)
         capture = _begin_capture(scope, observation)
         if capture is not None:
@@ -870,35 +773,76 @@ def _compile_async_call(fn, spec, observation):
 
 
 def _compile_sync_call(fn, spec, affinity, observation):
+    if affinity is MethodPolicy.WORKER:
+        @functools.wraps(fn)
+        def observed_worker(*args, **kwargs):
+            scope = current_execution_scope()
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                in_physical_worker = True
+            else:
+                in_physical_worker = False
+            if (
+                scope is not None
+                and _worker_observation_delta.get() is not None
+                and scope.worker_lane.is_current_worker_context()
+                and in_physical_worker
+            ):
+                if not getattr(scope, "tracing_enabled", True):
+                    return fn(*args, **kwargs)
+                capture = _begin_capture(scope, observation)
+                if capture is not None:
+                    return _run_captured_inline(
+                        scope, fn, args, kwargs, spec, observation, capture
+                    )
+                if observation.detail in (TraceDetail.AGGREGATE, TraceDetail.EXACT):
+                    return _run_aggregate_inline(
+                        scope, fn, args, kwargs, spec, observation
+                    )
+                return fn(*args, **kwargs)
+
+            if scope is None:
+                raise MissingExecutionScope(
+                    f"worker operation {fn.__qualname__} requires an active Runtime"
+                )
+
+            async def dispatch():
+                if not getattr(scope, "tracing_enabled", True):
+                    return await _call_owned_worker(
+                        scope, fn, args, kwargs, name=f"worker:{observation.operation}"
+                    )
+                capture = _begin_capture(scope, observation)
+                if capture is not None:
+                    return await _run_captured_worker(
+                        scope, fn, args, kwargs, spec, observation, capture
+                    )
+                if observation.detail not in (TraceDetail.AGGREGATE, TraceDetail.EXACT):
+                    return await _call_owned_worker(
+                        scope, fn, args, kwargs, name=f"worker:{observation.operation}"
+                    )
+                return await _run_aggregate_worker(
+                    scope, fn, args, kwargs, spec, observation
+                )
+
+            return dispatch()
+        return observed_worker
+
     @functools.wraps(fn)
     def observed(*args, **kwargs):
         scope = current_execution_scope()
         if scope is None:
             return fn(*args, **kwargs)
-        inline = affinity is MethodPolicy.EVENT_LOOP or scope.worker_lane.is_current_worker_context()
+        if not getattr(scope, "tracing_enabled", True):
+            return fn(*args, **kwargs)
         capture = _begin_capture(scope, observation)
         if capture is not None:
-            if inline:
-                return _run_captured_inline(
-                    scope, fn, args, kwargs, spec, observation, capture
-                )
-            return _run_captured_worker(
+            return _run_captured_inline(
                 scope, fn, args, kwargs, spec, observation, capture
             )
         if observation.detail not in (TraceDetail.AGGREGATE, TraceDetail.EXACT):
             return fn(*args, **kwargs)
-        if inline:
-            return _run_aggregate_inline(scope, fn, args, kwargs, spec, observation)
-        return _run_aggregate_worker(scope, fn, args, kwargs, spec, observation)
-    if affinity is MethodPolicy.WORKER:
-        # Runtime reflection contract used by generated/application protocols:
-        # in an active Runtime this callable's result must be awaited.
-        setattr(observed, "__runtime_worker__", True)
-        setattr(
-            observed,
-            "__runtime_result_annotation__",
-            fn.__annotations__.get("return", Any),
-        )
+        return _run_aggregate_inline(scope, fn, args, kwargs, spec, observation)
     return observed
 
 
@@ -911,15 +855,13 @@ def _compile_task_entry(fn, performance_spec, task_spec, observation):
         if callable(metadata):
             metadata = _extract_attributes(metadata, call, scope.diagnostics)
         metadata = dict(metadata or {})
-        if task_spec.state is not None:
-            metadata["_observable_machine"] = task_spec.state
         if observation.detail in (TraceDetail.AGGREGATE, TraceDetail.EXACT):
             factory = lambda: _invoke_aggregate_async(
                 scope, fn, args, kwargs, performance_spec, observation
             )
         else:
             factory = lambda: fn(*args, **kwargs)
-        return scope.task_scheduler.spawn_factory(
+        return scope.start(
             factory,
             name=task_spec.name or fn.__qualname__,
             kind=task_spec.kind,
@@ -955,7 +897,7 @@ def _compile_observation(owner, attr, fn, performance_spec, task_spec):
     if explicit is not None:
         detail = explicit.detail
     elif task_spec is not None:
-        detail = TraceDetail.STATE if task_spec.state is not None else TraceDetail.OFF
+        detail = TraceDetail.OFF
     else:
         detail = TraceDetail.AGGREGATE
     group = (
@@ -1014,18 +956,12 @@ class ObservedMeta(type):
 
 class ObservedComponent(metaclass=ObservedMeta):
     """Stateless opt-in base that compiles observation policy at class creation."""
+    # Ownerless helper components are explicitly classified at the protocol
+    # boundary. Lifecycle components override this by binding their machine.
+    __runtime_root_worker_utility__ = True
+    __worker_owner_binding__: WorkerOwnerBinding | None = None
 
-    pass
-
-
-class AsyncWorkerMethod(Protocol[P, T_co]):
-    """Static application view of a worker-classified synchronous method."""
-
-    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> Awaitable[T_co]: ...
-
-
-def async_worker_method(method: Callable[P, T]) -> AsyncWorkerMethod[P, T]:
-    """Return the typed active-Runtime view without changing runtime behavior."""
-    if not getattr(method, "__runtime_worker__", False):
-        raise TypeError("method is not worker-classified")
-    return cast(AsyncWorkerMethod[P, T], method)
+    def __bind_worker_owner__(self, runtime: Any, entity_id: str, epoch: int) -> None:
+        runtime.assert_owner_epoch(entity_id, epoch)
+        self.__worker_owner_binding__ = WorkerOwnerBinding(runtime, entity_id, epoch)
+        self.__runtime_root_worker_utility__ = False

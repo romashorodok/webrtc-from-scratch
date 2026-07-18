@@ -52,17 +52,16 @@ def test_runtime_tasks_share_trace_and_have_unique_parented_task_ids():
     asyncio.run(scenario())
 
 
-def test_runtime_tasks_are_not_published_as_schema1_trace_nodes():
+def test_runtime_tasks_are_projected_only_through_schema2_snapshot():
     async def scenario():
-        async with Runtime(trace_subscriber_batch_interval=0.01) as execution:
+        async with Runtime() as execution:
             sub = execution.trace_patch_subscribe()
             snapshot = await sub.get()
             assert snapshot["event"] == "trace:snapshot"
-            assert "tasks" not in snapshot["data"]
+            assert snapshot["data"]["schema"] == 2
             assert await execution.start(
                 lambda: asyncio.sleep(0, result=7), name="short"
             ) == 7
-            assert execution.trace_service.events._sequence == 0
             sub.close()
 
     asyncio.run(scenario())
@@ -142,9 +141,9 @@ def test_cancel_uses_node_id_and_preserves_observer_owned_pruning():
             assert execution.observability.cancel(node_id)
             with pytest.raises(asyncio.CancelledError):
                 await task
-            assert [node["name"] for node in execution.observability.live_tree()] == [
-                "execution.root"
-            ]
+            names = [node["name"] for node in execution.observability.live_tree()]
+            assert "sleep" not in names
+            assert "execution.root" in names
 
     asyncio.run(scenario())
 
@@ -165,11 +164,13 @@ def test_worker_context_propagates_and_metric_group_is_not_a_task():
 
             await execution.start(lambda: owner(), name="owner")
             assert seen["worker"].trace_id == seen["event_loop"].trace_id
-            assert seen["worker"].task_id == seen["event_loop"].task_id
+            assert seen["worker"].task_id != seen["event_loop"].task_id
             group = next(item for item in execution.activity_groups.snapshots()
                          if item.operation.endswith("Worker.context"))
             assert group.calls == 1
-            assert execution.task_registry.task_ids() == (execution.root_context.task_id,)
+            assert not any(
+                item["name"] == "owner" for item in execution.observability.live_tree()
+            )
 
     asyncio.run(scenario())
 
@@ -223,26 +224,6 @@ def test_worker_queue_is_cancelable_but_running_worker_is_not():
             await first
             with pytest.raises(asyncio.CancelledError):
                 await second
-
-    asyncio.run(scenario())
-
-
-def test_trace_live_context_limit_rejects_admission_without_evicting_running_nodes():
-    class Subject(ObservedComponent):
-        async def wait(self, release):
-            await release.wait()
-
-    async def scenario():
-        release = asyncio.Event()
-        async with Runtime(trace_context_limit=1) as execution:
-            task = asyncio.create_task(Subject().wait(release))
-            await asyncio.sleep(0)
-            live = execution.observability.live_tree()
-            assert len(live) == 1
-            assert live[0]["name"] == "execution.root"
-            assert execution.trace_service.diagnostics["live_context_limit_rejections"] == 0
-            release.set()
-            await task
 
     asyncio.run(scenario())
 

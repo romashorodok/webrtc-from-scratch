@@ -3,248 +3,519 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
+import uuid
+from collections import deque
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Any
 
 from .config import DebugConfig
 from .logger import get_logger
-from .performance import ObservedComponent, event_loop, performance, task, worker
-from .runtime_services import FailurePolicy
+from .machine_specs import MACHINE_SPECS
+from .observability import MachineTransitionOp
+from .performance import ObservedComponent, event_loop, performance, worker
+from .runtime_services import FailurePolicy, OwnedTaskHandle, ScopeState
+from .state_machine import (
+    AsyncStateMachineRunner, MachineCommand, PreparedTransition, ReplyPort,
+    StaleMachineAccess, TransitionCommit,
+)
+
+_LOG_STOP = object()
 
 
-class NeedMoreData:
-    pass
+class _LifecycleCommand(Enum):
+    MOVE = auto()
 
 
-class PeerEventInboxClosed:
-    pass
+@dataclass(frozen=True, slots=True)
+class _Move:
+    state: str
+    effect: object | None = None
+
+
+class _LifecycleRunner(AsyncStateMachineRunner[MachineCommand[_Move, TransitionCommit]]):
+    """Typed bounded runner used by Stage-6 auxiliary entities."""
+
+    def __init__(self, runtime: Any, machine_type: str, entity_id: str, *, capacity: int = 16):
+        self.runtime = runtime
+        super().__init__(
+            MACHINE_SPECS[machine_type], entity_id=entity_id,
+            mailbox_capacity=capacity, dedupe_capacity=max(16, capacity * 2),
+            controller=runtime.transition_controller,
+            transition_sink=self._project,
+        )
+
+    def _project(self, commit: TransitionCommit) -> None:
+        self.runtime.assert_owner_epoch(self.entity_id, self.epoch)
+        self.runtime.projection.transition(MachineTransitionOp(
+            commit.entity_id, commit.machine_type, commit.from_state,
+            commit.to_state, commit.epoch, commit.revision,
+            self.runtime.new_producer_dot(), cause_id=commit.cause,
+            monotonic_ns=commit.monotonic_ns,
+        ))
+
+    async def step(self, command: MachineCommand[_Move, TransitionCommit]):
+        if command.expected_epoch != self.epoch:
+            raise StaleMachineAccess("auxiliary command belongs to a stale epoch")
+        return PreparedTransition(
+            self.state, command.payload.state, command.payload.effect,
+            command.cause_id, command.expected_epoch, command.expected_revision,
+        )
+
+
+def _bind_runner(runtime: Any, machine_type: str, entity_id: str, *, capacity: int = 16):
+    if runtime.state is not ScopeState.ACTIVE:
+        raise RuntimeError("auxiliary entities require an active Runtime")
+    runtime._assert_loop()
+    runtime.register_owner(entity_id, epoch=1)
+    runtime.projection.machines.register(entity_id, MACHINE_SPECS[machine_type], epoch=1)
+    runner = _LifecycleRunner(runtime, machine_type, entity_id, capacity=capacity)
+    handle = runtime.start_machine(
+        runner, owner_entity_id=entity_id, owner_epoch=1,
+        failure=FailurePolicy.REPORT,
+    )
+    return runner, handle
+
+
+def _command(runner: _LifecycleRunner, command_id: int, state: str, cause: str,
+             *, reply: ReplyPort[TransitionCommit] | None = None,
+             effect: object | None = None) -> MachineCommand[_Move, TransitionCommit]:
+    return MachineCommand(
+        _LifecycleCommand.MOVE, command_id, runner.epoch, _Move(state, effect), reply,
+        expected_revision=None, producer_id=1, producer_seq=command_id,
+        cause_id=cause,
+    )
+
+
+async def _move(runner: _LifecycleRunner, command_id: int, state: str, cause: str,
+                *, effect: object | None = None) -> TransitionCommit:
+    reply = ReplyPort[TransitionCommit]()
+    await runner.submit(_command(runner, command_id, state, cause, reply=reply, effect=effect))
+    return await reply.wait()
+
+
+class NeedMoreData: pass
+class PeerEventInboxClosed: pass
 
 
 class PeerEventInbox:
-    """A bounded, single-terminal peer-domain event inbox."""
+    """Bounded ordinary classes plus one non-droppable terminal slot."""
 
     def __init__(self, maxsize: int = 1024) -> None:
-        self._queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=maxsize)
-        self._ready = asyncio.Event()
-        self._closed = False
+        if maxsize < 1:
+            raise ValueError("peer inbox capacity must be positive")
+        self.maxsize = maxsize
+        self._items: deque[Any] = deque()
+        self._terminal: Any | None = None
+        self._ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self.admitted = self.delivered = self.rejected = self.dropped = 0
+        self.high_water = 0
+        self._runtime = self._runner = self._handle = None
+        self._command_id = 0
+
+    def bind(self, runtime: Any, entity_id: str) -> None:
+        if self._runner is not None:
+            if runtime is not self._runtime or entity_id != self._runner.entity_id:
+                raise RuntimeError("peer inbox is already bound")
+            return
+        self._runtime = runtime
+        self._runner, self._handle = _bind_runner(runtime, "queue", entity_id)
+        self._observe("exact")
+
+    def _assert_bound(self) -> _LifecycleRunner:
+        if self._runner is None:
+            raise RuntimeError("peer inbox must be bound before mutation")
+        self._runtime._assert_loop()
+        self._runtime.assert_owner_epoch(self._runner.entity_id, self._runner.epoch)
+        return self._runner
+
+    def _observe(self, meta: str = "coalesced") -> None:
+        runner = self._assert_bound()
+        depth = len(self._items) + (self._terminal is not None)
+        self.high_water = max(self.high_water, depth)
+        self._runtime.projection.merge_values(runner.entity_id, self._runtime.new_producer_dot(), {
+            "depth": depth, "admitted": self.admitted, "delivered": self.delivered,
+            "rejected": self.rejected, "dropped": self.dropped,
+            "high_water": self.high_water,
+        }, observer_meta=meta, source_entity_id=runner.entity_id,
+           source_epoch=runner.epoch, source_revision=runner.revision,
+           source_order=self._runtime.projection.new_facet_source_order())
 
     @property
     def closed(self) -> bool:
-        return self._closed
+        return self._runner is not None and (
+            self._runner.snapshot().state != "open" or self._runner.commands.depth > 0
+        )
+
+    @staticmethod
+    def _is_terminal(event: Any) -> bool:
+        return isinstance(event, dict) and event.get("type") == "closed"
 
     def offer_nowait(self, event: Any) -> bool:
-        if self._closed:
-            return False
-        self._queue.put_nowait(event)
-        self._ready.set()
-        return True
+        self._assert_bound()
+        if self.closed and not self._is_terminal(event):
+            self.rejected += 1; self._observe(); return False
+        if self._is_terminal(event):
+            if self._terminal is None:
+                self._terminal = event; self.admitted += 1
+            else:
+                self.rejected += 1; self._observe(); return False
+        elif len(self._items) >= self.maxsize:
+            self.dropped += 1; self.rejected += 1; self._observe(); return False
+        else:
+            self._items.append(event); self.admitted += 1
+        self._signal_ready(); self._observe(); return True
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._ready.set()
+        runner = self._assert_bound()
+        if self.closed: return
+        self._command_id += 1
+        runner.try_submit(_command(runner, self._command_id, "closing", "peer-output-close"))
+        self._signal_ready(); self._observe()
 
     def receive_nowait(self) -> Any | NeedMoreData | PeerEventInboxClosed:
-        try:
-            event = self._queue.get_nowait()
-        except asyncio.QueueEmpty:
-            if self._closed:
-                return PeerEventInboxClosed()
-            self._ready.clear()
-            return NeedMoreData()
-        if not self._queue.empty() or self._closed:
-            self._ready.set()
+        runner = self._assert_bound()
+        if self._items:
+            item = self._items.popleft()
+        elif self._terminal is not None:
+            item, self._terminal = self._terminal, None
+        elif not self.closed:
+            self._reset_ready(); return NeedMoreData()
         else:
-            self._ready.clear()
-        return event
+            self._signal_ready(); return PeerEventInboxClosed()
+        self.delivered += 1
+        if not self._items and self._terminal is None:
+            if self.closed:
+                self._command_id += 1
+                runner.try_submit(_command(runner, self._command_id, "drained", "peer-output-drained"))
+                self._command_id += 1
+                runner.try_submit(_command(runner, self._command_id, "closed", "peer-output-closed"))
+            else: self._reset_ready()
+        self._observe(); return item
+
+    def _signal_ready(self) -> None:
+        if not self._ready.done():
+            self._ready.set_result(None)
+
+    def _reset_ready(self) -> None:
+        if self._ready.done():
+            self._ready = asyncio.get_running_loop().create_future()
 
     async def wait_ready(self) -> None:
-        await self._ready.wait()
+        await asyncio.shield(self._ready)
 
     def __aiter__(self) -> AsyncIterator[Any]:
-        async def iterator() -> AsyncIterator[Any]:
+        async def iterator():
             while True:
                 item = self.receive_nowait()
-                if isinstance(item, NeedMoreData):
-                    await self.wait_ready()
-                    continue
-                if isinstance(item, PeerEventInboxClosed):
-                    return
+                if isinstance(item, NeedMoreData): await self.wait_ready(); continue
+                if isinstance(item, PeerEventInboxClosed): return
                 yield item
-
         return iterator()
+
+    async def aclose(self) -> None:
+        self.close()
+        while self._items or self._terminal is not None:
+            item = self.receive_nowait()
+            if isinstance(item, (NeedMoreData, PeerEventInboxClosed)): break
+        if self._handle is not None:
+            await self._handle.wait()
+            self._runtime.remove_owner(self._runner.entity_id, self._runner.epoch)
 
 
 class PeerConnectionLogInbox:
     def __init__(self, maxsize: int = 4096) -> None:
+        if maxsize < 1: raise ValueError("log inbox capacity must be positive")
         self._queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=maxsize)
         self.accepting = True
-        self.dropped_debug = 0
-        self.dropped = 0
+        self.admitted = self.delivered = self.rejected = 0
+        self.dropped_debug = self.dropped = self.high_water = 0
+        self._runtime = self._runner = self._handle = None
+        self._command_id = 0
+        self._drain_requested = False
 
-    def stop_intake(self) -> None:
-        self.accepting = False
+    def bind(self, runtime: Any, entity_id: str) -> None:
+        if self._runner is not None: return
+        self._runtime = runtime
+        self._runner, self._handle = _bind_runner(runtime, "queue", entity_id)
+        self._observe("exact")
 
-    def put_nowait(self, event: Any) -> bool:
-        if not self.accepting:
-            return False
+    def _assert_bound(self):
+        if self._runner is None: raise RuntimeError("log inbox must be bound before mutation")
+        self._runtime.assert_owner_epoch(self._runner.entity_id, self._runner.epoch)
+        return self._runner
+
+    def _observe(self, meta="coalesced"):
+        runner = self._assert_bound(); depth = self._queue.qsize()
+        self.high_water = max(self.high_water, depth)
+        self._runtime.projection.merge_values(runner.entity_id, self._runtime.new_producer_dot(), {
+            "depth": depth, "high_water": self.high_water,
+            "admitted": self.admitted, "delivered": self.delivered,
+            "rejected": self.rejected, "dropped": self.dropped,
+            "dropped_debug": self.dropped_debug,
+        }, observer_meta=meta, source_entity_id=runner.entity_id,
+           source_epoch=runner.epoch, source_revision=runner.revision,
+           source_order=self._runtime.projection.new_facet_source_order())
+
+    def stop_intake(self):
+        runner = self._assert_bound()
+        if not self.accepting: return
+        self.accepting = False; self._command_id += 1
+        runner.try_submit(_command(runner, self._command_id, "closing", "log-intake-stop"))
+        if self._queue.empty(): self._queue.put_nowait(_LOG_STOP)
+
+    def put_nowait(self, event):
+        self._assert_bound()
+        if not self.accepting: self.rejected += 1; self._observe(); return False
         if not self._queue.full():
-            self._queue.put_nowait(event)
-            return True
+            self._queue.put_nowait(event); self.admitted += 1; self._observe(); return True
         level = getattr(getattr(event, "level", None), "value", 0)
-        if level >= 4:
-            self.dropped_debug += 1
-            return False
+        self.rejected += 1
+        if level >= 4: self.dropped_debug += 1; self._observe(); return False
         self.dropped += 1
-        try:
-            self._queue.get_nowait()
-        except asyncio.QueueEmpty:
-            pass
-        try:
-            self._queue.put_nowait(event)
-            return True
-        except asyncio.QueueFull:
-            return False
+        removed = self._queue.get_nowait()
+        if removed is not _LOG_STOP: self.rejected += 1
+        self._queue.put_nowait(event); self.admitted += 1; self._observe(); return True
 
-    async def get(self) -> Any:
-        return await self._queue.get()
+    async def get(self):
+        item = await self._queue.get()
+        if item is not _LOG_STOP: self.delivered += 1
+        self._observe(); return item
 
-    def drain_batch(self, maximum: int) -> list[Any]:
-        batch: list[Any] = []
+    def drain_batch(self, maximum):
+        self._assert_bound(); batch=[]
         for _ in range(maximum):
-            try:
-                batch.append(self._queue.get_nowait())
-            except asyncio.QueueEmpty:
-                break
+            try: item = self._queue.get_nowait()
+            except asyncio.QueueEmpty: break
+            if item is not _LOG_STOP: batch.append(item); self.delivered += 1
+        self._observe()
+        if not self.accepting and self._queue.empty() and self._runner.state == "closing":
+            self._command_id += 1
+            self._runner.try_submit(_command(self._runner, self._command_id, "drained", "log-queue-drained"))
+            self._drain_requested = True
         return batch
+
+    async def aclose(self):
+        self.stop_intake(); self.drain_batch(self._queue.maxsize + 1)
+        while self._runner.state == "open" and not self._handle.done():
+            await asyncio.sleep(0)
+        while self._drain_requested and self._runner.state == "closing" and not self._handle.done():
+            await asyncio.sleep(0)
+        if self._runner.state == "closing":
+            await _move(self._runner, self._next(), "drained", "log-queue-drained")
+        if self._runner.state == "drained": await _move(self._runner, self._next(), "closed", "log-queue-close")
+        await self._handle.wait(); self._runtime.remove_owner(self._runner.entity_id, 1)
+
+    def _next(self): self._command_id += 1; return self._command_id
+    def close(self):
+        # Compatibility spelling; terminal reconciliation remains awaitable.
+        self._assert_bound()
 
 
 class AsyncLogDrain(ObservedComponent):
-    """Peer-owned log intake and final-flush component."""
-
-    def __init__(self, inbox: PeerConnectionLogInbox | None = None) -> None:
+    def __init__(self, inbox=None):
         self.inbox = inbox or PeerConnectionLogInbox(DebugConfig.get().log_max)
-        self._stopping = asyncio.Event()
-        self._wake = asyncio.Event()
-        self._task: asyncio.Task[Any] | None = None
+        self._runtime = self._runner = self._handle = self._drain_handle = None
+        self._command_id = 0
+        self._failure: BaseException | None = None
 
     @event_loop
-    def start(self) -> None:
-        if self._task is None or self._task.done():
-            self._task = self.run()
+    def bind(self, runtime, entity_id):
+        self._runtime = runtime
+        self._runner, self._handle = _bind_runner(runtime, "log-drain", entity_id)
+        self.__bind_worker_owner__(runtime, entity_id, self._runner.epoch)
+        self.inbox.bind(runtime, f"{entity_id}:queue")
 
     @event_loop
-    def stop_intake(self) -> None:
-        self.inbox.stop_intake()
-        self._stopping.set()
-        self._wake.set()
+    def start(self):
+        if self._runner is None: raise RuntimeError("log drain must be bound before start")
+        if self._drain_handle is not None and not self._drain_handle.done(): return
+        self._drain_handle = self._runtime.start_pump(
+            self._run, owner_entity_id=self._runner.entity_id, owner_epoch=1,
+            name="logger.drain", kind="log", failure=FailurePolicy.REPORT,
+        )
 
-    @task(name="logger.drain", kind="log", failure=FailurePolicy.REPORT)
-    async def run(self) -> None:
-        config = DebugConfig.get()
-        last_flush = time.monotonic()
-        while not self._stopping.is_set():
-            timeout = max(0.0, config.log_flush_interval - (time.monotonic() - last_flush))
-            get_task = asyncio.create_task(self.inbox.get())
-            stop_task = asyncio.create_task(self._wake.wait())
-            done, pending = await asyncio.wait(
-                (get_task, stop_task), timeout=timeout, return_when=asyncio.FIRST_COMPLETED
-            )
-            for pending_task in pending:
-                pending_task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            batch = [get_task.result()] if get_task in done and not get_task.cancelled() else []
-            batch.extend(self.inbox.drain_batch(max(0, config.log_flush_max_batch - len(batch))))
-            if batch:
-                await self.write_batch(batch)
-            # Advance the flush deadline even when the periodic wake found an
-            # empty inbox.  Otherwise every subsequent timeout is zero and the
-            # drain spins creating and cancelling waiter tasks, starving the
-            # rest of the peer's event loop.
-            last_flush = time.monotonic()
-        await self.flush()
+    async def _run(self):
+        try:
+            await _move(self._runner, self._next(), "starting", "log-drain-start")
+            await _move(self._runner, self._next(), "idle", "log-drain-ready")
+            config=DebugConfig.get(); last=time.monotonic()
+            while self.inbox.accepting:
+                timeout=max(0.0, config.log_flush_interval-(time.monotonic()-last))
+                try: first=await asyncio.wait_for(self.inbox.get(), timeout)
+                except TimeoutError: first=None
+                if first is _LOG_STOP: break
+                batch=[] if first is None else [first]
+                batch.extend(self.inbox.drain_batch(max(0, config.log_flush_max_batch-len(batch))))
+                if batch:
+                    await _move(self._runner,self._next(),"draining","log-batch")
+                    await self.write_batch(batch)
+                    await _move(self._runner,self._next(),"idle","log-batch-complete")
+                last=time.monotonic()
+        except BaseException as error:
+            self._failure=error
+            if not isinstance(error, asyncio.CancelledError) and self._runner.state in {"starting","idle","draining"}:
+                await _move(self._runner,self._next(),"failed","log-write-failed")
+            raise
 
-    async def flush(self) -> None:
-        maximum = max(1, DebugConfig.get().log_flush_max_batch)
-        while batch := self.inbox.drain_batch(maximum):
-            await self.write_batch(batch)
+    @event_loop
+    def _next(self): self._command_id += 1; return self._command_id
+
+    @event_loop
+    def stop_intake(self): self.inbox.stop_intake()
 
     @worker
     @performance(name="logger.write", group="logger")
-    def write_batch(self, batch: list[Any]) -> None:
-        get_logger().write_events_sync(batch)
+    def write_batch(self, batch): get_logger().write_events_sync(batch)
 
-    async def aclose(self) -> None:
+    async def aclose(self):
         self.stop_intake()
-        task_handle = self._task
-        if task_handle is not None and task_handle is not asyncio.current_task():
-            await asyncio.gather(task_handle, return_exceptions=True)
-        else:
-            await self.flush()
+        if self._drain_handle is not None:
+            try: await self._drain_handle.wait()
+            except BaseException as error:
+                if self._failure is None: self._failure=error
+        while batch := self.inbox.drain_batch(max(1,DebugConfig.get().log_flush_max_batch)):
+            try:
+                await self.write_batch(batch)
+            except BaseException as error:
+                if self._failure is None: self._failure=error
+                break
+        if self._runner.state in {"starting","idle","draining","failed"}:
+            await _move(self._runner,self._next(),"stopping","log-drain-stop")
+        if self._runner.state == "stopping": await _move(self._runner,self._next(),"stopped","log-final-flush-complete")
+        await self._handle.wait(); self._runtime.remove_owner(self._runner.entity_id,1)
+        await self.inbox.aclose()
+        if self._failure is not None: raise self._failure
 
 
-async def _call_optional(target: Any, name: str) -> bool:
-    method = getattr(target, name, None)
-    if method is None:
-        return False
+async def _call_optional(target, name):
+    method=getattr(target,name,None)
+    if method is None: return False
     result = method()
     if inspect.isawaitable(result):
         await result
     return True
 
 
-class AttachmentController(ObservedComponent):
-    """Owns start tasks and ordered shutdown for attached domain producers."""
+@dataclass(slots=True)
+class _AttachmentEntry:
+    identity: str
+    target: Any
+    runner: _LifecycleRunner
+    handle: OwnedTaskHandle
+    command_id: int = 0
+    failure: BaseException | None = None
+    work: OwnedTaskHandle | None = None
 
-    def __init__(self, kind: str) -> None:
-        self.kind = kind
-        self._attachments: list[Any] = []
-        self._tasks: dict[int, asyncio.Task[Any]] = {}
-        self._closing = False
+
+class AttachmentController:
+    def __init__(self, kind: str, *, capacity: int = 64):
+        self.kind=kind; self.capacity=max(1,capacity)
+        self._runtime=self._runner=self._handle=None; self._entity_id=""
+        self._entries: dict[int,_AttachmentEntry]={}
+        self._command_id=0; self._work:set[OwnedTaskHandle]=set()
+        self._start_requested = False
 
     @event_loop
-    def attach(self, attachment: Any) -> Any:
-        if self._closing:
+    def bind(self,runtime,entity_id):
+        if self._runner is not None: return
+        self._runtime=runtime; self._entity_id=entity_id
+        self._runner,self._handle=_bind_runner(runtime,"attachment-registry",entity_id)
+
+    def _assert_bound(self):
+        if self._runner is None: raise RuntimeError("attachments must be Runtime-bound before mutation")
+        self._runtime.assert_owner_epoch(self._entity_id,1)
+
+    @event_loop
+    def attach(self,attachment):
+        self._assert_bound()
+        if self._runner.snapshot().state in {"closing", "closed"}:
             raise RuntimeError(f"{self.kind} attachments are closing")
-        self._attachments.append(attachment)
+        key=id(attachment)
+        if key in self._entries: raise ValueError("the same attachment object is already registered")
+        if len(self._entries)>=self.capacity: raise OverflowError("attachment registry capacity exceeded")
+        identity=uuid.uuid4().hex
+        entity=f"{self._entity_id}:attachment:{identity}"
+        runner,handle=_bind_runner(self._runtime,"attachment",entity)
+        entry=_AttachmentEntry(identity,attachment,runner,handle)
+        self._entries[key]=entry
+        entry.command_id+=1
+        runner.try_submit(_command(runner,entry.command_id,"attached",f"{self.kind}-attach"))
+        if self._start_requested: self._launch(entry)
         return attachment
 
     @event_loop
-    def start(self) -> None:
-        for attachment in self._attachments:
-            key = id(attachment)
-            if key not in self._tasks or self._tasks[key].done():
-                self._tasks[key] = self._run_attachment(attachment)
+    def start(self):
+        self._assert_bound()
+        if self._runner.snapshot().state in {"closing", "closed"}:
+            raise RuntimeError(f"{self.kind} attachments are closing")
+        if not self._start_requested:
+            self._start_requested = True
+            self._launch_registry_start()
+        for entry in self._entries.values(): self._launch(entry)
 
-    @task(name="attachment.run", kind="application", failure=FailurePolicy.REPORT)
-    async def _run_attachment(self, attachment: Any) -> None:
-        await _call_optional(attachment, "start")
+    def _launch_registry_start(self):
+        async def work():
+            if self._runner.state=="open": await _move(self._runner,self._next(),"starting",f"{self.kind}-start")
+            if self._runner.state=="starting": await _move(self._runner,self._next(),"active",f"{self.kind}-started")
+        self._own(work,"attachment.registry.start")
 
-    async def aclose(self) -> None:
-        if self._closing:
-            tasks = tuple(self._tasks.values())
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+    def _launch(self,entry):
+        if entry.work is not None: return
+        async def work():
+            while entry.runner.state == "detached":
+                await asyncio.sleep(0)
+            if entry.runner.state != "attached":
+                return
+            await _move(entry.runner,self._entry_next(entry),"starting",f"{self.kind}-start")
+            try: await _call_optional(entry.target,"start")
+            except BaseException as error:
+                entry.failure=error
+                await _move(entry.runner,self._entry_next(entry),"failed",f"{self.kind}-start-failed")
+                return
+            await _move(entry.runner,self._entry_next(entry),"active",f"{self.kind}-active")
+        entry.work = self._own(work,f"attachment.start:{entry.identity}")
+
+    def _own(self,factory,name):
+        handle=self._runtime.start_pump(factory,owner_entity_id=self._entity_id,owner_epoch=1,name=name,failure=FailurePolicy.REPORT)
+        self._work.add(handle)
+        return handle
+
+    def _next(self): self._command_id+=1; return self._command_id
+    @staticmethod
+    def _entry_next(entry): entry.command_id+=1; return entry.command_id
+
+    async def aclose(self):
+        self._assert_bound()
+        if self._runner.snapshot().state in {"closing", "closed"}:
+            for work in tuple(self._work):
+                try: await work.wait()
+                except BaseException: pass
             return
-        self._closing = True
-        for attachment in reversed(self._attachments):
-            await _call_optional(attachment, "stop")
-        for running in tuple(self._tasks.values()):
-            if not running.done():
-                running.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks.values(), return_exceptions=True)
-        for attachment in reversed(self._attachments):
-            if not await _call_optional(attachment, "aclose"):
-                await _call_optional(attachment, "close")
+        for work in tuple(self._work):
+            try: await work.wait()
+            except BaseException: pass
+        if self._runner.state in {"open","starting","active","failed"}:
+            await _move(self._runner,self._next(),"closing",f"{self.kind}-close")
+        first_failure=None
+        for entry in reversed(tuple(self._entries.values())):
+            if entry.runner.state in {"attached","starting","active","failed"}:
+                await _move(entry.runner,self._entry_next(entry),"stopping",f"{self.kind}-stop")
+            try:
+                await _call_optional(entry.target,"stop")
+                if not await _call_optional(entry.target,"aclose"): await _call_optional(entry.target,"close")
+            except BaseException as error:
+                if first_failure is None: first_failure=error
+            if entry.runner.state=="stopping": await _move(entry.runner,self._entry_next(entry),"stopped",f"{self.kind}-stopped")
+            await entry.handle.wait(); self._runtime.remove_owner(entry.runner.entity_id,1)
+            if first_failure is None and entry.failure is not None: first_failure=entry.failure
+        if self._runner.state=="closing": await _move(self._runner,self._next(),"closed",f"{self.kind}-closed")
+        await self._handle.wait(); self._runtime.remove_owner(self._entity_id,1)
+        if first_failure is not None: raise first_failure
 
 
 class SignalingController(AttachmentController):
-    def __init__(self) -> None:
-        super().__init__("signaling")
-
-
+    def __init__(self): super().__init__("signaling")
 class MediaSourceController(AttachmentController):
-    def __init__(self) -> None:
-        super().__init__("media")
+    def __init__(self): super().__init__("media")
