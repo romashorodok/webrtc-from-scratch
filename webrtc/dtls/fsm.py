@@ -12,7 +12,6 @@ from webrtc.performance import ObservedComponent, event_loop
 from webrtc.queue_machine import RuntimeOwnedQueue
 from webrtc.runtime_services import FailurePolicy, current_execution_scope
 from webrtc.machine_specs import MACHINE_SPECS
-from webrtc.observability import MachineTransitionOp
 from webrtc.state_machine import (
     AsyncStateMachineRunner, BoundedMailbox, PreparedTransition,
     TransitionCommit,
@@ -152,15 +151,16 @@ class FSM(ObservedComponent):
         root = getattr(scope, "root_context", None)
         identity = getattr(scope, "scope_id", None) or getattr(root, "trace_id", None)
         self.entity_id = f"dtls-handshake-phase:{identity or id(self)}"
+        self._runtime = scope if hasattr(scope, "start_machine") else None
         self._runner = _HandshakePhaseRunner(
             self, entity_id=self.entity_id, mailbox_capacity=16,
             controller=self._transition_controller,
-            transition_sink=self._project_transition,
+            transition_sink=(self._runtime.observe_transition
+                             if self._runtime is not None else None),
         )
         self.commands: BoundedMailbox[FSMCommand] = self._runner.commands
         if self._projection is not None:
             self._projection.machines.register(self.entity_id, DTLS_PHASE_SPEC)
-        self._runtime = scope if hasattr(scope, "start_machine") else None
         if self._runtime is not None:
             self._runtime.register_owner(self.entity_id, epoch=self._runner.epoch)
             self._runner_handle = self._runtime.start_machine(
@@ -188,19 +188,6 @@ class FSM(ObservedComponent):
     @property
     def transition_revision(self) -> int:
         return self._runner.snapshot().revision
-
-    @event_loop
-    def _project_transition(self, committed: TransitionCommit) -> None:
-        scope = current_execution_scope()
-        if (self._projection is None or scope is None
-                or not getattr(scope, "tracing_enabled", True)):
-            return
-        self._projection.machines.apply(MachineTransitionOp(
-            committed.entity_id, committed.machine_type,
-            committed.from_state, committed.to_state, committed.epoch,
-            committed.revision, scope.new_producer_dot(), committed.cause,
-            committed.monotonic_ns,
-        ))
 
     @event_loop
     def get_srtp_keying_material(self) -> SRTPKeyingMaterial | None:
@@ -565,7 +552,8 @@ class FSM(ObservedComponent):
             self._runner._checkpoint(preview, "before_commit")
         )
         committed = self._runner.commit(prepared, command)
-        self._project_transition(committed)
+        if self._runtime is not None:
+            self._runtime.observe_transition(committed)
         await self._runner.controller.after_commit(
             self._runner._checkpoint(committed, "after_commit")
         )

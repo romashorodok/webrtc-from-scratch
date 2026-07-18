@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from functools import wraps
 import secrets
@@ -34,10 +34,10 @@ from .runtime_services import (
     current_execution_scope,
 )
 from .machine_specs import MACHINE_SPECS
-from .observability import MachineTransitionOp
 from .state_machine import (
-    AsyncStateMachineRunner, BoundedMailbox, MachineCommand, MailboxClosed,
-    PreparedTransition, ReplyPort, StaleMachineAccess, TransitionCommit,
+    InlineStateMachineRunner, BoundedMailbox, MachineCommand, MachineSnapshot,
+    MailboxClosed, PreparedTransition, ReplyPort, StaleMachineAccess,
+    TransitionCommit,
 )
 from .peer_components import (
     AsyncLogDrain,
@@ -141,7 +141,7 @@ class _GathererCommand(StrEnum):
     CLOSE = "close"
 
 
-class _GathererRunner(AsyncStateMachineRunner[MachineCommand[object, TransitionCommit]]):
+class _GathererRunner(InlineStateMachineRunner):
     def __init__(self, owner: "ICEGatherer", **kwargs) -> None:
         super().__init__(MACHINE_SPECS["ice-gatherer"], **kwargs)
         self.owner = owner
@@ -194,7 +194,8 @@ class ICEGatherer:
         common = {"controller": getattr(scope, "transition_controller", None)}
         self._runner = _GathererRunner(
             self, entity_id=self.entity_id, mailbox_capacity=8,
-            transition_sink=self._project_transition, **common,
+            transition_sink=(self._runtime.observe_transition
+                             if self._runtime is not None else None), **common,
         )
         projection = getattr(scope, "projection", None)
         if projection is not None:
@@ -203,8 +204,8 @@ class ICEGatherer:
             self._machine_handles = []
             for runner in (self._runner,):
                 self._runtime.register_owner(runner.entity_id, epoch=runner.epoch)
-                self._machine_handles.append(self._runtime.start_machine(
-                    runner, owner_entity_id=runner.entity_id,
+                self._machine_handles.append(runner.activate(
+                    self._runtime, owner_entity_id=runner.entity_id,
                     owner_epoch=runner.epoch,
                 ))
         else:
@@ -214,18 +215,8 @@ class ICEGatherer:
         self._command_id += 1
         return MachineCommand(
             kind, self._command_id, runner.epoch, payload, reply,
-            expected_revision=runner.revision,
             cause_id=f"{runner.entity_id}:{self._command_id}",
         )
-
-    def _project_transition(self, commit: TransitionCommit) -> None:
-        if self._runtime is None or not getattr(self._runtime, "tracing_enabled", True):
-            return
-        self._runtime.projection.machines.apply(MachineTransitionOp(
-            commit.entity_id, commit.machine_type, commit.from_state, commit.to_state,
-            commit.epoch, commit.revision, self._runtime.new_producer_dot(),
-            commit.cause, commit.monotonic_ns,
-        ))
 
     def _launch_gather(self) -> None:
         if self._runtime is None:
@@ -481,7 +472,27 @@ class _SelectedTransportCommand(StrEnum):
     FAIL = "fail"
 
 
-class _SelectedTransportRunner(AsyncStateMachineRunner):
+@dataclass(frozen=True, slots=True)
+class SelectedTransportSnapshot:
+    """Authoritative selected-pair binding and its nomination provenance."""
+
+    revision: int = 0
+    state: str = "new"
+    transport: ice.CandidatePairTransport | None = None
+    nomination_entity_id: str | None = None
+    nomination_epoch: int | None = None
+    nomination_revision: int | None = None
+
+    @property
+    def ready(self) -> bool:
+        return self.state == "ready" and self.transport is not None
+
+
+class _SelectedTransportRunner(InlineStateMachineRunner):
+    def __init__(self, owner: "ICETransport", *args, **kwargs) -> None:
+        self.owner = owner
+        super().__init__(*args, **kwargs)
+
     async def step(self, command):
         proposed = {
             _SelectedTransportCommand.SELECT: "selecting",
@@ -497,6 +508,10 @@ class _SelectedTransportRunner(AsyncStateMachineRunner):
             command.expected_epoch, command.expected_revision,
         )
 
+    async def after_commit(self, commit, effects):
+        self.owner._commit_selected_transport(commit, effects)
+        self.owner._publish_selected_transport(commit)
+
 
 @impl_protocol(dtls.ICETransportDTLS)
 class ICETransport:
@@ -505,9 +520,7 @@ class ICETransport:
         gatherer: ICEGatherer,
     ) -> None:
         self.__gatherer = gatherer
-        self.__transport: ice.CandidatePairTransport | None = None
-        self.__nomination: TransitionCommit | None = None
-        self.__transport_revision = 0
+        self._selected = SelectedTransportSnapshot()
         scope = current_execution_scope()
         root = getattr(scope, "root_context", None)
         identity = (
@@ -519,18 +532,20 @@ class ICETransport:
         self._runtime = scope if hasattr(scope, "start_machine") else None
         self._command_id = 0
         self._runner = _SelectedTransportRunner(
+            self,
             MACHINE_SPECS["transport"], entity_id=self.entity_id,
             mailbox_capacity=8,
             controller=getattr(scope, "transition_controller", None),
-            transition_sink=self._project_transition,
+            transition_sink=(self._runtime.observe_transition
+                             if self._runtime is not None else None),
         )
         projection = getattr(scope, "projection", None)
         if projection is not None:
             projection.machines.register(self.entity_id, MACHINE_SPECS["transport"])
         if self._runtime is not None:
             self._runtime.register_owner(self.entity_id, epoch=self._runner.epoch)
-            self._machine_handle = self._runtime.start_machine(
-                self._runner, owner_entity_id=self.entity_id,
+            self._machine_handle = self._runner.activate(
+                self._runtime, owner_entity_id=self.entity_id,
                 owner_epoch=self._runner.epoch,
             )
         else:
@@ -540,37 +555,26 @@ class ICETransport:
         # self.__gatherer = gatherer
         # self._state: ICETransportState = ICETransportState.NEW
 
-    def _project_transition(self, commit: TransitionCommit) -> None:
+    def _publish_selected_transport(self, commit: TransitionCommit) -> None:
         if self._runtime is None:
             return
-        self._runtime.projection.machines.apply(MachineTransitionOp(
-            commit.entity_id, commit.machine_type, commit.from_state, commit.to_state,
-            commit.epoch, commit.revision, self._runtime.new_producer_dot(),
-            commit.cause, commit.monotonic_ns,
-        ))
         values = {}
-        if commit.to_state == "ready" and self.__transport is not None:
-            pair_id = self.__transport.entity_id
-            nomination = self.__nomination
-            if nomination is None:
+        selected = self._selected
+        if commit.to_state == "ready" and selected.ready:
+            if selected.nomination_entity_id is None:
                 raise RuntimeError("ready transport has no nomination provenance")
             values.update({
                 "selected": True,
-                "selected_pair_id": pair_id,
-                "nomination_entity_id": nomination.entity_id,
-                "nomination_revision": nomination.revision,
+                "selected_pair_id": selected.transport.entity_id,
+                "nomination_entity_id": selected.nomination_entity_id,
+                "nomination_revision": selected.nomination_revision,
             })
-        self._runtime.projection.merge_values(
-            self.entity_id, self._runtime.new_producer_dot(), values,
-            observer_meta="exact", source_entity_id=commit.entity_id,
-            source_epoch=commit.epoch, source_revision=commit.revision,
-            source_order=self._runtime.projection.new_facet_source_order(),
-        )
+        self._runtime.observe_facets(commit, values)
 
-    def _command(self, kind, *, cause_id=None, reply=None):
+    def _command(self, kind, payload=None, *, cause_id=None, reply=None):
         self._command_id += 1
         return MachineCommand(
-            kind, self._command_id, self._runner.epoch, None, reply,
+            kind, self._command_id, self._runner.epoch, payload, reply,
             expected_revision=None,
             cause_id=cause_id or f"{self.entity_id}:{self._command_id}",
         )
@@ -579,7 +583,8 @@ class ICETransport:
         self, transport: ice.CandidatePairTransport,
         nomination: TransitionCommit,
     ):
-        if self.__transport is not None and self.__transport is not transport:
+        selected = self._selected
+        if selected.transport is not None and selected.transport is not transport:
             raise RuntimeError("selected ICE transport is already bound")
         pair_entity = transport.entity_id
         if (
@@ -588,29 +593,56 @@ class ICETransport:
             or nomination.entity_id != pair_entity
         ):
             raise RuntimeError("selected transport requires a nomination commit")
-        if self.__transport is None:
+        if selected.transport is None:
             cause = nomination.cause
             if self._machine_handle is not None:
                 selected = ReplyPort[TransitionCommit]()
                 self._runner.try_submit(self._command(
-                    _SelectedTransportCommand.SELECT, cause_id=cause, reply=selected,
+                    _SelectedTransportCommand.SELECT, (transport, nomination),
+                    cause_id=cause, reply=selected,
                 ))
                 await selected.wait()
-            self.__transport = transport
-            self.__nomination = nomination
-            self.__transport_revision += 1
             if self._machine_handle is not None:
                 ready = ReplyPort[TransitionCommit]()
                 self._runner.try_submit(self._command(
-                    _SelectedTransportCommand.READY, cause_id=cause, reply=ready,
+                    _SelectedTransportCommand.READY, (transport, nomination),
+                    cause_id=cause, reply=ready,
                 ))
                 await ready.wait()
 
+    def _commit_selected_transport(
+        self, commit: TransitionCommit,
+        effect: tuple[ice.CandidatePairTransport, TransitionCommit] | None,
+    ) -> None:
+        current = self._selected
+        transport = current.transport
+        entity_id = current.nomination_entity_id
+        epoch = current.nomination_epoch
+        revision = current.nomination_revision
+        if effect is not None:
+            transport, nomination = effect
+            entity_id = nomination.entity_id
+            epoch = nomination.epoch
+            revision = nomination.revision
+        # Draining rejects new readers through ``ready`` while retaining the
+        # exact resource that teardown still has to close.
+        if commit.to_state in {"closed", "failed"}:
+            transport = None
+        self._selected = SelectedTransportSnapshot(
+            commit.revision, commit.to_state, transport,
+            entity_id, epoch, revision,
+        )
+
+    def authoritative_snapshot(self) -> SelectedTransportSnapshot:
+        return self._selected
+
     async def get_ice_pair_transport(self) -> ice.CandidatePairTransport | None:
-        return self.__transport
+        snapshot = self._selected
+        return snapshot.transport if snapshot.ready else None
 
     def selected_snapshot(self) -> tuple[int, ice.CandidatePairTransport | None]:
-        return self.__transport_revision, self.__transport
+        snapshot = self._selected
+        return snapshot.revision, snapshot.transport if snapshot.ready else None
 
     async def aclose(self) -> None:
         if self._machine_handle is None or self._runner.snapshot().terminal:
@@ -621,8 +653,7 @@ class ICETransport:
             _SelectedTransportCommand.DRAIN, cause_id=cause, reply=draining,
         ))
         await draining.wait()
-        transport, self.__transport = self.__transport, None
-        self.__nomination = None
+        transport = self._selected.transport
         if transport is not None:
             async_closer = getattr(transport, "aclose", None)
             if async_closer is not None:
@@ -736,8 +767,6 @@ class _PeerCommand(StrEnum):
     FAIL = "fail"
     CLOSE = "close"
     FINISH_CLOSE = "finish-close"
-    DIAL = "dial"
-    ACCEPT = "accept"
 
 
 class _SignalingCommand(StrEnum):
@@ -764,12 +793,19 @@ class _PeerReadiness:
 
 
 @dataclass(frozen=True, slots=True)
+class PeerAuthoritySnapshot:
+    """Peer protocol fields protected independently of trace projections."""
+
+    role: str | None = None
+    readiness: _PeerReadiness | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class _PeerCommandPayload:
     completion: ReplyPort[TransitionCommit] | None = None
     reason: str = ""
     error: BaseException | None = None
     readiness: _PeerReadiness | None = None
-    role: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -802,11 +838,26 @@ class _SignalingEffect:
     media_section_count: int = 0
 
 
-class _PeerRunner(AsyncStateMachineRunner[MachineCommand[object, TransitionCommit]]):
+class _PeerRunner(InlineStateMachineRunner):
     def __init__(self, owner: "PeerConnection", **kwargs) -> None:
         super().__init__(MACHINE_SPECS["peer"], **kwargs)
         self.owner = owner
-        self.role: str | None = None
+        self.authority = PeerAuthoritySnapshot()
+
+    @property
+    def role(self) -> str | None:
+        return self.authority.role
+
+    def claim_role(self, role: str) -> bool:
+        """Claim the immutable peer role without inventing a lifecycle edge."""
+        if self.authority.role == role:
+            return False
+        if self.authority.role is not None:
+            raise StaleMachineAccess(
+                f"peer role is already {self.authority.role}; cannot become {role}"
+            )
+        self.authority = replace(self.authority, role=role)
+        return True
 
     async def step(self, command):
         state = self.snapshot().state
@@ -818,8 +869,6 @@ class _PeerRunner(AsyncStateMachineRunner[MachineCommand[object, TransitionCommi
             _PeerCommand.FAIL: "failed",
             _PeerCommand.CLOSE: "closing",
             _PeerCommand.FINISH_CLOSE: "closed",
-            _PeerCommand.DIAL: state,
-            _PeerCommand.ACCEPT: state,
         }.get(command.kind)
         if proposed is None:
             raise ValueError(f"unsupported peer command: {command.kind}")
@@ -843,18 +892,15 @@ class _PeerRunner(AsyncStateMachineRunner[MachineCommand[object, TransitionCommi
                 and isinstance(payload, _PeerCommandPayload)
             ):
                 self.owner._validate_peer_readiness(payload.readiness)
-        if isinstance(proposed, PreparedTransition):
-            payload = proposed.effects
-            if isinstance(payload, _PeerCommandPayload) and payload.role is not None:
-                if self.role is not None and self.role != payload.role:
-                    raise StaleMachineAccess(
-                        f"peer role is already {self.role}; cannot become {payload.role}"
-                    )
         committed = super().commit(proposed, cause)
-        if isinstance(proposed, PreparedTransition):
-            payload = proposed.effects
-            if isinstance(payload, _PeerCommandPayload) and payload.role is not None:
-                self.role = payload.role
+        if (
+            isinstance(proposed, PreparedTransition)
+            and committed.to_state == "connected"
+            and isinstance(proposed.effects, _PeerCommandPayload)
+        ):
+            self.authority = replace(
+                self.authority, readiness=proposed.effects.readiness,
+            )
         return committed
 
     async def reconcile_terminal(self, prepared):
@@ -867,7 +913,7 @@ class _PeerRunner(AsyncStateMachineRunner[MachineCommand[object, TransitionCommi
         except BaseException as error:
             # Some public peer operations use a completion carried by the
             # immutable effect rather than MachineCommand.reply.  Once the
-            # transition has committed, AsyncStateMachineRunner can only
+            # transition has committed, the reducer can only
             # resolve the command reply; reject the public completion here so
             # callers observe the original post-commit failure instead of
             # waiting forever.
@@ -876,7 +922,7 @@ class _PeerRunner(AsyncStateMachineRunner[MachineCommand[object, TransitionCommi
             raise
 
 
-class _SignalingRunner(AsyncStateMachineRunner[MachineCommand[object, TransitionCommit]]):
+class _SignalingRunner(InlineStateMachineRunner):
     def __init__(self, owner: "PeerConnection", **kwargs) -> None:
         super().__init__(MACHINE_SPECS["signaling"], **kwargs)
         self.owner = owner
@@ -973,29 +1019,6 @@ class _SignalingRunner(AsyncStateMachineRunner[MachineCommand[object, Transition
         self.owner._after_signaling_commit(commit, effects)
 
 
-class _MediaSendCommand(StrEnum):
-    ACTIVATE = "activate"
-    FAIL = "fail"
-    DRAIN = "drain"
-    CLOSE = "close"
-
-
-class _MediaSendRunner(AsyncStateMachineRunner[MachineCommand[object, TransitionCommit]]):
-    async def step(self, command):
-        proposed = {
-            _MediaSendCommand.ACTIVATE: "active",
-            _MediaSendCommand.FAIL: "failed",
-            _MediaSendCommand.DRAIN: "draining",
-            _MediaSendCommand.CLOSE: "closed",
-        }.get(command.kind)
-        if proposed is None:
-            raise ValueError(f"unsupported media-send command: {command.kind}")
-        return PreparedTransition(
-            self.snapshot().state, proposed, command.payload, command.cause_id,
-            command.expected_epoch, command.expected_revision,
-        )
-
-
 @dataclass(frozen=True, slots=True)
 class _MediaSendRequest:
     submission_id: int
@@ -1072,17 +1095,22 @@ class PeerConnection(ObservedComponent):
         self.entity_id = self._observability_id
         self.signaling_entity_id = f"{self._observability_id}:signaling"
         self.media_send_entity_id = f"{self._observability_id}:media-send"
-        common = {"controller": None, "transition_sink": self._project_transition}
+        common = {
+            "controller": None,
+            "transition_sink": None,
+        }
         self._peer_runner = _PeerRunner(
             self, entity_id=self.entity_id, mailbox_capacity=16, **common,
         )
         self._signaling_runner = _SignalingRunner(
             self, entity_id=self.signaling_entity_id, mailbox_capacity=16, **common,
         )
-        self._media_send_runner = _MediaSendRunner(
-            MACHINE_SPECS["media-send"], entity_id=self.media_send_entity_id,
-            mailbox_capacity=8, **common,
-        )
+        # The pump and its bounded mailbox are the authoritative media-send
+        # admission primitive.  This lifecycle is intentionally local state,
+        # not a second mailbox/task pretending to control the same work.
+        self._media_send_state = "new"
+        self._media_send_revision = 0
+        self._media_send_epoch = 1
         self._media_send_mailbox = BoundedMailbox[_MediaSendRequest](32)
         self._media_send_credits = asyncio.Queue[None](4)
         for _ in range(4):
@@ -1094,10 +1122,15 @@ class PeerConnection(ObservedComponent):
         self._media_send_jobs: dict[int, OwnedTaskHandle[None]] = {}
         self._media_send_requests: dict[int, _MediaSendRequest] = {}
         self._media_send_results: dict[int, _MediaSendResult] = {}
+        self._media_send_abandoned: set[int] = set()
         self._media_send_next_commit = 1
         self._media_send_failure: BaseException | None = None
         self._media_send_dispatch_stopped = False
-        self._media_send_active: ReplyPort[TransitionCommit] | None = None
+
+    @property
+    def media_send_epoch(self) -> int:
+        """Runtime owner epoch for work attached to the media-send lane."""
+        return self._media_send_epoch
 
     @event_loop
     def _next_transceiver_observability_id(self) -> str:
@@ -1162,20 +1195,20 @@ class PeerConnection(ObservedComponent):
             return
         self._runtime = scope
         controller = getattr(scope, "transition_controller", None)
-        for runner in (
-            self._peer_runner, self._signaling_runner, self._media_send_runner,
-        ):
+        for runner in (self._peer_runner, self._signaling_runner):
             runner.controller = controller or runner.controller
+            runner._transition_sink = scope.observe_transition
             scope.projection.machines.register(runner.entity_id, runner.spec)
             scope.register_owner(runner.entity_id, epoch=runner.epoch)
-            self._machine_handles.append(scope.start_machine(
-                runner, owner_entity_id=runner.entity_id,
+            self._machine_handles.append(runner.activate(
+                scope, owner_entity_id=runner.entity_id,
                 owner_epoch=runner.epoch,
             ))
+        scope.register_owner(self.media_send_entity_id, epoch=self._media_send_epoch)
         self._media_send_pump = scope.start_pump(
             self._run_media_send_pump,
             owner_entity_id=self.media_send_entity_id,
-            owner_epoch=self._media_send_runner.epoch,
+            owner_epoch=self._media_send_epoch,
             name=f"media-send:pump:{self.media_send_entity_id}",
             kind="media",
             failure=FailurePolicy.FAIL_CONNECTION,
@@ -1185,12 +1218,7 @@ class PeerConnection(ObservedComponent):
                 "max_concurrency": self._media_send_credits.maxsize,
             },
         )
-        self._media_send_active = ReplyPort[TransitionCommit]()
-        self._media_send_runner.try_submit(self._command(
-            self._media_send_runner, _MediaSendCommand.ACTIVATE,
-            cause_id=f"{self.media_send_entity_id}:activate",
-            reply=self._media_send_active,
-        ))
+        self._set_media_send_state("active")
 
     @event_loop
     def _require_runtime_bound_children(self, scope) -> None:
@@ -1219,31 +1247,32 @@ class PeerConnection(ObservedComponent):
         self._command_id += 1
         return MachineCommand(
             kind, self._command_id, runner.epoch, payload, reply,
-            expected_revision=runner.revision,
+            # Description replacement is the retained optimistic operation:
+            # two offers prepared from the same signaling snapshot must not
+            # overwrite one another. Ordinary peer lifecycle commands are
+            # serialized locally and deliberately carry no revision token.
+            expected_revision=(runner.revision
+                               if runner is self._signaling_runner else None),
             cause_id=cause_id or f"{runner.entity_id}:{self._command_id}",
         )
 
     @event_loop
-    def _project_transition(self, commit: TransitionCommit) -> None:
-        runtime = self._runtime
-        if runtime is None or not getattr(runtime, "tracing_enabled", True):
+    def _set_media_send_state(self, proposed: str) -> None:
+        allowed = {
+            "new": {"active", "closed"},
+            "active": {"failed", "draining"},
+            "failed": {"draining"},
+            "draining": {"closed"},
+            "closed": set(),
+        }
+        if proposed == self._media_send_state:
             return
-        runtime.projection.machines.apply(MachineTransitionOp(
-            commit.entity_id, commit.machine_type, commit.from_state, commit.to_state,
-            commit.epoch, commit.revision, runtime.new_producer_dot(),
-            commit.cause, commit.monotonic_ns,
-        ))
-        if commit.machine_type == "media-send":
-            runtime.projection.merge_values(
-                commit.entity_id, runtime.new_producer_dot(), {
-                    "queued": self._media_send_mailbox.depth,
-                    "running": self._media_send_running,
-                    "high_water": self._media_send_high_water,
-                },
-                observer_meta="aggregate", source_entity_id=commit.entity_id,
-                source_epoch=commit.epoch, source_revision=commit.revision,
-                source_order=runtime.projection.new_facet_source_order(),
+        if proposed not in allowed[self._media_send_state]:
+            raise RuntimeError(
+                f"invalid media-send lifecycle: {self._media_send_state} -> {proposed}"
             )
+        self._media_send_state = proposed
+        self._media_send_revision += 1
 
     @event_loop
     def _publish_peer(
@@ -1263,12 +1292,22 @@ class PeerConnection(ObservedComponent):
                     "srtp_rtp_revision": readiness.srtp_rtp.revision,
                     "srtp_rtcp_revision": readiness.srtp_rtcp.revision,
                 })
-            runtime.projection.merge_values(
-                self.entity_id, runtime.new_producer_dot(), values,
-                observer_meta="exact", source_entity_id=commit.entity_id,
-                source_epoch=commit.epoch, source_revision=commit.revision,
-                source_order=runtime.projection.new_facet_source_order(),
-            )
+            runtime.observe_facets(commit, values)
+
+    @event_loop
+    def _publish_peer_configuration(self) -> None:
+        """Refresh peer facets for non-lifecycle configuration changes."""
+        runtime = self._runtime
+        if runtime is None or not getattr(runtime, "tracing_enabled", True):
+            return
+        snapshot = self._peer_runner.snapshot()
+        runtime.observe_facets(
+            snapshot, {
+                "negotiation_generation": self.generation,
+                "role": self._peer_runner.role,
+            },
+            observer_meta="exact",
+        )
 
     @event_loop
     def _after_signaling_commit(
@@ -1286,12 +1325,7 @@ class PeerConnection(ObservedComponent):
                 "media_section_count": effect.media_section_count,
                 "outcome": "failed" if commit.to_state == "failed" else "committed",
             }
-            runtime.projection.merge_values(
-                self.signaling_entity_id, runtime.new_producer_dot(), values,
-                observer_meta="exact", source_entity_id=commit.entity_id,
-                source_epoch=commit.epoch, source_revision=commit.revision,
-                source_order=runtime.projection.new_facet_source_order(),
-            )
+            runtime.observe_facets(commit, values)
 
     async def _after_peer_commit(
         self, commit: TransitionCommit, payload: _PeerCommandPayload,
@@ -1303,14 +1337,6 @@ class PeerConnection(ObservedComponent):
                 self._peer_runner, _PeerCommand.NEGOTIATING, payload,
                 cause_id=commit.cause,
             ))
-        elif payload.role == "dial":
-            await self.gatherer.dial()
-            if payload.completion is not None:
-                payload.completion.resolve(commit)
-        elif payload.role == "accept":
-            await self.gatherer.accept()
-            if payload.completion is not None:
-                payload.completion.resolve(commit)
         elif commit.to_state == "negotiating":
             if payload.completion is not None:
                 payload.completion.resolve(commit)
@@ -1323,7 +1349,6 @@ class PeerConnection(ObservedComponent):
             terminal = self._terminal_completion()
             failed_payload = _PeerCommandPayload(
                 terminal, payload.reason, payload.error, payload.readiness,
-                payload.role,
             )
             self._peer_runner.try_submit(self._command(
                 self._peer_runner, _PeerCommand.CLOSE, failed_payload,
@@ -1357,26 +1382,70 @@ class PeerConnection(ObservedComponent):
 
     @event_loop
     def _peer_readiness_snapshot(self) -> _PeerReadiness:
-        selected = self._ice_transport._runner.snapshot()
-        dtls_snapshot = self._dtls_transport._runner.snapshot()
+        selected_authority = getattr(
+            self._ice_transport, "authoritative_snapshot", None,
+        )
+        if selected_authority is None:
+            selected = self._ice_transport._runner.snapshot()
+            selected_entity = selected.entity_id
+            selected_epoch = selected.epoch
+            selected_ready = selected.state == "ready"
+        else:
+            selected = selected_authority()
+            selected_entity = self._ice_transport.entity_id
+            selected_epoch = self._ice_transport._runner.epoch
+            selected_ready = selected.ready
+        dtls_authority = getattr(
+            self._dtls_transport, "authoritative_snapshot", None,
+        )
+        if dtls_authority is None:
+            dtls_snapshot = self._dtls_transport._runner.snapshot()
+            dtls_entity = dtls_snapshot.entity_id
+            dtls_epoch = dtls_snapshot.epoch
+            dtls_ready = dtls_snapshot.state == "connected"
+        else:
+            dtls_snapshot = dtls_authority()
+            dtls_entity = self._dtls_transport.entity_id
+            dtls_epoch = self._dtls_transport._runner.epoch
+            dtls_ready = dtls_snapshot.media_ready
+        if not selected_ready or not dtls_ready:
+            raise RuntimeError("peer readiness requires authoritative transports")
         rtp = self._dtls_transport._srtp_rtp
         rtcp = self._dtls_transport._srtp_rtcp
         if rtp is None or rtcp is None:
             raise RuntimeError("peer readiness requires both SRTP sessions")
-        rtp_snapshot = rtp.lifecycle_snapshot()
-        rtcp_snapshot = rtcp.lifecycle_snapshot()
+        rtp_snapshot = (
+            rtp.admission_snapshot() if hasattr(rtp, "admission_snapshot")
+            else rtp.lifecycle_snapshot()
+        )
+        rtcp_snapshot = (
+            rtcp.admission_snapshot() if hasattr(rtcp, "admission_snapshot")
+            else rtcp.lifecycle_snapshot()
+        )
+        rtp_lifecycle = rtp.lifecycle_snapshot()
+        rtcp_lifecycle = rtcp.lifecycle_snapshot()
+        if (
+            getattr(rtp_snapshot, "accepting_packets", rtp_snapshot.state == "ready")
+            is not True
+            or getattr(rtcp_snapshot, "accepting_packets", rtcp_snapshot.state == "ready")
+            is not True
+        ):
+            raise RuntimeError("peer readiness requires authoritative SRTP admission")
         return _PeerReadiness(
-            _ChildReadiness(selected.entity_id, selected.epoch, selected.revision, "ready"),
             _ChildReadiness(
-                dtls_snapshot.entity_id, dtls_snapshot.epoch,
+                selected_entity, selected_epoch,
+                selected.revision, "ready",
+            ),
+            _ChildReadiness(
+                dtls_entity, dtls_epoch,
                 dtls_snapshot.revision, "connected",
             ),
             _ChildReadiness(
-                rtp_snapshot.entity_id, rtp_snapshot.epoch,
+                rtp_lifecycle.entity_id, rtp_lifecycle.epoch,
                 rtp_snapshot.revision, "ready",
             ),
             _ChildReadiness(
-                rtcp_snapshot.entity_id, rtcp_snapshot.epoch,
+                rtcp_lifecycle.entity_id, rtcp_lifecycle.epoch,
                 rtcp_snapshot.revision, "ready",
             ),
         )
@@ -1455,13 +1524,10 @@ class PeerConnection(ObservedComponent):
             raise StaleMachineAccess(
                 f"peer role is already {self._peer_runner.role}; cannot dial"
             )
-        completion = ReplyPort[TransitionCommit]()
-        await self._peer_runner.submit(self._command(
-            self._peer_runner, _PeerCommand.DIAL,
-            _PeerCommandPayload(completion=completion, role="dial"),
-            reply=completion,
-        ))
-        await completion.wait()
+        if not self._peer_runner.claim_role("dial"):
+            return
+        await self.gatherer.dial()
+        self._publish_peer_configuration()
 
     async def accept(self) -> None:
         if self._closing or self._closed:
@@ -1472,13 +1538,10 @@ class PeerConnection(ObservedComponent):
             raise StaleMachineAccess(
                 f"peer role is already {self._peer_runner.role}; cannot accept"
             )
-        completion = ReplyPort[TransitionCommit]()
-        await self._peer_runner.submit(self._command(
-            self._peer_runner, _PeerCommand.ACCEPT,
-            _PeerCommandPayload(completion=completion, role="accept"),
-            reply=completion,
-        ))
-        await completion.wait()
+        if not self._peer_runner.claim_role("accept"):
+            return
+        await self.gatherer.accept()
+        self._publish_peer_configuration()
 
     @event_loop
     def observe_task_failure(self, event: TaskFailureEvent) -> None:
@@ -1563,7 +1626,10 @@ class PeerConnection(ObservedComponent):
                 self._cleanup_completed.add(key)
 
         async def attempt_if_bound(key: str, component: object) -> None:
-            if getattr(component, "_runner", None) is None:
+            if (
+                getattr(component, "_runner", None) is None
+                and getattr(component, "_state", None) is None
+            ):
                 self._cleanup_completed.add(key)
                 return
             await attempt(key, component.aclose)
@@ -1598,21 +1664,11 @@ class PeerConnection(ObservedComponent):
                 await asyncio.gather(
                     *(handle.wait() for handle in jobs), return_exceptions=True,
                 )
-            state = self._media_send_runner.snapshot().state
+            state = self._media_send_state
             if state in {"active", "failed"}:
-                reply = ReplyPort[TransitionCommit]()
-                await self._media_send_runner.submit(self._command(
-                    self._media_send_runner, _MediaSendCommand.DRAIN,
-                    cause_id=f"{self.media_send_entity_id}:peer-close", reply=reply,
-                ))
-                await reply.wait()
-            if self._media_send_runner.snapshot().state == "draining":
-                reply = ReplyPort[TransitionCommit]()
-                await self._media_send_runner.submit(self._command(
-                    self._media_send_runner, _MediaSendCommand.CLOSE,
-                    cause_id=f"{self.media_send_entity_id}:peer-close", reply=reply,
-                ))
-                await reply.wait()
+                self._set_media_send_state("draining")
+            if self._media_send_state == "draining":
+                self._set_media_send_state("closed")
 
         await attempt("media-send", close_media_send)
 
@@ -1637,13 +1693,19 @@ class PeerConnection(ObservedComponent):
         await attempt_if_bound("log-drain", self.log_drain)
         if len(self._machine_handles) > 1:
             for runner, handle in zip(
-                (self._signaling_runner, self._media_send_runner),
-                self._machine_handles[1:3],
+                (self._signaling_runner,), self._machine_handles[1:2],
             ):
                 if not handle.done():
                     await handle.wait()
                 if self._runtime is not None:
                     self._runtime.remove_owner(runner.entity_id, runner.epoch)
+        if self._runtime is not None:
+            try:
+                self._runtime.remove_owner(
+                    self.media_send_entity_id, self._media_send_epoch,
+                )
+            except (KeyError, StaleOwnerEpoch):
+                pass
         if cleanup_errors:
             errors = ([payload.error] if payload.error is not None else []) + cleanup_errors
             self._close_error = BaseExceptionGroup(
@@ -1678,16 +1740,18 @@ class PeerConnection(ObservedComponent):
         runtime = self._runtime
         if runtime is None or not getattr(runtime, "tracing_enabled", True):
             return
-        snapshot = self._media_send_runner.snapshot()
-        runtime.projection.merge_values(
-            self.media_send_entity_id, runtime.new_producer_dot(), {
+        source = MachineSnapshot(
+            self.media_send_entity_id, "media-send", self._media_send_epoch,
+            self._media_send_revision, self._media_send_state,
+            self._media_send_state == "closed",
+        )
+        runtime.observe_facets(
+            source, {
                 "queued": self._media_send_mailbox.depth,
                 "running": self._media_send_running,
                 "high_water": self._media_send_high_water,
             },
-            observer_meta="aggregate", source_entity_id=snapshot.entity_id,
-            source_epoch=snapshot.epoch, source_revision=snapshot.revision,
-            source_order=runtime.projection.new_facet_source_order(),
+            observer_meta="aggregate",
         )
 
     async def _run_media_send_pump(self) -> None:
@@ -1723,7 +1787,7 @@ class PeerConnection(ObservedComponent):
             handle = scope.start_pump(
                 lambda request=request: self._execute_media_send(request),
                 owner_entity_id=self.media_send_entity_id,
-                owner_epoch=self._media_send_runner.epoch,
+                owner_epoch=self._media_send_epoch,
                 name=f"media-send:{request.submission_id}",
                 kind="media",
                 failure=FailurePolicy.REPORT,
@@ -1756,15 +1820,8 @@ class PeerConnection(ObservedComponent):
                 for submission_id, handle in tuple(self._media_send_jobs.items()):
                     if submission_id != request.submission_id and not handle.done():
                         handle.cancel()
-            if self._media_send_runner.snapshot().state == "active":
-                try:
-                    self._media_send_runner.try_submit(self._command(
-                        self._media_send_runner, _MediaSendCommand.FAIL,
-                        payload=error, cause_id=request.cause_id,
-                    ))
-                except RuntimeError:
-                    # A concurrent peer close already owns terminal reconciliation.
-                    pass
+            if self._media_send_state == "active":
+                self._set_media_send_state("failed")
             self._media_send_results[request.submission_id] = _MediaSendResult(
                 request.submission_id, error=causal,
             )
@@ -1782,9 +1839,16 @@ class PeerConnection(ObservedComponent):
     @event_loop
     def _commit_media_send_results(self) -> None:
         """Resolve tagged results strictly in admission order on the owner loop."""
-        while result := self._media_send_results.pop(
-            self._media_send_next_commit, None
-        ):
+        while True:
+            if self._media_send_next_commit in self._media_send_abandoned:
+                self._media_send_abandoned.remove(self._media_send_next_commit)
+                self._media_send_next_commit += 1
+                continue
+            result = self._media_send_results.pop(
+                self._media_send_next_commit, None,
+            )
+            if result is None:
+                break
             request = self._media_send_requests.pop(result.submission_id, None)
             if request is not None:
                 if result.error is not None:
@@ -1798,9 +1862,7 @@ class PeerConnection(ObservedComponent):
     ) -> int:
         if not self._machine_handles:
             raise RuntimeError("media send requires an active PeerConnection")
-        if self._media_send_active is not None:
-            await self._media_send_active.wait()
-        if self._media_send_runner.snapshot().state != "active":
+        if self._media_send_state != "active":
             raise RuntimeError("media-send lane is not active")
         self._media_send_submission_id += 1
         reply = ReplyPort[int]()
@@ -1810,7 +1872,16 @@ class PeerConnection(ObservedComponent):
             get_current_performance_recorder(),
         )
         self._media_send_requests[request.submission_id] = request
-        await self._media_send_mailbox.submit(request)
+        try:
+            await self._media_send_mailbox.submit(request)
+        except BaseException:
+            # A blocked producer can be woken by close before admission.  It
+            # has no pump result, so remove its pre-admission bookkeeping and
+            # explicitly skip the sequence slot once earlier work completes.
+            self._media_send_requests.pop(request.submission_id, None)
+            self._media_send_abandoned.add(request.submission_id)
+            self._commit_media_send_results()
+            raise
         self._media_send_high_water = max(
             self._media_send_high_water, self._media_send_mailbox.depth,
         )

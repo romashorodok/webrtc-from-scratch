@@ -10,10 +10,8 @@ from webrtc.config import get_config
 from webrtc.performance import ObservedComponent, event_loop
 from webrtc.runtime_services import current_execution_scope
 from webrtc.machine_specs import MACHINE_SPECS
-from webrtc.observability import MachineTransitionOp
 from webrtc.state_machine import (
-    AsyncStateMachineRunner, MachineCommand, PreparedTransition, ReplyPort,
-    TransitionCommit,
+    SynchronousStateReducer,
 )
 from webrtc.tracing import perf_mark
 
@@ -47,6 +45,8 @@ class Interceptor:
         self._queue_id = queue_id
         self._observability_id = f"{queue_id}:{secrets.token_hex(6)}"
         self._high_water = 0
+        self._dequeued = 0
+        self._facets_pending = False
         self.admitted = 0
         self.dropped_media = 0
         self.rejected_control = 0
@@ -54,60 +54,61 @@ class Interceptor:
         self._runtime = current_execution_scope()
         scope_id = getattr(self._runtime, "scope_id", None) or id(self)
         self.entity_id = f"queue:{scope_id}:{self._observability_id}"
-        self._command_id = 0
-        self._runner = _InterceptorQueueRunner(
+        self._runner = SynchronousStateReducer(
             MACHINE_SPECS["queue"], entity_id=self.entity_id,
-            mailbox_capacity=8,
-            controller=getattr(self._runtime, "transition_controller", None),
-            transition_sink=self._project_transition,
+            transition_sink=(self._runtime.transition_observer(
+                self._facet_values, observer_meta="aggregate",
+                failure_diagnostic="udp_queue_projection_failures",
+            ) if self._runtime is not None else None),
         )
-        if hasattr(self._runtime, "start_machine"):
+        if self._runtime is not None:
             self._runtime.projection.machines.register(
                 self.entity_id, MACHINE_SPECS["queue"]
             )
-            self._runtime.register_owner(self.entity_id, epoch=self._runner.epoch)
-            self._machine_handle = self._runtime.start_machine(
-                self._runner, owner_entity_id=self.entity_id,
-                owner_epoch=self._runner.epoch,
-            )
             self._publish_depth()
-        else:
-            self._machine_handle = None
 
-    def _project_transition(self, commit: TransitionCommit) -> None:
-        if self._runtime is None:
-            return
-        self._runtime.projection.machines.apply(MachineTransitionOp(
-            commit.entity_id, commit.machine_type, commit.from_state,
-            commit.to_state, commit.epoch, commit.revision,
-            self._runtime.new_producer_dot(), commit.cause, commit.monotonic_ns,
-        ))
-        self._publish_depth(commit.revision)
-
-    def _submit(self, kind: str, reply=None) -> None:
-        if self._machine_handle is None:
-            return
-        self._command_id += 1
-        self._runner.try_submit(MachineCommand(
-            kind, self._command_id, self._runner.epoch, None, reply,
-            expected_revision=None,
-            cause_id=f"{self.entity_id}:{kind}:{self._command_id}",
-        ))
-
-    def _publish_depth(self, revision: int | None = None) -> None:
+    def _facet_values(self, _source: object = None) -> dict[str, object]:
         depth = self._queue.qsize()
         self._high_water = max(self._high_water, depth)
+        return {
+            "depth": depth, "high_water": self._high_water,
+            "queue_kind": self._queue_id,
+            "admitted_packets": self.admitted,
+            "dequeued_packets": self._dequeued,
+            "dropped_media_packets": self.dropped_media,
+            "rejected_control_packets": self.rejected_control,
+        }
+
+    def _publish_depth(self, revision: int | None = None) -> None:
         if self._runtime is not None:
-            self._runtime.projection.merge_values(
-                self.entity_id, self._runtime.new_producer_dot(), {
-                    "depth": depth, "high_water": self._high_water,
-                    "queue_kind": self._queue_id,
-                },
-                observer_meta="exact", source_entity_id=self.entity_id,
-                source_epoch=self._runner.epoch,
-                source_revision=(self._runner.revision if revision is None else revision),
-                source_order=self._runtime.projection.new_facet_source_order(),
+            self._runtime.observe_facets(
+                self._runner.snapshot(), self._facet_values(),
+                observer_meta="aggregate",
+                failure_diagnostic="udp_queue_facet_publish_failures",
             )
+
+    def _record_packet_activity(self) -> None:
+        self._high_water = max(self._high_water, self._queue.qsize())
+        if self._runtime is None or self._facets_pending:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if loop.is_closed():
+            return
+        self._facets_pending = True
+        loop.call_soon(self._flush_depth)
+
+    def _flush_depth(self) -> None:
+        self._facets_pending = False
+        try:
+            self._publish_depth()
+        except Exception:
+            diagnostics = getattr(self._runtime, "diagnostics", None)
+            if diagnostics is not None:
+                with diagnostics.suspend_notifications():
+                    diagnostics["udp_queue_facet_publish_failures"] += 1
 
     @property
     def observability_id(self) -> str:
@@ -117,10 +118,11 @@ class Interceptor:
         kind = _packet_kind(pkt.data)
         if self._queue.full() and kind == "stun":
             self.rejected_control += 1
+            self._record_packet_activity()
             error = asyncio.QueueFull("bounded STUN/control ingress overflow")
             self._fatal_error = error
             if self._runner.snapshot().state == "open":
-                self._submit("fail")
+                self._runner.transition("failed", cause=f"{self.entity_id}:fail")
             raise error
         if self._drop_oldest and self._queue.full():
             # Datagram producers cannot apply backpressure. Keep the freshest
@@ -133,11 +135,12 @@ class Interceptor:
                 pass
         self._queue.put_nowait(pkt)
         self.admitted += 1
-        self._publish_depth()
+        self._record_packet_activity()
 
     async def put(self, pkt: Packet):
         result = await self._queue.put(pkt)
-        self._publish_depth()
+        self.admitted += 1
+        self._record_packet_activity()
         return result
 
     async def get(self) -> Packet:
@@ -148,32 +151,22 @@ class Interceptor:
         if self._fatal_error is not None:
             error, self._fatal_error = self._fatal_error, None
             raise error
-        self._publish_depth()
+        self._dequeued += 1
+        self._record_packet_activity()
         return result
 
     async def aclose(self) -> None:
-        if self._machine_handle is None or self._runner.snapshot().terminal:
+        if self._runner.snapshot().terminal:
             return
-        for kind in ("close", "drain", "closed"):
-            reply = ReplyPort[TransitionCommit]()
-            self._submit(kind, reply)
-            await reply.wait()
-        await self._machine_handle.wait()
-        self._runtime.remove_owner(self.entity_id, self._runner.epoch)
-
-
-class _InterceptorQueueRunner(AsyncStateMachineRunner):
-    async def step(self, command):
-        proposed = {
-            "fail": "failed", "close": "closing",
-            "drain": "drained", "closed": "closed",
-        }.get(command.kind)
-        if proposed is None:
-            raise ValueError(f"unsupported queue command: {command.kind}")
-        return PreparedTransition(
-            self.snapshot().state, proposed, command.payload, command.cause_id,
-            command.expected_epoch, command.expected_revision,
-        )
+        self._runner.transition("closing", cause=f"{self.entity_id}:close")
+        while not self._queue.empty():
+            self._queue.get_nowait()
+        self._runner.transition("drained", cause=f"{self.entity_id}:drain")
+        self._runner.transition("closed", cause=f"{self.entity_id}:closed")
+        if self._runtime is not None:
+            self._runtime.projection.terminate_entity_epoch(
+                self.entity_id, self._runner.epoch
+            )
 
 class InterfaceMuxUDPHandler(asyncio.DatagramProtocol):
     def __init__(self, interface: Interface, port: int) -> None:
@@ -410,27 +403,6 @@ class _UDPCommand(str):
     FAIL = "fail"
 
 
-class _UDPRunner(AsyncStateMachineRunner):
-    async def step(self, command):
-        state = self.snapshot().state
-        if command.kind == _UDPCommand.BIND:
-            proposed = "binding" if self.spec.machine_type == "udp-mux" else "bound"
-        elif command.kind == _UDPCommand.ACTIVE:
-            proposed = "active"
-        elif command.kind == _UDPCommand.DRAIN:
-            proposed = "draining"
-        elif command.kind == _UDPCommand.CLOSE:
-            proposed = "closed"
-        elif command.kind == _UDPCommand.FAIL:
-            proposed = "failed"
-        else:
-            raise ValueError(f"unsupported UDP command: {command.kind}")
-        return PreparedTransition(
-            state, proposed, command.payload, command.cause_id,
-            command.expected_epoch, command.expected_revision,
-        )
-
-
 @impl_protocol(MuxProtocol)
 class UDPMux:
     def __init__(
@@ -445,55 +417,27 @@ class UDPMux:
         self._runtime = current_execution_scope()
         scope_id = getattr(self._runtime, "scope_id", None) or id(self)
         self.entity_id = f"udp-binding:{scope_id}:{secrets.token_hex(4)}"
-        self._command_id = 0
-        self._runner = _UDPRunner(
+        self._runner = SynchronousStateReducer(
             MACHINE_SPECS["udp-binding"], entity_id=self.entity_id,
-            mailbox_capacity=8,
-            controller=getattr(self._runtime, "transition_controller", None),
-            transition_sink=self._project,
+            transition_sink=(self._runtime.observe_transition
+                             if self._runtime is not None else None),
         )
         projection = getattr(self._runtime, "projection", None)
         if projection is not None:
             projection.machines.register(self.entity_id, MACHINE_SPECS["udp-binding"])
-        if hasattr(self._runtime, "start_machine"):
-            self._runtime.register_owner(self.entity_id, epoch=self._runner.epoch)
-            self._machine_handle = self._runtime.start_machine(
-                self._runner, owner_entity_id=self.entity_id,
-                owner_epoch=self._runner.epoch,
-            )
-            self._submit(_UDPCommand.BIND)
-            self._submit(_UDPCommand.ACTIVE)
-        else:
-            self._machine_handle = None
-
-    @event_loop
-    def _project(self, commit: TransitionCommit) -> None:
-        if self._runtime is None:
-            return
-        self._runtime.projection.machines.apply(MachineTransitionOp(
-            commit.entity_id, commit.machine_type, commit.from_state, commit.to_state,
-            commit.epoch, commit.revision, self._runtime.new_producer_dot(),
-            commit.cause, commit.monotonic_ns,
-        ))
-
-    def _submit(self, kind, reply=None, cause_id=None):
-        self._command_id += 1
-        self._runner.try_submit(MachineCommand(
-            kind, self._command_id, self._runner.epoch, None, reply,
-            expected_revision=None,
-            cause_id=cause_id or f"{self.entity_id}:{self._command_id}",
-        ))
+        self._runner.transition("bound", cause=f"{self.entity_id}:bind")
+        self._runner.transition("active", cause=f"{self.entity_id}:active")
 
     async def aclose(self) -> None:
-        if self._machine_handle is None or self._runner.snapshot().terminal:
+        if self._runner.snapshot().terminal:
             return
         cause = f"{self.entity_id}:close"
-        for kind in (_UDPCommand.DRAIN, _UDPCommand.CLOSE):
-            reply = ReplyPort[TransitionCommit]()
-            self._submit(kind, reply, cause)
-            await reply.wait()
-        await self._machine_handle.wait()
-        self._runtime.remove_owner(self.entity_id, self._runner.epoch)
+        self._runner.transition("draining", cause=cause)
+        self._runner.transition("closed", cause=cause)
+        if self._runtime is not None:
+            self._runtime.projection.terminate_entity_epoch(
+                self.entity_id, self._runner.epoch
+            )
 
     def intercept(self, remote: CandidateProtocol) -> MuxConnProtocol:
         interceptor = Interceptor()
@@ -525,48 +469,19 @@ class MultiUDPMux(ObservedComponent):
         self._runtime = current_execution_scope()
         scope_id = getattr(self._runtime, "scope_id", None) or id(self)
         self.entity_id = f"udp-mux:{scope_id}:{secrets.token_hex(4)}"
-        self._command_id = 0
-        self._runner = _UDPRunner(
+        self._runner = SynchronousStateReducer(
             MACHINE_SPECS["udp-mux"], entity_id=self.entity_id,
-            mailbox_capacity=8,
-            controller=getattr(self._runtime, "transition_controller", None),
-            transition_sink=self._project,
+            transition_sink=(self._runtime.observe_transition
+                             if self._runtime is not None else None),
         )
         projection = getattr(self._runtime, "projection", None)
         if projection is not None:
             projection.machines.register(self.entity_id, MACHINE_SPECS["udp-mux"])
-        if hasattr(self._runtime, "start_machine"):
-            self._runtime.register_owner(self.entity_id, epoch=self._runner.epoch)
-            self._machine_handle = self._runtime.start_machine(
-                self._runner, owner_entity_id=self.entity_id,
-                owner_epoch=self._runner.epoch,
-            )
-        else:
-            self._machine_handle = None
-
-    @event_loop
-    def _project(self, commit: TransitionCommit) -> None:
-        if self._runtime is None:
-            return
-        self._runtime.projection.machines.apply(MachineTransitionOp(
-            commit.entity_id, commit.machine_type, commit.from_state, commit.to_state,
-            commit.epoch, commit.revision, self._runtime.new_producer_dot(),
-            commit.cause, commit.monotonic_ns,
-        ))
-
-    @event_loop
-    def _command(self, kind, reply=None, cause_id=None):
-        self._command_id += 1
-        return MachineCommand(
-            kind, self._command_id, self._runner.epoch, None, reply,
-            expected_revision=None,
-            cause_id=cause_id or f"{self.entity_id}:{self._command_id}",
-        )
+        if hasattr(self._runtime, "register_owner"):
+            self._runtime.register_owner(self.entity_id, epoch=1)
 
     async def accept(self, port: int = 0):
-        binding = ReplyPort[TransitionCommit]()
-        self._runner.try_submit(self._command(_UDPCommand.BIND, binding))
-        await binding.wait()
+        self._runner.transition("binding", cause=f"{self.entity_id}:bind")
         try:
             for interface in self._interfaces:
                 _, handler = await self._loop.create_datagram_endpoint(
@@ -580,18 +495,14 @@ class MultiUDPMux(ObservedComponent):
                     self._socket_resources[handler] = self._runtime.register_owned_resource(
                         close=transport.close, wait_closed=handler.wait_closed,
                         owner_entity_id=self.entity_id,
-                        owner_epoch=self._runner.epoch,
+                        owner_epoch=1,
                         name=f"udp:socket-barrier:{handler.addr_str()}",
                     )
         except BaseException:
             await self._close_socket_handlers()
-            failed = ReplyPort[TransitionCommit]()
-            self._runner.try_submit(self._command(_UDPCommand.FAIL, failed))
-            await failed.wait()
+            self._runner.transition("failed", cause=f"{self.entity_id}:bind-failed")
             raise
-        active = ReplyPort[TransitionCommit]()
-        self._runner.try_submit(self._command(_UDPCommand.ACTIVE, active))
-        await active.wait()
+        self._runner.transition("active", cause=f"{self.entity_id}:active")
 
     @event_loop
     def bind(
@@ -634,30 +545,20 @@ class MultiUDPMux(ObservedComponent):
                 handler._transport = None
 
     async def aclose(self) -> None:
-        if self._machine_handle is None or self._runner.snapshot().terminal:
+        if self._runner.snapshot().terminal:
             return
         cause = f"{self.entity_id}:close"
         if self._runner.snapshot().state != "draining":
-            draining = ReplyPort[TransitionCommit]()
-            self._runner.try_submit(self._command(_UDPCommand.DRAIN, draining, cause))
-            await draining.wait()
+            self._runner.transition("draining", cause=cause)
         for binding in self._bindings:
             await binding.aclose()
         self._bindings.clear()
         try:
             await self._close_socket_handlers()
         except TimeoutError as exc:
-            failed = ReplyPort[TransitionCommit]()
-            self._runner.try_submit(self._command(_UDPCommand.FAIL, failed, cause))
-            await failed.wait()
-            closed = ReplyPort[TransitionCommit]()
-            self._runner.try_submit(self._command(_UDPCommand.CLOSE, closed, cause))
-            await closed.wait()
-            await self._machine_handle.wait()
-            self._runtime.remove_owner(self.entity_id, self._runner.epoch)
+            self._runner.transition("failed", cause=cause)
+            self._runner.transition("closed", cause=cause)
+            self._runtime.remove_owner(self.entity_id, 1)
             raise RuntimeError("UDP socket connection_lost barrier timed out") from exc
-        closed = ReplyPort[TransitionCommit]()
-        self._runner.try_submit(self._command(_UDPCommand.CLOSE, closed, cause))
-        await closed.wait()
-        await self._machine_handle.wait()
-        self._runtime.remove_owner(self.entity_id, self._runner.epoch)
+        self._runner.transition("closed", cause=cause)
+        self._runtime.remove_owner(self.entity_id, 1)

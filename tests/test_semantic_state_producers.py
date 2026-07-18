@@ -44,18 +44,19 @@ def test_production_worker_lane_and_packet_queue_publish_live_state():
             assert lane["queued"] == 0
             assert lane["running"] >= 1
             assert lane["lane_kind"] == "concurrent"
-            assert {item.observer_meta for item in _facet_snapshots(runtime, lane_owner)} == {"exact"}
+            assert {item.observer_meta for item in _facet_snapshots(runtime, lane_owner)} == {"aggregate"}
 
             queue = Interceptor(maxsize=2, queue_id="test-packets")
             queue.put_nowait(Packet(Address("127.0.0.1", 9), b"one"))
             queue.put_nowait(Packet(Address("127.0.0.1", 9), b"two"))
             await queue.get()
+            await asyncio.sleep(0)
             queue_owner = f"queue:scope:{queue.observability_id}"
             queue_facets = _facets(runtime, queue_owner)
             assert queue_facets["depth"] == 1
             assert queue_facets["high_water"] == 2
             assert queue_facets["queue_kind"] == "test-packets"
-            assert {item.observer_meta for item in _facet_snapshots(runtime, queue_owner)} == {"exact"}
+            assert {item.observer_meta for item in _facet_snapshots(runtime, queue_owner)} == {"aggregate"}
 
             release.set()
             await asyncio.gather(running, waiting)
@@ -63,6 +64,7 @@ def test_production_worker_lane_and_packet_queue_publish_live_state():
                 await asyncio.sleep(0)
             lane = _facets(runtime, lane_owner)
             assert lane["queued"] == lane["running"] == 0
+            assert lane["high_water"] >= 1
             assert lane["lane_kind"] == "concurrent"
             await queue.aclose()
 
@@ -78,6 +80,7 @@ def test_same_kind_queues_have_stable_distinct_instance_entities():
 
             first.put_nowait(packet)
             second.put_nowait(packet)
+            await asyncio.sleep(0)
             first_owner = f"queue:scope:{first.observability_id}"
             second_owner = f"queue:scope:{second.observability_id}"
             assert first_owner != second_owner
@@ -89,6 +92,7 @@ def test_same_kind_queues_have_stable_distinct_instance_entities():
                 if item.facet_id == f"{first_owner}:depth"
             )
             await first.get()
+            await asyncio.sleep(0)
             assert _facets(runtime, first_owner)["depth"] == 0
             assert _facets(runtime, second_owner)["depth"] == 1
             assert next(

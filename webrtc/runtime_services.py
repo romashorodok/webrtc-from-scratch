@@ -433,6 +433,25 @@ class TaskRegistry:
         self._barriers: dict[str, set[asyncio.Future[Any]]] = {}
         self._cancel_blocks: dict[str, tuple[bool, int]] = {}
         self._node_cancellers: dict[str, Callable[[], bool]] = {}
+        self._revision = 0
+        self._changed: asyncio.Future[None] | None = None
+
+    @property
+    def revision(self) -> int:
+        return self._revision
+
+    def _signal_change(self) -> None:
+        self._revision += 1
+        changed, self._changed = self._changed, None
+        if changed is not None and not changed.done():
+            changed.set_result(None)
+
+    async def wait_for_change(self, after_revision: int) -> int:
+        while self._revision <= after_revision:
+            if self._changed is None:
+                self._changed = asyncio.get_running_loop().create_future()
+            await asyncio.shield(self._changed)
+        return self._revision
 
     def add(self, entry: TaskEntry) -> None:
         task_id = entry.context.task_id
@@ -442,6 +461,7 @@ class TaskRegistry:
         parent_id = entry.context.parent_task_id
         if parent_id is not None:
             self._children.setdefault(parent_id, set()).add(task_id)
+        self._signal_change()
 
     def remove(self, task_id: str) -> None:
         entry = self._entries.pop(task_id, None)
@@ -454,6 +474,8 @@ class TaskRegistry:
         if not self._children.get(task_id):
             self._children.pop(task_id, None)
         self._cancel_blocks.pop(task_id, None)
+        if entry is not None:
+            self._signal_change()
 
     def get(self, task_id: str) -> TaskEntry | None:
         return self._entries.get(task_id)
@@ -523,6 +545,7 @@ class TaskRegistry:
     def add_barrier(self, task_id: str, barrier: asyncio.Future[Any]) -> None:
         self._barriers.setdefault(task_id, set()).add(barrier)
         barrier.add_done_callback(lambda done: self.remove_barrier(task_id, done))
+        self._signal_change()
 
     def remove_barrier(self, task_id: str, barrier: asyncio.Future[Any]) -> None:
         barriers = self._barriers.get(task_id)
@@ -530,6 +553,7 @@ class TaskRegistry:
             barriers.discard(barrier)
             if not barriers:
                 self._barriers.pop(task_id, None)
+            self._signal_change()
 
     def barriers(self, task_id: str) -> tuple[asyncio.Future[Any], ...]:
         return tuple(self._barriers.get(task_id, ()))
@@ -708,10 +732,15 @@ class ConcurrentWorkerLane:
 
     def _publish_state(self) -> None:
         if self._state_publisher is not None:
-            self._state_publisher(
-                queued=self._queued, running=self._running,
-                high_water=self._high_water,
-            )
+            try:
+                self._state_publisher(
+                    queued=self._queued, running=self._running,
+                    high_water=self._high_water,
+                )
+            except Exception:
+                # Observation is best effort. A metrics callback must not turn
+                # accepted worker work into a lifecycle or mailbox failure.
+                pass
 
     @property
     def observability_id(self) -> str:
@@ -1015,6 +1044,7 @@ class TaskScheduler:
 
     async def _reconcile_children(self, task_id: str, *, cancel: bool) -> None:
         while True:
+            registry_revision = self.registry.revision
             current = asyncio.current_task()
             children = tuple(
                 entry for entry in self.registry.child_entries(task_id)
@@ -1028,7 +1058,7 @@ class TaskScheduler:
                 self._cancel_descendants(task_id)
             waits: list[asyncio.Future[Any] | asyncio.Task[Any]] = [*tasks, *barriers]
             if not waits:
-                await asyncio.sleep(0)
+                await self.registry.wait_for_change(registry_revision)
                 continue
             await asyncio.gather(*(asyncio.shield(item) for item in waits), return_exceptions=True)
 

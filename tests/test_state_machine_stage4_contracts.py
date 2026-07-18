@@ -321,8 +321,9 @@ def test_stage4_concurrent_role_intents_have_one_typed_winner() -> None:
     async def scenario() -> None:
         peer = PeerConnection()
         _replace_stage4_children(peer)
-        async with Runtime(scope_id="stage4-role-race"):
+        async with Runtime(scope_id="stage4-role-race") as runtime:
             async with peer:
+                revision = peer._peer_runner.snapshot().revision
                 results = await asyncio.gather(
                     peer.dial(), peer.accept(), return_exceptions=True,
                 )
@@ -330,6 +331,12 @@ def test_stage4_concurrent_role_intents_have_one_typed_winner() -> None:
                 assert sum(isinstance(result, StaleMachineAccess) for result in results) == 1
                 assert peer.gatherer.roles in (["dial"], ["accept"])
                 assert "_role" not in peer.__dict__
+                assert peer._peer_runner.snapshot().revision == revision
+                assert all(
+                    item.from_state != item.to_state
+                    for item in runtime.projection.machines.transition_snapshots()
+                    if item.entity_id == peer.entity_id
+                )
 
     asyncio.run(scenario())
 

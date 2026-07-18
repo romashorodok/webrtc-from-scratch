@@ -91,11 +91,16 @@ class MachineCommand(Generic[P, R]):
             raise ValueError("producer_id and producer_seq must be supplied together")
 
     @property
-    def deduplication_key(self) -> tuple[int, int, int]:
+    def deduplication_key(self) -> tuple[int, int, int] | None:
+        """Return retry identity only when the caller explicitly supplied it.
+
+        ``command_id`` is useful for local diagnostics and replies, but it is
+        not retry evidence.  Treating every local command as retryable retains
+        payload/results unnecessarily and can make a later, unrelated local
+        command look like a duplicate after an owner restart.
+        """
         if self.producer_id is None:
-            # Commands without retry metadata retain the original command-id
-            # identity used by pre-Stage-1 callers.
-            return (self.expected_epoch, 0, self.command_id)
+            return None
         return (self.expected_epoch, self.producer_id, self.producer_seq)
 
 
@@ -454,6 +459,12 @@ class AsyncStateMachineRunner(ABC, Generic[C]):
         self._seen: dict[tuple[int, int, int], TransitionCommit | _CachedFailure] = {}
         self._seen_order: deque[tuple[int, int, int]] = deque()
         self._running = False
+        self._changed = asyncio.Event()
+        self._stopped_error: BaseException | None = None
+
+    def _signal_change(self) -> None:
+        changed, self._changed = self._changed, asyncio.Event()
+        changed.set()
 
     def _assert_loop(self) -> None:
         loop = asyncio.get_running_loop()
@@ -482,6 +493,27 @@ class AsyncStateMachineRunner(ABC, Generic[C]):
             self.entity_id, self.spec.machine_type, self.epoch, self._revision,
             self._state, self._state in self.spec.terminal,
         )
+
+    async def wait_for_revision(self, after_revision: int) -> MachineSnapshot:
+        """Block until a newer authoritative snapshot is available.
+
+        A runner that stops before advancing the revision wakes all waiters and
+        propagates its failure/cancellation instead of leaving them stranded.
+        """
+        self._assert_loop()
+        while self._revision <= after_revision:
+            if not self._running and self._stopped_error is not None:
+                raise self._stopped_error
+            changed = self._changed
+            await changed.wait()
+        return self.snapshot()
+
+    async def wait_terminal(self) -> MachineSnapshot:
+        """Block on state-change notification until the machine is terminal."""
+        snapshot = self.snapshot()
+        while not snapshot.terminal:
+            snapshot = await self.wait_for_revision(snapshot.revision)
+        return snapshot
 
     async def submit(self, command: C) -> None:
         self._assert_loop()
@@ -533,6 +565,7 @@ class AsyncStateMachineRunner(ABC, Generic[C]):
         self.spec.validate(previous, prepared.proposed_state)
         self._state = prepared.proposed_state
         self._revision += 1
+        self._signal_change()
         return TransitionCommit(
             self.entity_id, self.spec.machine_type, previous, prepared.proposed_state,
             self._revision, prepared.cause_id, time.monotonic_ns(), self.epoch,
@@ -571,6 +604,8 @@ class AsyncStateMachineRunner(ABC, Generic[C]):
         self, command: MachineCommand[Any, Any], result: TransitionCommit | BaseException
     ) -> None:
         key = command.deduplication_key
+        if key is None:
+            return
         cached: TransitionCommit | _CachedFailure = (
             _CachedFailure.from_error(result) if isinstance(result, BaseException) else result
         )
@@ -591,6 +626,20 @@ class AsyncStateMachineRunner(ABC, Generic[C]):
         for command in rejected:
             self._reply(command, failure)
 
+    def abort(self, error: BaseException) -> None:
+        """Wake queued commands and state waiters if owner startup is cancelled.
+
+        A task cancelled before its coroutine's first timeslice never enters
+        ``run()`` and therefore cannot execute that method's cancellation
+        handler. Runtime task completion uses this idempotent hook to close the
+        gap.
+        """
+        self._assert_loop()
+        if self._stopped_error is None:
+            self._stopped_error = error
+        self.close_mailbox(error)
+        self._signal_change()
+
     async def run(self) -> None:
         self._assert_loop()
         if self._running:
@@ -610,7 +659,8 @@ class AsyncStateMachineRunner(ABC, Generic[C]):
                         error = StaleMachineAccess("command belongs to a stale epoch")
                         self._reply(cause, error)
                         continue
-                    cached = self._seen.get(command.deduplication_key)
+                    retry_key = command.deduplication_key
+                    cached = self._seen.get(retry_key) if retry_key is not None else None
                     if cached is not None:
                         self._reply_cached(cause, cached)
                         continue
@@ -653,7 +703,13 @@ class AsyncStateMachineRunner(ABC, Generic[C]):
                     self.close_mailbox()
                 try:
                     if self._transition_sink is not None:
-                        self._transition_sink(committed)
+                        # Observation is downstream of the authoritative
+                        # commit. A broken projection must never stop the
+                        # protocol owner that already committed the edge.
+                        try:
+                            self._transition_sink(committed)
+                        except Exception:
+                            pass
                     await self.controller.after_commit(
                         self._checkpoint(committed, "after_commit")
                     )
@@ -672,11 +728,270 @@ class AsyncStateMachineRunner(ABC, Generic[C]):
                     self._remember(command, committed)
                 self._reply(cause, committed)
         except asyncio.CancelledError as error:
+            self._stopped_error = error
             if cause is not None:
                 self._reply(cause, error)
             self.close_mailbox(error)
+            raise
+        except BaseException as error:
+            self._stopped_error = error
             raise
         finally:
             if self._state in self.spec.terminal:
                 self.close_mailbox()
             self._running = False
+            self._signal_change()
+
+
+class SynchronousStateReducer:
+    """Small event-loop-local state authority without a mailbox owner task.
+
+    Protocol objects are already serialized by their Runtime event loop.  This
+    reducer retains edge validation, immutable snapshots and change
+    notification without allocating commands, reply futures, retry caches or
+    a permanent task for every resource.
+    """
+
+    def __init__(
+        self, spec: MachineSpec, *, entity_id: str, epoch: int = 1,
+        transition_sink: Callable[[TransitionCommit], None] | None = None,
+    ) -> None:
+        self.spec = spec
+        self.entity_id = entity_id
+        self.epoch = epoch
+        self._state = spec.initial
+        self._revision = 0
+        self._transition_sink = transition_sink
+        self._changed = asyncio.Event()
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def revision(self) -> int:
+        return self._revision
+
+    def snapshot(self) -> MachineSnapshot:
+        return MachineSnapshot(
+            self.entity_id, self.spec.machine_type, self.epoch, self._revision,
+            self._state, self._state in self.spec.terminal,
+        )
+
+    def transition(self, proposed_state: str, *, cause: str = "") -> TransitionCommit:
+        previous = self._state
+        self.spec.validate(previous, proposed_state)
+        self._state = proposed_state
+        self._revision += 1
+        commit = TransitionCommit(
+            self.entity_id, self.spec.machine_type, previous, proposed_state,
+            self._revision, cause, time.monotonic_ns(), self.epoch,
+        )
+        changed, self._changed = self._changed, asyncio.Event()
+        changed.set()
+        if self._transition_sink is not None:
+            # Synchronous reducers have the same commit boundary as async
+            # owners: observability is best effort after the state mutation.
+            try:
+                self._transition_sink(commit)
+            except Exception:
+                pass
+        return commit
+
+    async def wait_for_revision(self, after_revision: int) -> MachineSnapshot:
+        while self._revision <= after_revision:
+            await self._changed.wait()
+        return self.snapshot()
+
+    async def wait_terminal(self) -> MachineSnapshot:
+        snapshot = self.snapshot()
+        while not snapshot.terminal:
+            snapshot = await self.wait_for_revision(snapshot.revision)
+        return snapshot
+
+
+class InlineStateMachineRunner:
+    """Serialized event-loop reducer with no permanent mailbox task.
+
+    This is a migration adapter for domain owners that still expose typed
+    ``MachineCommand`` APIs. A Runtime-owned drain exists only while commands
+    are pending; state reduction itself happens in the drain's event-loop turn.
+    """
+
+    def __init__(
+        self, spec: MachineSpec, *, entity_id: str, mailbox_capacity: int = 16,
+        dedupe_capacity: int = 128, controller=None, transition_sink=None,
+    ) -> None:
+        del dedupe_capacity
+        self.spec = spec
+        self.entity_id = entity_id
+        self.epoch = 1
+        self._state = spec.initial
+        self._revision = 0
+        self.commands = BoundedMailbox(mailbox_capacity)
+        self.controller = controller or NullTransitionController()
+        self._transition_sink = transition_sink
+        self._changed = asyncio.Event()
+        self._runtime = None
+        self._owner_entity_id = entity_id
+        self._owner_epoch = 1
+        self._drain_handle = None
+
+    @property
+    def state(self): return self._state
+    @property
+    def revision(self): return self._revision
+
+    def snapshot(self) -> MachineSnapshot:
+        return MachineSnapshot(
+            self.entity_id, self.spec.machine_type, self.epoch, self._revision,
+            self._state, self._state in self.spec.terminal,
+        )
+
+    def activate(self, runtime, *, owner_entity_id=None, owner_epoch=None):
+        self._runtime = runtime
+        self._owner_entity_id = owner_entity_id or self.entity_id
+        self._owner_epoch = owner_epoch or self.epoch
+        return self
+
+    async def submit(self, command) -> None:
+        await self.commands.submit(command)
+        self._ensure_drain()
+
+    async def apply_command(self, command) -> None:
+        """Apply directly from an owner workflow already providing serialization."""
+        await self._apply(command)
+
+    def try_submit(self, command) -> None:
+        self.commands.try_submit(command)
+        self._ensure_drain()
+
+    def _ensure_drain(self) -> None:
+        if self._drain_handle is not None and not self._drain_handle.done():
+            return
+        if self._runtime is None:
+            raise RuntimeError("inline reducer is not Runtime-bound")
+        from .runtime_services import FailurePolicy
+        self._drain_handle = self._runtime.start_pump(
+            self._drain, owner_entity_id=self._owner_entity_id,
+            owner_epoch=self._owner_epoch,
+            name=f"state-reducer:{self.entity_id}", kind="state-reducer",
+            failure=FailurePolicy.REPORT,
+        )
+        self._drain_handle._task.add_done_callback(self._drain_finished)
+
+    def _drain_finished(self, _task) -> None:
+        if self.commands.depth and self._state not in self.spec.terminal:
+            self._ensure_drain()
+
+    async def _drain(self) -> None:
+        while self.commands.depth:
+            command = await self.commands.receive()
+            await self._apply(command)
+
+    async def prepare(self, command):
+        return await self.step(command)
+
+    async def step(self, command):
+        raise NotImplementedError
+
+    def commit(self, prepared, cause=None):
+        del cause
+        if isinstance(prepared, str):
+            prepared = PreparedTransition(
+                self._state, prepared, None, "direct", self.epoch, self._revision,
+            )
+        self.spec.validate(self._state, prepared.proposed_state)
+        previous = self._state
+        self._state = prepared.proposed_state
+        self._revision += 1
+        changed, self._changed = self._changed, asyncio.Event()
+        changed.set()
+        return TransitionCommit(
+            self.entity_id, self.spec.machine_type, previous, self._state,
+            self._revision, prepared.cause_id, time.monotonic_ns(), self.epoch,
+        )
+
+    def _checkpoint(self, commit, phase):
+        factory = getattr(self.controller, "checkpoint", None)
+        if factory is not None:
+            return factory(
+                entity_id=commit.entity_id, machine_type=commit.machine_type,
+                from_state=commit.from_state, to_state=commit.to_state,
+                revision=commit.revision, phase=phase,
+                allowed_actions=self.spec.test_actions,
+            )
+        return TransitionCheckpoint(
+            0, commit.entity_id, commit.machine_type, commit.from_state,
+            commit.to_state, commit.revision, phase, self.spec.test_actions,
+        )
+
+    async def _apply(self, command) -> None:
+        try:
+            if command.expected_epoch != self.epoch:
+                raise StaleMachineAccess("command belongs to a stale epoch")
+            if (
+                command.expected_revision is not None
+                and command.expected_revision != self._revision
+            ):
+                raise StaleMachineAccess("machine revision changed")
+            prepared = await self.prepare(command)
+            preview = TransitionCommit(
+                self.entity_id, self.spec.machine_type, self._state,
+                prepared.proposed_state, self._revision + 1,
+                prepared.cause_id, 0, self.epoch,
+            )
+            self.spec.validate(self._state, prepared.proposed_state)
+            await self.controller.before_commit(self._checkpoint(preview, "before_commit"))
+            if prepared.proposed_state in self.spec.terminal:
+                await self.reconcile_terminal(prepared)
+            committed = self.commit(prepared, command)
+            if self._transition_sink is not None:
+                self._transition_sink(committed)
+            await self.controller.after_commit(self._checkpoint(committed, "after_commit"))
+            await self.after_commit(committed, prepared.effects)
+            if committed.to_state in self.spec.terminal:
+                self.commands.close()
+                await self.controller.terminal(self._checkpoint(committed, "terminal"))
+        except BaseException as error:
+            if command.reply is not None:
+                command.reply.reject(error)
+            return
+        if command.reply is not None:
+            command.reply.resolve(committed)
+
+    async def reconcile_terminal(self, prepared): return None
+    async def after_commit(self, commit, effects): return None
+
+    async def wait_for_revision(self, after_revision: int) -> MachineSnapshot:
+        while self._revision <= after_revision:
+            await self._changed.wait()
+        return self.snapshot()
+
+    async def wait_terminal(self) -> MachineSnapshot:
+        snapshot = self.snapshot()
+        while not snapshot.terminal:
+            snapshot = await self.wait_for_revision(snapshot.revision)
+        return snapshot
+
+    def done(self) -> bool:
+        return self.snapshot().terminal and (
+            self._drain_handle is None or self._drain_handle.done()
+        )
+
+    def cancel(self) -> bool:
+        cancelled = False
+        if self._drain_handle is not None:
+            cancelled = self._drain_handle.cancel()
+        self.commands.close()
+        if self._state not in self.spec.terminal and self.spec.terminal:
+            self._state = sorted(self.spec.terminal)[0]
+            self._revision += 1
+            changed, self._changed = self._changed, asyncio.Event()
+            changed.set()
+        return cancelled
+
+    async def wait(self) -> None:
+        await self.wait_terminal()
+        if self._drain_handle is not None and not self._drain_handle.done():
+            await self._drain_handle.wait()

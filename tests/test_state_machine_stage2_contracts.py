@@ -31,9 +31,24 @@ class _Remote:
 class _PairTransport:
     def __init__(self) -> None:
         self.ingress_started = asyncio.Event()
+        self.rtp_started = asyncio.Event()
+        self.rtcp_started = asyncio.Event()
+        self.dtls: DTLSTransport | None = None
 
     async def recv_dtls(self):
         self.ingress_started.set()
+        await asyncio.Event().wait()
+
+    async def recv_rtp(self):
+        assert self.dtls is not None
+        assert self.dtls.authoritative_snapshot().media_ready
+        self.rtp_started.set()
+        await asyncio.Event().wait()
+
+    async def recv_rtcp(self):
+        assert self.dtls is not None
+        assert self.dtls.authoritative_snapshot().media_ready
+        self.rtcp_started.set()
         await asyncio.Event().wait()
 
 
@@ -61,13 +76,16 @@ def test_stage2_runtime_registers_distinct_bounded_dtls_machines() -> None:
             assert fsm.entity_id == "dtls-handshake-phase:stage2"
             assert transport.record_layer_chan.maxsize == RECORD_INGRESS_CAPACITY
             queue_entity = f"{transport.entity_id}:record-ingress"
-            assert runtime.projection.machines.get(queue_entity).state == "open"
+            # Queue admission/close is owned by the primitive; it has no
+            # permanent mailbox task or observational lifecycle machine.
+            assert runtime.projection.machines.get(queue_entity) is None
+            assert "_runner" not in transport.record_layer_chan.__dict__
             queue_facets = {
                 item.facet_id.rsplit(":", 1)[-1]: item
                 for item in runtime.projection.facets.snapshots()
                 if item.owner_entity_id == queue_entity
             }
-            assert {item.observer_meta for item in queue_facets.values()} == {"exact"}
+            assert {item.observer_meta for item in queue_facets.values()} == {"aggregate"}
             assert queue_facets["capacity"].value == RECORD_INGRESS_CAPACITY
             assert fsm.commands.capacity == 16
             assert runtime.projection.machines.get(transport.entity_id).state == "new"
@@ -154,10 +172,14 @@ def test_stage2_connected_is_ordered_after_keys_sessions_and_revision_facets(mon
         async with Runtime(scope_id="stage2-order") as runtime:
             transport = DTLSTransport(webrtc_rs.Certificate())
             pair = _PairTransport()
+            pair.dtls = transport
             await transport.start(DTLSRole.Client, pair)
             snapshot = runtime.projection.machines.get(transport.entity_id)
             assert snapshot.state == "connected"
+            assert transport.authoritative_snapshot().media_ready
             assert pair.ingress_started.is_set()
+            await asyncio.wait_for(pair.rtp_started.wait(), 1.0)
+            await asyncio.wait_for(pair.rtcp_started.wait(), 1.0)
             facets = {
                 item.facet_id.rsplit(":", 1)[-1]: item.value
                 for item in runtime.projection.facets.snapshots()

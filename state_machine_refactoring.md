@@ -1,1025 +1,487 @@
-# Runtime-Owned State Machine Refactoring Plan
-
-## Status
-
-Implementation plan only. This plan builds on the completed
-`live_tracing_performance_aggregation_plan.md` schema-2 observability work. It
-replaces scattered mutable flags, locks, events, directly created tasks, and
-facet-only lifecycle reporting with runtime-owned, single-writer state
-machines for the complete peer-to-peer WebRTC lifecycle.
-
-The motivating trace is not yet internally consistent:
-
-- the peer machine remains `new` while the peer connection facet is
-  `connected`;
-- the ICE machine reaches `connected` while the ICE connection facet remains
-  `checking`;
-- the DTLS observable machine exposes internal `Preparing/Sending/Waiting`
-  flight phases and ends in `Finished`, while the public DTLS machine contract
-  in `machine_specs.py` expects `new/connecting/connected/...`;
-- transport, transceiver, media session, media stream, queue, worker, and
-  tracing lifecycles are represented by facets but not consistently by
-  authoritative machines;
-- some component-owned tasks are created with `asyncio.create_task` rather
-  than through Runtime ownership.
-
-These are correctness and ownership defects, not summary-format defects. The
-compact LLM summary must be a projection of authoritative commits; it must
-never infer protocol state by reconciling contradictory facets after the fact.
-
-## Goals
-
-- Make Runtime the owner of every long-lived coroutine, worker submission,
-  queue pump, timer, protocol controller, and teardown barrier created by a
-  peer connection.
-- Give every bounded lifecycle-bearing component an explicit typed state
-  machine, legal transition table, epoch, revision, command set, and terminal
-  reconciliation rule.
-- Use one event-loop writer for authoritative protocol state and observability
-  projection. Workers return immutable results and never mutate component or
-  tracing state.
-- Remove component locks that compensate for multi-writer state mutation.
-  Serialize commands through bounded mailboxes or explicit runtime lanes.
-- Preserve high throughput: packet processing and crypto do not create a
-  transition per packet, per frame, or per observed call.
-- Produce a coherent schema-2 trace in which machines, transitions, activity
-  groups, facets, and diagnostics share stable entity identity and revision
-  ordering.
-- Automatically offload synchronous work when its compiled execution policy is
-  CPU-bound or potentially blocking, while retaining cheap atomic state
-  mutation on the runtime loop.
-- Make shutdown deterministic: reject new commands, drain or cancel owned work,
-  reconcile children, commit one terminal state, flush final projection, and
-  remove the entity epoch.
-
-## Non-goals and precise meaning of “lock-free”
-
-- CRDTs are used only for the observability replica and cross-producer result
-  merging. They do not decide ICE, DTLS, SRTP, RTP, signaling, or peer behavior.
-- “Lock-free” means no application-level shared mutex or shared mutable map on
-  normal transition, tracing, packet, or worker-result paths. Runtime's event
-  loop is the sole writer. It does not claim that CPython, `asyncio`, socket
-  wakeups, or the physical thread-pool implementation contain no internal
-  locks.
-- Not every synchronous method should be offloaded. A tiny accessor, command
-  validation, queue accounting update, or atomic state commit must execute on
-  the owning loop. Offloading such work would add latency and break commit
-  ordering.
-- Packets, STUN transactions, RTP sequence numbers, RTCP reports, DTLS records,
-  and individual media frames are bounded activities or protocol data, not
-  independently replicated lifecycle machines.
-- This plan does not introduce distributed control of one live peer across
-  multiple Runtime processes. CRDT convergence is for retry, reordering,
-  worker results, and frontend replication.
-
-## Confirmed architecture decisions
-
-These decisions were selected for this refactor and supersede recommendations
-elsewhere in the original tracing plan when they conflict.
-
-1. **All unannotated synchronous `ObservedComponent` methods are offloaded.**
-   `ObservedMeta` compiles every eligible unannotated synchronous method as a
-   Runtime worker call. State-machine validation/commit code is kept outside
-   `ObservedComponent` wrappers in neutral runner primitives; explicitly
-   annotated loop callbacks remain loop callbacks. This prevents a synchronous
-   component method from unexpectedly blocking the event loop.
-2. **Preserve sync-or-awaitable compatibility during the refactor.** A worker
-   call in an active async Runtime context returns an awaitable; an explicitly
-   loop-inline method can return its value. Call sites must use the common
-   `maybe_await`/typed adapter until migration is complete. The ambiguity is a
-   deliberate compatibility decision and must have type-check tests.
-3. **Internal API breakage is allowed.** Update every repository caller and
-   test with the owning component. Do not retain obsolete internal adapters.
-4. **Deliver one atomic full refactor.** Component work may be developed in the
-   dependency order below, but the new architecture is enabled only when all
-   components, tests, and trace consumers have migrated. Do not ship a runtime
-   with two lifecycle authorities.
-5. **Remove EventEmitter completely.** Replace `EventEmitter` and
-   `AsyncEventEmitter` inheritance, `.on()`, `.emit()`, decorator listeners,
-   and listener locks with owned typed machine commands, reply ports, and
-   bounded subscriber/output mailboxes.
-6. **Every component is an observable machine.** Queues, bindings, candidate
-   pairs, attachments, worker lanes, SRTP streams, inboxes, and other bounded
-   component instances receive machine identity. Hot operations still update
-   aggregate counters rather than transitioning per packet/call.
-7. **Mailbox overload is class-specific.** Backpressure at safe async API
-   boundaries; fail an owner when dropping a protocol/control command would
-   violate correctness; drop and count only explicitly lossy media/log data.
-8. **Maximize worker concurrency.** Under the selected CPython-with-GIL target,
-   worker threads make blocking calls and Python work concurrent; they do not
-   provide true parallel execution of Python bytecode. True CPU parallelism is
-   available only when native/Rust code releases the GIL, through subprocess
-   workers, or on a future validated free-threaded runtime. Do not serialize
-   concurrent worker execution merely to preserve call order. Assign submission
-   sequence numbers and commit results through the owning loop. Where a
-   stateful foreign object cannot safely be called concurrently, use isolated
-   per-call/per-shard state or move the minimal unsafe mutation to the owner;
-   do not add a lock or global serialized lane. Network arrival order is not an
-   execution-serialization requirement, but protocol invariants such as DTLS
-   flight causality, SRTP replay state, packet sequence allocation, and machine
-   revision order remain mandatory at commit.
-9. **Observation failure is non-fatal in production and fatal in strict tests.**
-10. **Target CPython with the GIL initially.** Immutable worker boundaries and
-    wrong-thread assertions are still required; free-threaded Python is not an
-    acceptance target for this refactor.
-11. **Delete schema 1 and duplicate metric paths.** Schema 2 is the only trace
-    authority; no permanent dual emission or compatibility event bus remains.
-12. **No explicit locks or semaphores in project code.** Delete all
-    `asyncio.Lock`, `threading.Lock`, `RLock`, and component/executor ordering
-    semaphores. Internal synchronization inside CPython, asyncio queues, the
-    event loop, socket implementation, Rust libraries, and the selected
-    executor is outside this source-level rule.
-13. **Use a bounded live journal plus snapshot/resync.** Do not retain an
-    unbounded transition history.
-14. **Derive numeric performance gates from the existing benchmark baseline.**
-    Record the chosen values in the checked-in performance budgets before the
-    atomic architecture switch.
-
-## Required invariants
-
-1. **One authoritative writer.** Only the Runtime loop may mutate a component
-   machine, component-owned collection, readiness predicate, or schema-2
-   projection store.
-2. **Commands are not states.** Callers enqueue typed intent. Only the machine
-   runner validates and commits a state edge.
-3. **Commit is synchronous.** A commit validates the expected epoch/revision,
-   updates the authoritative state and derived readiness bits, and emits one
-   immutable transition operation without awaiting.
-4. **No await inside an invariant.** Potentially suspending protocol work is
-   performed before proposing a commit or after a committed checkpoint.
-5. **One public machine per semantic lifecycle.** Internal phase machines use
-   distinct types and entity IDs; they cannot masquerade as the public DTLS or
-   peer state.
-6. **Facets are derived.** A facet may add bounded detail but cannot carry a
-   lifecycle value that conflicts with its owning machine revision.
-7. **All work is registered before it can run.** No bare component-level
-   `asyncio.create_task`, orphan future, untracked timer, or fire-and-forget
-   callback may outlive its owner.
-8. **Bounded ingress.** Every mailbox, worker lane, packet queue, transition
-   journal, pending-op buffer, and diagnostic exemplar store has a capacity and
-   an explicit overflow policy.
-9. **Terminal means reconciled.** The terminal checkpoint occurs only after all
-   owned children and worker barriers are joined and no producer can publish a
-   later transition for that entity epoch.
-10. **Tracing is downstream only.** Failure or overload in observability cannot
-    change protocol decisions; it records a bounded diagnostic and requests a
-    subscriber resynchronization if necessary.
-
-## Core architecture
-
-```text
-application/API callers
-        |
-        v
-typed bounded component mailbox --------+
-        |                                |
-        v                                | immutable worker result
-Runtime-owned machine runner             |
-        | prepare async work             |
-        +------> Runtime worker lane -----+
-        |
-        | validate + synchronous commit
-        v
-authoritative component snapshot
-        |
-        +--> readiness/barrier notification
-        +--> domain event compatibility adapter (temporary)
-        `--> MachineTransitionOp + derived FacetOp
-                    |
-                    v
-          loop-owned CRDT projection
-                    |
-                    v
-          schema-2 journal and summary
-```
-
-### Generic machine contract
-
-Extend `webrtc/state_machine.py` instead of creating a bespoke runner for each
-component:
-
-```python
-@dataclass(frozen=True, slots=True)
-class MachineCommand(Generic[P]):
-    kind: CommandKind
-    command_id: int
-    expected_epoch: int
-    cause_id: int | str | None
-    payload: P
-    reply: ReplyPort | None
-
-@dataclass(frozen=True, slots=True)
-class PreparedTransition(Generic[E]):
-    expected_state: str
-    proposed_state: str
-    effects: E
-    cause_id: int | str | None
-
-@dataclass(frozen=True, slots=True)
-class MachineCommit:
-    entity_id: str
-    machine_type: str
-    epoch: int
-    revision: int
-    from_state: str
-    to_state: str
-    cause_id: int | str | None
-    monotonic_ns: int
-```
-
-The reusable runner must provide:
-
-- a bounded mailbox with `submit`, `try_submit`, and close/reject behavior;
-- exactly one Runtime-owned runner task;
-- duplicate command suppression by `(epoch, producer_id, producer_seq)` where
-  retry is possible;
-- `prepare(command)` for suspending I/O or worker work;
-- `commit(prepared)` as a non-awaiting compare/validate/mutate operation;
-- `after_commit(commit, effects)` for notifications and follow-up commands;
-- terminal reconciliation and controller checkpoints;
-- typed failure mapping rather than an implicit transition to a generic error;
-- snapshots that can be read on-loop without a lock;
-- a debug assertion for wrong-loop and wrong-epoch access.
-
-`AsyncStateMachineRunner` currently supplies part of this contract. Refactor it
-so `step()` cannot mutate public state, terminal commands can wake a runner
-blocked on protocol input, mailbox capacity is configurable, and Runtime owns
-the task handle. Remove direct projector callbacks that allow arbitrary
-component code; inject a narrow Runtime transition sink instead.
-
-### Hierarchical machine graph
-
-Use these semantic parents. Parentage controls cancellation, final flushing,
-and compact summary grouping, but child machines retain independent state and
-revision.
-
-```text
-runtime
-`-- peer
-    |-- signaling
-    |-- attachment:signaling
-    |-- attachment:media-source[*]
-    |-- ice-gatherer
-    |   `-- ice-agent
-    |       `-- candidate-pair[*]
-    |           `-- candidate-pair-controller[*]
-    |-- selected-transport
-    |   `-- dtls-transport
-    |       |-- dtls-handshake-phase
-    |       |-- srtp-session:rtp
-    |       `-- srtp-session:rtcp
-    |           `-- srtp-stream[*]
-    |-- transceiver[*]
-    |   |-- rtp-sender
-    |   |-- rtp-receiver
-    |   `-- media-track[*]
-    |-- queue[*]
-    `-- worker-lane[*]
-```
-
-Runtime and tracing-service health are separate root machines, not peer
-children, because they may outlive and observe multiple peers.
-
-## Machine catalog and component plans
-
-### Runtime and observability service
-
-Machine type `runtime`:
-
-```text
-new -> starting -> active -> quiescing -> draining -> closed
-                  \-> failed -> draining
-```
-
-- Runtime owns the root task context, scheduler, offloader, concurrent workers,
-  transition ingress, schema-2 journal, subscriber dispatchers, and every peer
-  scope.
-- Replace `_close_lock` idempotence with a close command and one retained
-  Runtime-owned close future. Concurrent closers await the same reply.
-- `quiescing` rejects new roots and worker submissions. `draining` joins peer
-  scopes, scheduler descendants, dispatched futures, journal flush, and owned
-  resources in that order.
-- Add an `observability` machine:
-  `stopped -> starting -> active -> degraded -> draining -> stopped`, with
-  facets for admission, journal depth, subscriber count, drops, resyncs, and
-  observer failures. Diagnostics may move it to/from `degraded`; they must not
-  fail Runtime.
-- Runtime allocates stable numeric producer IDs and component entity IDs. All
-  random/public IDs are allocated once per component epoch, never per packet or
-  transition.
-
-### PeerConnection
-
-Machine type `peer`:
-
-```text
-new -> starting -> negotiating -> connecting -> connected
- |       |             |             |             |
- +-------+-------------+-------------+-----------> closing -> closed
-         \------------- failure ----------------> failed -> closing
-```
-
-- Make the peer machine the authority for `_started`, `_closing`, `_closed`,
-  `state`, connection readiness, and failure cleanup. Remove those independent
-  flags after compatibility accessors read the snapshot.
-- `__aenter__`, `dial`, `accept`, offer/answer operations, nominated transport,
-  DTLS readiness, protocol failure, and `aclose` submit typed commands.
-- Do not derive connection state merely from `_transport is not None`.
-  `connected` requires selected ICE transport plus committed DTLS/SRTP readiness
-  according to the peer's negotiated media requirements.
-- Replace `_peer_connection_lock`, `_close_lock`, and ad hoc failure-close task
-  with mailbox serialization and a Runtime-owned close workflow.
-- Replace the media-send lock with a bounded concurrent `media-send` worker
-  component. Tag submissions and reconcile results on the peer loop; preserve
-  only protocol-required sequence allocation at commit. Its queue and running
-  status have their own machines and facets.
-- Commit `closed` only after attachments, transceivers, pair controllers, DTLS,
-  selected transport, log drain, event emitter, worker barriers, and final
-  observability flush reconcile.
-
-### Signaling and SDP offer/answer
-
-Machine type `signaling` uses WebRTC signaling states as real state identities:
-
-```text
-stable -> have-local-offer -> stable
-stable -> have-remote-offer -> stable
-offer states -> closed
-any nonterminal -> failed -> closed
-```
-
-- Fold `_signaling_state`, pending/current descriptions, and
-  `_signaling_lock` into one signaling machine snapshot.
-- `create_offer` reads a stable snapshot. `set_local_description` and
-  `set_remote_description` prepare parsing/validation first, then atomically
-  commit description pointers and signaling state together.
-- A stale prepared result carries its expected signaling revision and is
-  rejected/retried rather than overwriting a newer description.
-- SDP parsing or certificate/fingerprint validation that is CPU-heavy uses a
-  worker result; the worker receives immutable bytes/strings and never sees the
-  live PeerConnection.
-- Redact SDP, ICE credentials, fingerprints, and addresses from facets. Trace
-  only description type, negotiation generation, bounded media-section count,
-  and outcome.
-
-### AttachmentController, AsyncLogDrain, and peer inboxes
-
-Machine type `attachment`:
-`detached -> attached -> starting -> active -> stopping -> stopped`, with
-`failed -> stopping`.
-
-- Give the signaling attachment and each media source a stable entity. The
-  controller is a registry machine; attachments are child machines.
-- `start()` must be idempotent by command identity, not by duplicate tasks.
-  Runtime owns attachment pumps and joins them before `stopped`.
-- Model `AsyncLogDrain` as
-  `stopped -> starting -> idle <-> draining -> stopping -> stopped`, with log
-  count and queue high-water as facets/activity counters.
-- `PeerEventInbox`, log inbox, and attachment inbox remain bounded queues, but
-  queue lifecycle is a `queue` machine:
-  `open -> closing -> drained -> closed`, plus depth/high-water/drop facets.
-- Replace the two bare `asyncio.create_task` calls used to race drain input and
-  stop wakeups with a Runtime-owned receive primitive or one runner mailbox.
-
-### ICE gatherer and Agent
-
-Split the overloaded ICE view into distinct machines:
-
-- `ice-gatherer`: `new -> gathering -> complete -> closed`, with
-  `gathering -> failed -> closed`;
-- `ice-agent`: `new -> waiting-remote -> checking -> connected -> completed`,
-  with reconnect path `connected/completed -> disconnected -> checking` and
-  terminal `failed/closed`;
-- `candidate-pair`: `frozen -> waiting -> in-progress -> succeeded ->
-  nominated`, with failure and close edges;
-- `candidate-pair-controller`: `new -> starting -> checking -> nominated ->
-  forwarding -> stopping -> stopped`, with `failed -> stopping`.
-
-Implementation rules:
-
-- `ICEGatherer.__gather_lock`, candidate registries, controller registries,
-  role, credentials, candidate lists, pair lists, and selected pair mutate only
-  through the ICE runner on the Runtime loop.
-- DNS resolution (`socket.gethostbyname`) is blocking and must use the Runtime
-  offloader with a timeout and immutable result command.
-- Candidate creation and STUN parsing remain ordinary activities unless they
-  cross the measured CPU offload threshold. Never transition for every inbound
-  STUN request.
-- Nomination commits the pair and agent states before notifying PeerConnection.
-  The selected pair ID facet must carry the exact nomination revision.
-- Controller receive loops are Runtime-owned children. `start_managed` returns
-  an owned handle, not a task created or stored by the component.
-- Replace `CandidatePairController._close_task = asyncio.create_task(...)` with
-  an idempotent stop command and Runtime-owned terminal reply.
-- Controller failure maps once into pair/controller/agent states, then sends a
-  causally linked peer failure command. It must not generate competing close
-  tasks.
-
-### UDP mux, interceptors, and selected CandidatePairTransport
-
-Machine types:
-
-- `udp-mux`: `new -> binding -> active -> draining -> closed`, with `failed`;
-- `udp-binding`: `new -> bound -> active -> draining -> closed`;
-- `transport`: `new -> selecting -> ready -> draining -> closed`, with
-  `failed`;
-- queue children use the common queue machine.
-
-- Runtime owns socket transports and datagram protocols as resources with
-  explicit close barriers.
-- Datagram callbacks may only parse the minimum routing key and enqueue an
-  immutable packet reference into a bounded loop-owned queue. They do not
-  mutate ICE/DTLS/media machines.
-- Define overflow per route: STUN/control overflow is diagnostic and may fail
-  the affected controller; media overflow uses bounded drop accounting. Never
-  block a UDP callback.
-- A selected transport is `ready` only after a nominated pair commit. On close,
-  stop ingress, drain/cancel consumers, close interceptors/bindings, then close
-  the mux.
-- Queue facets are updated at threshold/coalescing boundaries, not per packet
-  schema-2 patches.
-
-### DTLS transport and handshake phase FSM
-
-Use two machines, fixing the current semantic collision:
-
-- public `dtls-transport`:
-  `new -> binding -> connecting -> connected -> closing -> closed`, with
-  `connecting/connected -> failed -> closing`;
-- internal `dtls-handshake-phase`:
-  `preparing -> sending -> waiting -> preparing`, ending in `finished` or
-  `errored`.
-
-- Rename the current trace machine type from public `dtls` to
-  `dtls-handshake-phase`. Project public `dtls` only from DTLSTransport
-  lifecycle commits.
-- Adapt `FSM` to the generic runner: one typed command mailbox, no state lock,
-  no stale shadow state, explicit transition table, and one terminal commit.
-- A phase prepares a flight or wait outcome; it cannot directly publish a
-  state. Retransmit timers are Runtime-owned timer handles tied to the handshake
-  epoch and ignored after epoch change.
-- `DTLSTransport.start` becomes an async command/reply operation. It must not
-  return merely because it scheduled `_run_handshake`.
-- Record ingestion is bounded. The reconstructor is loop-owned; expensive
-  certificate verification and cryptographic operations use a serialized DTLS
-  worker lane when they cannot run in Rust without blocking the loop.
-- Handshake `finished` causes key extraction and SRTP session creation. Commit
-  public `connected` only after both SRTP sessions are installed and their
-  readiness snapshots are visible. Never expose key material to tracing.
-- Replace readiness events as authorities with revision predicates; events may
-  remain temporary compatibility wait adapters.
-
-### SRTP sessions and streams
-
-Machine types:
-
-- `srtp-session`: `new -> initializing -> ready -> draining -> closed`, with
-  `failed -> draining`;
-- `srtp-stream`: `new -> active -> draining -> closed`, with `failed`.
-
-- Session keys and Rust contexts are immutable after initialization. Their
-  existence is represented only by `keys_ready=true` and negotiated profile.
-- Replace `_streams_lock` with loop-owned stream-map mutation. Concurrent
-  decrypt calls return immutable `(ssrc, plaintext, crypto counters)` worker
-  results; the loop performs get-or-create and delivery ordering.
-- Allocate one bounded stream entity per admitted SSRC. Apply an explicit SSRC
-  cardinality budget and overflow diagnostic; never create unbounded observed
-  identities from hostile packets.
-- Crypto sync methods are compiled worker operations and automatically
-  offloaded when called from async component code. A call already inside the
-  worker context executes inline to avoid recursive resubmission overhead.
-- Preserve protocol commit order per session/direction where the cipher replay
-  window requires it. Execute independent sessions concurrently; true CPU
-  parallelism exists only when the Rust context releases the GIL or work is
-  moved to subprocesses.
-- Encrypt/decrypt calls stay aggregate activity groups. Session/stream state
-  changes only on initialization, admission, failure, drain, and close.
-
-### RTP transceiver, sender, receiver, tracks, packetizer, and jitter buffer
-
-Machine types:
-
-- `transceiver`: `inactive -> negotiating -> active -> stopping -> stopped`,
-  with active/inactive renegotiation and `failed -> stopping`;
-- `rtp-sender`: `new -> bound -> active -> paused -> stopping -> stopped`;
-- `rtp-receiver`: same lifecycle;
-- `media-track`: `new -> live -> muted -> ended`, with `failed -> ended`;
-- optional `media-pipeline`: `new -> configured -> running -> draining ->
-  stopped` for each admitted sender/receiver pipeline.
-
-- Direction, MID, codec, sender, receiver, negotiated parameters, and lifecycle
-  are committed atomically at a transceiver revision. Remove independent
-  `_emit_transceiver_state` lifecycle guesses.
-- `set_mid`, `set_preferred_codec`, and sender/receiver attachment submit
-  commands or are private commit helpers invoked only by the runner.
-- Replace `RTPSender.__transport_lock` with binding-state commands and revision
-  checks. Send attempts wait for a `bound/active` predicate outside the commit.
-- TrackRemote delivery uses its bounded queue machine. Drops and delivered
-  counts are coalesced G-counters; the queue does not transition per packet.
-- Packetizer, sequencer, RTP header extension, RTCP report builder, and jitter
-  buffer are loop-owned data-plane helpers, not machines unless they own a
-  long-lived pipeline. Their CPU-heavy sync work follows the execution policy.
-- Codec/encode work and `WebSocketMediaWorker.invoke` use bounded concurrent
-  workers based on codec thread-safety. Native codecs that release the GIL or
-  subprocess codecs may run in true parallel. The 31k-call activity group
-  remains aggregated and must not produce 31k state transitions.
-
-### Worker lanes and automatic synchronous offload
-
-Machine type `worker-lane`:
-`idle -> queued -> running -> idle`, with `running -> failed -> idle` and any
-nonterminal state to `closing -> closed`.
-
-Compile one execution policy per observed method at class creation. Because
-automatic offload was selected, `WORKER_CONCURRENT` is the default for every
-unannotated synchronous `ObservedComponent` method:
-
-```text
-LOOP_INLINE       explicit loop callback/accessor exemption only
-LOOP_ASYNC        coroutine orchestrating loop-owned state or I/O
-WORKER_CONCURRENT default synchronous component method
-BLOCKING_WORKER   potentially blocking filesystem/DNS/foreign call
-```
-
-- `@event_loop` explicitly selects `LOOP_INLINE`/`LOOP_ASYNC`; unannotated sync
-  and `@worker` select `WORKER_CONCURRENT`; `@blocking` additionally selects the
-  blocking-worker capacity class. There is no serialized-worker policy.
-- For an async caller, invoking a worker-policy synchronous method returns an
-  awaitable owned by Runtime and automatically dispatches it. Compatibility
-  call sites accept a direct value or awaitable and normalize through one
-  typed adapter, as selected above.
-- For a synchronous caller without an active Runtime, worker-policy methods
-  fail with `MissingExecutionScope`; they must not silently run blocking work
-  on the event loop.
-- Nested synchronous calls already inside a worker execute inline and append
-  observation deltas to the submission-local buffer; they must not recursively
-  resubmit to the executor.
-- Worker functions receive immutable arguments/snapshots and return immutable
-  results. Completion callbacks enqueue results to the owning loop; they never
-  commit state from executor threads.
-- Delete `SerializedWorkerLane`. Replace its semaphore and helper
-  `create_task` cleanup with a concurrent Runtime worker pool, bounded command
-  admission, submission sequence IDs, owned futures, and loop-side result
-  reconciliation.
-- Queue time, worker time, total time, cancellations, and errors merge into the
-  activity CRDT once per submission.
-
-Execution backends must be named accurately in code, traces, and benchmarks:
-
-| Backend | Python bytecode behavior on target CPython | Intended work |
-| --- | --- | --- |
-| event loop | cooperative concurrency | machine ownership, async I/O, commit |
-| thread executor | concurrent, normally not CPU-parallel under the GIL | blocking calls and native work |
-| GIL-releasing Rust/native function | may execute truly in parallel | crypto/codec hot paths proven to release GIL |
-| subprocess pool | true process parallelism with serialization cost | large pure-Python CPU jobs only |
-| free-threaded Python | potentially true thread parallelism | future target, excluded from current acceptance |
-
-Metrics must use `concurrent_in_flight`, `native_parallelism`, and
-`subprocess_parallelism` rather than describing every worker thread as
-parallel. Benchmarks must separately prove whether a native operation releases
-the GIL before attributing throughput improvement to parallel execution.
-
-### Common queue machine
-
-Machine type `queue`: `open -> closing -> drained -> closed`, with `failed`.
-
-- The lifecycle machine owns acceptance and close semantics. Depth,
-  high-water, admitted, delivered, dropped, and rejected are facets/counters.
-- Producers use `try_submit` for callback/hot paths and `submit` only at async
-  backpressure-safe points. Every queue declares which is legal.
-- Closing rejects new entries before suspension. `drained` means the last
-  accepted entry was processed or explicitly cancelled.
-- Publish depth changes only on zero/nonzero transitions, threshold crossings,
-  health changes, or display cadence. Keep exact counters internally.
-
-## CRDT and schema-2 projection
-
-### Operation types
-
-Every machine commit produces one immutable operation:
-
-```text
-(runtime_epoch, entity_id, entity_epoch, machine_type,
- revision, from_state, to_state, producer_dot, cause_id, monotonic_ns)
-```
-
-Derived facets use `(entity_id, entity_epoch, facet_revision, producer_dot)`.
-Activity counters use per-producer G-counters/PN-counters. Entity membership is
-an epoch-scoped observed-remove map. The loop reducer applies these rules:
-
-- duplicate dot: ignore and increment duplicate diagnostic;
-- future contiguous revision: validate and commit;
-- bounded future gap: retain temporarily and request missing operation;
-- stale epoch/revision: ignore;
-- invalid edge or source mismatch: do not change visible state, retain one
-  bounded exemplar, and increment diagnostic;
-- removal: wins for the same/older entity epoch only;
-- incompatible machine type for an existing entity epoch: reject.
-
-### Facet coherence
-
-- Machine state is emitted only in `machine:transition`/snapshot records. Do
-  not duplicate it as an independently revised `state` facet.
-- Connection, readiness, active, selected, direction, role, profile, queue
-  depth, and counters may be facets. Each derived facet includes
-  `source_machine_revision`.
-- The reducer rejects or withholds a facet whose source revision is ahead of
-  the machine and ignores one older than the installed facet revision.
-- A snapshot is captured at one service revision. The compact summary is
-  generated from that snapshot, never from live component objects.
-
-### Compact LLM summary requirements
-
-The summary must report:
-
-- all nonterminal/failed machines and the final state of bounded terminal
-  machines;
-- legal transitions in runtime commit order with repeated phase cycles compacted
-  as counts when causality would not be lost;
-- aggregate operation call counts and bounded nesting;
-- only latest coherent facets per entity;
-- diagnostics for invalid transitions, stale/future revisions, drops,
-  overflow, worker failures, resyncs, and untracked-work attempts.
-
-Add consistency diagnostics to summary generation:
-
-- `machine_facet_state_conflict`;
-- `peer_connected_without_transport`;
-- `peer_connected_without_srtp`;
-- `ice_selected_pair_without_nomination`;
-- `dtls_connected_without_keys`;
-- `terminal_entity_with_live_children`;
-- `untracked_runtime_work`;
-- `wrong_loop_mutation`.
-
-A consistency error makes an end-to-end trace test fail even when signaling and
-media otherwise complete.
-
-## Runtime ownership enforcement
-
-- Add `Runtime.start_machine(...)`, `Runtime.start_pump(...)`,
-  `Runtime.call_worker(...)`, and `Runtime.call_later_owned(...)`. Each requires
-  an owner entity, failure policy, and terminal reconciliation barrier.
-- Return opaque `OwnedTaskHandle`/`OwnedTimerHandle`, not raw tasks to component
-  code. Handles support cancel, wait, and status but not task-tree mutation.
-- In test/debug mode, install an event-loop task factory that records or rejects
-  task creation not originating from TaskScheduler. Permit a tiny allowlist for
-  asyncio internals and third-party libraries, with ownership adapters.
-- Add a static repository check for `asyncio.create_task`,
-  `loop.create_task`, `ensure_future`, raw executor submission, and unbounded
-  `asyncio.Queue` outside approved runtime modules.
-- Runtime shutdown reports `untracked_runtime_work` and fails tests if live
-  tasks, worker futures, timers, transports, or machine entities remain.
-
-## Aggressive lock deletion ledger
-
-The target architecture does not preserve locks for compatibility. Delete each
-lock below as soon as its protected fields have moved behind the named owner.
-Do not replace an `asyncio.Lock` with a different mutex. Replace multi-writer
-access with one writer, typed commands, immutable worker results, or an owned
-serialized lane.
-
-| Current lock | Protected concern | Replacement | Delete when |
+# Async State Machine Audit
+
+## Scope and conclusion
+
+This document audits the current implementation of
+`AsyncStateMachineRunner` in `webrtc/state_machine.py` and every production
+component that subclasses it. It is an audit only; it does not prescribe an
+implementation patch.
+
+The repository currently defines 22 production runner subclasses. Only the
+DTLS handshake-phase runner performs genuinely asynchronous work in `step()`.
+Every other `step()` is synchronous logic declared `async` to satisfy the base
+class. Some owners do need asynchronous orchestration or teardown, but that
+does not require every state reduction to have a permanent task, mailbox,
+reply future, retry cache, tracing identity, and async checkpoint chain.
+
+The state-machine implementation is not an idle busy loop: an idle runner is
+blocked in `BoundedMailbox.receive()`. The excessive CPU comes from active-path
+amplification and explicit polling:
+
+1. State waiters repeatedly use `await asyncio.sleep(0)`, keeping themselves
+   runnable and spinning until another task changes a state.
+2. The global worker-lane machine can receive up to three state publications
+   for every worker call: queued, running, and completion/idle.
+3. Every accepted command pays for command and reply objects, mailbox wakeups,
+   an async `step`, async production no-op checkpoints, transition allocation,
+   retry-cache bookkeeping, projection allocation, producer-dot allocation,
+   and often a facet merge.
+4. Queue and SRTP stream facets are published on every packet enqueue and
+   dequeue. This is adjacent to, rather than inherent in, the runner, but it is
+   part of the same machine/metadata design and is likely a larger steady-state
+   data-plane cost than lifecycle transitions.
+5. A full peer creates a permanent runner task for runtime, observability,
+   worker lane, peer, signaling, media send, gatherer, agent, candidate pair,
+   pair controller, selected transport, UDP mux/bindings and interceptor
+   queues, DTLS transport and phase, two SRTP sessions, streams and packet
+   queues, transceivers, senders, receivers, tracks, attachments, and inboxes.
+   Sleeping tasks do not burn CPU by themselves, but they increase scheduling,
+   ownership, shutdown, and metadata work.
+
+The main architectural finding is that four responsibilities have been merged:
+
+- WebRTC/domain state validation;
+- event-loop serialization and task ownership;
+- retry/reply transport semantics;
+- observability and deterministic test metadata.
+
+That violates SRP and makes components understand infrastructure metadata that
+is irrelevant to their protocol behavior. Meaningful WebRTC states should be
+retained, but most do not need `AsyncStateMachineRunner`.
+
+## Evidence and confidence
+
+This is a static source audit, not a profiler report. The CPU causes above are
+directly visible in the control flow, but their percentages cannot be claimed
+without a full-peer profile.
+
+The state-machine commit (`4353bac`) removed the existing backend live-tracing
+benchmark, full peer performance tests, and JSON baselines in the same change
+that introduced the broad runner use. The repository still documents a target
+of at most 5% aggregate tracing CPU overhead, but there is no current benchmark
+that enforces or even reports that target. Consequently:
+
+- the polling loops and per-call amplification are confirmed mechanisms;
+- the ordering of their real-world cost is a strong source-based assessment;
+- numeric CPU attribution remains unverified until the deleted benchmark
+  coverage is restored or replaced.
+
+## What one transition currently costs
+
+For a typical component lifecycle move:
+
+1. The component increments its own command ID and often formats a cause ID.
+2. It allocates `ReplyPort`, which allocates an `asyncio.Future`.
+3. It allocates a nine-field `MachineCommand` carrying epoch, revision,
+   producer/deduplication and causality concerns.
+4. `BoundedMailbox` appends the command and replaces its `asyncio.Event` on
+   every signal (`state_machine.py:160-162`).
+5. The runner wakes, performs dedupe lookup, awaits `prepare()`, and awaits an
+   `async step()` even when the step has no suspension.
+6. It allocates a preview `TransitionCommit`.
+7. It allocates a checkpoint and awaits `NullTransitionController.before_commit()`;
+   production therefore still crosses an async function boundary for a no-op.
+8. It validates again, allocates the authoritative `TransitionCommit`, and
+   reads the monotonic clock.
+9. It invokes a component-owned transition sink, which usually converts the
+   commit to a second `MachineTransitionOp`, allocates a producer dot, and
+   updates the projection.
+10. It allocates another checkpoint and awaits the production no-op
+    `after_commit()` checkpoint, then awaits the usually empty component
+    `after_commit()` hook.
+11. It inserts the result into the per-runner dedupe dictionary/deque even for
+    commands that are never retried.
+12. It resolves the reply future; the caller performs another shielded await.
+
+Terminal transitions add reconciliation, mailbox rejection, a terminal
+checkpoint, task joining, and owner removal. This machinery is defensible for
+rare externally retryable orchestration commands. It is disproportionate for
+local queue close flags, attachment status, worker load, and simple resource
+lifecycle changes.
+
+## Confirmed CPU amplification
+
+### 1. Zero-delay state polling
+
+The following state waiters repeatedly yield and immediately become runnable:
+
+- `peer_components.py:301-304`: log-inbox close waits for `open`/`closing`;
+- `peer_components.py:467-468`: attachment work waits for `detached` to change;
+- `srtp/session.py:337-344`: stream close waits for activation and terminal;
+- `srtp/session.py:426-427`: session readiness;
+- `srtp/session.py:452-454`: terminal reconciliation waits for in-flight work;
+- `srtp/session.py:724-725`: session close waits for terminal;
+- `ice/agent.py:1189`: controller start waits for its receive handle;
+- `ice/agent.py:1217-1218`: controller close waits for terminal;
+- `runtime_services.py:1031`: child reconciliation retries when registry state
+  exists but exposes no waitable handle.
+
+`asyncio.sleep(0)` is a fairness yield, not a blocking notification. These
+loops can execute thousands of times while waiting and are the clearest direct
+explanation for CPU spikes during startup, state convergence, and shutdown.
+They also compete with the runner that must make the condition true.
+
+The state owner already has reply futures and task handles, so polling is not
+necessary. A state change should resolve a retained revision/terminal waiter;
+in-flight counters should have a zero-count barrier.
+
+### 2. Worker-lane transition churn
+
+`ConcurrentWorkerLane.run_observed()` publishes load at admission, dispatch,
+and completion (`runtime_services.py:746-764`). `Runtime._worker_state_changed()`
+turns changes in those counters into machine commands and exact facet updates
+(`runtime.py:376-406`). Thus a packet crypto worker, codec worker, or any other
+observed synchronous call can indirectly cause up to three complete state
+machine/projection cycles.
+
+This is a model error as well as a performance error. A concurrent lane can be
+queued and running at the same time; `idle | queued | running` is not a valid
+state model for two independent counters. The producer-side
+`_worker_desired_state` can also advance before the runner commits earlier
+commands. Under concurrency it can request edges the spec does not allow, for
+example `running -> queued`, and it uses `try_submit()` into a capacity-32
+mailbox. Load reporting can therefore raise `MailboxFull` in the work path or
+silently cache invalid-transition failures when no reply port was supplied.
+
+Worker queued/running/high-water values are metrics, not lifecycle states.
+Only `accepting/closing/closed` is a useful lane lifecycle.
+
+### 3. Exact data-plane facet publication
+
+The following paths publish projection values for ordinary packet queue
+traffic:
+
+- `RuntimeOwnedQueue.put/get/put_nowait/get_nowait()` in
+  `queue_machine.py:67-83`;
+- UDP `Interceptor.put/get()` in `ice/net/udp_mux.py:116-151`;
+- SRTP `Stream.write/read()` via `_publish_queue_facets()` in
+  `srtp/session.py`.
+
+Each publication allocates a producer dot and value mapping and merges it into
+the projection. This happens even though queue depth is not a state transition.
+For RTP/SRTP traffic, coalesced counters or threshold/high-water updates are
+appropriate; exact depth per packet is not.
+
+### 4. Per-entity runner/task multiplication
+
+One SRTP stream creates both an `srtp-stream` runner and a `queue` runner. A
+track creates a media-track runner; a sender and receiver each create another.
+Each UDP interceptor creates a queue runner. Each attachment creates a runner.
+This produces many permanent task registry entries and terminal reconciliation
+edges for objects whose behavior is already serialized on one event loop.
+
+This is mostly task, allocation, and shutdown overhead rather than idle CPU.
+It becomes CPU overhead when all entities start or close together and when
+their projections/facets are updated.
+
+## Async necessity and state-authority inventory
+
+“Keep state” below means the state has useful domain or admission semantics.
+It does not mean the current async runner should be retained.
+
+| Component / runner | Current use | Actually async? | State authority and verdict |
 | --- | --- | --- | --- |
-| `ICEGatherer.__gather_lock` | duplicate gather/agent creation | `ice-gatherer` mailbox; concurrent callers share one command reply | gatherer machine lands |
-| `ICETransport.__transport_lock` | selected transport pointer | transport machine commit and revisioned on-loop snapshot | ICE transport migration lands |
-| `PeerConnection._signaling_lock` | SDP state/description mutation | signaling runner; descriptions and state commit atomically | signaling machine lands |
-| `PeerConnection._close_lock` | idempotent teardown | one peer close command plus retained terminal reply | peer runner owns teardown |
-| `PeerConnection._peer_connection_lock` | broad peer mutation serialization | typed peer/signaling/transceiver commands with distinct owners | all protected call sites are routed |
-| `PeerConnection._media_send_lock` | ordered public media bursts | bounded concurrent media-send worker plus loop-owned sequence allocation/result reconciliation | send path no longer mutates shared state |
-| `BindingRequestCacheRegistry._lock` | STUN transaction cache mutation | ICE-controller loop ownership; cache commands/timer expiry on same runner | selectors cannot mutate off-loop |
-| `DTLSConn.recv_lock` | inbound record ordering | single DTLS receive pump and bounded mailbox | all records enter through pump |
-| `Session._streams_lock` | SSRC stream map creation | SRTP-session loop-owned admission command; worker returns immutable SSRC result | decrypt workers cannot touch map |
-| `RTPSender.__transport_lock` | transport bind/read | sender machine `bound` snapshot and revision predicate | sender migration lands |
-| `Runtime._close_lock` | Runtime close idempotence | runtime close command and shared close reply | runtime machine lands |
-| `SerializedWorkerLane._semaphore` | lane ordering | one owned lane runner consuming a bounded mailbox | new worker lane is enabled |
-| `SyncOffloader._limiter` semaphore | physical worker capacity | bounded Runtime command queue plus explicit dispatch-credit messages | new offloader lands |
-| `TaskRegistry._lock` | cross-thread task/barrier registry | Runtime-loop-only registry; executor threads enqueue immutable completion operations | no registry API is called off-loop |
-| `MetricRecorder._lock` in `performance.py` | arbitrary-thread metric list | loop-owned aggregate store and worker-local delta merge | legacy per-call metric recorder is removed |
-| operation interning lock in `performance.py` | dynamic global operation IDs | compile/intern operation IDs during class registration/startup; freeze table before Runtime active | no runtime dynamic registration remains |
-| `TraceEventBus._lock` | subscriber set, pending batches, sequence | loop-owned schema-2 journal/cursors and immutable shared batch | legacy event bus is deleted |
-| tracing performance recorder `RLock` | legacy retained perf events | loop-owned bounded diagnostic/activity reducers | compatibility recorder is deleted |
-| `EventEmitter._lock` | listener registry across threads | delete emitter; typed machine commands and bounded output mailboxes | no emitter inheritance or call site remains |
+| Runtime `_LifecycleRunner` (`runtime`) | Startup and shutdown stages | Reduction: no; shutdown workflow: yes | Keep a small runtime lifecycle, but a mailbox task is unnecessary because Runtime already owns the loop and close task. |
+| Runtime `_LifecycleRunner` (`worker-lane`) | Converts queued/running counts to enum transitions | No | Remove this state model. Keep counters plus `accepting/closing/closed`. |
+| `_ObservabilityRunner` | Tracing service start/degrade/drain | No | Keep service health as a snapshot/metric. It must not require tracing metadata to report tracing metadata. |
+| `RuntimeOwnedQueue._QueueRunner` | `open -> closing -> drained -> closed` | No | Remove the runner. Queue close/admission must be enforced by the queue primitive itself; observe it downstream. |
+| `peer_components._LifecycleRunner` | Peer/log inboxes, log drain, attachment registry and each attachment | No reduction; some start/stop work awaits | Keep explicit close/start workflows where useful, but not a generic caller-selected `MOVE` machine. |
+| `_GathererRunner` | Gathering lifecycle and launch | Reduction: no; gather operation: yes | Keep `new/gathering/complete/failed/closed`; use one gather task/result. |
+| `_SelectedTransportRunner` | Records selecting/ready/draining/closed | No | Keep selected-transport readiness, preferably as an atomic selected binding snapshot rather than a separate runner task. |
+| `_PeerRunner` | Peer lifecycle, child-readiness gate, role and teardown | Reduction: no; effects/teardown: yes | Keep. This is a legitimate aggregate WebRTC lifecycle, but use a synchronous reducer inside the peer's existing serialized orchestration. |
+| `_SignalingRunner` | Offer/answer validation and atomic descriptions | No; SDP capture/materialization is synchronous | Keep. This is the strongest state-machine use because WebRTC signaling has normative states. The reducer should be synchronous and metadata-free. |
+| `_MediaSendRunner` | Active/draining/failed/closed around a separate media mailbox/pump | No | Remove runner; the media-send pump already owns admission, jobs, credits and drain. |
+| `_CandidatePairRunner` | ICE checklist pair state | No | Keep. Pair state is real ICE logic and should gate checks/nomination, but it needs no dedicated task per pair. |
+| `_CandidatePairControllerRunner` | Starts/checks/nominates/forwards and closes receive pump | Reduction: no; packet pump/close: yes | Keep only meaningful controller phase or derive it from pair/pump status. Do not dedicate a second state authority to the same pair lifecycle. |
+| `_AgentRunner` | ICE agent connectivity state | No | Keep. Agent states are useful for connection/reconnect decisions, but current registry/role/candidate mutation is still outside the runner. |
+| `_InterceptorQueueRunner` | Queue failure and close sequence | No | Remove. Queue failure/admission must be direct queue behavior; coalesce metrics. |
+| `_UDPRunner` (`udp-mux`, `udp-binding`) | Resource bind/active/drain/close | No; socket bind/close awaits | Keep resource readiness if consumers use it, but one resource task/result is sufficient. Per-binding runner tasks add little value. |
+| `_DTLSTransportRunner` | Bind, handshake readiness/failure, SRTP-ready gate, close | Reduction: no; handshake and reconciliation: yes | Keep public DTLS state. It is useful to gate media, but state reduction need not be async. |
+| `_HandshakePhaseRunner` | Calls `await owner._step(current)` for flights/retransmission | Yes | Retain asynchronous orchestration. This is the only runner whose `step()` genuinely suspends. Consider separating the synchronous phase transition from the flight I/O workflow. |
+| SRTP `_LifecycleRunner` (`srtp-session`) | Key readiness, stream admission, drain/close | Reduction: no; draining streams awaits | Keep session readiness/admission state; use direct notification instead of readiness polling. |
+| SRTP `_LifecycleRunner` (`srtp-stream`) | Active/draining/closed | No; optional close callback awaits | Simplify to queue/admission close state. A separate stream runner plus queue runner is redundant. |
+| SRTP `_PacketQueueRunner` | Queue close/drain/closed | No | Remove; fold into the stream queue. |
+| Transceiver `_ComponentRunner` | Track, sender and receiver lifecycle | No; terminal child close awaits | Keep sender/receiver/track readiness where it gates media. Do not create a runner task for every small media object. |
+| `_TransceiverRunner` | Negotiation lifecycle and configuration mutation | No | Keep negotiated state/snapshot. Configuration commands should update one negotiation snapshot, not create lifecycle self-transitions. |
 
-There is no project-code exception for `SyncOffloader`: capacity control moves
-to bounded Runtime command admission and explicit dispatch-credit messages.
-The physical executor may synchronize internally, but project code neither
-imports nor exposes that synchronization.
+## SRP and metadata coupling findings
 
-### Lock-removal procedure
+### Components know infrastructure details they should not know
 
-For every ledger row:
+Nearly every owner currently knows how to:
 
-1. List every field and call site previously protected by the lock.
-2. Assign those fields to exactly one machine/Runtime-loop owner.
-3. Convert external mutation to a command and external reads to an immutable
-   snapshot, revision predicate, or command reply.
-4. Route worker/thread callbacks through immutable ingress operations.
-5. Add a wrong-loop assertion and a concurrency/race test.
-6. Delete the lock and the old direct-mutator methods in the same change. Do
-   not leave an unused compatibility lock or dual mutation path.
-7. Run deterministic interleaving, cancellation, shutdown, and throughput
-   tests before checking off the row.
+- allocate monotonically increasing command IDs;
+- copy the runner epoch and sometimes revision;
+- decide whether revision checking is enabled by passing `None`;
+- generate textual cause IDs;
+- create and await `ReplyPort` futures;
+- choose mailbox and dedupe capacities;
+- register machine specs and owner epochs with Runtime;
+- start and join the runner task;
+- convert `TransitionCommit` to `MachineTransitionOp`;
+- allocate producer dots and projection source order;
+- merge machine-linked facets;
+- remove the owner after terminal completion.
 
-The final repository check must reject `asyncio.Lock`, `threading.Lock`,
-`RLock`, and ordering semaphores everywhere under `webrtc/`. External-library
-bridges must communicate through immutable messages rather than wrapping the
-library with a project-owned lock.
+None of those concerns computes ICE nomination, signaling legality, DTLS
+readiness, SRTP admission, or RTP behavior. Repeating them across components is
+the concrete SRP violation.
 
-## Evidence-based component update inventory
+### The generic command is over-specified
 
-This inventory is based on the current implementation, not only the desired
-machine graph. Every row names concrete evidence that requires migration. A row
-is complete only when its component uses owned commands, has a declared machine
-spec, produces coherent schema-2 state, and leaves no event, lock, task, or
-mutable lifecycle authority behind.
+`MachineCommand` has nine fields. Most local lifecycle callers need only an
+event kind and optional payload/result. `producer_id` and `producer_seq` are
+used only by a small subset of commands; `expected_epoch`, `command_id`, and
+`cause_id` are nevertheless mandatory everywhere. Every command is entered in
+the dedupe cache, even if it originated locally and cannot be retried.
 
-| Component/file | Current evidence | Required update |
-| --- | --- | --- |
-| `performance.py` — `ObservedMeta`, `ObservedComponent` | `_compile_sync_call` currently classifies affinity; worker wrappers create lane tasks; global operation interning and `MetricRecorder` use locks | Make unannotated sync methods concurrent-worker calls, preserve value-or-awaitable compatibility, remove wrapper-created tasks, freeze operation IDs, return worker-local CRDT deltas, delete metric locks |
-| `state_machine.py` | generic runner has an unbounded `asyncio.Queue`, directly invokes a projector callback, and owns no Runtime task handle | Add bounded command ingress, epoch/expected-revision commands, prepared effects, owned runner handle, reply ports, terminal reconciliation, and transition sink |
-| `machine_specs.py` | only peer/ICE/DTLS/transport/worker/transceiver/media specs exist; DTLS spec conflicts with the traced phase enum | Declare every catalog machine, separate `dtls-transport` from `dtls-handshake-phase`, compile parents/terminal rules/readiness predicates |
-| `runtime.py` — `Runtime` | `_close_lock` protects close; Runtime owns tracing primitives but is not itself an observable lifecycle machine | Add runtime and observability machines, close command/reply, entity registry, owned timer/socket/future audit, remove close lock |
-| `runtime_services.py` — `TaskRegistry` | registry uses `RLock`; `TaskScheduler` and reconciliation create raw asyncio tasks | Make registry loop-owned, route executor completions through ingress, make reconciliation an already-registered child/barrier, delete registry lock and raw task creation |
-| `runtime_services.py` — `SyncOffloader`, `SerializedWorkerLane` | capacity and ordering use semaphores; lane dispatch and cancellation cleanup use `asyncio.create_task` | Replace with bounded concurrent command dispatcher, explicit credits, owned futures, sequence-tagged results and barriers; delete serialized lane |
-| `observability.py` | projection stores already assert one owner and use dots/revisions, but component machines do not consistently feed them | Extend entity epochs/removal, source-machine facet revision checks, complete CRDT types, consistency diagnostics and all-component registration |
-| `state_facets.py` | domain-event adapter currently synthesizes DTLS and other facet state independently | Derive facets only from machine commits/snapshots; remove duplicated lifecycle fields and eventually delete the domain-event compatibility adapter |
-| `utils/event_emitter.py` | listener map is protected by `threading.Lock`; peer and ICE inherit its async form | Delete emitter implementation and replace every listener edge with typed command/reply/output mailboxes |
-| `peer_connection.py` — `PeerConnection` | inherits `AsyncEventEmitter` and `ObservedComponent`; has signaling, close, broad peer and media-send locks; maintains `_started/_closing/_closed/state`; creates failure cleanup task; emits peer/transceiver state manually | Add peer/signaling machines, child readiness join, typed application output mailbox, owned failure command and close workflow, machine-owned transceiver updates; delete emitter, flags, locks, task and manual lifecycle emitters |
-| `peer_connection.py` — `ICEGatherer` | inherits `AsyncEventEmitter`; uses gather lock; mutable gathering/connection strings; forwards controller through `.on/.emit` | Add gatherer machine and commands, shared gather reply, machine output to peer, remove lock/emitter/string authorities |
-| `peer_connection.py` — `ICETransport` | transport pointer is guarded by a lock and exposed by async getter | Replace with selected-transport machine snapshot and revisioned bind command; delete lock |
-| `peer_components.py` — inboxes | peer/log inboxes own queues, close flags/events and drop behavior but have no machines | Give each inbox a queue machine, bounded counters, typed close/drain commands and schema-2 identity |
-| `peer_components.py` — `AsyncLogDrain` | `ObservedComponent`; races two raw tasks for input vs stop and owns stopping/wake events | Add log-drain machine and one owned mailbox pump; remove raw tasks/events; all sync methods auto-offload unless explicit loop callbacks |
-| `peer_components.py` — attachment controllers | `ObservedComponent`; `start` schedules attachment work while lifecycle is held in controller collections | Create controller and per-attachment machines, typed attach/start/stop commands, Runtime-owned pumps and terminal joins |
-| `ice/agent.py` — `CandidatePair` and registries | pair state is a directly settable enum; pair/controller registries are mutable dictionaries/lists | Make pair and registry machines loop-owned, replace public setter/direct collection mutation with commands and immutable snapshots |
-| `ice/agent.py` — binding request cache | registry combines sync reads with an async locked writer and wall-clock expiry | Move cache to controller owner, use monotonic owned expiry timers and commands, remove lock and mixed access |
-| `ice/agent.py` — selectors | controlling/controlled selectors inherit emitter and emit nomination callbacks | Convert selector outcomes to typed controller result commands; remove listener protocol and emitter inheritance |
-| `ice/agent.py` — `CandidatePairController` | inherits emitter/ObservedComponent; listener-driven nomination; stores task handle; creates a close task; infinite packet loop | Add controller machine, bounded packet mailbox, owned receive child, nomination commit/output, terminal reconciliation; remove emitter and task handles |
-| `ice/agent.py` — `Agent` | inherits emitter/ObservedComponent; mutable credentials/role/candidate/pair/controller/transport collections; emits new controller | Add agent machine and registry ownership, typed credential/candidate/connect commands, bounded child creation and causal nomination output |
-| `ice/net/udp_mux.py` — interceptor/handler/connections | datagram callbacks route directly into mutable interceptor maps and queues | Give handler, interceptor, binding and connection machines; callback only submits immutable packets; define overflow and close barriers |
-| `ice/net/udp_mux.py` — `MultiUDPMux` | `ObservedComponent`; accept/bind/inbound handler access and close are ordinary methods around socket resources | Add mux machine, Runtime-owned socket resources, typed bind/snapshot commands; automatic worker wrapping must explicitly exempt actual loop callbacks |
-| `dtls/fsm.py` — `FSM` | current explicit `Preparing/Sending/Waiting/Finished` transitions use their own command queue and state/revision logic | Adapt to generic handshake-phase runner, bounded commands, epoch timers and one terminal commit; keep it distinct from public DTLS lifecycle |
-| `dtls/fsm.py` — `DTLSConn` | `ObservedComponent`; owns `recv_lock`, unbounded handshake queue and receive-loop task path | Add connection/receive-pump machines, bounded record/message mailboxes, immutable crypto results; remove lock |
-| `dtls/dtlstransport.py` | `ObservedComponent`; sync `start` schedules handshake; multiple task handles and readiness events; RTP/RTCP receive loops | Add public transport machine, typed start/bind/record/close commands, owned child machines, revision readiness, bounded ingress; remove direct task/event authority |
-| `srtp/session.py` — `Session` | `ObservedComponent`; stream map uses lock; crypto sync methods use worker wrappers; new-stream queue is unbounded | Add session machine, loop-owned bounded stream admission, concurrent sequence-tagged crypto submissions, bounded output mailbox, remove stream lock |
-| `srtp/session.py` — `Stream` | stream owns packet queue, activity counters and close/delivery semantics but only emits facets | Add visible stream and queue machines, admission budget, lossy overflow policy and terminal join |
-| `transceiver.py` — `RTPTransceiver` | `ObservedComponent`; MID/direction/sender/receiver are mutated through ordinary methods and peer emits lifecycle separately | Add transceiver machine with atomic negotiated snapshot and typed configuration commands; remove peer-side lifecycle inference |
-| `transceiver.py` — `RTPSender` | transport pointer uses `__transport_lock`; send lifecycle is not a machine | Add sender/binding machine, revision readiness and concurrent packet work with loop commit; remove lock |
-| `transceiver.py` — `RTPReceiver`, `TrackRemote` | receiver is observed but lifecycle is incomplete; remote track owns bounded queue and direct drop logic | Add receiver, track and queue machines, typed packet delivery and terminal reconciliation |
-| `media/packetizer.py`, payloaders, RTP/RTCP helpers | synchronous data-plane helpers are not `ObservedComponent`; some hold sequence/config state | Wrap stateful component instances in machines/ObservedComponent ownership; automatically offload sync calls; keep pure value functions outside wrapping |
-| `media/jitterbuffer.py` | mutable buffer/frame state has no owner machine | Add jitter-buffer component and queue machine, immutable packet commands, bounded admission and concurrent parse results with loop commit |
-| tracing event/performance modules | `TraceEventBus` and legacy performance recorder use `RLock` and retained event lists | Delete schema-1 bus and duplicate recorder; use only loop-owned schema-2 journal, cursors, activity CRDT and snapshot/resync |
+Epoch, producer sequence, and causal trace identity belong at an external
+retry/observability boundary. Revision belongs only on operations that truly
+perform optimistic concurrency. They should not be part of the protocol
+component's everyday command vocabulary.
 
-### EventEmitter removal evidence and replacement routes
+### Observability is injected into the state owner
 
-The following current event chains must be removed rather than wrapped:
+The supposedly neutral runner invokes `_transition_sink` synchronously inside
+its authoritative post-commit path (`state_machine.py:655-660`). Every
+component implements nearly identical projection glue. Projection failure can
+terminate the runner after the state is already committed. This means
+observability is not purely downstream and forces protocol owners to know
+projection types and source metadata.
 
-```text
-Agent --CANDIDATE_PAIR_CONTROLLER--> ICEGatherer --> PeerConnection
-Selector --NOMINATE--> CandidatePairController
-CandidatePairController --NOMINATE_TRANSPORT--> PeerConnection
-PeerConnection --TRACK/STATE/etc.--> application listeners
-```
+### Test control affects production shape
 
-Their replacements are:
+Every transition allocates checkpoints and awaits three controller methods in
+the terminal case, even though the production controller is a no-op. Test
+pause/failure injection is useful, but the production transition algorithm
+should not require async no-op hooks at each edge.
 
-```text
-agent child-created commit -> gatherer/peer command
-selector result command -> pair/controller nomination commit
-nomination commit -> selected-transport command -> peer readiness command
-peer output commit -> bounded application output mailbox / async iterator
-```
+### Generic `MOVE` moves policy to callers
 
-Each replacement carries `cause_id`, owner/entity epoch, producer dot, command
-ID, and reply/error policy. There is no arbitrary callback execution in a
-machine commit or packet callback.
+The auxiliary lifecycle runner accepts a payload containing the desired state.
+It does not map a domain event to a state; callers select the target directly.
+Legal-edge validation remains, but state policy is distributed across log,
+inbox, and attachment code. That is an observable state register, not an
+encapsulated state machine.
 
-## Migration stages
+## State-model correctness audit
 
-### Stage 0 — Freeze contracts and establish baselines
+### States currently used correctly or worth retaining
 
-- Capture the supplied 161-record trace as a regression fixture.
-- Record throughput, event-loop lag, CPU, allocations, packet loss, media
-  delivery, trace record count, patch rate, and shutdown duration with tracing
-  off/on.
-- Add an inventory of every lock, event, queue, task creation, timer, worker
-  submission, mutable lifecycle flag, and domain state emitter.
-- Define budgets before refactoring; do not accept “more state machines” if it
-  causes per-packet transitions or materially regresses throughput.
+- WebRTC signaling: `stable`, `have-local-offer`, `have-remote-offer`.
+- ICE gatherer and agent connectivity states.
+- ICE candidate-pair progress and nomination.
+- Selected transport readiness tied to exact nomination provenance.
+- Public DTLS transport readiness tied to handshake and both SRTP sessions.
+- Internal DTLS flight/handshake phases.
+- SRTP session readiness as a gate for crypto and stream admission.
+- Peer aggregate connection state with exact child epoch/revision readiness.
+- RTP sender/receiver/track readiness when it actually gates packet admission.
+- Transceiver negotiation state and one atomic negotiated snapshot.
 
-Exit: reproducible full-peer loopback benchmark and ownership inventory exist.
+These states can make WebRTC processing safer: reject media before DTLS/SRTP
+readiness, reject nomination without pair success, reject invalid signaling
+edges, reject stale negotiated snapshots, and make teardown stop admission
+before resources are released.
 
-### Stage 1 — Harden the generic runner and Runtime ownership APIs
+### States that currently act mainly as tracing labels
 
-- Implement bounded typed mailboxes, prepared transitions, epoch/revision
-  compare, idempotent command replies, terminal reconciliation, owned timers,
-  and opaque task handles.
-- Refactor worker lanes to Runtime ownership and immutable result delivery.
-- Add wrong-loop, wrong-epoch, untracked-task, and terminal-child assertions.
+- worker-lane `idle/queued/running`;
+- per-queue `open/closing/drained/closed` runners;
+- observability service runner;
+- attachment registry and per-attachment runners;
+- media-send runner layered over its own mailbox/pump/job state;
+- many UDP binding/interceptor lifecycle runners;
+- the second queue runner attached to every SRTP stream.
 
-Exit: synthetic machine tests cover cancellation, duplicate/reordered commands,
-worker completion after close, mailbox overflow, and deterministic checkpoints.
+For these, ordinary owned-resource state, counters, and completion futures are
+clearer and cheaper.
 
-### Stage 2 — Separate public DTLS lifecycle from handshake phases
+### Commands are being recorded as false state changes
 
-- Migrate the existing FSM first because it already exposes explicit phases.
-- Rename its machine identity, remove stale duplicate state, bound its channels,
-  and connect public DTLSTransport commits.
-- Migrate SRTP session creation/readiness and ensure keys precede public DTLS
-  `connected`.
+`_PeerRunner` maps `DIAL` and `ACCEPT` to the current state
+(`peer_connection.py:821-822`). `_TransceiverRunner` maps MID, codec, sender,
+receiver, and snapshot updates to `active`, creating `active -> active`
+transitions (`transceiver.py:984-988`). The machine spec explicitly permits
+some self-edges to support this.
 
-Exit: trace shows two coherent DTLS machines and no `dtls=Finished` public
-state.
+Those are operations or snapshot revisions, not lifecycle changes. Treating
+them as state transitions inflates transition revisions and projection work
+and makes the trace claim that a lifecycle transition occurred when it did
+not.
 
-### Stage 3 — Migrate ICE and transport ownership
+### Queue state does not consistently control queue behavior
 
-- Migrate gatherer, agent, pair, controller, mux/binding, selected transport,
-  DNS offload, and receive-loop ownership.
-- Remove candidate/controller registry locks and bare close tasks.
-- Make nomination the single causal source for selected transport.
+`RuntimeOwnedQueue.put()` and `put_nowait()` do not consult the queue runner's
+state. The runner can report closing/closed while the underlying queue still
+accepts items. Similar queue wrappers publish lifecycle and depth separately.
+This proves the machine is not the queue's authoritative behavior; it is an
+observational companion.
 
-Exit: ICE machine and facets agree; all controller tasks and socket resources
-are Runtime-owned and reconciled.
+### Several authoritative fields remain outside machine commits
 
-### Stage 4 — Migrate peer and signaling
+Examples include ICE agent credentials/role/candidate and controller
+registries, selected transport pointers and revisions, UDP binding maps,
+media-send job/result maps, and multiple transceiver fields. Some mutations
+are carefully sequenced around commits, but the runner's “single writer” claim
+only protects `_state`, `_revision`, and `epoch`. It cannot detect mutation of
+the owner's actual protocol fields during `step()` or from another method.
 
-- Introduce peer and signaling mailboxes, replace lifecycle flags/locks, and
-  make negotiation generation revisioned.
-- Express child readiness as revision predicates and commit peer `connected`
-  from coherent ICE+DTLS+SRTP snapshots.
-- Replace failure cleanup scheduling with one failure command.
+The strongest exception is signaling, where the immutable description snapshot
+is committed with the lifecycle edge. That pattern should be the standard for
+states that remain.
 
-Exit: peer progresses from `new` to `connected` in the end-to-end trace and
-closes without a competing cleanup task.
+### Fire-and-forget failures can be silent
 
-### Stage 5 — Migrate transceivers and media pipelines
+When a `MachineCommand` has no reply, preparation or validation failures are
+cached and the loop continues (`state_machine.py:621-646`). The caller is not
+notified. Many automatic follow-up and worker-state commands omit replies.
+Invalid edges can therefore leave producer-side desired state different from
+committed state without a direct failure signal.
 
-- Migrate transceiver, sender, receiver, tracks, stream admission, media send
-  lane, packet queues, packetizer/codec workers, and WebSocket media worker.
-- Retain aggregate activities for packet/frame operations.
+### Terminal and restart semantics are awkward
 
-Exit: media begins only after committed transport readiness, stream entities
-are bounded, and media throughput meets baseline budgets.
+`log-drain` and `observability` use `stopped` as both initial and terminal.
+The base runner special-cases revision zero so it will accept the first
+command. Once it returns to `stopped`, the runner exits and cannot represent a
+second start. This is acceptable only if these objects are strictly one-shot;
+the specs otherwise look restartable.
 
-### Stage 6 — Migrate attachments, log drain, queues, and tracing service
+### Long reconciliation blocks the only command consumer
 
-- Remove remaining bare tasks and lifecycle flags from auxiliary components.
-- Add queue and observability machines, coherent threshold-based facets, and
-  final-flush reconciliation.
-- Remove compatibility state emitters once all consumers read commits/facets.
+Terminal reconciliation occurs before the terminal commit while the runner is
+the only mailbox consumer. Some reconciliation closes multiple descendants or
+waits for in-flight work. New close/failure commands remain queued until it
+finishes. This provides serialization, but it also couples state progress to
+potentially slow I/O and makes shutdown depend on the polling loops described
+above.
 
-Exit: repository ownership scan has no unexplained exception and every
-lifecycle facet has an owning machine.
+## Does the runner need to be async?
 
-### Stage 7 — Remove locks and compatibility paths deliberately
+Not as a general abstraction.
 
-- Remove each component lock only after its protected fields have one writer.
-- Remove Event objects as sources of truth; retain lightweight wait adapters
-  only where public API compatibility requires them.
-- Remove “sync result or awaitable” call patterns and direct task handles.
-- Delete legacy facet state duplication and deprecated machine mappings.
+All components already run on one asyncio event loop and the runner asserts
+that loop ownership. A synchronous reducer can validate and atomically update
+state in the same event-loop turn without a lock. Async work can be launched or
+awaited by the owning workflow before/after that reducer. A permanent mailbox
+task is justified only where multiple independent producers need backpressure,
+ordering, cancellation, and reply semantics that are not already supplied by
+the component's existing pump or Runtime task.
 
-Exit: no application state lock remains on the normal peer/ICE/DTLS/SRTP/media
-path; exceptions are documented with benchmark evidence and do not protect
-multi-writer protocol state.
+Recommended separation of concerns:
 
-### Stage 8 — Full end-to-end validation and rollout
+1. **Synchronous domain reducer** — current snapshot plus typed event yields
+   the next immutable domain snapshot and effects. It knows no task IDs,
+   producer dots, trace cause IDs, or reply futures.
+2. **Optional command serializer** — used only by genuinely multi-producer
+   owners. It handles bounded admission and completion, without pretending
+   every command is a state transition.
+3. **Async workflow/task owner** — performs socket, handshake, worker, child
+   join, and teardown work through Runtime.
+4. **State notification** — revision/terminal futures or a condition that
+   wakes only on change; never `sleep(0)` polling.
+5. **Observability adapter** — consumes a small domain transition after commit
+   and adds entity IDs, epochs, cause IDs, producer dots, timestamps, and
+   projection ordering outside the component.
+6. **Optional retry envelope** — adds command identity/dedupe only at API or
+   transport boundaries that can actually retry.
+7. **Test interception** — wraps selected reducer commits in tests without
+   imposing async no-op checkpoints on production transitions.
 
-- Run deterministic checkpoint, failure injection, cancellation, overload,
-  reconnect, renegotiation, shutdown, CRDT convergence, and schema-2 resync
-  suites.
-- Compare trace-off/on throughput and event-loop lag to budgets.
-- Roll out behind per-component migration flags only while mixed-mode adapters
-  are required; never allow two authorities for one lifecycle.
+The DTLS handshake phase is the one clear special case. It is an async workflow
+whose next phase depends on network/timer/flight work. Even there, separating
+the flight I/O from the synchronous phase commit would make the state easier
+to reason about.
 
-Exit: all acceptance criteria below pass and mixed-mode code is deleted.
+## Refactoring priorities
 
-## File-level change map
+### P0: remove confirmed CPU spinners
 
-- `webrtc/state_machine.py`: prepared-transition runner, bounded mailbox,
-  epochs, typed replies, reconciliation, loop assertions.
-- `webrtc/machine_specs.py`: complete machine catalog, separate public DTLS and
-  handshake-phase specs, parent and readiness metadata.
-- `webrtc/runtime.py`: runtime/observability machines, owned work APIs, entity
-  registry, shutdown audit.
-- `webrtc/runtime_services.py`: opaque handles, owned timers, worker execution
-  policies and lanes, task-factory audit.
-- `webrtc/observability.py`: epoch-scoped CRDT reducers, coherent facet/source
-  revisions, consistency diagnostics.
-- `webrtc/state_facets.py`: derive facets from commits; remove duplicated state
-  authority and compatibility emitters at the end.
-- `webrtc/performance.py`: compile execution plus observation policy, automatic
-  async offload, immutable worker delta collection.
-- `webrtc/peer_connection.py`: peer/signaling runners, readiness joins,
-  Runtime-owned close and media lane.
-- `webrtc/peer_components.py`: attachment/log/queue machines and owned pumps.
-- `webrtc/ice/agent.py`: gatherer/agent/pair/controller runners and registries.
-- `webrtc/ice/net/udp_mux.py`: mux/binding/queue lifecycle and callback ingress.
-- `webrtc/dtls/fsm.py`: internal handshake-phase runner and owned timers.
-- `webrtc/dtls/dtlstransport.py`: public DTLS lifecycle, bounded ingestion,
-  SRTP child readiness.
-- `webrtc/srtp/session.py`: session/stream machines, loop-owned stream map,
-  ordered crypto result delivery.
-- `webrtc/transceiver.py`: transceiver/sender/receiver/track machines.
-- `webrtc/media/*`: immutable worker inputs/results, pipeline ownership, bounded
-  queue integration; keep stateless parsers/helpers out of machine catalog.
-- `webrtc/tracing/*`: schema-2 consistency checks and compact summary sourcing.
-- `tests/*`: unit, lifecycle, ownership, convergence, failure, and deterministic
-  checkpoint coverage.
-- `tests/performance/*`: throughput, latency, allocation, trace-overhead, and
-  overload gates.
+- Replace every state-related `await asyncio.sleep(0)` loop with a reply,
+  revision waiter, terminal future, task handle, or counter barrier.
+- Ensure notification is resolved after the authoritative change and on every
+  failure/cancellation path.
 
-## Test plan
+### P0: remove worker calls from the transition hot path
 
-### Machine contract tests
+- Stop translating queued/running counts into lifecycle transitions.
+- Keep coalesced counters and high-water metrics.
+- Keep only admission lifecycle (`accepting`, `closing`, `closed`) if needed.
+- Make metrics incapable of failing worker admission through `MailboxFull` or
+  an invalid lifecycle edge.
 
-- every declared state is reachable or explicitly terminal-only;
-- every valid edge commits once and increments revision once;
-- invalid, stale, duplicate, reordered, wrong-epoch, and wrong-loop operations
-  have specified outcomes and diagnostics;
-- cancellation at before/after/terminal checkpoints preserves invariants;
-- terminal commit occurs after children, timers, queues, and worker barriers;
-- mailbox close and overflow cannot strand a reply waiter.
+### P1: remove exact per-packet projection updates
 
-### Component tests
+- Coalesce queue depth and delivery counters by time, count, or threshold.
+- Publish high-water, drops, failures, and bounded diagnostics.
+- Keep packet processing independent of tracing availability.
 
-- peer offer/answer, dial/accept, renegotiation, protocol failure, concurrent
-  close, and close during connection;
-- ICE gather success/failure, delayed remote credentials, nomination,
-  disconnect/recheck, multiple pairs, controller failure, and DNS timeout;
-- DTLS loss/reorder/retransmit, client/server flights, invalid record,
-  certificate failure, duplicate start, and close mid-handshake;
-- SRTP initialization, ordered encrypt/decrypt, replay failure, SSRC admission
-  limit, close with worker result in flight, and key redaction;
-- transceiver direction changes, bind/unbind, sender/receiver stop, queue
-  overflow, codec worker failure, and media shutdown;
-- attachment/log drain start/stop races and bounded inbox behavior.
+### P1: retain only meaningful domain machines
 
-### Ownership tests
+Prioritize synchronous reducers for signaling, peer readiness, ICE pair/agent,
+selected transport, DTLS transport/phase, SRTP session admission, and
+transceiver negotiation. Fold queue, worker-load, attachment, media-send, and
+duplicated stream lifecycle machines into their existing owner primitives.
 
-- no component-created task, timer, executor future, socket transport, or worker
-  result remains after Runtime close;
-- a child cannot publish after owner epoch removal;
-- repeated `aclose` calls await one workflow;
-- Runtime rejects new work from `quiescing` onward;
-- failure propagation retains original exception and one causal transition
-  chain.
+### P1: move metadata out of components
 
-### CRDT and trace tests
+Components should emit a minimal domain event/snapshot. Runtime/observability
+should attach identity, epoch, timestamps, producer ordering and causal trace
+metadata. Retry identity and optimistic revision checks should be opt-in.
 
-- randomized duplicate/reorder/drop-then-resync streams converge to the same
-  snapshot;
-- transition/facet source revisions never conflict;
-- old-epoch updates cannot resurrect removed entities;
-- summary generation is deterministic from a snapshot;
-- the motivating trace becomes coherent: peer connected, ICE selected and
-  connected/completed, public DTLS connected with keys ready, internal DTLS
-  phase finished, transport ready, and media children active;
-- packet and media call volume changes aggregate counters but not machine or
-  facet cardinality.
+### P2: make state authoritative
 
-### Performance gates
+For each retained machine, list the exact fields protected by its commit and
+move them into one immutable snapshot. Reads and admission decisions must use
+that snapshot. Delete observational states that do not control behavior.
 
-Measure tracing disabled, tracing enabled without subscriber, and tracing with
-one normal plus one slow subscriber. Gate on:
+### P2: restore performance evidence
 
-- peer setup p50/p95/p99;
-- media packets/frames per second and end-to-end loss;
-- event-loop lag p95/p99;
-- CPU time and allocations per packet/frame;
-- worker queue time, utilization, and saturation;
-- machine transitions and patches per connection;
-- schema-2 records, patch bytes, journal depth, and resync count;
-- shutdown duration and remaining owned-work count.
+Restore or replace the deleted worker/mixed/full-peer benchmarks. Measure at
+least:
 
-Initial rule: a packet/frame load increase may raise aggregate counters, but it
-must not linearly raise machine transitions, state facets, UUID allocation, or
-transport patches. Final numeric budgets must be copied from the Stage 0
-baseline and checked into the existing performance baseline files.
+- process CPU and event-loop lag with tracing off and on;
+- worker calls/second with worker-state projection disabled/enabled;
+- state commands, commits, rejected commands, mailbox high-water, projection
+  merges, and producer-dot allocations;
+- runnable task count during steady media and shutdown;
+- SRTP/RTP packets per second with exact versus coalesced queue facets;
+- startup and close CPU with polling waiters removed.
 
-## Final acceptance criteria
+Use sampling profiles to confirm time in runner/checkpoint/projection code and
+event-loop scheduling. Do not treat reduced wall time from worker threads as
+proof of reduced process CPU.
 
-- The full peer-to-peer WebRTC run has an authoritative, causally linked state
-  machine graph from Runtime through peer, ICE, transport, DTLS, SRTP,
-  transceiver, and media terminal reconciliation.
-- Schema-2 snapshot and compact LLM summary contain no machine/facet
-  contradiction and no missing required lifecycle machine.
-- Peer reaches `connected` only after selected ICE transport and required
-  DTLS/SRTP readiness; shutdown reaches terminal states in dependency order.
-- Every long-lived task, worker submission, timer, queue pump, socket resource,
-  and close barrier is Runtime-owned and accounted for at shutdown.
-- Component state has one loop writer. Workers use immutable inputs/results and
-  cannot mutate component or observability stores.
-- No shared application mutex exists on normal transition, tracing, packet, or
-  media hot paths. Any retained lock is documented, outside authoritative
-  state, and justified by measurement or an external API contract.
-- All unannotated synchronous `ObservedComponent` operations invoked by async
-  component code are automatically and boundedly offloaded. Cheap machine
-  commits/accessors stay inline only as neutral runner primitives or explicit
-  loop callbacks outside automatic component wrapping.
-- CRDT projection converges under duplicate and reordered delivery, remains
-  epoch-safe, and never feeds merged state back into protocol behavior.
-- Packet/frame volume affects bounded aggregate statistics, not lifecycle
-  machine cardinality or per-call trace-node allocation.
-- Correctness, ownership, consistency, overload, failure-injection, resync, and
-  performance suites pass with no unexplained diagnostics.
+## Acceptance criteria for a future implementation
+
+- No state waiter polls with `asyncio.sleep(0)`.
+- Idle lifecycle observation creates no permanent task unless the owner needs a
+  command serializer.
+- A worker call does not create a lifecycle transition.
+- Packet enqueue/dequeue does not synchronously merge exact tracing facets.
+- Observability failure cannot terminate a committed protocol state owner.
+- Queue/transport/session “closed” state rejects new admission in the same
+  authoritative primitive.
+- Configuration changes do not appear as lifecycle self-transitions.
+- Each retained state has at least one protocol decision, admission rule, or
+  public WebRTC semantic that depends on it.
+- Local commands that cannot retry do not enter a dedupe cache.
+- Components do not construct producer dots, trace ordering, or projection
+  operations.
+- Full-peer tracing CPU overhead is measured against an unobserved baseline and
+  meets a checked-in budget.
+
+## Final assessment
+
+The current state machine is useful in a few places, especially signaling,
+ICE nomination, peer child-readiness, public DTLS readiness, and the DTLS
+handshake phase. The broad application of `AsyncStateMachineRunner` to queues,
+worker load, attachments, media-send status, UDP resources, and every media
+child is not justified by their behavior.
+
+The high CPU is not caused by an idle runner loop. It is caused by busy-yield
+polling plus high-frequency command/projection amplification, with the worker
+lane and exact packet queue facets as the most important steady-state suspects.
+The architectural remedy is to keep WebRTC domain states, make their reducers
+synchronous and authoritative, use async only for workflows that truly wait,
+and move retry/test/observability metadata out of the components.

@@ -120,6 +120,18 @@ def test_stage5_transceiver_configuration_has_one_exact_machine_authority():
             assert {item.source_revision for item in provenance} == {observed.revision}
             assert "_stopped" not in transceiver.__dict__
 
+            replacement = transceiver.negotiated_snapshot
+            replaced = await transceiver.apply_negotiated_snapshot(
+                replacement, expected_epoch=snapshot.epoch,
+                expected_revision=snapshot.revision,
+            )
+            assert replaced.revision == snapshot.revision + 2
+            assert all(
+                item.from_state != item.to_state
+                for item in runtime.projection.machines.transition_snapshots()
+                if item.entity_id == transceiver.entity_id
+            )
+
             await transceiver.aclose()
             assert runtime.projection.machines.get(transceiver.entity_id) is None
 
@@ -144,6 +156,8 @@ def test_stage5_media_send_lane_is_bounded_concurrent_and_reconciled():
                 await asyncio.sleep(0)
             assert dtls.max_in_flight == 2
             assert peer._media_send_mailbox.capacity == 32
+            assert peer.media_send_epoch == 1
+            assert "_media_send_runner" not in peer.__dict__
             assert "_media_send_lock" not in peer.__dict__
             dtls.release.set()
             assert await first == 5
@@ -154,6 +168,43 @@ def test_stage5_media_send_lane_is_bounded_concurrent_and_reconciled():
             facets = _facets(runtime, peer.media_send_entity_id)
             assert observed is None
             assert facets == {}
+
+    asyncio.run(scenario())
+
+
+def test_stage5_media_send_close_forgets_blocked_unadmitted_requests():
+    async def scenario():
+        peer = PeerConnection()
+        peer.gatherer = _Gatherer()
+        peer._ice_transport = _SelectedTransport()
+        dtls = _DtlsTransport()
+        peer._dtls_transport = dtls
+
+        async with Runtime(scope_id="stage5-media-close-race"):
+            await peer.__aenter__()
+            sends = [
+                asyncio.create_task(peer.send_rtp_packet(bytes([index])))
+                for index in range(44)
+            ]
+            for _ in range(100):
+                if peer._media_send_mailbox.depth == 32:
+                    break
+                await asyncio.sleep(0)
+            assert peer._media_send_mailbox.depth == 32
+
+            closing = asyncio.create_task(peer.aclose())
+            for _ in range(20):
+                if peer._media_send_mailbox.closed:
+                    break
+                await asyncio.sleep(0)
+            dtls.release.set()
+            await closing
+            await asyncio.gather(*sends, return_exceptions=True)
+
+            assert peer._media_send_requests == {}
+            assert peer._media_send_results == {}
+            assert peer._media_send_abandoned == set()
+            assert peer._media_send_next_commit == peer._media_send_submission_id + 1
 
     asyncio.run(scenario())
 

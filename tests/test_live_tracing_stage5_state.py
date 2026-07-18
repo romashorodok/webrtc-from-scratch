@@ -221,8 +221,8 @@ def test_worker_call_projects_worker_lane_without_exact_call_node():
             await asyncio.sleep(0)
             machine = runtime.projection.machines.get(runtime._worker_entity_id)
             assert machine is not None
-            assert machine.state == "idle"
-            assert machine.revision >= 2
+            assert machine.state == "accepting"
+            assert machine.revision == 0
             assert not any(
                 item["name"].endswith("serve") for item in runtime.trace_live_tree()
             )

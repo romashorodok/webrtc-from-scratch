@@ -123,7 +123,7 @@ def test_machine_specs_are_bounded_and_cover_required_owners():
         "dtls-handshake-phase", "srtp-session", "srtp-stream", "transport",
         "worker-lane",
         "transceiver", "rtp-sender", "rtp-receiver", "media-track",
-        "media-send", "attachment", "attachment-registry", "log-drain",
+        "attachment", "attachment-registry", "log-drain",
         "queue", "observability",
     } <= set(MACHINE_SPECS)
     assert {"dtls", "ice", "ice-candidate-pair", "ice-controller", "worker"}.isdisjoint(

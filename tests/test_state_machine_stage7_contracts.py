@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import inspect
 import threading
 from pathlib import Path
@@ -44,6 +45,39 @@ def test_stage7_has_no_project_lock_or_removed_compatibility_authority():
         if "create_task(" in source or "ensure_future(" in source
     }
     assert raw_task_sites <= {Path("webrtc/runtime_services.py")}
+
+
+def test_only_dtls_handshake_uses_async_runner_and_permanent_machine_task():
+    sources = _sources()
+    async_runner_classes = []
+    start_machine_calls = []
+    for path, source in sources.items():
+        relative = path.relative_to(ROOT)
+        tree = ast.parse(source, filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and any(
+                (
+                    isinstance(base, ast.Name)
+                    and base.id == "AsyncStateMachineRunner"
+                ) or (
+                    isinstance(base, ast.Subscript)
+                    and isinstance(base.value, ast.Name)
+                    and base.value.id == "AsyncStateMachineRunner"
+                )
+                for base in node.bases
+            ):
+                async_runner_classes.append((relative, node.name))
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "start_machine"
+            ):
+                start_machine_calls.append(relative)
+
+    assert async_runner_classes == [
+        (Path("webrtc/dtls/fsm.py"), "_HandshakePhaseRunner")
+    ]
+    assert start_machine_calls == [Path("webrtc/dtls/fsm.py")]
 
     raw_timer_sites = {
         path.relative_to(ROOT) for path, source in sources.items()

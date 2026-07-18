@@ -1,0 +1,26 @@
+{
+  "schema_version": 2,
+  "budget": {
+    "aggregate_tracing_cpu_overhead_percent_max": 5.0
+  },
+  "methodology": {
+    "clock": "time.process_time_ns",
+    "comparison": "median of five paired ratios",
+    "order": "alternating AB/BA after warmup",
+    "gc": "full collection before each sample, cyclic GC disabled during timed region",
+    "ci": "structural checks always; numeric budget on idle pinned performance workers",
+    "minimum_pairs": 5,
+    "profile": "normal mixed component CPU work; startup and shutdown excluded"
+  },
+  "required_evidence": [
+    "tracing_off", "tracing_on", "worker_projection_disabled",
+    "worker_projection_enabled", "state_counter_scope", "state_commands", "state_commits",
+    "rejected_commands", "mailbox_high_water", "projection_merges",
+    "activity_projection_updates",
+    "producer_dot_allocations", "packet_exact", "packet_coalesced",
+    "full_peer_tracing_off", "full_peer_tracing_on",
+    "full_peer_cpu_overhead_samples_percent", "full_peer_cpu_overhead_percent",
+    "runnable_tasks_steady", "runnable_tasks_after_shutdown",
+    "startup_cpu_ms", "close_cpu_ms", "polling_waiter_tasks"
+  ]
+}

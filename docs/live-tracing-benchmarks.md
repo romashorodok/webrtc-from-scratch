@@ -1,5 +1,38 @@
 # Live tracing performance benchmarks
 
+## State-machine refactoring evidence
+
+Stage 7 restores backend evidence with
+`tests/performance/state_machine_evidence.py`.  It reports process CPU and
+event-loop lag for tracing off/on, worker throughput with load projection
+disabled/enabled, state/projection counters, steady/shutdown task counts,
+exact-versus-coalesced SRTP/RTP queue throughput, and startup/close CPU.
+The paired full-peer profile constructs the real `PeerConnection` ownership
+graph, runs calibrated component work while all owners are active, and closes
+the graph. It is explicitly a lifecycle/mixed-work profile rather than a claim
+of steady network media. Packet rate remains an isolated deterministic profile
+so local network conditions do not contaminate its CPU comparison.
+State command/commit/rejection and mailbox high-water fields are explicitly
+scoped to an isolated Runtime lifecycle admission/rejection/close probe; they
+are not presented as packet-workload pressure. Activity projection updates and
+facet `merge_values` calls are reported as separate counters.
+
+```sh
+uv run python -m tests.performance.state_machine_evidence --calls 512 --pairs 5
+uv run python -m tests.performance.state_machine_evidence \
+  --calls 4096 --pairs 9 --packets 4096 --enforce-cpu --output /tmp/state-machine-perf.json
+uv run pytest -q tests/performance/test_state_machine_evidence.py
+```
+
+The checked-in budget is at most 5% aggregate tracing process-CPU overhead.
+The comparison uses warmed, alternating AB/BA pairs, pre-sample collections,
+a fixed cyclic-GC state, and the median of paired ratios. Normal CI enforces the schema and structural invariants, while an idle
+CPU-pinned performance worker runs `--enforce-cpu`; this avoids pretending that
+contended shared CI gives stable sub-5% timing evidence.  Reports retain every
+raw paired ratio.  Sampling profiles should be captured around the same command
+(for example `py-spy record --native -- ...`) and inspected for time in runner,
+checkpoint, projection, and event-loop scheduling code.
+
 Stage 0 establishes a repeatable measurement contract before tracing semantics
 change. The numeric budgets are intentionally provisional: normal tests enforce
 the result schema and bounded structural behavior, not machine-dependent timing.

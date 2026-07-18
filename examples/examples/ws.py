@@ -205,7 +205,7 @@ async def start_write_loop(
     execution: Runtime,
 ):
     worker = WebSocketMediaWorker(
-        execution, pc.media_send_entity_id, pc._media_send_runner.epoch,
+        execution, pc.media_send_entity_id, pc.media_send_epoch,
     )
     sender = pc._transceivers[0].sender
     if not sender:

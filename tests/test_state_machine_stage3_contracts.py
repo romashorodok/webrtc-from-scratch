@@ -17,6 +17,8 @@ from webrtc.peer_connection import ICEGatherer, ICETransport, PeerConnection
 from webrtc.ice.net.types import Address, LocalCandidate, Packet, RemoteCandidate
 from webrtc.ice.net.udp_mux import Interceptor, MultiUDPMux
 from webrtc.state_machine import TransitionCommit
+from webrtc.state_machine import TransitionController
+from webrtc.runtime_services import Borrowed
 
 
 class _FakeAgent:
@@ -45,6 +47,81 @@ class _FakeAgent:
 
     async def aclose_controllers(self) -> None:
         return None
+
+
+def test_controller_start_waits_for_receive_effect_not_machine_revision() -> None:
+    class Conn:
+        def __init__(self) -> None:
+            self.release = asyncio.Event()
+
+        def sendto(self, _data) -> None:
+            return None
+
+        async def recvfrom(self):
+            await self.release.wait()
+            raise RuntimeError("released")
+
+    class Mux:
+        def __init__(self, conn: Conn) -> None:
+            self.conn = conn
+
+        def intercept(self, _remote):
+            return self.conn
+
+    class Owner:
+        async def _controller_failed(self, error, commit):
+            del error, commit
+
+        async def _controller_nominated(self, transport, commit):
+            del transport, commit
+
+    async def scenario() -> None:
+        transition_controller = TransitionController(timeout=1)
+        transition_controller.pause_at(
+            "candidate-pair-controller", to_state="checking",
+            phase="after_commit",
+        )
+        async with Runtime(
+            scope_id="controller-receive-ready",
+            transition_controller=Borrowed(transition_controller),
+        ):
+            conn = Conn()
+            local_raw, remote_raw = CandidateBase(), CandidateBase()
+            local_raw.set_address("127.0.0.1")
+            local_raw.set_port(5000)
+            local_raw.set_priority(100)
+            remote_raw.set_address("127.0.0.2")
+            remote_raw.set_port(5001)
+            remote_raw.set_priority(90)
+            pair = CandidatePair(
+                "local", "local-password", "remote", "remote-password",
+                LocalCandidate(local_raw, Mux(conn)),
+                RemoteCandidate(remote_raw, conn),
+            )
+            snapshot = pair._runner.snapshot()
+            while snapshot.state != "waiting":
+                snapshot = await pair._runner.wait_for_revision(snapshot.revision)
+            registry = CandidatePairRegistry()
+            registry.append(pair)
+            controller = CandidatePairController(
+                pair, ControlledSelector(registry, 1), 1, owner=Owner(),
+            )
+
+            starting = asyncio.create_task(controller.start_managed())
+            checkpoint = await transition_controller.wait_until(
+                "candidate-pair-controller", "checking", phase="after_commit",
+            )
+            assert controller._runner.snapshot().state == "checking"
+            assert controller._receive_handle is None
+            assert not starting.done()
+
+            transition_controller.release(checkpoint.checkpoint_id)
+            handle = await asyncio.wait_for(starting, 1)
+            assert handle is controller._receive_handle
+            await controller.aclose()
+            await pair.aclose()
+
+    asyncio.run(scenario())
 
 
 def test_stage3_gather_is_one_runtime_owned_command_with_shared_completion() -> None:

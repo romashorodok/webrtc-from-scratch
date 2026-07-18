@@ -13,12 +13,11 @@ from typing import Any
 from .config import DebugConfig
 from .logger import get_logger
 from .machine_specs import MACHINE_SPECS
-from .observability import MachineTransitionOp
 from .performance import ObservedComponent, event_loop, performance, worker
 from .runtime_services import FailurePolicy, OwnedTaskHandle, ScopeState
 from .state_machine import (
-    AsyncStateMachineRunner, MachineCommand, PreparedTransition, ReplyPort,
-    StaleMachineAccess, TransitionCommit,
+    InlineStateMachineRunner, MachineCommand, PreparedTransition, ReplyPort,
+    StaleMachineAccess, SynchronousStateReducer, TransitionCommit,
 )
 
 _LOG_STOP = object()
@@ -34,7 +33,7 @@ class _Move:
     effect: object | None = None
 
 
-class _LifecycleRunner(AsyncStateMachineRunner[MachineCommand[_Move, TransitionCommit]]):
+class _LifecycleRunner(InlineStateMachineRunner):
     """Typed bounded runner used by Stage-6 auxiliary entities."""
 
     def __init__(self, runtime: Any, machine_type: str, entity_id: str, *, capacity: int = 16):
@@ -43,17 +42,8 @@ class _LifecycleRunner(AsyncStateMachineRunner[MachineCommand[_Move, TransitionC
             MACHINE_SPECS[machine_type], entity_id=entity_id,
             mailbox_capacity=capacity, dedupe_capacity=max(16, capacity * 2),
             controller=runtime.transition_controller,
-            transition_sink=self._project,
+            transition_sink=runtime.observe_transition,
         )
-
-    def _project(self, commit: TransitionCommit) -> None:
-        self.runtime.assert_owner_epoch(self.entity_id, self.epoch)
-        self.runtime.projection.transition(MachineTransitionOp(
-            commit.entity_id, commit.machine_type, commit.from_state,
-            commit.to_state, commit.epoch, commit.revision,
-            self.runtime.new_producer_dot(), cause_id=commit.cause,
-            monotonic_ns=commit.monotonic_ns,
-        ))
 
     async def step(self, command: MachineCommand[_Move, TransitionCommit]):
         if command.expected_epoch != self.epoch:
@@ -71,10 +61,7 @@ def _bind_runner(runtime: Any, machine_type: str, entity_id: str, *, capacity: i
     runtime.register_owner(entity_id, epoch=1)
     runtime.projection.machines.register(entity_id, MACHINE_SPECS[machine_type], epoch=1)
     runner = _LifecycleRunner(runtime, machine_type, entity_id, capacity=capacity)
-    handle = runtime.start_machine(
-        runner, owner_entity_id=entity_id, owner_epoch=1,
-        failure=FailurePolicy.REPORT,
-    )
+    handle = runner.activate(runtime, owner_entity_id=entity_id, owner_epoch=1)
     return runner, handle
 
 
@@ -83,7 +70,7 @@ def _command(runner: _LifecycleRunner, command_id: int, state: str, cause: str,
              effect: object | None = None) -> MachineCommand[_Move, TransitionCommit]:
     return MachineCommand(
         _LifecycleCommand.MOVE, command_id, runner.epoch, _Move(state, effect), reply,
-        expected_revision=None, producer_id=1, producer_seq=command_id,
+        expected_revision=None,
         cause_id=cause,
     )
 
@@ -134,13 +121,11 @@ class PeerEventInbox:
         runner = self._assert_bound()
         depth = len(self._items) + (self._terminal is not None)
         self.high_water = max(self.high_water, depth)
-        self._runtime.projection.merge_values(runner.entity_id, self._runtime.new_producer_dot(), {
+        self._runtime.observe_facets(runner.snapshot(), {
             "depth": depth, "admitted": self.admitted, "delivered": self.delivered,
             "rejected": self.rejected, "dropped": self.dropped,
             "high_water": self.high_water,
-        }, observer_meta=meta, source_entity_id=runner.entity_id,
-           source_epoch=runner.epoch, source_revision=runner.revision,
-           source_order=self._runtime.projection.new_facet_source_order())
+        }, observer_meta=meta)
 
     @property
     def closed(self) -> bool:
@@ -249,14 +234,12 @@ class PeerConnectionLogInbox:
     def _observe(self, meta="coalesced"):
         runner = self._assert_bound(); depth = self._queue.qsize()
         self.high_water = max(self.high_water, depth)
-        self._runtime.projection.merge_values(runner.entity_id, self._runtime.new_producer_dot(), {
+        self._runtime.observe_facets(runner.snapshot(), {
             "depth": depth, "high_water": self.high_water,
             "admitted": self.admitted, "delivered": self.delivered,
             "rejected": self.rejected, "dropped": self.dropped,
             "dropped_debug": self.dropped_debug,
-        }, observer_meta=meta, source_entity_id=runner.entity_id,
-           source_epoch=runner.epoch, source_revision=runner.revision,
-           source_order=self._runtime.projection.new_facet_source_order())
+        }, observer_meta=meta)
 
     def stop_intake(self):
         runner = self._assert_bound()
@@ -298,10 +281,14 @@ class PeerConnectionLogInbox:
 
     async def aclose(self):
         self.stop_intake(); self.drain_batch(self._queue.maxsize + 1)
-        while self._runner.state == "open" and not self._handle.done():
-            await asyncio.sleep(0)
-        while self._drain_requested and self._runner.state == "closing" and not self._handle.done():
-            await asyncio.sleep(0)
+        while not self._handle.done():
+            snapshot = self._runner.snapshot()
+            if snapshot.state != "open": break
+            await self._runner.wait_for_revision(snapshot.revision)
+        while self._drain_requested and not self._handle.done():
+            snapshot = self._runner.snapshot()
+            if snapshot.state != "closing": break
+            await self._runner.wait_for_revision(snapshot.revision)
         if self._runner.state == "closing":
             await _move(self._runner, self._next(), "drained", "log-queue-drained")
         if self._runner.state == "drained": await _move(self._runner, self._next(), "closed", "log-queue-close")
@@ -402,9 +389,7 @@ async def _call_optional(target, name):
 class _AttachmentEntry:
     identity: str
     target: Any
-    runner: _LifecycleRunner
-    handle: OwnedTaskHandle
-    command_id: int = 0
+    state: SynchronousStateReducer
     failure: BaseException | None = None
     work: OwnedTaskHandle | None = None
 
@@ -412,43 +397,55 @@ class _AttachmentEntry:
 class AttachmentController:
     def __init__(self, kind: str, *, capacity: int = 64):
         self.kind=kind; self.capacity=max(1,capacity)
-        self._runtime=self._runner=self._handle=None; self._entity_id=""
+        self._runtime=None; self._state=None; self._entity_id=""
         self._entries: dict[int,_AttachmentEntry]={}
         self._command_id=0; self._work:set[OwnedTaskHandle]=set()
         self._start_requested = False
 
     @event_loop
     def bind(self,runtime,entity_id):
-        if self._runner is not None: return
+        if self._state is not None: return
         self._runtime=runtime; self._entity_id=entity_id
-        self._runner,self._handle=_bind_runner(runtime,"attachment-registry",entity_id)
+        runtime.register_owner(entity_id, epoch=1)
+        runtime.projection.machines.register(
+            entity_id, MACHINE_SPECS["attachment-registry"], epoch=1
+        )
+        self._state = SynchronousStateReducer(
+            MACHINE_SPECS["attachment-registry"], entity_id=entity_id,
+            transition_sink=runtime.observe_transition,
+        )
 
     def _assert_bound(self):
-        if self._runner is None: raise RuntimeError("attachments must be Runtime-bound before mutation")
+        if self._state is None: raise RuntimeError("attachments must be Runtime-bound before mutation")
         self._runtime.assert_owner_epoch(self._entity_id,1)
 
     @event_loop
     def attach(self,attachment):
         self._assert_bound()
-        if self._runner.snapshot().state in {"closing", "closed"}:
+        if self._state.state in {"closing", "closed"}:
             raise RuntimeError(f"{self.kind} attachments are closing")
         key=id(attachment)
         if key in self._entries: raise ValueError("the same attachment object is already registered")
         if len(self._entries)>=self.capacity: raise OverflowError("attachment registry capacity exceeded")
         identity=uuid.uuid4().hex
         entity=f"{self._entity_id}:attachment:{identity}"
-        runner,handle=_bind_runner(self._runtime,"attachment",entity)
-        entry=_AttachmentEntry(identity,attachment,runner,handle)
+        self._runtime.projection.machines.register(
+            entity, MACHINE_SPECS["attachment"], epoch=1
+        )
+        state = SynchronousStateReducer(
+            MACHINE_SPECS["attachment"], entity_id=entity,
+            transition_sink=self._runtime.observe_transition,
+        )
+        entry=_AttachmentEntry(identity,attachment,state)
         self._entries[key]=entry
-        entry.command_id+=1
-        runner.try_submit(_command(runner,entry.command_id,"attached",f"{self.kind}-attach"))
+        state.transition("attached", cause=f"{self.kind}-attach")
         if self._start_requested: self._launch(entry)
         return attachment
 
     @event_loop
     def start(self):
         self._assert_bound()
-        if self._runner.snapshot().state in {"closing", "closed"}:
+        if self._state.state in {"closing", "closed"}:
             raise RuntimeError(f"{self.kind} attachments are closing")
         if not self._start_requested:
             self._start_requested = True
@@ -457,24 +454,22 @@ class AttachmentController:
 
     def _launch_registry_start(self):
         async def work():
-            if self._runner.state=="open": await _move(self._runner,self._next(),"starting",f"{self.kind}-start")
-            if self._runner.state=="starting": await _move(self._runner,self._next(),"active",f"{self.kind}-started")
+            if self._state.state=="open": self._state.transition("starting",cause=f"{self.kind}-start")
+            if self._state.state=="starting": self._state.transition("active",cause=f"{self.kind}-started")
         self._own(work,"attachment.registry.start")
 
     def _launch(self,entry):
         if entry.work is not None: return
         async def work():
-            while entry.runner.state == "detached":
-                await asyncio.sleep(0)
-            if entry.runner.state != "attached":
+            if entry.state.state != "attached":
                 return
-            await _move(entry.runner,self._entry_next(entry),"starting",f"{self.kind}-start")
+            entry.state.transition("starting",cause=f"{self.kind}-start")
             try: await _call_optional(entry.target,"start")
             except BaseException as error:
                 entry.failure=error
-                await _move(entry.runner,self._entry_next(entry),"failed",f"{self.kind}-start-failed")
+                entry.state.transition("failed",cause=f"{self.kind}-start-failed")
                 return
-            await _move(entry.runner,self._entry_next(entry),"active",f"{self.kind}-active")
+            entry.state.transition("active",cause=f"{self.kind}-active")
         entry.work = self._own(work,f"attachment.start:{entry.identity}")
 
     def _own(self,factory,name):
@@ -483,12 +478,9 @@ class AttachmentController:
         return handle
 
     def _next(self): self._command_id+=1; return self._command_id
-    @staticmethod
-    def _entry_next(entry): entry.command_id+=1; return entry.command_id
-
     async def aclose(self):
         self._assert_bound()
-        if self._runner.snapshot().state in {"closing", "closed"}:
+        if self._state.state in {"closing", "closed"}:
             for work in tuple(self._work):
                 try: await work.wait()
                 except BaseException: pass
@@ -496,22 +488,22 @@ class AttachmentController:
         for work in tuple(self._work):
             try: await work.wait()
             except BaseException: pass
-        if self._runner.state in {"open","starting","active","failed"}:
-            await _move(self._runner,self._next(),"closing",f"{self.kind}-close")
+        if self._state.state in {"open","starting","active","failed"}:
+            self._state.transition("closing",cause=f"{self.kind}-close")
         first_failure=None
         for entry in reversed(tuple(self._entries.values())):
-            if entry.runner.state in {"attached","starting","active","failed"}:
-                await _move(entry.runner,self._entry_next(entry),"stopping",f"{self.kind}-stop")
+            if entry.state.state in {"attached","starting","active","failed"}:
+                entry.state.transition("stopping",cause=f"{self.kind}-stop")
             try:
                 await _call_optional(entry.target,"stop")
                 if not await _call_optional(entry.target,"aclose"): await _call_optional(entry.target,"close")
             except BaseException as error:
                 if first_failure is None: first_failure=error
-            if entry.runner.state=="stopping": await _move(entry.runner,self._entry_next(entry),"stopped",f"{self.kind}-stopped")
-            await entry.handle.wait(); self._runtime.remove_owner(entry.runner.entity_id,1)
+            if entry.state.state=="stopping": entry.state.transition("stopped",cause=f"{self.kind}-stopped")
+            self._runtime.projection.terminate_entity_epoch(entry.state.entity_id, 1)
             if first_failure is None and entry.failure is not None: first_failure=entry.failure
-        if self._runner.state=="closing": await _move(self._runner,self._next(),"closed",f"{self.kind}-closed")
-        await self._handle.wait(); self._runtime.remove_owner(self._entity_id,1)
+        if self._state.state=="closing": self._state.transition("closed",cause=f"{self.kind}-closed")
+        self._runtime.remove_owner(self._entity_id,1)
         if first_failure is not None: raise first_failure
 
 

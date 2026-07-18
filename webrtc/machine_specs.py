@@ -23,7 +23,7 @@ MACHINE_SPECS = MappingProxyType({
     "peer": _spec("peer", "new", {
         "new": {"starting", "closing"},
         "starting": {"negotiating", "failed", "closing"},
-        "negotiating": {"negotiating", "connecting", "failed", "closing"},
+        "negotiating": {"connecting", "failed", "closing"},
         "connecting": {"connected", "failed", "closing"},
         "connected": {"negotiating", "failed", "closing"},
         "failed": {"closing"},
@@ -101,17 +101,14 @@ MACHINE_SPECS = MappingProxyType({
         "ready": {"draining", "failed"},
         "failed": {"draining"}, "draining": {"closed"}, "closed": set(),
     }, {"closed"}, {"cancel_owner"}),
-    "worker-lane": _spec("worker-lane", "idle", {
-        "idle": {"queued", "closing"},
-        "queued": {"running", "idle", "closing"},
-        "running": {"idle", "failed", "closing"},
-        "failed": {"idle", "closing"},
+    "worker-lane": _spec("worker-lane", "accepting", {
+        "accepting": {"closing"},
         "closing": {"closed"}, "closed": set(),
     }, {"closed"}, {"cancel_owner", "inject_failure"}),
     "transceiver": _spec("transceiver", "inactive", {
         "inactive": {"negotiating", "stopping", "failed"},
         "negotiating": {"active", "inactive", "failed", "stopping"},
-        "active": {"active", "negotiating", "inactive", "stopping", "failed"},
+        "active": {"negotiating", "inactive", "stopping", "failed"},
         "stopping": {"stopped"}, "failed": {"stopping", "stopped"}, "stopped": set(),
     }, {"stopped"}, {"cancel_owner"}),
     "rtp-sender": _spec("rtp-sender", "new", {
@@ -132,10 +129,6 @@ MACHINE_SPECS = MappingProxyType({
         "new": {"live", "ended"}, "live": {"muted", "ended", "failed"},
         "muted": {"live", "ended", "failed"}, "failed": {"ended"}, "ended": set(),
     }, {"ended"}, {"cancel_owner"}),
-    "media-send": _spec("media-send", "new", {
-        "new": {"active", "closed"}, "active": {"draining", "failed"},
-        "failed": {"draining"}, "draining": {"closed"}, "closed": set(),
-    }, {"closed"}, {"cancel_owner", "inject_failure"}),
     "media": _spec("media", "inactive", {
         "inactive": {"active", "ended"}, "active": {"muted", "inactive", "ended", "failed"},
         "muted": {"active", "inactive", "ended"}, "failed": {"ended"}, "ended": set(),

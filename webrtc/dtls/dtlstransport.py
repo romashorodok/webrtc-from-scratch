@@ -30,9 +30,8 @@ from webrtc.runtime_services import (
 )
 from webrtc.machine_specs import MACHINE_SPECS
 from webrtc.queue_machine import RuntimeOwnedQueue
-from webrtc.observability import MachineTransitionOp
 from webrtc.state_machine import (
-    AsyncStateMachineRunner, MachineCommand, PreparedTransition, ReplyPort,
+    InlineStateMachineRunner, MachineCommand, PreparedTransition, ReplyPort,
     TransitionCommit,
 )
 from webrtc.lifecycle import (
@@ -55,6 +54,12 @@ class _TransportCommandKind(Enum):
     CLOSE = "close"
 
 
+class DTLSRole(Enum):
+    Auto = "auto"
+    Server = "server"
+    Client = "client"
+
+
 @dataclass(frozen=True, slots=True)
 class _StartPayload:
     role: "DTLSRole"
@@ -62,7 +67,31 @@ class _StartPayload:
     completion: ReplyPort[TransitionCommit]
 
 
-class _DTLSTransportRunner(AsyncStateMachineRunner[MachineCommand[Any, Any]]):
+@dataclass(frozen=True, slots=True)
+class DTLSTransportSnapshot:
+    """Authoritative DTLS binding and media-admission readiness."""
+
+    revision: int = 0
+    state: str = "new"
+    role: DTLSRole = DTLSRole.Auto
+    transport: "ice.CandidatePairTransport | None" = None
+    selected_pair_id: str | None = None
+    handshake_ready: bool = False
+    srtp_rtp_revision: int | None = None
+    srtp_rtcp_revision: int | None = None
+
+    @property
+    def media_ready(self) -> bool:
+        return (
+            self.state == "connected"
+            and self.handshake_ready
+            and self.transport is not None
+            and self.srtp_rtp_revision is not None
+            and self.srtp_rtcp_revision is not None
+        )
+
+
+class _DTLSTransportRunner(InlineStateMachineRunner):
     def __init__(self, owner: "DTLSTransport", **kwargs: Any) -> None:
         self.owner = owner
         super().__init__(MACHINE_SPECS["dtls-transport"], **kwargs)
@@ -108,15 +137,12 @@ class _DTLSTransportRunner(AsyncStateMachineRunner[MachineCommand[Any, Any]]):
                 preserve_handshake=self.owner._srtp_rtcp is not None
                 or self.owner._srtp_rtp is not None
             )
+        self.owner._commit_authority(commit, effects)
+        if commit.to_state == "connected":
+            self.owner._launch_media_receive_pumps()
 
     async def reconcile_terminal(self, prepared: PreparedTransition[Any]) -> None:
         await self.owner._reconcile_terminal()
-
-
-class DTLSRole(Enum):
-    Auto = "auto"
-    Server = "server"
-    Client = "client"
 
 
 class ICETransportDTLS(Protocol):
@@ -191,6 +217,7 @@ class DTLSTransport(ObservedComponent):
         self.__dtls_conn: DTLSConn | None = None
         self.__role: DTLSRole = DTLSRole.Auto
         self.__transport: ice.CandidatePairTransport | None = None
+        self._authority = DTLSTransportSnapshot(role=DTLSRole.Auto)
 
         self.__handshake_reconstructor = HandshakeReconstructor()
 
@@ -226,7 +253,8 @@ class DTLSTransport(ObservedComponent):
         self._runner = _DTLSTransportRunner(
             self, entity_id=self.entity_id, mailbox_capacity=16,
             controller=getattr(scope, "transition_controller", None),
-            transition_sink=self._project_transition,
+            transition_sink=(self._runtime.observe_transition
+                             if self._runtime is not None else None),
         )
         projection = getattr(scope, "projection", None)
         if projection is not None:
@@ -235,8 +263,8 @@ class DTLSTransport(ObservedComponent):
             )
         if self._runtime is not None:
             self._runtime.register_owner(self.entity_id, epoch=self._runner.epoch)
-            self._machine_handle = self._runtime.start_machine(
-                self._runner, owner_entity_id=self.entity_id,
+            self._machine_handle = self._runner.activate(
+                self._runtime, owner_entity_id=self.entity_id,
                 owner_epoch=self._runner.epoch,
             )
             self.__bind_worker_owner__(
@@ -251,26 +279,43 @@ class DTLSTransport(ObservedComponent):
         self._command_id += 1
         return MachineCommand(
             kind, self._command_id, self._runner.epoch, payload, reply,
-            expected_revision=self._runner.revision,
         )
-
-    @event_loop
-    def _project_transition(self, committed: TransitionCommit) -> None:
-        scope = current_execution_scope()
-        projection = getattr(scope, "projection", None)
-        if (projection is None or scope is None
-                or not getattr(scope, "tracing_enabled", True)):
-            return
-        projection.machines.apply(MachineTransitionOp(
-            committed.entity_id, committed.machine_type,
-            committed.from_state, committed.to_state, committed.epoch,
-            committed.revision, scope.new_producer_dot(), None,
-            committed.monotonic_ns,
-        ))
 
     @event_loop
     def _set_bound_transport(self, transport: ice.CandidatePairTransport) -> None:
         self.__transport = transport
+
+    @event_loop
+    def authoritative_snapshot(self) -> DTLSTransportSnapshot:
+        return self._authority
+
+    @event_loop
+    def _commit_authority(self, commit: TransitionCommit, effects: Any) -> None:
+        current = self._authority
+        role = current.role
+        transport = current.transport
+        if commit.to_state == "binding":
+            transport = effects
+        elif commit.to_state == "connecting":
+            role = effects.role
+            transport = effects.transport
+        if commit.to_state in {"failed", "closed"}:
+            transport = None
+        rtp = self._srtp_rtp.lifecycle_snapshot() if self._srtp_rtp else None
+        rtcp = self._srtp_rtcp.lifecycle_snapshot() if self._srtp_rtcp else None
+        self._authority = DTLSTransportSnapshot(
+            revision=commit.revision,
+            state=commit.to_state,
+            role=role,
+            transport=transport,
+            selected_pair_id=(
+                getattr(transport, "entity_id", f"candidate-pair:{id(transport)}")
+                if transport is not None else None
+            ),
+            handshake_ready=commit.to_state == "connected",
+            srtp_rtp_revision=(rtp.revision if rtp and rtp.state == "ready" else None),
+            srtp_rtcp_revision=(rtcp.revision if rtcp and rtcp.state == "ready" else None),
+        )
 
     @event_loop
     def _begin_start(
@@ -347,18 +392,34 @@ class DTLSTransport(ObservedComponent):
     def _mark_handshake_connected(self) -> None:
         self._require_connected_readiness()
         scope = current_execution_scope()
-        projection = getattr(scope, "projection", None)
-        if projection is not None and getattr(scope, "tracing_enabled", True):
-            projection.merge_values(
-                self.entity_id, scope.new_producer_dot(), {
+        if scope is not None and getattr(scope, "tracing_enabled", True):
+            scope.observe_facets(
+                self._runner.snapshot(), {
                     "srtp_keys_ready": True,
                     "srtp_rtp_ready": True,
                     "srtp_rtcp_ready": True,
                 },
-                observer_meta="exact", source_entity_id=self.entity_id,
-                source_epoch=self._runner.epoch,
-                source_revision=self._runner.revision,
-                source_order=projection.new_facet_source_order(),
+                observer_meta="exact",
+            )
+
+    @event_loop
+    def _launch_media_receive_pumps(self) -> None:
+        """Start media ingress only after connected authority is published."""
+        if self._runtime is None:
+            raise RuntimeError("SRTP receive pumps require an active Runtime")
+        if self._rtp_handle is None:
+            self._rtp_handle = self._runtime.start_pump(
+                self._rtp_receive_loop,
+                owner_entity_id=self.entity_id, owner_epoch=self._runner.epoch,
+                name="dtls:rtp-receive-loop", kind="dtls",
+                failure=FailurePolicy.FAIL_CONNECTION,
+            )
+        if self._rtcp_handle is None:
+            self._rtcp_handle = self._runtime.start_pump(
+                self._rtcp_receive_loop,
+                owner_entity_id=self.entity_id, owner_epoch=self._runner.epoch,
+                name="dtls:rtcp-receive-loop", kind="dtls",
+                failure=FailurePolicy.FAIL_CONNECTION,
             )
 
     @event_loop
@@ -419,7 +480,7 @@ class DTLSTransport(ObservedComponent):
         perf_mark("dtls", "role", "selected", metadata={"role": role.value})
 
         # Bind transport if provided
-        selected_transport = transport or self.__transport
+        selected_transport = transport or self._authority.transport
         if not selected_transport:
             wlogger.error(Component.DTLS, "No transport bound - cannot start DTLS handshake")
             perf_mark(
@@ -538,21 +599,6 @@ class DTLSTransport(ObservedComponent):
             wlogger.debug(Component.DTLS, "RTCP SRTP session created")
 
             wlogger.info(Component.DTLS, "SRTP sessions initialized")
-
-            if self._runtime is None:
-                raise RuntimeError("SRTP receive pumps require an active Runtime")
-            self._rtp_handle = self._runtime.start_pump(
-                self._rtp_receive_loop,
-                owner_entity_id=self.entity_id, owner_epoch=self._runner.epoch,
-                name="dtls:rtp-receive-loop", kind="dtls",
-                failure=FailurePolicy.FAIL_CONNECTION,
-            )
-            self._rtcp_handle = self._runtime.start_pump(
-                self._rtcp_receive_loop,
-                owner_entity_id=self.entity_id, owner_epoch=self._runner.epoch,
-                name="dtls:rtcp-receive-loop", kind="dtls",
-                failure=FailurePolicy.FAIL_CONNECTION,
-            )
 
         except Exception as e:
             wlogger.error(Component.DTLS, "Failed to initialize SRTP", error=str(e))
@@ -675,9 +721,18 @@ class DTLSTransport(ObservedComponent):
 
     @event_loop
     def _srtp_ready(self) -> bool:
+        authority = getattr(self, "_authority", None)
+        if authority is None:  # lightweight protocol test doubles
+            return self._srtp_rtp is not None and self._srtp_rtcp is not None
+        if not authority.media_ready or self._srtp_rtp is None or self._srtp_rtcp is None:
+            return False
+        rtp = self._srtp_rtp.admission_snapshot()
+        rtcp = self._srtp_rtcp.admission_snapshot()
         return (
-            self._srtp_rtp is not None
-            and self._srtp_rtcp is not None
+            rtp.accepting_packets
+            and rtcp.accepting_packets
+            and rtp.revision == authority.srtp_rtp_revision
+            and rtcp.revision == authority.srtp_rtcp_revision
         )
 
     async def wait(self, condition: TransportCondition, timeout: float) -> None:
@@ -721,26 +776,28 @@ class DTLSTransport(ObservedComponent):
 
     async def encrypt_rtp_bytes(self, data: bytes) -> bytes:
         """Encrypt RTP packet using SRTP (synchronous)."""
-        if srtp := self._srtp_rtp:
+        if self._srtp_ready() and (srtp := self._srtp_rtp):
             return await srtp.encrypt(data)
-        raise ValueError("SRTP not initialized")
+        raise RuntimeError("DTLS media admission is not ready")
 
     async def encrypt_rtcp_bytes(self, data: bytes) -> bytes:
         """Encrypt RTCP packet using SRTP (synchronous)."""
-        if srtp := self._srtp_rtcp:
+        if self._srtp_ready() and (srtp := self._srtp_rtcp):
             return await srtp.encrypt(data)
-        raise ValueError("SRTP not initialized")
+        raise RuntimeError("DTLS media admission is not ready")
 
     async def write_rtcp_bytes(self, data: bytes) -> int:
         """Write RTCP packet (encrypted via SRTP) and send to network."""
         await self.wait(TransportCondition.SRTP_READY, 30.0)
-        if not self._srtp_rtcp or not self.__transport:
+        authority = self._authority
+        if not self._srtp_ready() or not self._srtp_rtcp:
             return 0
         try:
             # Encrypt synchronously (Rust crypto is fast)
             encrypted = await self._srtp_rtcp.encrypt(data)
             # Send via ICE transport
-            self.__transport.sendto(encrypted)
+            assert authority.transport is not None
+            authority.transport.sendto(encrypted)
             return len(encrypted)
         except Exception as e:
             get_logger().error(Component.DTLS, "Failed to send RTCP", error=str(e))
@@ -749,17 +806,19 @@ class DTLSTransport(ObservedComponent):
     async def write_rtp_bytes(self, data: bytes) -> int:
         """Write RTP packet (encrypted via SRTP) and send to network."""
         await self.wait(TransportCondition.SRTP_READY, 30.0)
-        if not self._srtp_rtp or not self.__transport:
+        authority = self._authority
+        if not self._srtp_ready() or not self._srtp_rtp:
             wlogger = get_logger()
             wlogger.trace(Component.DTLS, "write_rtp_bytes skipped",
                         srtp_ready=self._srtp_rtp is not None,
-                        transport_ready=self.__transport is not None)
+                        transport_ready=authority.transport is not None)
             return 0
         try:
             # Encrypt synchronously (Rust crypto is fast)
             encrypted = await self._srtp_rtp.encrypt(data)
             # Send via ICE transport
-            self.__transport.sendto(encrypted)
+            assert authority.transport is not None
+            authority.transport.sendto(encrypted)
             return len(encrypted)
         except Exception as e:
             wlogger = get_logger()
@@ -785,7 +844,8 @@ class DTLSTransport(ObservedComponent):
         wlogger = get_logger()
         config = get_config()
 
-        if not self.__transport:
+        transport = self._authority.transport
+        if transport is None or not self._srtp_ready():
             wlogger.error(Component.DTLS, "No transport for RTP receive loop")
             return
 
@@ -796,7 +856,7 @@ class DTLSTransport(ObservedComponent):
 
         while True:
             try:
-                packet = await self.__transport.recv_rtp()
+                packet = await transport.recv_rtp()
                 rtp_packet_count += 1
 
                 # Parse packet info for logging
@@ -845,14 +905,15 @@ class DTLSTransport(ObservedComponent):
     async def _rtcp_receive_loop(self):
         """Internal loop that reads RTCP from ICE and routes to SRTP streams."""
         wlogger = get_logger()
-        if not self.__transport:
+        transport = self._authority.transport
+        if transport is None or not self._srtp_ready():
             wlogger.error(Component.DTLS, "No transport for RTCP receive loop")
             return
 
         wlogger.info(Component.DTLS, "RTCP receive loop started")
         while True:
             try:
-                packet = await self.__transport.recv_rtcp()
+                packet = await transport.recv_rtcp()
                 if self._srtp_rtcp:
                     await self._srtp_rtcp.write_incoming(packet.data)
             except Exception as e:

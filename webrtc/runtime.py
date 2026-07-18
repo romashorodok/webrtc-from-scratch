@@ -4,7 +4,7 @@ import asyncio
 import time
 import uuid
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import Executor
 from typing import Any, TypeVar, cast
 
@@ -46,7 +46,7 @@ from .tracing.events import JournalSubscription, ObservableDiagnostics, TracePat
 from .activity import ActivityGroupStore, DrainedMetricSinkAdapter
 from .observability import MachineTransitionOp, ObservabilityService, ProducerDot
 from .state_machine import (
-    AsyncStateMachineRunner, MachineCommand, NullTransitionController,
+    InlineStateMachineRunner, MachineCommand, NullTransitionController,
     PreparedTransition, ReplyPort, TransitionCommit,
 )
 from .state_facets import AggregateFacetAdapter
@@ -62,7 +62,7 @@ class _NullMetricSink:
 
 
 class _ObservabilityRunner(
-    AsyncStateMachineRunner[MachineCommand[str, TransitionCommit]]
+    InlineStateMachineRunner
 ):
     """The sole lifecycle authority for schema-2 observation."""
 
@@ -72,7 +72,7 @@ class _ObservabilityRunner(
             MACHINE_SPECS["observability"], entity_id=entity_id,
             mailbox_capacity=16, dedupe_capacity=32,
             controller=runtime.transition_controller,
-            transition_sink=self._project,
+            transition_sink=runtime.observe_transition,
         )
 
     async def step(self, command: MachineCommand[str, TransitionCommit]):
@@ -81,18 +81,8 @@ class _ObservabilityRunner(
             command.expected_epoch, command.expected_revision,
         )
 
-    def _project(self, commit: TransitionCommit) -> None:
-        self.runtime.assert_owner_epoch(self.entity_id, self.epoch)
-        self.runtime.projection.transition(MachineTransitionOp(
-            commit.entity_id, commit.machine_type, commit.from_state,
-            commit.to_state, commit.epoch, commit.revision,
-            self.runtime.new_producer_dot(), cause_id=commit.cause,
-            monotonic_ns=commit.monotonic_ns,
-        ))
-
-
 class _LifecycleRunner(
-    AsyncStateMachineRunner[MachineCommand[str, TransitionCommit]]
+    InlineStateMachineRunner
 ):
     """Typed lifecycle authority used by Runtime and its worker lane."""
 
@@ -102,7 +92,7 @@ class _LifecycleRunner(
             MACHINE_SPECS[machine_type], entity_id=entity_id,
             mailbox_capacity=32, dedupe_capacity=64,
             controller=runtime.transition_controller,
-            transition_sink=self._project,
+            transition_sink=runtime.observe_transition,
         )
 
     async def step(self, command: MachineCommand[str, TransitionCommit]):
@@ -110,18 +100,6 @@ class _LifecycleRunner(
             self.state, command.payload, None, command.cause_id,
             command.expected_epoch, command.expected_revision,
         )
-
-    def _project(self, commit: TransitionCommit) -> None:
-        self.runtime.assert_owner_epoch(self.entity_id, self.epoch)
-        self.runtime.projection.transition(MachineTransitionOp(
-            commit.entity_id, commit.machine_type, commit.from_state,
-            commit.to_state, commit.epoch, commit.revision,
-            self.runtime.new_producer_dot(), cause_id=commit.cause,
-            monotonic_ns=commit.monotonic_ns,
-        ))
-        if commit.machine_type == "worker-lane":
-            self.runtime._publish_worker_facets(commit.revision)
-
 
 class RuntimeObservability:
     """Scoped query/cancellation surface owned by one Runtime."""
@@ -342,7 +320,7 @@ class Runtime(ExecutionScope):
         )
         self._worker_handle: OwnedTaskHandle[None] | None = None
         self._worker_command_id = 0
-        self._worker_desired_state = "idle"
+        self._worker_facets_pending = False
         self.worker_lane.set_lifecycle_state(
             lambda: self._worker_runner.snapshot().state
         )
@@ -369,30 +347,44 @@ class Runtime(ExecutionScope):
             self._runtime_command_id += 1
             command_id = self._runtime_command_id
         reply = ReplyPort[TransitionCommit]()
-        runner.try_submit(MachineCommand(
+        command = MachineCommand(
             "move", command_id, runner.epoch, target, reply,
-            expected_revision=runner.revision,
             cause_id=f"{runner.entity_id}:{target}:{command_id}",
-        ))
+        )
+        await runner.apply_command(command)
         return await reply.wait()
 
     def _worker_state_changed(
         self, *, queued: int, running: int, high_water: int
     ) -> None:
+        # Load is a metric, not a lifecycle state. Coalesce all changes made in
+        # one event-loop turn and keep the worker admission path independent of
+        # the lifecycle mailbox and projection availability.
+        del queued, running, high_water
+        if self._worker_handle is None or self._worker_runner.snapshot().terminal:
+            return
+        if self._worker_facets_pending:
+            return
+        loop = self._event_loop
+        if loop is None or loop.is_closed():
+            return
+        self._worker_facets_pending = True
+        loop.call_soon(self._flush_worker_facets)
+
+    def _flush_worker_facets(self) -> None:
+        self._worker_facets_pending = False
         runner = self._worker_runner
         if self._worker_handle is None or runner.snapshot().terminal:
             return
-        target = "running" if running else "queued" if queued else "idle"
-        if target != self._worker_desired_state:
-            self._worker_desired_state = target
-            self._worker_command_id += 1
-            runner.try_submit(MachineCommand(
-                "move", self._worker_command_id, runner.epoch, target, None,
-                expected_revision=None,
-                cause_id=f"{runner.entity_id}:work:{self._worker_command_id}",
-            ))
-        elif runner.snapshot().state == target:
+        try:
             self._publish_worker_facets(runner.revision)
+        except Exception:
+            # Metrics are best effort and must never fail worker execution.
+            # Do not notify observability about this counter: its dirty callback
+            # publishes facets and would recursively re-enter the projection
+            # that just failed.
+            with self.diagnostics.suspend_notifications():
+                self.diagnostics["worker_facet_publish_failures"] += 1
 
     def _publish_worker_facets(self, revision: int) -> None:
         queued, running, high_water = self.worker_lane.load_snapshot()
@@ -401,7 +393,7 @@ class Runtime(ExecutionScope):
                 "queued": queued, "running": running,
                 "high_water": high_water, "lane_kind": "concurrent",
             },
-            observer_meta="exact", source_entity_id=self._worker_entity_id,
+            observer_meta="aggregate", source_entity_id=self._worker_entity_id,
             source_epoch=self._worker_runner.epoch, source_revision=revision,
             source_order=self.projection.new_facet_source_order(),
         )
@@ -410,6 +402,90 @@ class Runtime(ExecutionScope):
         """Return the next dot for the Runtime's event-loop-owned producer."""
         self._producer_sequence += 1
         return ProducerDot(self.runtime_epoch, 1, self._producer_sequence)
+
+    def observe_transition(self, commit: TransitionCommit) -> None:
+        """Attach Runtime-owned observation metadata to a domain transition.
+
+        Protocol components only emit the committed edge. Entity epoch
+        validation, producer ordering, timestamp forwarding and projection
+        encoding live at this boundary. Projection failures are diagnostics;
+        they cannot roll back or terminate the already-committed owner.
+        """
+        try:
+            # Some synchronous domain reducers are projection-owned but do
+            # not own Runtime children. Validate epochs for registered task
+            # owners without forcing every small reducer into that registry.
+            if commit.entity_id in self._owner_epochs:
+                self.assert_owner_epoch(commit.entity_id, commit.epoch)
+            self.projection.transition(MachineTransitionOp(
+                commit.entity_id, commit.machine_type, commit.from_state,
+                commit.to_state, commit.epoch, commit.revision,
+                self.new_producer_dot(), cause_id=commit.cause,
+                monotonic_ns=time.monotonic_ns(),
+            ))
+        except Exception:
+            with self.diagnostics.suspend_notifications():
+                self.diagnostics["transition_observation_failures"] += 1
+
+    def observe_facets(
+        self,
+        source: Any,
+        values: Mapping[str, Any],
+        *,
+        owner_entity_id: str | None = None,
+        observer_meta: str = "exact",
+        failure_diagnostic: str = "facet_observation_failures",
+    ) -> None:
+        """Attach projection identity and ordering to a domain facet snapshot.
+
+        Components provide only values plus the authoritative snapshot/commit
+        they describe. Runtime owns producer dots, source order and failure
+        isolation, just as it does for lifecycle transitions.
+        """
+        try:
+            source_entity_id = source.entity_id
+            source_epoch = source.epoch
+            source_revision = source.revision
+            self.projection.merge_values(
+                owner_entity_id or source_entity_id,
+                self.new_producer_dot(),
+                values,
+                observer_meta=observer_meta,
+                source_entity_id=source_entity_id,
+                source_epoch=source_epoch,
+                source_revision=source_revision,
+                source_order=self.projection.new_facet_source_order(),
+            )
+        except Exception:
+            with self.diagnostics.suspend_notifications():
+                self.diagnostics[failure_diagnostic] += 1
+
+    def transition_observer(
+        self,
+        facet_values: Callable[[TransitionCommit], Mapping[str, Any] | None] | None = None,
+        *,
+        owner_entity_id: str | None = None,
+        observer_meta: str = "exact",
+        failure_diagnostic: str = "facet_observation_failures",
+    ) -> Callable[[TransitionCommit], None]:
+        """Build a Runtime-owned sink for an optional domain snapshot factory."""
+        def observe(commit: TransitionCommit) -> None:
+            self.observe_transition(commit)
+            if facet_values is None:
+                return
+            try:
+                values = facet_values(commit)
+            except Exception:
+                with self.diagnostics.suspend_notifications():
+                    self.diagnostics["facet_snapshot_failures"] += 1
+                return
+            if values is not None:
+                self.observe_facets(
+                    commit, values, owner_entity_id=owner_entity_id,
+                    observer_meta=observer_meta,
+                    failure_diagnostic=failure_diagnostic,
+                )
+        return observe
 
     def record_queue_state(self, **values: Any) -> None:
         self._assert_loop()
@@ -432,11 +508,10 @@ class Runtime(ExecutionScope):
         reply = ReplyPort[TransitionCommit]()
         command = MachineCommand(
             "move", self._observability_command_id, self.observability_epoch,
-            state, reply, expected_revision=self._observability_runner.revision,
-            producer_id=1, producer_seq=self._observability_command_id,
+            state, reply,
             cause_id=cause_id,
         )
-        await self._observability_runner.submit(command)
+        await self._observability_runner.apply_command(command)
         return await reply.wait()
 
     async def _reconcile_observability_health(self) -> None:
@@ -560,18 +635,14 @@ class Runtime(ExecutionScope):
             self.projection.machines.register(
                 runner.entity_id, runner.spec, epoch=runner.epoch,
             )
-        runtime_task = self.task_scheduler.spawn_factory(
-            self._runtime_runner.run, name="machine:runtime", kind="machine",
-            scope_id=self.scope_id, cancelable=False,
-        )
-        self._runtime_handle = OwnedTaskHandle(
-            runtime_task, owner_entity_id=self._runtime_entity_id,
+        self._runtime_handle = self._runtime_runner.activate(
+            self, owner_entity_id=self._runtime_entity_id,
             owner_epoch=self._runtime_runner.epoch,
         )
         await self._move_lifecycle(self._runtime_runner, "starting")
         await self._move_lifecycle(self._runtime_runner, "active")
-        self._worker_handle = self.start_machine(
-            self._worker_runner, owner_entity_id=self._worker_entity_id,
+        self._worker_handle = self._worker_runner.activate(
+            self, owner_entity_id=self._worker_entity_id,
             owner_epoch=self._worker_runner.epoch,
         )
         self.register_owner(self._observability_entity_id, epoch=self.observability_epoch)
@@ -579,11 +650,9 @@ class Runtime(ExecutionScope):
             self._observability_entity_id, MACHINE_SPECS["observability"],
             epoch=self.observability_epoch,
         )
-        self._observability_handle = self.start_machine(
-            self._observability_runner,
-            owner_entity_id=self._observability_entity_id,
+        self._observability_handle = self._observability_runner.activate(
+            self, owner_entity_id=self._observability_entity_id,
             owner_epoch=self.observability_epoch,
-            failure=FailurePolicy.REPORT,
         )
         await self._move_observability("starting", "runtime-observability-start")
         await self._move_observability("active", "runtime-observability-ready")
@@ -736,11 +805,17 @@ class Runtime(ExecutionScope):
             raise ValueError("machine entity and Runtime owner must match")
         if getattr(runner, "epoch", None) != owner_epoch:
             raise StaleOwnerEpoch("machine and Runtime owner epochs differ")
-        return self.start_pump(
+        handle = self.start_pump(
             runner.run, owner_entity_id=owner_entity_id, owner_epoch=owner_epoch,
             name=f"machine:{runner.spec.machine_type}:{owner_entity_id}",
             kind="machine", failure=failure,
         )
+        handle._task.add_done_callback(
+            lambda done: runner.abort(asyncio.CancelledError(
+                f"machine {owner_entity_id} was cancelled"
+            )) if done.cancelled() else None
+        )
+        return handle
 
     def call_worker(
         self, fn: Callable[..., T], *args: Any, owner_entity_id: str,
@@ -1013,24 +1088,9 @@ class Runtime(ExecutionScope):
         health = self._observability_health_handle
         if health is not None and not health.done():
             await health.wait()
-        observability_ids = tuple(
-            task_id for task_id in self.task_registry.task_ids()
-            if (
-                (entry := self.task_registry.get(task_id)) is not None
-                and self._observability_handle is not None
-                and entry.task is self._observability_handle._task
-            )
-        )
-        lifecycle_ids = tuple(
-            task_id for task_id in self.task_registry.task_ids()
-            if (
-                (entry := self.task_registry.get(task_id)) is not None
-                and any(
-                    handle is not None and entry.task is handle._task
-                    for handle in (self._runtime_handle, self._worker_handle)
-                )
-            )
-        )
+        # Inline reducers have no permanent scheduler entries to exclude.
+        observability_ids: tuple[str, ...] = ()
+        lifecycle_ids: tuple[str, ...] = ()
         deadline = asyncio.get_running_loop().time() + self.shutdown_timeout
         for timers in tuple(self._owner_timers.values()):
             for timer in tuple(timers):
