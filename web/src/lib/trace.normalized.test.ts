@@ -165,6 +165,30 @@ test("schema-2 snapshot replaces every live normalized collection", () => {
   expect(state.resyncRequired).toBe(false);
 });
 
+test("terminal envelope atomically replaces final records, entities, counts, and version", () => {
+  let state = apply(createInitialTraceState(), snapshot([group(1, 1)]));
+  state = apply(state, batch(1, [{ type: "group:upsert", records: [group(1, 2)] }]));
+  const terminal = apply(state, {
+    event: "trace:terminal",
+    data: {
+      schema: 2, trace_id: "trace", snapshot_sequence: 1, sequence: 7, terminal: true,
+      entities: [{ entity_id: "peer", alias: "@9", role: "peer-connection", kind: "machine" }],
+      machines: [{
+        entity_id: "peer", machine_type: "peer", state: "closed",
+        machine_epoch: 1, revision: 9, cause_id: null, monotonic_ns: 9,
+      }],
+      controls: [], groups: [group(2, 3)], facets: [], transitions: [transition(3, 3)],
+      operation_strings: { 7: "peer.tick" }, diagnostics: { final_count: 4 },
+    },
+  });
+  expect(terminal.terminal).toBe(true);
+  expect(terminal.sequence).toBe(7);
+  expect(terminal.machinesById.get("peer")?.state).toBe("closed");
+  expect([...terminal.groupsById.keys()]).toEqual([2]);
+  expect(terminal.entitiesById.get("peer")?.alias).toBe("@9");
+  expect(terminal.diagnostics.final_count).toBe(4);
+});
+
 test("a sequence gap requests one explicit resync and blocks patches until snapshot", () => {
   const initial = apply(createInitialTraceState(), snapshot());
   const gap = apply(initial, batch(2, [{ type: "group:upsert", records: [group(1, 1)] }]));

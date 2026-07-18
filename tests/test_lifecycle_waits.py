@@ -3,7 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from webrtc.dtls.dtlstransport import DTLSTransport
+from webrtc.dtls.dtlstransport import DTLSTransport, DTLSTransportSnapshot
+from webrtc.srtp import SessionAdmissionSnapshot
 from webrtc.ice.agent import Agent, CandidatePairState
 from webrtc.lifecycle import ICECondition, PeerCondition, TransportCondition
 from webrtc.peer_connection import ICEGatherer, PeerConnection
@@ -123,11 +124,23 @@ def make_dtls_wait_subject(*, handshake=False, rtp=False, rtcp=False):
     transport._DTLSTransport__handshake_failed = None
     transport._DTLSTransport__srtp_rtp_lock = asyncio.Event()
     transport._DTLSTransport__srtp_rtcp_lock = asyncio.Event()
-    transport._srtp_rtp = object() if rtp else None
-    transport._srtp_rtcp = object() if rtcp else None
-    state = "connected" if handshake else "connecting"
+    admission = SessionAdmissionSnapshot(
+        state="ready", keys_ready=True, accepting_packets=True,
+        accepting_streams=True,
+    )
+    session = lambda: SimpleNamespace(admission_snapshot=lambda: admission)
+    transport._srtp_rtp = session() if rtp else None
+    transport._srtp_rtcp = session() if rtcp else None
+    state = "connected" if handshake or (rtp and rtcp) else "connecting"
+    transport._authority = DTLSTransportSnapshot(
+        state=state, transport=object() if handshake or (rtp and rtcp) else None,
+        handshake_ready=handshake or (rtp and rtcp),
+        srtp_rtp_ready=rtp, srtp_rtcp_ready=rtcp,
+    )
     transport._runner = SimpleNamespace(
-        snapshot=lambda: SimpleNamespace(state=state)
+        snapshot=lambda: (_ for _ in ()).throw(
+            AssertionError("DTLS wait read the generic machine snapshot")
+        )
     )
     if handshake:
         transport._DTLSTransport__handshake_complete.set()

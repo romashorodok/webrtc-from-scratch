@@ -49,6 +49,7 @@ class WorkerOwnerBinding:
     runtime: Any
     entity_id: str
     epoch: int
+    role: str | None = None
 
 
 def _attributes(values: Mapping[str, Any] | None, limit: int = 32) -> Mapping[str, Scalar]:
@@ -135,6 +136,9 @@ class CompiledObservation:
     slow_ms: float | None
     capture_failures: bool
     slow_ns: int | None = None
+    method: str | None = None
+    workflow: bool = False
+    cadence_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +167,27 @@ def _intern_operation(operation: str) -> int:
 def compiled_operation_strings() -> Mapping[int, str]:
     """Snapshot the intern table for a future schema-2 snapshot/patch."""
     return MappingProxyType(dict(_operation_names_by_id))
+
+
+def compile_observation_policy(
+    *, method: str, operation: str, detail: TraceDetail | str, group: str,
+    slow_ms: float | None = None, capture_failures: bool = True,
+    workflow: bool = False, cadence_ms: int | None = None,
+) -> CompiledObservation:
+    """Compile one externally declared Runtime observation policy record."""
+    selected = TraceDetail(detail)
+    if not method or not operation or not group:
+        raise ValueError("external observation method, operation, and group are required")
+    if slow_ms is not None and slow_ms < 0:
+        raise ValueError("slow_ms must be non-negative")
+    if cadence_ms is not None and cadence_ms <= 0:
+        raise ValueError("cadence_ms must be positive")
+    return CompiledObservation(
+        _intern_operation(operation), operation, group, selected, slow_ms,
+        bool(capture_failures),
+        int(slow_ms * 1_000_000) if slow_ms is not None else None,
+        method, bool(workflow), cadence_ms,
+    )
 
 
 def observe(
@@ -278,23 +303,20 @@ _worker_observation_delta: contextvars.ContextVar[WorkerObservationDelta | None]
 
 
 def _worker_owner(scope, args) -> WorkerOwnerBinding:
-    subject = args[0] if args and isinstance(args[0], ObservedComponent) else None
+    subject = args[0] if args else None
     if subject is not None:
-        binding = getattr(subject, "__worker_owner_binding__", None)
+        binding = scope.observation_registry.get(subject)
+        if binding is None and isinstance(subject, ObservedComponent):
+            binding = _ensure_receiver_binding(scope, subject)
         if binding is not None:
-            if binding.runtime is not scope:
-                raise MissingExecutionScope("component worker owner belongs to another Runtime")
-            scope.assert_owner_epoch(binding.entity_id, binding.epoch)
-            return binding
-        if not getattr(subject, "__runtime_root_worker_utility__", False):
-            raise MissingExecutionScope(
-                f"{type(subject).__name__} has no authoritative worker owner binding"
+            return WorkerOwnerBinding(
+                scope, binding.entity_id, binding.owner_epoch, binding.role.value
             )
     entity_id = getattr(scope, "_runtime_entity_id", None)
     epoch = getattr(getattr(scope, "_runtime_runner", None), "epoch", None)
     if entity_id is None or epoch is None:
         raise MissingExecutionScope("worker submission requires a Runtime owner")
-    return WorkerOwnerBinding(scope, entity_id, epoch)
+    return WorkerOwnerBinding(scope, entity_id, epoch, "runtime")
 
 
 def _aggregate_identity(scope, binding: WorkerOwnerBinding | None = None):
@@ -308,6 +330,86 @@ def _aggregate_identity(scope, binding: WorkerOwnerBinding | None = None):
     return "", getattr(scope, "scope_id", None) or ""
 
 
+def _ensure_receiver_binding(scope, subject):
+    binding = scope.observation_registry.get(subject)
+    if binding is not None:
+        return binding
+    if not isinstance(subject, ObservedComponent):
+        return None
+    from .operation_policy import is_production_component
+    if is_production_component(subject):
+        raise MissingExecutionScope(
+            f"{type(subject).__name__} requires explicit Runtime observation composition"
+        )
+    if getattr(type(subject), "__requires_observation_binding__", False):
+        raise MissingExecutionScope(
+            f"{type(subject).__name__} requires Runtime composition before observed use"
+        )
+    root_entity = getattr(scope, "_runtime_entity_id", None)
+    root_epoch = getattr(getattr(scope, "_runtime_runner", None), "epoch", None)
+    if root_entity is None or root_epoch is None:
+        raise MissingExecutionScope("observed receiver requires a Runtime owner")
+    from .observation_registry import default_semantic_role
+    return scope.bind_observation(
+        subject, entity_id=root_entity, role=default_semantic_role(subject),
+        entity_role="runtime", owner_epoch=root_epoch,
+        runtime_root_utility=True,
+    )
+
+
+def _validate_production_composition(scope, args) -> None:
+    """Enforce Runtime composition independently of observation policy.
+
+    This runs before every tracing fast path. It neither selects a detail
+    level nor creates work; it only checks the external production catalog and
+    the Runtime sidecar binding.
+    """
+    if not args:
+        return
+    subject = args[0]
+    from .operation_policy import is_production_component
+    if not is_production_component(subject):
+        return
+    # Outside an execution scope there is no Runtime-side observation path to
+    # validate. Domain-only compatibility remains until Stage 7; once a
+    # Runtime is active, composition is mandatory regardless of trace mode.
+    if scope is None:
+        return
+    if scope.observation_registry.get(subject) is None:
+        raise MissingExecutionScope(
+            f"{type(subject).__name__} requires explicit Runtime observation composition"
+        )
+
+
+def _component_binding(scope, args) -> WorkerOwnerBinding | None:
+    if not args:
+        return None
+    binding = _ensure_receiver_binding(scope, args[0])
+    if binding is None:
+        return None
+    return WorkerOwnerBinding(
+        scope, binding.entity_id, binding.owner_epoch, binding.role.value
+    )
+
+
+def _bound_policy(scope, args, fallback: CompiledObservation) -> CompiledObservation:
+    if not args:
+        return fallback
+    binding = _ensure_receiver_binding(scope, args[0])
+    if binding is None:
+        return fallback
+    if fallback.method is not None:
+        policy = binding.operation_policy.get(fallback.method)
+        if policy is not None:
+            return policy
+    for policy in binding.operation_policy.values():
+        if getattr(policy, "operation_id", None) == fallback.operation_id:
+            return policy
+    if binding.policy_is_authoritative:
+        return replace(fallback, detail=TraceDetail.OFF)
+    return fallback
+
+
 def _aggregate_record(scope, policy, binding: WorkerOwnerBinding | None = None) -> ActivityGroupRecord:
     trace_id, owner_id = _aggregate_identity(scope, binding)
     return scope.activity_groups.resolve(
@@ -317,6 +419,7 @@ def _aggregate_record(scope, policy, binding: WorkerOwnerBinding | None = None) 
         parent_ref_id=_current_activity_group.get(),
         owner_epoch=(binding.epoch if binding is not None
                      else getattr(scope, "observability_epoch", 1)),
+        owner_role=(binding.role if binding is not None else "runtime"),
     )
 
 
@@ -344,11 +447,12 @@ def _finish_activity(
 
 
 def _run_aggregate_inline(scope, fn, args, kwargs, spec, policy):
+    binding = _component_binding(scope, args)
     delta = _worker_observation_delta.get()
     started = time.monotonic_ns()
     try:
         if delta is None:
-            record = _aggregate_record(scope, policy)
+            record = _aggregate_record(scope, policy, binding)
             scope.activity_groups.begin(record, started)
         else:
             record = delta.resolve(policy, _current_activity_group.get())
@@ -388,9 +492,10 @@ def _run_aggregate_inline(scope, fn, args, kwargs, spec, policy):
 
 
 async def _invoke_aggregate_async(scope, fn, args, kwargs, spec, policy):
+    binding = _component_binding(scope, args)
     started = time.monotonic_ns()
     try:
-        record = _aggregate_record(scope, policy)
+        record = _aggregate_record(scope, policy, binding)
         scope.activity_groups.begin(record, started)
     except Exception:
         _activity_failed(scope)
@@ -526,9 +631,12 @@ async def _call_owned_worker(scope, fn, args, kwargs, *, name: str):
     raise RuntimeError(f"worker submission {result.outcome}")
 
 
-async def _run_aggregate_worker(scope, fn, args, kwargs, spec, policy):
+async def _run_aggregate_worker(
+    scope, fn, args, kwargs, spec, policy,
+    *, binding_override: WorkerOwnerBinding | None = None,
+):
     started = time.monotonic_ns()
-    binding = _worker_owner(scope, args)
+    binding = binding_override or _worker_owner(scope, args)
     try:
         record = _aggregate_record(scope, policy, binding)
         scope.activity_groups.begin(record, started)
@@ -569,6 +677,7 @@ async def _run_aggregate_worker(scope, fn, args, kwargs, spec, policy):
                 event.observation_delta, trace_id=trace_id,
                 owner_entity_id=owner_id,
                 owner_epoch=binding.epoch,
+                owner_role=binding.role,
             )
             failure = type(event.exception).__name__ if event.exception is not None else None
             scope.activity_groups.end(
@@ -648,6 +757,49 @@ async def _run_aggregate_worker(scope, fn, args, kwargs, spec, policy):
         _current_activity_group.reset(parent_token)
 
 
+async def observe_worker(execution, method, *args, name: str | None = None, **kwargs):
+    """Observe an explicitly selected worker dispatch without selecting it.
+
+    ``execution`` is the authority for scheduling and ownership.  This adapter
+    only records the already-explicit operation, and its disabled fast path
+    uses the exact same execution port and return contract.
+    """
+    scope = execution.runtime
+    wrapper = getattr(method, "__func__", method)
+    subject = getattr(method, "__self__", None)
+    physical = getattr(wrapper, "__wrapped__", wrapper)
+    call_args = ((subject,) if subject is not None else ()) + args
+    policy = getattr(wrapper, "__compiled_observation__", None)
+    spec = getattr(wrapper, "__performance_spec__", None)
+    component_binding = None
+    if subject is not None:
+        binding = _ensure_receiver_binding(scope, subject)
+        if binding is not None:
+            policy = binding.operation_policy.get(getattr(physical, "__name__", ""))
+            if policy is None and binding.policy_is_authoritative:
+                policy = None
+            component_binding = WorkerOwnerBinding(
+                scope, binding.entity_id, binding.owner_epoch, binding.role.value,
+            )
+    if (
+        not getattr(scope, "tracing_enabled", True)
+        or policy is None
+        or policy.detail not in (TraceDetail.AGGREGATE, TraceDetail.EXACT)
+    ):
+        return await execution.run_worker(
+            physical, *call_args,
+            name=name or f"worker:{getattr(policy, 'operation', physical.__qualname__)}",
+            **kwargs,
+        )
+    binding = component_binding or WorkerOwnerBinding(
+        scope, execution.owner_entity_id, execution.owner_epoch, "worker-lane"
+    )
+    return await _run_aggregate_worker(
+        scope, physical, call_args, kwargs, spec, policy,
+        binding_override=binding,
+    )
+
+
 async def _invoke_task_body(scope, fn, args, kwargs, spec):
     call = CallInfo(args, MappingProxyType(dict(kwargs)))
     context = current_execution_context()
@@ -683,19 +835,19 @@ def _classify_sync_affinity(fn):
         return MethodPolicy.EVENT_LOOP
     if getattr(fn, "__worker__", False):
         return MethodPolicy.WORKER
-    # Automatic offload is the class contract.  Merely referring to an
-    # asyncio-looking name cannot grant loop affinity: loop callbacks and
-    # accessors must opt in explicitly with @event_loop.
+    # Compatibility for not-yet-migrated/test components.  Production classes
+    # opt into explicit execution at class composition and never reach this
+    # automatic legacy fallback.
     return MethodPolicy.WORKER
 
 
-def _begin_capture(scope, policy):
+def _begin_capture(scope, policy, args=()):
     if _worker_observation_delta.get() is not None:
         return None
     manager = scope.capture_manager
     if not manager.has_active_rules:
         return None
-    _, owner_id = _aggregate_identity(scope)
+    _, owner_id = _aggregate_identity(scope, _component_binding(scope, args))
     try:
         return manager.begin(
             policy, owner_id, getattr(scope, "scope_id", None), None
@@ -759,15 +911,17 @@ def _compile_async_call(fn, spec, observation):
     @functools.wraps(fn)
     async def observed(*args, **kwargs):
         scope = current_execution_scope()
+        _validate_production_composition(scope, args)
         if scope is None or not getattr(scope, "tracing_enabled", True):
             return await fn(*args, **kwargs)
-        capture = _begin_capture(scope, observation)
+        policy = _bound_policy(scope, args, observation)
+        capture = _begin_capture(scope, policy, args)
         if capture is not None:
             return await _invoke_captured_async(
-                scope, fn, args, kwargs, spec, observation, capture
+                scope, fn, args, kwargs, spec, policy, capture
             )
-        if observation.detail in (TraceDetail.AGGREGATE, TraceDetail.EXACT):
-            return await _invoke_aggregate_async(scope, fn, args, kwargs, spec, observation)
+        if policy.detail in (TraceDetail.AGGREGATE, TraceDetail.EXACT):
+            return await _invoke_aggregate_async(scope, fn, args, kwargs, spec, policy)
         return await fn(*args, **kwargs)
     return observed
 
@@ -777,6 +931,8 @@ def _compile_sync_call(fn, spec, affinity, observation):
         @functools.wraps(fn)
         def observed_worker(*args, **kwargs):
             scope = current_execution_scope()
+            _validate_production_composition(scope, args)
+            policy = _bound_policy(scope, args, observation) if scope is not None else observation
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
@@ -791,14 +947,14 @@ def _compile_sync_call(fn, spec, affinity, observation):
             ):
                 if not getattr(scope, "tracing_enabled", True):
                     return fn(*args, **kwargs)
-                capture = _begin_capture(scope, observation)
+                capture = _begin_capture(scope, policy, args)
                 if capture is not None:
                     return _run_captured_inline(
-                        scope, fn, args, kwargs, spec, observation, capture
+                        scope, fn, args, kwargs, spec, policy, capture
                     )
-                if observation.detail in (TraceDetail.AGGREGATE, TraceDetail.EXACT):
+                if policy.detail in (TraceDetail.AGGREGATE, TraceDetail.EXACT):
                     return _run_aggregate_inline(
-                        scope, fn, args, kwargs, spec, observation
+                        scope, fn, args, kwargs, spec, policy
                     )
                 return fn(*args, **kwargs)
 
@@ -810,19 +966,19 @@ def _compile_sync_call(fn, spec, affinity, observation):
             async def dispatch():
                 if not getattr(scope, "tracing_enabled", True):
                     return await _call_owned_worker(
-                        scope, fn, args, kwargs, name=f"worker:{observation.operation}"
+                        scope, fn, args, kwargs, name=f"worker:{policy.operation}"
                     )
-                capture = _begin_capture(scope, observation)
+                capture = _begin_capture(scope, policy, args)
                 if capture is not None:
                     return await _run_captured_worker(
-                        scope, fn, args, kwargs, spec, observation, capture
+                        scope, fn, args, kwargs, spec, policy, capture
                     )
-                if observation.detail not in (TraceDetail.AGGREGATE, TraceDetail.EXACT):
+                if policy.detail not in (TraceDetail.AGGREGATE, TraceDetail.EXACT):
                     return await _call_owned_worker(
-                        scope, fn, args, kwargs, name=f"worker:{observation.operation}"
+                        scope, fn, args, kwargs, name=f"worker:{policy.operation}"
                     )
                 return await _run_aggregate_worker(
-                    scope, fn, args, kwargs, spec, observation
+                    scope, fn, args, kwargs, spec, policy
                 )
 
             return dispatch()
@@ -831,18 +987,20 @@ def _compile_sync_call(fn, spec, affinity, observation):
     @functools.wraps(fn)
     def observed(*args, **kwargs):
         scope = current_execution_scope()
+        _validate_production_composition(scope, args)
         if scope is None:
             return fn(*args, **kwargs)
         if not getattr(scope, "tracing_enabled", True):
             return fn(*args, **kwargs)
-        capture = _begin_capture(scope, observation)
+        policy = _bound_policy(scope, args, observation)
+        capture = _begin_capture(scope, policy, args)
         if capture is not None:
             return _run_captured_inline(
-                scope, fn, args, kwargs, spec, observation, capture
+                scope, fn, args, kwargs, spec, policy, capture
             )
-        if observation.detail not in (TraceDetail.AGGREGATE, TraceDetail.EXACT):
+        if policy.detail not in (TraceDetail.AGGREGATE, TraceDetail.EXACT):
             return fn(*args, **kwargs)
-        return _run_aggregate_inline(scope, fn, args, kwargs, spec, observation)
+        return _run_aggregate_inline(scope, fn, args, kwargs, spec, policy)
     return observed
 
 
@@ -850,14 +1008,16 @@ def _compile_task_entry(fn, performance_spec, task_spec, observation):
     @functools.wraps(fn)
     def scheduled(*args, **kwargs):
         scope = require_execution_scope()
+        _validate_production_composition(scope, args)
+        policy = _bound_policy(scope, args, observation)
         call = CallInfo(args, MappingProxyType(dict(kwargs)))
         metadata = task_spec.metadata
         if callable(metadata):
             metadata = _extract_attributes(metadata, call, scope.diagnostics)
         metadata = dict(metadata or {})
-        if observation.detail in (TraceDetail.AGGREGATE, TraceDetail.EXACT):
+        if policy.detail in (TraceDetail.AGGREGATE, TraceDetail.EXACT):
             factory = lambda: _invoke_aggregate_async(
-                scope, fn, args, kwargs, performance_spec, observation
+                scope, fn, args, kwargs, performance_spec, policy
             )
         else:
             factory = lambda: fn(*args, **kwargs)
@@ -869,6 +1029,18 @@ def _compile_task_entry(fn, performance_spec, task_spec, observation):
             failure=task_spec.failure,
         )
     return scheduled
+
+
+def compile_runtime_operation_adapter(fn, policy: CompiledObservation):
+    """Build an external, execution-neutral adapter for an allowlisted method.
+
+    Production classes use this entry point from the Runtime-owned operation
+    catalog.  Unlike ``ObservedMeta`` it does not discover methods, attach
+    policy to the class, or select worker/task execution semantics.
+    """
+    if inspect.iscoroutinefunction(fn):
+        return _compile_async_call(fn, None, policy)
+    return _compile_sync_call(fn, None, MethodPolicy.EVENT_LOOP, policy)
 
 
 def _validate_markers(owner, attr, fn):
@@ -911,6 +1083,7 @@ def _compile_observation(owner, attr, fn, performance_spec, task_spec):
         explicit.capture_failures if explicit is not None else True,
         int(explicit.slow_ms * 1_000_000)
         if explicit is not None and explicit.slow_ms is not None else None,
+        attr,
     )
 
 
@@ -939,9 +1112,12 @@ class ObservedMeta(type):
             elif inspect.iscoroutinefunction(fn):
                 wrapped = _compile_async_call(fn, performance_spec, policy)
             else:
-                wrapped = _compile_sync_call(
-                    fn, performance_spec, _classify_sync_affinity(fn), policy
+                affinity = (
+                    MethodPolicy.EVENT_LOOP
+                    if getattr(cls, "__explicit_execution__", False)
+                    else _classify_sync_affinity(fn)
                 )
+                wrapped = _compile_sync_call(fn, performance_spec, affinity, policy)
             if isinstance(descriptor, staticmethod):
                 wrapped = staticmethod(wrapped)
             elif isinstance(descriptor, classmethod):
@@ -956,12 +1132,11 @@ class ObservedMeta(type):
 
 class ObservedComponent(metaclass=ObservedMeta):
     """Stateless opt-in base that compiles observation policy at class creation."""
-    # Ownerless helper components are explicitly classified at the protocol
-    # boundary. Lifecycle components override this by binding their machine.
-    __runtime_root_worker_utility__ = True
-    __worker_owner_binding__: WorkerOwnerBinding | None = None
-
-    def __bind_worker_owner__(self, runtime: Any, entity_id: str, epoch: int) -> None:
-        runtime.assert_owner_epoch(entity_id, epoch)
-        self.__worker_owner_binding__ = WorkerOwnerBinding(runtime, entity_id, epoch)
-        self.__runtime_root_worker_utility__ = False
+    def __bind_worker_owner__(
+        self, runtime: Any, entity_id: str, epoch: int, *, role: str | None = None,
+    ) -> None:
+        runtime.bind_observation(
+            self, entity_id=entity_id,
+            role=role or "component",
+            owner_epoch=epoch,
+        )

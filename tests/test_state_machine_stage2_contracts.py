@@ -76,6 +76,7 @@ def test_stage2_runtime_registers_distinct_bounded_dtls_machines() -> None:
             assert fsm.entity_id == "dtls-handshake-phase:stage2"
             assert transport.record_layer_chan.maxsize == RECORD_INGRESS_CAPACITY
             queue_entity = f"{transport.entity_id}:record-ingress"
+            queue_telemetry_entity = runtime.telemetry_entity_id("queue", queue_entity)
             # Queue admission/close is owned by the primitive; it has no
             # permanent mailbox task or observational lifecycle machine.
             assert runtime.projection.machines.get(queue_entity) is None
@@ -83,7 +84,7 @@ def test_stage2_runtime_registers_distinct_bounded_dtls_machines() -> None:
             queue_facets = {
                 item.facet_id.rsplit(":", 1)[-1]: item
                 for item in runtime.projection.facets.snapshots()
-                if item.owner_entity_id == queue_entity
+                if item.owner_entity_id == queue_telemetry_entity
             }
             assert {item.observer_meta for item in queue_facets.values()} == {"aggregate"}
             assert queue_facets["capacity"].value == RECORD_INGRESS_CAPACITY

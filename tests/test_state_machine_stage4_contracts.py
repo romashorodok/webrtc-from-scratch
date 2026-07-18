@@ -1,13 +1,16 @@
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 from webrtc import Runtime
 from webrtc.peer_connection import (
-    PeerConnection, _PeerCommand, _PeerCommandPayload,
+    PeerConnection, SelectedTransportSnapshot, _PeerCommand, _PeerCommandPayload,
     _SignalingCommand,
 )
+from webrtc.dtls import DTLSTransportSnapshot
+from webrtc.srtp import SessionAdmissionSnapshot
 from webrtc.session_description import (
     SessionDescription, SessionDescriptionAttr, SessionDescriptionAttrKey,
     SessionDescriptionType,
@@ -33,9 +36,19 @@ class _Session:
             entity_id=entity_id, machine_type="srtp-session", state="ready",
             revision=revision, epoch=1, terminal=False,
         )
+        self._admission = SessionAdmissionSnapshot(
+            state="ready", keys_ready=True, accepting_packets=True,
+            accepting_streams=True,
+        )
 
     def lifecycle_snapshot(self):
         return self._snapshot
+
+    def admission_snapshot(self):
+        return self._admission
+
+    def _observation_revision(self):
+        return self._snapshot.revision
 
 
 class _Gatherer:
@@ -66,6 +79,12 @@ class _SelectedTransport:
         self._runner = _SnapshotOwner(
             "selected-transport:test", "transport", state, revision,
         )
+        self._authority = SelectedTransportSnapshot(
+            state, self if state == "ready" else None,
+        )
+
+    def authoritative_snapshot(self):
+        return self._authority
 
     async def aclose(self):
         return None
@@ -78,6 +97,14 @@ class _DtlsTransport:
         )
         self._srtp_rtp = _Session("srtp:rtp", 2)
         self._srtp_rtcp = _Session("srtp:rtcp", 2)
+        self._authority = DTLSTransportSnapshot(
+            state=state, transport=self if state == "connected" else None,
+            handshake_ready=state == "connected", srtp_rtp_ready=True,
+            srtp_rtcp_ready=True,
+        )
+
+    def authoritative_snapshot(self):
+        return self._authority
 
     async def aclose(self):
         return None
@@ -184,12 +211,7 @@ def test_stage4_peer_connected_requires_exact_child_revisions() -> None:
                 stale = ReplyPort()
                 ready = peer._peer_readiness_snapshot()
                 stale_readiness = type(ready)(
-                    type(ready.selected_transport)(
-                        ready.selected_transport.entity_id,
-                        ready.selected_transport.epoch,
-                        ready.selected_transport.revision - 1,
-                        ready.selected_transport.required_state,
-                    ),
+                    replace(ready.selected_transport, state="new"),
                     ready.dtls, ready.srtp_rtp, ready.srtp_rtcp,
                 )
                 await peer._peer_runner.submit(peer._command(
@@ -252,8 +274,9 @@ def test_stage4_readiness_is_revalidated_after_before_commit_checkpoint() -> Non
                 checkpoint = await controller.wait_until(
                     "peer", "connected", phase="before_commit",
                 )
-                peer._dtls_transport._runner.value.epoch += 1
-                peer._dtls_transport._runner.value.revision += 1
+                peer._dtls_transport._authority = replace(
+                    peer._dtls_transport._authority, state="failed",
+                )
                 controller.release(checkpoint.checkpoint_id)
                 with pytest.raises(StaleMachineAccess):
                     await reply.wait()
@@ -414,6 +437,34 @@ def test_stage4_create_offer_rejects_changed_signaling_snapshot(monkeypatch) -> 
                 release.set()
                 with pytest.raises(StaleMachineAccess):
                     await creating
+
+    asyncio.run(scenario())
+
+
+def test_stage1_create_offer_occ_reads_domain_signaling_revision(monkeypatch) -> None:
+    async def scenario() -> None:
+        peer = PeerConnection()
+        _replace_stage4_children(peer)
+
+        async def generated(_transceivers):
+            return SessionDescription()
+
+        monkeypatch.setattr(peer, "_generate_unmatched_sdp", generated)
+        async with Runtime(scope_id="stage1-signaling-domain-occ"):
+            async with peer:
+                original_snapshot = peer._signaling_runner.snapshot
+                monkeypatch.setattr(
+                    peer._signaling_runner, "snapshot",
+                    lambda: (_ for _ in ()).throw(AssertionError(
+                        "create_offer read the generic signaling machine snapshot"
+                    )),
+                )
+                try:
+                    assert await peer.create_offer() is not None
+                finally:
+                    monkeypatch.setattr(
+                        peer._signaling_runner, "snapshot", original_snapshot,
+                    )
 
     asyncio.run(scenario())
 

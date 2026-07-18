@@ -13,7 +13,7 @@ from typing import Any
 from .config import DebugConfig
 from .logger import get_logger
 from .machine_specs import MACHINE_SPECS
-from .performance import ObservedComponent, event_loop, performance, worker
+from .performance import observe_worker
 from .runtime_services import FailurePolicy, OwnedTaskHandle, ScopeState
 from .state_machine import (
     InlineStateMachineRunner, MachineCommand, PreparedTransition, ReplyPort,
@@ -59,8 +59,10 @@ def _bind_runner(runtime: Any, machine_type: str, entity_id: str, *, capacity: i
         raise RuntimeError("auxiliary entities require an active Runtime")
     runtime._assert_loop()
     runtime.register_owner(entity_id, epoch=1)
-    runtime.projection.machines.register(entity_id, MACHINE_SPECS[machine_type], epoch=1)
     runner = _LifecycleRunner(runtime, machine_type, entity_id, capacity=capacity)
+    runner._transition_sink = runtime.observe_machine(
+        entity_id, MACHINE_SPECS[machine_type], epoch=1,
+    )
     handle = runner.activate(runtime, owner_entity_id=entity_id, owner_epoch=1)
     return runner, handle
 
@@ -96,8 +98,6 @@ class PeerEventInbox:
         self._items: deque[Any] = deque()
         self._terminal: Any | None = None
         self._ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        self.admitted = self.delivered = self.rejected = self.dropped = 0
-        self.high_water = 0
         self._runtime = self._runner = self._handle = None
         self._command_id = 0
 
@@ -108,7 +108,7 @@ class PeerEventInbox:
             return
         self._runtime = runtime
         self._runner, self._handle = _bind_runner(runtime, "queue", entity_id)
-        self._observe("exact")
+        self._observe(exact=True)
 
     def _assert_bound(self) -> _LifecycleRunner:
         if self._runner is None:
@@ -117,15 +117,30 @@ class PeerEventInbox:
         self._runtime.assert_owner_epoch(self._runner.entity_id, self._runner.epoch)
         return self._runner
 
-    def _observe(self, meta: str = "coalesced") -> None:
+    def _observe(self, *, admitted: int = 0, delivered: int = 0,
+                 rejected: int = 0, dropped: int = 0,
+                 exact: bool = False) -> None:
         runner = self._assert_bound()
         depth = len(self._items) + (self._terminal is not None)
-        self.high_water = max(self.high_water, depth)
-        self._runtime.observe_facets(runner.snapshot(), {
-            "depth": depth, "admitted": self.admitted, "delivered": self.delivered,
-            "rejected": self.rejected, "dropped": self.dropped,
-            "high_water": self.high_water,
-        }, observer_meta=meta)
+        self._runtime.record_queue_activity(
+            entity_id=runner.entity_id, queue_kind="peer-event-inbox",
+            depth=depth, capacity=self.maxsize + 1,
+            deltas={"admitted": admitted, "delivered": delivered,
+                    "rejected": rejected, "dropped": dropped}, exact=exact,
+        )
+
+    def _counter(self, name: str) -> int:
+        if self._runner is None:
+            return 0
+        return self._runtime.queue_telemetry_snapshot(
+            self._runner.entity_id
+        ).get(name, 0)
+
+    admitted = property(lambda self: self._counter("admitted"))
+    delivered = property(lambda self: self._counter("delivered"))
+    rejected = property(lambda self: self._counter("rejected"))
+    dropped = property(lambda self: self._counter("dropped"))
+    high_water = property(lambda self: self._counter("high_water"))
 
     @property
     def closed(self) -> bool:
@@ -140,17 +155,17 @@ class PeerEventInbox:
     def offer_nowait(self, event: Any) -> bool:
         self._assert_bound()
         if self.closed and not self._is_terminal(event):
-            self.rejected += 1; self._observe(); return False
+            self._observe(rejected=1); return False
         if self._is_terminal(event):
             if self._terminal is None:
-                self._terminal = event; self.admitted += 1
+                self._terminal = event; self._observe(admitted=1)
             else:
-                self.rejected += 1; self._observe(); return False
+                self._observe(rejected=1); return False
         elif len(self._items) >= self.maxsize:
-            self.dropped += 1; self.rejected += 1; self._observe(); return False
+            self._observe(dropped=1, rejected=1); return False
         else:
-            self._items.append(event); self.admitted += 1
-        self._signal_ready(); self._observe(); return True
+            self._items.append(event); self._observe(admitted=1)
+        self._signal_ready(); return True
 
     def close(self) -> None:
         runner = self._assert_bound()
@@ -169,7 +184,7 @@ class PeerEventInbox:
             self._reset_ready(); return NeedMoreData()
         else:
             self._signal_ready(); return PeerEventInboxClosed()
-        self.delivered += 1
+        self._observe(delivered=1)
         if not self._items and self._terminal is None:
             if self.closed:
                 self._command_id += 1
@@ -177,7 +192,7 @@ class PeerEventInbox:
                 self._command_id += 1
                 runner.try_submit(_command(runner, self._command_id, "closed", "peer-output-closed"))
             else: self._reset_ready()
-        self._observe(); return item
+        return item
 
     def _signal_ready(self) -> None:
         if not self._ready.done():
@@ -214,8 +229,6 @@ class PeerConnectionLogInbox:
         if maxsize < 1: raise ValueError("log inbox capacity must be positive")
         self._queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=maxsize)
         self.accepting = True
-        self.admitted = self.delivered = self.rejected = 0
-        self.dropped_debug = self.dropped = self.high_water = 0
         self._runtime = self._runner = self._handle = None
         self._command_id = 0
         self._drain_requested = False
@@ -224,22 +237,33 @@ class PeerConnectionLogInbox:
         if self._runner is not None: return
         self._runtime = runtime
         self._runner, self._handle = _bind_runner(runtime, "queue", entity_id)
-        self._observe("exact")
+        self._observe(exact=True)
 
     def _assert_bound(self):
         if self._runner is None: raise RuntimeError("log inbox must be bound before mutation")
         self._runtime.assert_owner_epoch(self._runner.entity_id, self._runner.epoch)
         return self._runner
 
-    def _observe(self, meta="coalesced"):
+    def _observe(self, *, admitted=0, delivered=0, rejected=0, dropped=0,
+                 dropped_debug=0, exact=False):
         runner = self._assert_bound(); depth = self._queue.qsize()
-        self.high_water = max(self.high_water, depth)
-        self._runtime.observe_facets(runner.snapshot(), {
-            "depth": depth, "high_water": self.high_water,
-            "admitted": self.admitted, "delivered": self.delivered,
-            "rejected": self.rejected, "dropped": self.dropped,
-            "dropped_debug": self.dropped_debug,
-        }, observer_meta=meta)
+        self._runtime.record_queue_activity(
+            entity_id=runner.entity_id, queue_kind="peer-log-inbox",
+            depth=depth, capacity=self._queue.maxsize,
+            deltas={"admitted": admitted, "delivered": delivered,
+                    "rejected": rejected, "dropped": dropped,
+                    "dropped_debug": dropped_debug}, exact=exact,
+        )
+
+    def _counter(self, name):
+        if self._runner is None: return 0
+        return self._runtime.queue_telemetry_snapshot(self._runner.entity_id).get(name, 0)
+    admitted = property(lambda self: self._counter("admitted"))
+    delivered = property(lambda self: self._counter("delivered"))
+    rejected = property(lambda self: self._counter("rejected"))
+    dropped = property(lambda self: self._counter("dropped"))
+    dropped_debug = property(lambda self: self._counter("dropped_debug"))
+    high_water = property(lambda self: self._counter("high_water"))
 
     def stop_intake(self):
         runner = self._assert_bound()
@@ -250,29 +274,28 @@ class PeerConnectionLogInbox:
 
     def put_nowait(self, event):
         self._assert_bound()
-        if not self.accepting: self.rejected += 1; self._observe(); return False
+        if not self.accepting: self._observe(rejected=1); return False
         if not self._queue.full():
-            self._queue.put_nowait(event); self.admitted += 1; self._observe(); return True
+            self._queue.put_nowait(event); self._observe(admitted=1); return True
         level = getattr(getattr(event, "level", None), "value", 0)
-        self.rejected += 1
-        if level >= 4: self.dropped_debug += 1; self._observe(); return False
-        self.dropped += 1
+        if level >= 4: self._observe(rejected=1, dropped_debug=1); return False
         removed = self._queue.get_nowait()
-        if removed is not _LOG_STOP: self.rejected += 1
-        self._queue.put_nowait(event); self.admitted += 1; self._observe(); return True
+        extra_rejected = 1 if removed is not _LOG_STOP else 0
+        self._queue.put_nowait(event)
+        self._observe(admitted=1, rejected=1 + extra_rejected, dropped=1)
+        return True
 
     async def get(self):
         item = await self._queue.get()
-        if item is not _LOG_STOP: self.delivered += 1
-        self._observe(); return item
+        self._observe(delivered=1 if item is not _LOG_STOP else 0); return item
 
     def drain_batch(self, maximum):
         self._assert_bound(); batch=[]
         for _ in range(maximum):
             try: item = self._queue.get_nowait()
             except asyncio.QueueEmpty: break
-            if item is not _LOG_STOP: batch.append(item); self.delivered += 1
-        self._observe()
+            if item is not _LOG_STOP: batch.append(item)
+        self._observe(delivered=len(batch))
         if not self.accepting and self._queue.empty() and self._runner.state == "closing":
             self._command_id += 1
             self._runner.try_submit(_command(self._runner, self._command_id, "drained", "log-queue-drained"))
@@ -300,21 +323,23 @@ class PeerConnectionLogInbox:
         self._assert_bound()
 
 
-class AsyncLogDrain(ObservedComponent):
+class AsyncLogDrain:
     def __init__(self, inbox=None):
         self.inbox = inbox or PeerConnectionLogInbox(DebugConfig.get().log_max)
         self._runtime = self._runner = self._handle = self._drain_handle = None
         self._command_id = 0
         self._failure: BaseException | None = None
 
-    @event_loop
     def bind(self, runtime, entity_id):
         self._runtime = runtime
         self._runner, self._handle = _bind_runner(runtime, "log-drain", entity_id)
-        self.__bind_worker_owner__(runtime, entity_id, self._runner.epoch)
+        runtime.bind_observation(
+            self, entity_id=entity_id, owner_epoch=self._runner.epoch,
+            role="log-drain",
+        )
+        self._execution = runtime.execution_port(entity_id, self._runner.epoch)
         self.inbox.bind(runtime, f"{entity_id}:queue")
 
-    @event_loop
     def start(self):
         if self._runner is None: raise RuntimeError("log drain must be bound before start")
         if self._drain_handle is not None and not self._drain_handle.done(): return
@@ -337,7 +362,10 @@ class AsyncLogDrain(ObservedComponent):
                 batch.extend(self.inbox.drain_batch(max(0, config.log_flush_max_batch-len(batch))))
                 if batch:
                     await _move(self._runner,self._next(),"draining","log-batch")
-                    await self.write_batch(batch)
+                    await observe_worker(
+                        self._execution,
+                        self.write_batch, batch, name="worker:logger.write"
+                    )
                     await _move(self._runner,self._next(),"idle","log-batch-complete")
                 last=time.monotonic()
         except BaseException as error:
@@ -346,14 +374,10 @@ class AsyncLogDrain(ObservedComponent):
                 await _move(self._runner,self._next(),"failed","log-write-failed")
             raise
 
-    @event_loop
     def _next(self): self._command_id += 1; return self._command_id
 
-    @event_loop
     def stop_intake(self): self.inbox.stop_intake()
 
-    @worker
-    @performance(name="logger.write", group="logger")
     def write_batch(self, batch): get_logger().write_events_sync(batch)
 
     async def aclose(self):
@@ -364,7 +388,10 @@ class AsyncLogDrain(ObservedComponent):
                 if self._failure is None: self._failure=error
         while batch := self.inbox.drain_batch(max(1,DebugConfig.get().log_flush_max_batch)):
             try:
-                await self.write_batch(batch)
+                await observe_worker(
+                    self._execution,
+                    self.write_batch, batch, name="worker:logger.write"
+                )
             except BaseException as error:
                 if self._failure is None: self._failure=error
                 break
@@ -402,24 +429,25 @@ class AttachmentController:
         self._command_id=0; self._work:set[OwnedTaskHandle]=set()
         self._start_requested = False
 
-    @event_loop
     def bind(self,runtime,entity_id):
         if self._state is not None: return
         self._runtime=runtime; self._entity_id=entity_id
-        runtime.register_owner(entity_id, epoch=1)
-        runtime.projection.machines.register(
-            entity_id, MACHINE_SPECS["attachment-registry"], epoch=1
+        runtime.register_owner(
+            entity_id, epoch=1,
+            role=("signaling-attachments" if self.kind == "signaling" else "media-attachments"),
         )
         self._state = SynchronousStateReducer(
             MACHINE_SPECS["attachment-registry"], entity_id=entity_id,
             transition_sink=runtime.observe_transition,
+        )
+        self._state._transition_sink = runtime.observe_machine(
+            entity_id, MACHINE_SPECS["attachment-registry"], epoch=1,
         )
 
     def _assert_bound(self):
         if self._state is None: raise RuntimeError("attachments must be Runtime-bound before mutation")
         self._runtime.assert_owner_epoch(self._entity_id,1)
 
-    @event_loop
     def attach(self,attachment):
         self._assert_bound()
         if self._state.state in {"closing", "closed"}:
@@ -429,12 +457,12 @@ class AttachmentController:
         if len(self._entries)>=self.capacity: raise OverflowError("attachment registry capacity exceeded")
         identity=uuid.uuid4().hex
         entity=f"{self._entity_id}:attachment:{identity}"
-        self._runtime.projection.machines.register(
-            entity, MACHINE_SPECS["attachment"], epoch=1
-        )
         state = SynchronousStateReducer(
             MACHINE_SPECS["attachment"], entity_id=entity,
             transition_sink=self._runtime.observe_transition,
+        )
+        state._transition_sink = self._runtime.observe_machine(
+            entity, MACHINE_SPECS["attachment"], epoch=1,
         )
         entry=_AttachmentEntry(identity,attachment,state)
         self._entries[key]=entry
@@ -442,7 +470,6 @@ class AttachmentController:
         if self._start_requested: self._launch(entry)
         return attachment
 
-    @event_loop
     def start(self):
         self._assert_bound()
         if self._state.state in {"closing", "closed"}:

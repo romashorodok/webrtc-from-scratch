@@ -714,6 +714,7 @@ def test_stage3_peer_close_terminates_selected_transport_before_nomination() -> 
     async def scenario() -> None:
         async with Runtime(scope_id="stage3-pre-nomination-close") as runtime:
             peer = PeerConnection()
+            peer.__compose_runtime__(runtime)
             selected_entity = peer._ice_transport.entity_id
             assert runtime.projection.machines.get(selected_entity).state == "new"
             await peer.aclose()

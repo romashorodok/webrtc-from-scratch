@@ -21,10 +21,10 @@ from webrtc.media.rtcp import (
 from . import ice
 from .ice import net
 from . import dtls
+from .srtp import SessionAdmissionSnapshot
 
 import socket
 from .utils import impl_protocol, current_ntp_time
-from .performance import ObservedComponent, event_loop, task
 from .runtime_services import (
     FailurePolicy,
     OwnedTaskHandle,
@@ -183,31 +183,22 @@ class ICEGatherer:
         self._gather_submitted = False
         self._command_id = 0
         scope = current_execution_scope()
-        root = getattr(scope, "root_context", None)
-        identity = (
-            getattr(owner, "_observability_id", None)
-            or getattr(scope, "scope_id", None)
-            or getattr(root, "trace_id", None)
-        )
         self._runtime = scope if hasattr(scope, "start_machine") else None
-        self.entity_id = f"ice-gatherer:{identity or id(self)}"
+        hint = getattr(owner, "_observability_id", None)
+        self.entity_id = (
+            self._runtime.allocate_domain_entity_id("ice-gatherer", hint=hint)
+            if self._runtime is not None else f"ice-gatherer:{hint or secrets.token_hex(6)}"
+        )
         common = {"controller": getattr(scope, "transition_controller", None)}
         self._runner = _GathererRunner(
             self, entity_id=self.entity_id, mailbox_capacity=8,
-            transition_sink=(self._runtime.observe_transition
-                             if self._runtime is not None else None), **common,
+            transition_sink=None, **common,
         )
-        projection = getattr(scope, "projection", None)
-        if projection is not None:
-            projection.machines.register(self.entity_id, MACHINE_SPECS["ice-gatherer"])
         if self._runtime is not None:
             self._machine_handles = []
-            for runner in (self._runner,):
-                self._runtime.register_owner(runner.entity_id, epoch=runner.epoch)
-                self._machine_handles.append(runner.activate(
-                    self._runtime, owner_entity_id=runner.entity_id,
-                    owner_epoch=runner.epoch,
-                ))
+            self._machine_handles.append(self._runtime.compose_domain_runner(
+                self, self._runner, role="component", bind=False,
+            ))
         else:
             self._machine_handles = []
 
@@ -474,14 +465,10 @@ class _SelectedTransportCommand(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class SelectedTransportSnapshot:
-    """Authoritative selected-pair binding and its nomination provenance."""
+    """Authoritative ICE transport binding, free of tracing provenance."""
 
-    revision: int = 0
     state: str = "new"
     transport: ice.CandidatePairTransport | None = None
-    nomination_entity_id: str | None = None
-    nomination_epoch: int | None = None
-    nomination_revision: int | None = None
 
     @property
     def ready(self) -> bool:
@@ -508,9 +495,14 @@ class _SelectedTransportRunner(InlineStateMachineRunner):
             command.expected_epoch, command.expected_revision,
         )
 
+    def commit(self, proposed, cause=None):
+        commit = super().commit(proposed, cause)
+        if isinstance(proposed, PreparedTransition):
+            self.owner._commit_selected_transport(commit, proposed.effects)
+        return commit
+
     async def after_commit(self, commit, effects):
-        self.owner._commit_selected_transport(commit, effects)
-        self.owner._publish_selected_transport(commit)
+        return None
 
 
 @impl_protocol(dtls.ICETransportDTLS)
@@ -522,31 +514,26 @@ class ICETransport:
         self.__gatherer = gatherer
         self._selected = SelectedTransportSnapshot()
         scope = current_execution_scope()
-        root = getattr(scope, "root_context", None)
-        identity = (
-            getattr(gatherer, "entity_id", None)
-            or getattr(scope, "scope_id", None)
-            or getattr(root, "trace_id", None)
-        )
-        self.entity_id = f"selected-transport:{identity or id(self)}"
         self._runtime = scope if hasattr(scope, "start_machine") else None
+        hint = getattr(gatherer, "entity_id", None)
+        self.entity_id = (
+            self._runtime.allocate_domain_entity_id("selected-transport", hint=hint)
+            if self._runtime is not None
+            else f"selected-transport:{hint or secrets.token_hex(6)}"
+        )
         self._command_id = 0
         self._runner = _SelectedTransportRunner(
             self,
             MACHINE_SPECS["transport"], entity_id=self.entity_id,
             mailbox_capacity=8,
             controller=getattr(scope, "transition_controller", None),
-            transition_sink=(self._runtime.observe_transition
-                             if self._runtime is not None else None),
+            transition_sink=None,
         )
-        projection = getattr(scope, "projection", None)
-        if projection is not None:
-            projection.machines.register(self.entity_id, MACHINE_SPECS["transport"])
         if self._runtime is not None:
-            self._runtime.register_owner(self.entity_id, epoch=self._runner.epoch)
-            self._machine_handle = self._runner.activate(
-                self._runtime, owner_entity_id=self.entity_id,
-                owner_epoch=self._runner.epoch,
+            self._machine_handle = self._runtime.compose_domain_runner(
+                self, self._runner, role="selected-transport", bind=False,
+                adapter_name="selected_transport",
+                capture_name="capture_selected_transport",
             )
         else:
             self._machine_handle = None
@@ -554,22 +541,6 @@ class ICETransport:
 
         # self.__gatherer = gatherer
         # self._state: ICETransportState = ICETransportState.NEW
-
-    def _publish_selected_transport(self, commit: TransitionCommit) -> None:
-        if self._runtime is None:
-            return
-        values = {}
-        selected = self._selected
-        if commit.to_state == "ready" and selected.ready:
-            if selected.nomination_entity_id is None:
-                raise RuntimeError("ready transport has no nomination provenance")
-            values.update({
-                "selected": True,
-                "selected_pair_id": selected.transport.entity_id,
-                "nomination_entity_id": selected.nomination_entity_id,
-                "nomination_revision": selected.nomination_revision,
-            })
-        self._runtime.observe_facets(commit, values)
 
     def _command(self, kind, payload=None, *, cause_id=None, reply=None):
         self._command_id += 1
@@ -616,22 +587,13 @@ class ICETransport:
     ) -> None:
         current = self._selected
         transport = current.transport
-        entity_id = current.nomination_entity_id
-        epoch = current.nomination_epoch
-        revision = current.nomination_revision
         if effect is not None:
-            transport, nomination = effect
-            entity_id = nomination.entity_id
-            epoch = nomination.epoch
-            revision = nomination.revision
+            transport, _nomination = effect
         # Draining rejects new readers through ``ready`` while retaining the
         # exact resource that teardown still has to close.
         if commit.to_state in {"closed", "failed"}:
             transport = None
-        self._selected = SelectedTransportSnapshot(
-            commit.revision, commit.to_state, transport,
-            entity_id, epoch, revision,
-        )
+        self._selected = SelectedTransportSnapshot(commit.to_state, transport)
 
     def authoritative_snapshot(self) -> SelectedTransportSnapshot:
         return self._selected
@@ -640,9 +602,9 @@ class ICETransport:
         snapshot = self._selected
         return snapshot.transport if snapshot.ready else None
 
-    def selected_snapshot(self) -> tuple[int, ice.CandidatePairTransport | None]:
-        snapshot = self._selected
-        return snapshot.revision, snapshot.transport if snapshot.ready else None
+    def selected_snapshot(self) -> SelectedTransportSnapshot:
+        """Return the same domain snapshot used by all selected-pair readers."""
+        return self._selected
 
     async def aclose(self) -> None:
         if self._machine_handle is None or self._runner.snapshot().terminal:
@@ -777,25 +739,18 @@ class _SignalingCommand(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class _ChildReadiness:
-    entity_id: str
-    epoch: int
-    revision: int
-    required_state: str
-
-
-@dataclass(frozen=True, slots=True)
 class _PeerReadiness:
-    selected_transport: _ChildReadiness
-    dtls: _ChildReadiness
-    srtp_rtp: _ChildReadiness
-    srtp_rtcp: _ChildReadiness
+    selected_transport: SelectedTransportSnapshot
+    dtls: "dtls.DTLSTransportSnapshot"
+    srtp_rtp: SessionAdmissionSnapshot
+    srtp_rtcp: SessionAdmissionSnapshot
 
 
 @dataclass(frozen=True, slots=True)
 class PeerAuthoritySnapshot:
     """Peer protocol fields protected independently of trace projections."""
 
+    state: str = "new"
     role: str | None = None
     readiness: _PeerReadiness | None = None
 
@@ -829,6 +784,11 @@ class _SignalingSnapshot:
     pending_local: _CanonicalSDP | None = None
     current_remote: _CanonicalSDP | None = None
     pending_remote: _CanonicalSDP | None = None
+
+
+# Public domain name; the compatibility alias keeps existing internal imports
+# stable while callers migrate to ``PeerConnection.signaling_snapshot``.
+SignalingSnapshot = _SignalingSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -893,6 +853,7 @@ class _PeerRunner(InlineStateMachineRunner):
             ):
                 self.owner._validate_peer_readiness(payload.readiness)
         committed = super().commit(proposed, cause)
+        self.authority = replace(self.authority, state=committed.to_state)
         if (
             isinstance(proposed, PreparedTransition)
             and committed.to_state == "connected"
@@ -1016,7 +977,7 @@ class _SignalingRunner(InlineStateMachineRunner):
         return commit
 
     async def after_commit(self, commit, effects):
-        self.owner._after_signaling_commit(commit, effects)
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1052,7 +1013,7 @@ async def dtls_ice_pair_queue_handshake_routine(
 
 
 # TODO: Watch into ORTC API
-class PeerConnection(ObservedComponent):
+class PeerConnection:
     def __init__(self, *, peer_id: str | None = None) -> None:
         self.__loop = asyncio.get_running_loop()
         self.id = peer_id or uuid.uuid4().hex
@@ -1117,7 +1078,6 @@ class PeerConnection(ObservedComponent):
             self._media_send_credits.put_nowait(None)
         self._media_send_submission_id = 0
         self._media_send_running = 0
-        self._media_send_high_water = 0
         self._media_send_pump: OwnedTaskHandle[None] | None = None
         self._media_send_jobs: dict[int, OwnedTaskHandle[None]] = {}
         self._media_send_requests: dict[int, _MediaSendRequest] = {}
@@ -1132,7 +1092,6 @@ class PeerConnection(ObservedComponent):
         """Runtime owner epoch for work attached to the media-send lane."""
         return self._media_send_epoch
 
-    @event_loop
     def _next_transceiver_observability_id(self) -> str:
         self._transceiver_observability_sequence += 1
         return (
@@ -1142,12 +1101,16 @@ class PeerConnection(ObservedComponent):
 
     @property
     def closed(self) -> bool:
-        return self._peer_runner.snapshot().state == "closed"
+        return self._peer_runner.authority.state == "closed"
 
     @property
     def state(self) -> str:
-        state = self._peer_runner.snapshot().state
+        state = self._peer_runner.authority.state
         return "error" if state == "failed" else state
+
+    @property
+    def peer_snapshot(self) -> PeerAuthoritySnapshot:
+        return self._peer_runner.authority
 
     @property
     def _closed(self) -> bool:
@@ -1155,11 +1118,11 @@ class PeerConnection(ObservedComponent):
 
     @property
     def _closing(self) -> bool:
-        return self._peer_runner.snapshot().state in {"closing", "closed"}
+        return self._peer_runner.authority.state in {"closing", "closed"}
 
     @property
     def _started(self) -> bool:
-        return self._peer_runner.snapshot().state != "new"
+        return self._peer_runner.authority.state != "new"
 
     @property
     def _signaling_state(self) -> SignalingState:
@@ -1189,38 +1152,23 @@ class PeerConnection(ObservedComponent):
     def generation(self) -> int:
         return self._signaling_runner.signaling.negotiation_generation
 
-    @event_loop
+    @property
+    def signaling_snapshot(self) -> SignalingSnapshot:
+        return self._signaling_runner.signaling
+
     def _ensure_machine_owners(self, scope) -> None:
         if self._machine_handles:
             return
         self._runtime = scope
-        controller = getattr(scope, "transition_controller", None)
-        for runner in (self._peer_runner, self._signaling_runner):
-            runner.controller = controller or runner.controller
-            runner._transition_sink = scope.observe_transition
-            scope.projection.machines.register(runner.entity_id, runner.spec)
-            scope.register_owner(runner.entity_id, epoch=runner.epoch)
-            self._machine_handles.append(runner.activate(
-                scope, owner_entity_id=runner.entity_id,
-                owner_epoch=runner.epoch,
-            ))
-        scope.register_owner(self.media_send_entity_id, epoch=self._media_send_epoch)
-        self._media_send_pump = scope.start_pump(
-            self._run_media_send_pump,
-            owner_entity_id=self.media_send_entity_id,
-            owner_epoch=self._media_send_epoch,
-            name=f"media-send:pump:{self.media_send_entity_id}",
-            kind="media",
-            failure=FailurePolicy.FAIL_CONNECTION,
-            metadata={
-                "observerMeta": "aggregate",
-                "mailbox_capacity": self._media_send_mailbox.capacity,
-                "max_concurrency": self._media_send_credits.maxsize,
-            },
-        )
+        handles, self._media_send_pump = scope.compose_peer_runtime(self)
+        self._machine_handles.extend(handles)
         self._set_media_send_state("active")
 
-    @event_loop
+    def __compose_runtime__(self, scope) -> None:
+        """Explicit composition boundary used before observed public calls."""
+        self._execution_scope = scope
+        self._ensure_machine_owners(scope)
+
     def _require_runtime_bound_children(self, scope) -> None:
         # Test/application peers may replace the complete ICE facade with an
         # injected implementation that does not use these concrete children.
@@ -1242,7 +1190,6 @@ class PeerConnection(ObservedComponent):
                 f"unbound components: {', '.join(unbound)}"
             )
 
-    @event_loop
     def _command(self, runner, kind, payload=None, *, cause_id=None, reply=None):
         self._command_id += 1
         return MachineCommand(
@@ -1256,7 +1203,6 @@ class PeerConnection(ObservedComponent):
             cause_id=cause_id or f"{runner.entity_id}:{self._command_id}",
         )
 
-    @event_loop
     def _set_media_send_state(self, proposed: str) -> None:
         allowed = {
             "new": {"active", "closed"},
@@ -1274,63 +1220,19 @@ class PeerConnection(ObservedComponent):
         self._media_send_state = proposed
         self._media_send_revision += 1
 
-    @event_loop
-    def _publish_peer(
-        self, commit: TransitionCommit, readiness: _PeerReadiness | None = None,
-    ) -> None:
-        runtime = self._runtime
-        if runtime is not None and getattr(runtime, "tracing_enabled", True):
-            values = {
-                "negotiation_generation": self.generation,
-            }
-            if commit.to_state == "connected":
-                if readiness is None:
-                    raise RuntimeError("connected commit omitted its readiness effect")
-                values.update({
-                    "selected_transport_revision": readiness.selected_transport.revision,
-                    "dtls_revision": readiness.dtls.revision,
-                    "srtp_rtp_revision": readiness.srtp_rtp.revision,
-                    "srtp_rtcp_revision": readiness.srtp_rtcp.revision,
-                })
-            runtime.observe_facets(commit, values)
-
-    @event_loop
-    def _publish_peer_configuration(self) -> None:
-        """Refresh peer facets for non-lifecycle configuration changes."""
+    def _configuration_committed(self) -> None:
+        """Notify the Runtime sidecar of a committed non-lifecycle snapshot."""
         runtime = self._runtime
         if runtime is None or not getattr(runtime, "tracing_enabled", True):
             return
         snapshot = self._peer_runner.snapshot()
-        runtime.observe_facets(
-            snapshot, {
-                "negotiation_generation": self.generation,
-                "role": self._peer_runner.role,
-            },
-            observer_meta="exact",
+        runtime.record_domain_evidence(
+            "peer-configuration", snapshot, subject=self,
         )
-
-    @event_loop
-    def _after_signaling_commit(
-        self, commit: TransitionCommit, effect: _SignalingEffect,
-    ) -> None:
-        runtime = self._runtime
-        snapshot = effect.snapshot
-        if runtime is not None and getattr(runtime, "tracing_enabled", True):
-            values = {
-                "description_type": (
-                    effect.description_type.value
-                    if effect.description_type is not None else None
-                ),
-                "negotiation_generation": snapshot.negotiation_generation,
-                "media_section_count": effect.media_section_count,
-                "outcome": "failed" if commit.to_state == "failed" else "committed",
-            }
-            runtime.observe_facets(commit, values)
 
     async def _after_peer_commit(
         self, commit: TransitionCommit, payload: _PeerCommandPayload,
     ) -> None:
-        self._publish_peer(commit, payload.readiness)
         if commit.to_state == "starting":
             await self.gatherer.start()
             self._peer_runner.try_submit(self._command(
@@ -1380,33 +1282,35 @@ class PeerConnection(ObservedComponent):
                 except ValueError:
                     pass
 
-    @event_loop
     def _peer_readiness_snapshot(self) -> _PeerReadiness:
         selected_authority = getattr(
             self._ice_transport, "authoritative_snapshot", None,
         )
         if selected_authority is None:
-            selected = self._ice_transport._runner.snapshot()
-            selected_entity = selected.entity_id
-            selected_epoch = selected.epoch
-            selected_ready = selected.state == "ready"
+            machine = self._ice_transport._runner.snapshot()
+            selected = SelectedTransportSnapshot(
+                machine.state,
+                self._ice_transport if machine.state == "ready" else None,
+            )
+            selected_ready = selected.ready
         else:
             selected = selected_authority()
-            selected_entity = self._ice_transport.entity_id
-            selected_epoch = self._ice_transport._runner.epoch
             selected_ready = selected.ready
         dtls_authority = getattr(
             self._dtls_transport, "authoritative_snapshot", None,
         )
         if dtls_authority is None:
-            dtls_snapshot = self._dtls_transport._runner.snapshot()
-            dtls_entity = dtls_snapshot.entity_id
-            dtls_epoch = dtls_snapshot.epoch
-            dtls_ready = dtls_snapshot.state == "connected"
+            machine = self._dtls_transport._runner.snapshot()
+            dtls_snapshot = dtls.DTLSTransportSnapshot(
+                state=machine.state,
+                transport=(self._dtls_transport if machine.state == "connected" else None),
+                handshake_ready=machine.state == "connected",
+                srtp_rtp_ready=machine.state == "connected",
+                srtp_rtcp_ready=machine.state == "connected",
+            )
+            dtls_ready = dtls_snapshot.media_ready
         else:
             dtls_snapshot = dtls_authority()
-            dtls_entity = self._dtls_transport.entity_id
-            dtls_epoch = self._dtls_transport._runner.epoch
             dtls_ready = dtls_snapshot.media_ready
         if not selected_ready or not dtls_ready:
             raise RuntimeError("peer readiness requires authoritative transports")
@@ -1414,16 +1318,8 @@ class PeerConnection(ObservedComponent):
         rtcp = self._dtls_transport._srtp_rtcp
         if rtp is None or rtcp is None:
             raise RuntimeError("peer readiness requires both SRTP sessions")
-        rtp_snapshot = (
-            rtp.admission_snapshot() if hasattr(rtp, "admission_snapshot")
-            else rtp.lifecycle_snapshot()
-        )
-        rtcp_snapshot = (
-            rtcp.admission_snapshot() if hasattr(rtcp, "admission_snapshot")
-            else rtcp.lifecycle_snapshot()
-        )
-        rtp_lifecycle = rtp.lifecycle_snapshot()
-        rtcp_lifecycle = rtcp.lifecycle_snapshot()
+        rtp_snapshot = rtp.admission_snapshot()
+        rtcp_snapshot = rtcp.admission_snapshot()
         if (
             getattr(rtp_snapshot, "accepting_packets", rtp_snapshot.state == "ready")
             is not True
@@ -1431,31 +1327,50 @@ class PeerConnection(ObservedComponent):
             is not True
         ):
             raise RuntimeError("peer readiness requires authoritative SRTP admission")
-        return _PeerReadiness(
-            _ChildReadiness(
-                selected_entity, selected_epoch,
-                selected.revision, "ready",
-            ),
-            _ChildReadiness(
-                dtls_entity, dtls_epoch,
-                dtls_snapshot.revision, "connected",
-            ),
-            _ChildReadiness(
-                rtp_lifecycle.entity_id, rtp_lifecycle.epoch,
-                rtp_snapshot.revision, "ready",
-            ),
-            _ChildReadiness(
-                rtcp_lifecycle.entity_id, rtcp_lifecycle.epoch,
-                rtcp_snapshot.revision, "ready",
-            ),
+        readiness = _PeerReadiness(selected, dtls_snapshot, rtp_snapshot, rtcp_snapshot)
+        return readiness
+
+    def _selected_transport_snapshot(self) -> SelectedTransportSnapshot:
+        """Normalize legacy transport test ports at the peer composition edge."""
+        snapshot = self._ice_transport.selected_snapshot()
+        if isinstance(snapshot, SelectedTransportSnapshot):
+            return snapshot
+        transport = snapshot[1]
+        return SelectedTransportSnapshot(
+            "ready" if transport is not None else "new", transport,
         )
 
-    @event_loop
     def _validate_peer_readiness(self, readiness: _PeerReadiness | None) -> None:
-        if readiness is None or readiness != self._peer_readiness_snapshot():
-            raise StaleMachineAccess("peer child readiness revisions are stale")
+        try:
+            current = self._peer_readiness_snapshot()
+        except RuntimeError as error:
+            raise StaleMachineAccess(
+                "peer child readiness snapshots are stale"
+            ) from error
+        selected_same = (
+            readiness is not None
+            and (
+                readiness.selected_transport is current.selected_transport
+                if hasattr(self._ice_transport, "authoritative_snapshot")
+                else readiness.selected_transport == current.selected_transport
+            )
+        )
+        dtls_same = (
+            readiness is not None
+            and (
+                readiness.dtls is current.dtls
+                if hasattr(self._dtls_transport, "authoritative_snapshot")
+                else readiness.dtls == current.dtls
+            )
+        )
+        if readiness is None or any((
+            not selected_same,
+            not dtls_same,
+            readiness.srtp_rtp is not current.srtp_rtp,
+            readiness.srtp_rtcp is not current.srtp_rtcp,
+        )):
+            raise StaleMachineAccess("peer child readiness snapshots are stale")
 
-    @event_loop
     def _assert_peer_reconciled(self) -> None:
         if not self._cleanup_completed.issuperset({
             "signaling", "media-sources", "dtls", "selected-transport",
@@ -1469,9 +1384,8 @@ class PeerConnection(ObservedComponent):
         scope = current_execution_scope()
         if scope is None or scope.state is not ScopeState.ACTIVE:
             raise RuntimeError("PeerConnection requires an active Runtime")
+        self.__compose_runtime__(scope)
         self._require_runtime_bound_children(scope)
-        self._execution_scope = scope
-        self._ensure_machine_owners(scope)
         self.signaling.bind(scope, f"{self.entity_id}:attachment-registry:signaling")
         self.media_sources.bind(scope, f"{self.entity_id}:attachment-registry:media")
         self.log_drain.bind(scope, f"{self.entity_id}:log-drain")
@@ -1487,7 +1401,6 @@ class PeerConnection(ObservedComponent):
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.aclose("error" if exc is not None else "closed", error=exc)
 
-    @event_loop
     def _offer_event(self, event: object) -> None:
         try:
             self.event_inbox.offer_nowait(event)
@@ -1501,14 +1414,12 @@ class PeerConnection(ObservedComponent):
         await wait_until(lambda: self.closed, timeout=30.0)
         await self._join_peer_runner()
 
-    @event_loop
     def attach_signaling(self, signaling: object) -> object:
         attached = self.signaling.attach(signaling)
         if self._started and not self._closing:
             self.signaling.start()
         return attached
 
-    @event_loop
     def attach_media_source(self, source: object, *, kind: str | None = None) -> object:
         attached = self.media_sources.attach(source)
         if self._started and not self._closing:
@@ -1527,7 +1438,8 @@ class PeerConnection(ObservedComponent):
         if not self._peer_runner.claim_role("dial"):
             return
         await self.gatherer.dial()
-        self._publish_peer_configuration()
+        self._configuration_committed()
+        await self._runtime.flush_observations()
 
     async def accept(self) -> None:
         if self._closing or self._closed:
@@ -1541,9 +1453,9 @@ class PeerConnection(ObservedComponent):
         if not self._peer_runner.claim_role("accept"):
             return
         await self.gatherer.accept()
-        self._publish_peer_configuration()
+        self._configuration_committed()
+        await self._runtime.flush_observations()
 
-    @event_loop
     def observe_task_failure(self, event: TaskFailureEvent) -> None:
         if event.spec.failure is not FailurePolicy.FAIL_CONNECTION:
             return
@@ -1572,7 +1484,7 @@ class PeerConnection(ObservedComponent):
             self._execution_scope = scope
             self._ensure_machine_owners(scope)
         completion = self._terminal_completion()
-        if not self.closed and self._peer_runner.snapshot().state not in {"closing"}:
+        if not self.closed and self._peer_runner.authority.state != "closing":
             payload = _PeerCommandPayload(completion, reason, error)
             kind = (
                 _PeerCommand.FAIL if error is not None else _PeerCommand.CLOSE
@@ -1590,7 +1502,6 @@ class PeerConnection(ObservedComponent):
         finally:
             await self._join_peer_runner()
 
-    @event_loop
     def _terminal_completion(self) -> ReplyPort[TransitionCommit]:
         if self._close_completion is None:
             self._close_completion = ReplyPort[TransitionCommit]()
@@ -1727,7 +1638,7 @@ class PeerConnection(ObservedComponent):
         # Lifecycle waits are deliberately bounded so a failed negotiation cannot
         # leave a public send call (and its send lock) blocked forever.
         await wait_until(
-            lambda: self._ice_transport.selected_snapshot()[1] is not None,
+            lambda: self._selected_transport_snapshot().ready,
             timeout=30.0,
         )
         # DTLSTransport owns the SRTP readiness state.  Its write methods also
@@ -1735,23 +1646,15 @@ class PeerConnection(ObservedComponent):
         # public PeerConnection contract explicit before a send begins.
         await self._dtls_transport.wait(TransportCondition.SRTP_READY, timeout=30.0)
 
-    @event_loop
     def _publish_media_send_load(self) -> None:
         runtime = self._runtime
-        if runtime is None or not getattr(runtime, "tracing_enabled", True):
+        if runtime is None:
             return
-        source = MachineSnapshot(
-            self.media_send_entity_id, "media-send", self._media_send_epoch,
-            self._media_send_revision, self._media_send_state,
-            self._media_send_state == "closed",
-        )
-        runtime.observe_facets(
-            source, {
-                "queued": self._media_send_mailbox.depth,
-                "running": self._media_send_running,
-                "high_water": self._media_send_high_water,
-            },
-            observer_meta="aggregate",
+        runtime.record_queue_activity(
+            entity_id=self.media_send_entity_id, queue_kind="media-send",
+            depth=self._media_send_mailbox.depth,
+            capacity=self._media_send_mailbox.capacity,
+            gauges={"running": self._media_send_running},
         )
 
     async def _run_media_send_pump(self) -> None:
@@ -1792,7 +1695,6 @@ class PeerConnection(ObservedComponent):
                 kind="media",
                 failure=FailurePolicy.REPORT,
                 metadata={
-                    "observerMeta": "aggregate",
                     "submission_id": request.submission_id,
                     "packet_count": len(request.packets),
                 },
@@ -1836,7 +1738,6 @@ class PeerConnection(ObservedComponent):
             self._commit_media_send_results()
             self._publish_media_send_load()
 
-    @event_loop
     def _commit_media_send_results(self) -> None:
         """Resolve tagged results strictly in admission order on the owner loop."""
         while True:
@@ -1882,14 +1783,10 @@ class PeerConnection(ObservedComponent):
             self._media_send_abandoned.add(request.submission_id)
             self._commit_media_send_results()
             raise
-        self._media_send_high_water = max(
-            self._media_send_high_water, self._media_send_mailbox.depth,
-        )
         self._publish_media_send_load()
         return await reply.wait()
 
     @staticmethod
-    @event_loop
     def _media_packet_bytes(packet: bytes | bytearray) -> bytes:
         if not isinstance(packet, (bytes, bytearray)):
             raise TypeError("media packet must be bytes or bytearray")
@@ -2006,7 +1903,6 @@ class PeerConnection(ObservedComponent):
             )
         return feedback
 
-    @event_loop
     def build_twcc_feedback(self, media_ssrc: int, transport_sequences: Iterable[int]) -> bytes:
         """Build receiver-owned TWCC feedback for received transport sequences."""
         sequences = tuple(transport_sequences)
@@ -2061,8 +1957,9 @@ class PeerConnection(ObservedComponent):
         if not hasattr(self, "_ice_transport"):
             self._ice_transport = ICETransport(self.gatherer)
         await self._ice_transport.bind(transport, commit)
-        selected_revision, selected_transport = self._ice_transport.selected_snapshot()
-        if selected_transport is not transport or selected_revision < 1:
+        selected_snapshot = self._selected_transport_snapshot()
+        selected_transport = selected_snapshot.transport if selected_snapshot.ready else None
+        if selected_transport is not transport:
             raise RuntimeError("selected transport did not commit the nominated pair")
         dtls_role = self.__get_dtls_role()
         self._transport = selected_transport
@@ -2118,12 +2015,6 @@ class PeerConnection(ObservedComponent):
         ))
         await completion.wait()
 
-    @task(
-        name="dtls:ice-pair-queue-handshake",
-        kind="dtls",
-        metadata={"expected_long_running": True, "loop_role": "receive"},
-        failure=FailurePolicy.FAIL_CONNECTION,
-    )
     async def _dtls_ice_pair_queue_handshake(
         self, transport: ice.CandidatePairTransport
     ) -> None:
@@ -2143,7 +2034,7 @@ class PeerConnection(ObservedComponent):
                 await self.gatherer.wait(ICECondition.NOMINATED, timeout)
             case PeerCondition.NOMINATED_TRANSPORT_READY:
                 await wait_until(
-                    lambda: self._ice_transport.selected_snapshot()[1] is not None,
+                    lambda: self._selected_transport_snapshot().ready,
                     timeout=timeout,
                 )
             case PeerCondition.DTLS_HANDSHAKE_COMPLETE:
@@ -2172,7 +2063,8 @@ class PeerConnection(ObservedComponent):
         await self.wait(PeerCondition.SRTP_READY, timeout)
 
     async def add_transceiver_from_track(
-        self, track: TrackLocal, direction: RTPTransceiverDirection
+        self, track: TrackLocal, direction: RTPTransceiverDirection, *,
+        receiver: RTPReceiver | None = None,
     ) -> RTPTransceiver:
         # TODO: this may contain directly transport creation
         # gathering process may take that list/set of transports
@@ -2180,7 +2072,6 @@ class PeerConnection(ObservedComponent):
         # dtls_transport = dtls.DTLSTransport(transport, self.__certificate)
         # self.__dtls_transports.append(dtls_transport)
 
-        receiver: RTPReceiver | None = None
         sender: RTPSender | None = None
 
         codec = track._rtp_codec_params
@@ -2191,26 +2082,28 @@ class PeerConnection(ObservedComponent):
                 sender = RTPSender(self._caps)
             case RTPTransceiverDirection.Sendrecv:
                 sender = RTPSender(self._caps)
-                receiver = RTPReceiver(self._caps, kind)
-                receiver.receive(
-                    RTPDecodingParameters(
-                        rid=random_string(12),
-                        ssrc=secrets.randbits(32),
-                        payload_type=codec.payload_type,
-                        rtx=RTPRtxParameters(ssrc=secrets.randbits(32)),
+                if receiver is None:
+                    receiver = RTPReceiver(self._caps, kind)
+                    receiver.receive(
+                        RTPDecodingParameters(
+                            rid=random_string(12),
+                            ssrc=secrets.randbits(32),
+                            payload_type=codec.payload_type,
+                            rtx=RTPRtxParameters(ssrc=secrets.randbits(32)),
+                        )
                     )
-                )
 
             case RTPTransceiverDirection.Recvonly:
-                receiver = RTPReceiver(self._caps, kind)
-                receiver.receive(
-                    RTPDecodingParameters(
-                        rid=random_string(12),
-                        ssrc=secrets.randbits(32),
-                        payload_type=codec.payload_type,
-                        rtx=RTPRtxParameters(ssrc=secrets.randbits(32)),
+                if receiver is None:
+                    receiver = RTPReceiver(self._caps, kind)
+                    receiver.receive(
+                        RTPDecodingParameters(
+                            rid=random_string(12),
+                            ssrc=secrets.randbits(32),
+                            payload_type=codec.payload_type,
+                            rtx=RTPRtxParameters(ssrc=secrets.randbits(32)),
+                        )
                     )
-                )
 
         transceiver = RTPTransceiver(
             self._dtls_transport, caps=self._caps, kind=kind, direction=direction,
@@ -2231,14 +2124,15 @@ class PeerConnection(ObservedComponent):
                 stream_id=track.stream_id,
             )
         if receiver:
-            if not receiver._track:
+            receiver_track = receiver.track
+            if receiver_track is None:
                 raise ValueError("Receiver stream must bedefined")
 
             # NOTE: It may have different SSRC after negotiation
             get_logger().debug(
                 Component.PEER_CONNECTION,
                 "Configured remote receiver stream",
-                ssrc=receiver._track.ssrc,
+                ssrc=receiver_track.ssrc,
                 stream_id=track.stream_id,
             )
 
@@ -2485,7 +2379,6 @@ class PeerConnection(ObservedComponent):
         for transceiver in self._transceivers:
             transceiver.start_srtp_streams()
 
-    @event_loop
     def __get_sdp_role(self) -> ConnectionRole:
         role = self.gatherer.get_role()
 
@@ -2499,7 +2392,6 @@ class PeerConnection(ObservedComponent):
 
         return ConnectionRole.Actpass
 
-    @event_loop
     def __get_dtls_role(self) -> dtls.DTLSRole:
         remote_description = (
             self._current_remote_description or self._pending_remote_description
@@ -2715,7 +2607,7 @@ class PeerConnection(ObservedComponent):
 
         try:
             signaling = self._signaling_runner.signaling
-            signaling_revision = self._signaling_runner.snapshot().revision
+            signaling_revision = signaling.revision
             remote = (
                 signaling.current_remote.materialize()
                 if signaling.current_remote is not None else None
@@ -2741,7 +2633,7 @@ class PeerConnection(ObservedComponent):
                     current_transceivers, remote_description=remote,
                 )
 
-            if self._signaling_runner.snapshot().revision != signaling_revision:
+            if self._signaling_runner.signaling.revision != signaling_revision:
                 raise StaleMachineAccess(
                     "create_offer signaling snapshot changed during generation"
                 )

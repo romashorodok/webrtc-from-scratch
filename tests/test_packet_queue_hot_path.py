@@ -39,7 +39,7 @@ def test_runtime_owned_queue_packet_facets_coalesce_per_loop_turn():
 
             await asyncio.sleep(0)
             assert calls == 1
-            facets = _facets(runtime, queue.entity_id)
+            facets = _facets(runtime, runtime.telemetry_entity_id("queue", queue.entity_id))
             assert facets["depth"].value == 0
             assert facets["high_water"].value == 2
             assert facets["enqueued_packets"].value == 2
@@ -73,7 +73,7 @@ def test_udp_interceptor_coalesces_admission_drop_and_dequeue_counters():
 
             await asyncio.sleep(0)
             assert calls == 1
-            facets = _facets(runtime, queue.entity_id)
+            facets = _facets(runtime, runtime.telemetry_entity_id("queue", queue.entity_id))
             assert facets["depth"].value == 1
             assert facets["high_water"].value == 2
             assert facets["admitted_packets"].value == 3
@@ -111,7 +111,9 @@ def test_srtp_stream_coalesces_delivery_drop_and_read_counters():
 
             await asyncio.sleep(0)
             assert calls == 1
-            facets = _facets(runtime, stream.observability_id)
+            facets = _facets(
+                runtime, runtime.telemetry_entity_id("queue", stream.observability_id)
+            )
             assert facets["depth"].value == 1
             assert facets["high_water"].value == 2
             assert facets["delivered_packets"].value == 2

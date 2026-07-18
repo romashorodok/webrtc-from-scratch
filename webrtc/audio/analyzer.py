@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from webrtc.logger import Component, get_logger
-from webrtc.performance import ObservedComponent, worker
+from webrtc.runtime_services import current_execution_scope
 
 logger = get_logger()
 
@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from .filters import FilterChain
 
 
-class AudioAnalyzer(ObservedComponent):
+class AudioAnalyzer:
     """
     Real-time audio analyzer for PCM frames.
 
@@ -55,7 +55,13 @@ class AudioAnalyzer(ObservedComponent):
             0, len(self.freq_bins) - 1, self.target_bins, dtype=int
         )
 
-        self.frame_count = 0
+        runtime = current_execution_scope()
+        if runtime is not None:
+            self._execution = runtime.execution_port(
+                runtime._worker_entity_id, runtime._worker_runner.epoch
+            )
+        else:
+            self._execution = None
 
         logger.info(
             Component.OPUS,
@@ -66,7 +72,6 @@ class AudioAnalyzer(ObservedComponent):
             has_filters=filter_chain is not None,
         )
 
-    @worker
     def _compute_spectrum(self, pcm_bytes: bytes) -> tuple[np.ndarray, Optional[dict]]:
         """
         Compute FFT spectrum from PCM bytes.
@@ -112,7 +117,6 @@ class AudioAnalyzer(ObservedComponent):
 
         return downsampled, vad_features
 
-    @worker
     def _compute_features(self, pcm_bytes: bytes) -> Dict[str, float]:
         """
         Extract audio features from PCM bytes.
@@ -171,11 +175,15 @@ class AudioAnalyzer(ObservedComponent):
         Returns:
             Dictionary with timestamp, spectrum, and features
         """
-        self.frame_count += 1
-
         # Run CPU-intensive computation in thread pool
-        spectrum, vad_features = await self._compute_spectrum(pcm_bytes)
-        features = await self._compute_features(pcm_bytes)
+        if self._execution is None:
+            raise RuntimeError("AudioAnalyzer requires an active Runtime execution port")
+        spectrum, vad_features = await self._execution.run_worker(
+            self._compute_spectrum, pcm_bytes, name="worker:audio.spectrum"
+        )
+        features = await self._execution.run_worker(
+            self._compute_features, pcm_bytes, name="worker:audio.features"
+        )
 
         # Merge VAD features into main features dict
         if vad_features:
@@ -187,15 +195,13 @@ class AudioAnalyzer(ObservedComponent):
             for i, idx in enumerate(self.downsample_indices)
         ]
 
-        if self.frame_count <= 5 or self.frame_count % 100 == 0:
-            logger.debug(
-                Component.OPUS,
-                "Analyzed frame",
-                count=self.frame_count,
-                rms=features["rms"],
-                zcr=features["zcr"],
-                centroid=features["spectral_centroid"],
-                is_voice=features.get("is_voice", None),
+        runtime = current_execution_scope()
+        if runtime is not None:
+            binding = runtime.observation_registry.get(self)
+            runtime.record_audio_frame(
+                analyzer_id=(binding.entity_id if binding is not None
+                             else runtime._worker_entity_id),
+                features=features,
             )
 
         return {"timestamp": timestamp, "bins": bins, "features": features}
@@ -347,7 +353,6 @@ class SpectrumAggregator:
         self.ws = ws
         self.buffer: deque = deque()
         self.last_send = time.time()
-        self.send_count = 0
 
         logger.info(
             Component.OPUS,
@@ -426,16 +431,6 @@ class SpectrumAggregator:
                     await self.ws.send_json(
                         {"event": "audio_threshold", "data": latest_threshold}
                     )
-
-            self.send_count += 1
-            if self.send_count <= 5 or self.send_count % 50 == 0:
-                logger.debug(
-                    Component.OPUS,
-                    "Sent aggregated spectrum",
-                    count=self.send_count,
-                    frames_aggregated=len(self.buffer),
-                    rms=avg_features["rms"],
-                )
 
         except Exception as e:
             logger.error(Component.OPUS, "Failed to send spectrum", error=str(e))

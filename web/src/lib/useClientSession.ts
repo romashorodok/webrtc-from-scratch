@@ -11,8 +11,8 @@ export function useClientSession() {
   const [toasts, setToasts] = useState<string[]>([]);
   const {
     enqueueTraceBatch,
-    enqueueTraceSnapshot, enqueueTraceResyncRequired,
-    machinesById, transitions, controlsById, groupsById, facetsById, capturesById,
+    enqueueTraceSnapshot, enqueueTraceResyncRequired, enqueueTraceTerminal,
+    machinesById, entitiesById, transitions, controlsById, groupsById, facetsById, capturesById,
     operationNamesById, diagnostics, topologyVersion, valueVersion,
   } = useTraceState((request) => signalRef.current?.send("trace:resync_request", request));
 
@@ -46,6 +46,7 @@ export function useClientSession() {
     const unsubscribeTraceResyncRequired = signal.on(
       "trace:resync_required", enqueueTraceResyncRequired,
     );
+    const unsubscribeTraceTerminal = signal.on("trace:terminal", enqueueTraceTerminal);
     const unsubscribeCaptureResult = signal.on("trace:capture_result", (data) => {
       const result = parseJson<{ success?: boolean; capture_id?: number; error?: string }>(data);
       setToasts((previous) => [...previous, result?.success
@@ -82,6 +83,7 @@ export function useClientSession() {
       unsubscribeTraceBatch();
       unsubscribeTraceSnapshot();
       unsubscribeTraceResyncRequired();
+      unsubscribeTraceTerminal();
       unsubscribeCaptureResult();
       signal.close();
       pc.close();
@@ -89,7 +91,7 @@ export function useClientSession() {
     };
   }, [
     enqueueTraceBatch,
-    enqueueTraceSnapshot, enqueueTraceResyncRequired,
+    enqueueTraceSnapshot, enqueueTraceResyncRequired, enqueueTraceTerminal,
   ]);
 
   const startNegotiation = () => {
@@ -127,6 +129,7 @@ export function useClientSession() {
     dismissToast,
     requestTraceCapture,
     machinesById,
+    entitiesById,
     transitions,
     controlsById,
     groupsById,

@@ -13,8 +13,9 @@ from webrtc.runtime_services import FailurePolicy
 
 def test_peer_start_is_an_ordinary_structured_async_method() -> None:
     async def scenario() -> None:
-        async with Runtime(scope_id="phase-4"):
+        async with Runtime(scope_id="phase-4") as runtime:
             peer = PeerConnection()
+            peer.__compose_runtime__(runtime)
 
             async def start_gatherer() -> None:
                 return None

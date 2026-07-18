@@ -21,6 +21,9 @@ export function useTraceState(onResyncRequest?: (request: TraceResyncRequest) =>
   const enqueueTraceResyncRequired = useCallback((data: unknown) => {
     dispatch({ type: "events", events: [{ event: "trace:resync_required", data }] });
   }, []);
+  const enqueueTraceTerminal = useCallback((data: unknown) => {
+    dispatch({ type: "events", events: [{ event: "trace:terminal", data }] });
+  }, []);
 
   useEffect(() => {
     if (state.resyncRequestVersion === 0) return;
@@ -35,7 +38,9 @@ export function useTraceState(onResyncRequest?: (request: TraceResyncRequest) =>
     enqueueTraceBatch,
     enqueueTraceSnapshot,
     enqueueTraceResyncRequired,
+    enqueueTraceTerminal,
     machinesById: state.machinesById,
+    entitiesById: state.entitiesById,
     transitions: state.transitions,
     controlsById: state.controlsById,
     groupsById: state.groupsById,
@@ -46,5 +51,6 @@ export function useTraceState(onResyncRequest?: (request: TraceResyncRequest) =>
     valueVersion: state.valueVersion,
     diagnostics: state.diagnostics,
     resyncRequired: state.resyncRequired,
+    terminal: state.terminal,
   };
 }

@@ -78,10 +78,10 @@ def test_selected_transport_commits_binding_and_provenance_as_one_snapshot():
 
             assert before.state == "new" and before.transport is None
             assert committed.ready and committed.transport is pair
-            assert committed.nomination_entity_id == nomination.entity_id
-            assert committed.nomination_epoch == nomination.epoch
-            assert committed.nomination_revision == nomination.revision
-            assert selected.selected_snapshot() == (committed.revision, pair)
+            assert selected.selected_snapshot() is committed
+            assert committed.transport is pair
+            assert not hasattr(committed, "nomination_entity_id")
+            assert not hasattr(committed, "revision")
 
             with pytest.raises(RuntimeError, match="already bound"):
                 await selected.bind(_PairTransport("candidate-pair:stale"), nomination)
@@ -143,8 +143,12 @@ def test_transceiver_snapshot_is_the_read_authority_and_stale_cas_is_rejected():
 
             with pytest.raises(StaleMachineAccess):
                 await transceiver.apply_negotiated_snapshot(
-                    authority, expected_epoch=machine.epoch,
-                    expected_revision=machine.revision - 1,
+                    authority,
+                    expected_snapshot=type(authority)(
+                        authority.direction, authority.mid, authority.codecs,
+                        authority.sender_config, authority.receiver_config,
+                        authority.sender, authority.receiver,
+                    ),
                 )
             assert transceiver.negotiated_snapshot is authority
             await transceiver.aclose()

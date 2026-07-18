@@ -6,6 +6,7 @@ import uuid
 from collections import Counter
 from collections.abc import Callable, Mapping
 from concurrent.futures import Executor
+from types import MappingProxyType
 from typing import Any, TypeVar, cast
 
 from .runtime_services import (
@@ -20,6 +21,7 @@ from .runtime_services import (
     OwnedTimerHandle,
     OwnedResourceHandle,
     ResourceDeclaration,
+    RuntimeExecutionPort,
     ScopeNotActive,
     ScopeShutdownTimeout,
     ScopeState,
@@ -48,10 +50,12 @@ from .observability import MachineTransitionOp, ObservabilityService, ProducerDo
 from .state_machine import (
     InlineStateMachineRunner, MachineCommand, NullTransitionController,
     PreparedTransition, ReplyPort, TransitionCommit,
+    begin_observation_dispatch, end_observation_dispatch,
 )
 from .state_facets import AggregateFacetAdapter
 from .machine_specs import MACHINE_SPECS
 from .diagnostic_capture import CaptureAuthorization, DiagnosticCaptureManager
+from .observation_registry import ObservationBinding, ObservationRegistry, SemanticRole
 
 T = TypeVar("T")
 
@@ -189,6 +193,8 @@ class Runtime(ExecutionScope):
         task_observers=(),
         failure_observers=(),
     ) -> None:
+        from .operation_policy import install_loaded_production_operation_adapters
+        install_loaded_production_operation_adapters()
         self.scope_id = scope_id
         self.tracing_enabled = tracing_enabled
         self.shutdown_timeout = shutdown_timeout
@@ -251,6 +257,7 @@ class Runtime(ExecutionScope):
                 delay, callback, owner_entity_id=self._observability_entity_id,
                 owner_epoch=self.observability_epoch,
             ),
+            entity_provider=self.trace_entity_descriptors,
         )
         if self.tracing_enabled:
             self.activity_groups.set_dirty_callback(self.trace_transport.dirty)
@@ -260,11 +267,15 @@ class Runtime(ExecutionScope):
         self._publishing_diagnostic_health = False
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self._owner_epochs: dict[str, int] = {}
+        self._owner_roles: dict[str, str] = {}
+        self._trace_aliases: dict[str, str] = {}
+        self._domain_entity_counts: dict[tuple[str, str], int] = {}
         self._owner_tasks: dict[tuple[str, int], set[OwnedTaskHandle[Any]]] = {}
         self._owner_timers: dict[tuple[str, int], set[OwnedTimerHandle]] = {}
         self._owner_resources: dict[
             tuple[str, int], set[OwnedResourceHandle]
         ] = {}
+        self.observation_registry = ObservationRegistry(self)
         self._worker_submission_id = 0
         self.diagnostics.set_dirty_callback(self._diagnostics_changed)
 
@@ -427,6 +438,53 @@ class Runtime(ExecutionScope):
             with self.diagnostics.suspend_notifications():
                 self.diagnostics["transition_observation_failures"] += 1
 
+    def observe_machine(
+        self, entity_id: str, spec: Any, *, epoch: int = 1,
+        facet_values: Callable[[TransitionCommit, Any], Mapping[str, Any] | None] | None = None,
+        capture_effect: Callable[[Any, TransitionCommit, Any], Any] | None = None,
+        capture_subject: Any = None,
+        owner_entity_id: str | None = None, observer_meta: str = "exact",
+        failure_diagnostic: str = "facet_observation_failures",
+    ) -> Callable[[TransitionCommit], None]:
+        """Compose a domain state owner with its Runtime observation sidecar."""
+        return self.observation_registry.observe_machine(
+            entity_id=entity_id, spec=spec, epoch=epoch,
+            facet_values=facet_values, capture_effect=capture_effect,
+            capture_subject=capture_subject,
+            owner_entity_id=owner_entity_id,
+            observer_meta=observer_meta,
+            failure_diagnostic=failure_diagnostic,
+        )
+
+    async def flush_observations(self) -> None:
+        """Deterministically drain queued after-commit observation work."""
+        await self.observation_registry.flush()
+
+    def observe_snapshot(
+        self, source: Any, values: Mapping[str, Any], *,
+        observer_meta: str = "exact",
+        failure_diagnostic: str = "facet_observation_failures",
+    ) -> None:
+        """Queue translation of a committed snapshot outside its reducer."""
+        try:
+            captured = dict(values)
+            def observe() -> None:
+                token = begin_observation_dispatch()
+                try:
+                    self.observe_facets(
+                        source, captured, observer_meta=observer_meta,
+                        failure_diagnostic=failure_diagnostic,
+                    )
+                finally:
+                    end_observation_dispatch(token)
+            asyncio.get_running_loop().call_soon(observe)
+        except BaseException:
+            try:
+                with self.diagnostics.suspend_notifications():
+                    self.diagnostics["observation_admission_failures"] += 1
+            except Exception:
+                pass
+
     def observe_facets(
         self,
         source: Any,
@@ -468,7 +526,11 @@ class Runtime(ExecutionScope):
         observer_meta: str = "exact",
         failure_diagnostic: str = "facet_observation_failures",
     ) -> Callable[[TransitionCommit], None]:
-        """Build a Runtime-owned sink for an optional domain snapshot factory."""
+        """Build an unregistered compatibility observer.
+
+        New state owners should use :meth:`observe_machine`, which also keeps
+        machine registration in the Runtime sidecar.
+        """
         def observe(commit: TransitionCommit) -> None:
             self.observe_transition(commit)
             if facet_values is None:
@@ -489,19 +551,55 @@ class Runtime(ExecutionScope):
 
     def record_queue_state(self, **values: Any) -> None:
         self._assert_loop()
-        self._aggregate_facet_adapter.queue_state(**values)
+        self._record_telemetry("queue", self._aggregate_facet_adapter.queue_state, values)
+
+    def record_queue_activity(self, **values: Any) -> None:
+        self._assert_loop()
+        self._record_telemetry(
+            "queue", self._aggregate_facet_adapter.queue_activity, values,
+        )
+
+    def queue_telemetry_snapshot(self, entity_id: str) -> Mapping[str, int]:
+        """Compatibility/testing view; the queue itself owns no counters."""
+        return MappingProxyType(
+            self._aggregate_facet_adapter.queue_snapshot(entity_id)
+        )
+
+    def telemetry_entity_id(self, namespace: str, identity: object) -> str:
+        """Return the Runtime-side canonical alias used by telemetry facets."""
+        return self._aggregate_facet_adapter._alias(namespace, identity)
 
     def record_worker_state(self, **values: Any) -> None:
         self._assert_loop()
-        self._aggregate_facet_adapter.worker_state(**values)
+        self._record_telemetry("worker", self._aggregate_facet_adapter.worker_state, values)
 
     def record_srtp_stream(self, **values: Any) -> None:
         self._assert_loop()
-        self._aggregate_facet_adapter.srtp_stream(**values)
+        self._record_telemetry("srtp_stream", self._aggregate_facet_adapter.srtp_stream, values)
 
     def record_srtp_delivery(self, **values: Any) -> None:
         self._assert_loop()
-        self._aggregate_facet_adapter.srtp_delivery(**values)
+        self._record_telemetry("srtp_delivery", self._aggregate_facet_adapter.srtp_delivery, values)
+
+    def record_srtp_packet(self, **values: Any) -> None:
+        self._assert_loop()
+        self._record_telemetry("srtp_packet", self._aggregate_facet_adapter.srtp_packet, values)
+
+    def record_audio_frame(self, **values: Any) -> None:
+        self._assert_loop()
+        self._record_telemetry("audio", self._aggregate_facet_adapter.audio_frame, values)
+
+    def _record_telemetry(self, kind: str, reducer: Callable[..., None],
+                          values: Mapping[str, Any]) -> None:
+        """Keep all telemetry/reporting failures off protocol control paths."""
+        try:
+            reducer(**values)
+        except BaseException:
+            try:
+                with self.diagnostics.suspend_notifications():
+                    self.diagnostics[f"{kind}_telemetry_failures"] += 1
+            except Exception:
+                pass
 
     async def _move_observability(self, state: str, cause_id: str) -> TransitionCommit:
         self._observability_command_id += 1
@@ -525,20 +623,24 @@ class Runtime(ExecutionScope):
         self, admitted: bool, subscriber_count: int, journal_depth: int
     ) -> None:
         runner = self._observability_runner
-        self.projection.merge_values(
-            runner.entity_id, self.new_producer_dot(), {
-                "enabled": self.tracing_enabled,
-                "admitted": admitted,
-                "subscriber_count": subscriber_count,
-                "journal_depth": journal_depth,
-                "subscriber_drops": self.diagnostics["trace_subscriber_drops"],
-                "resyncs": self.diagnostics["trace_resync_required"],
-                "failures": self.diagnostics["trace_transport_failures"],
-            },
-            observer_meta="exact", source_entity_id=runner.entity_id,
-            source_epoch=runner.epoch, source_revision=runner.revision,
-            source_order=self.projection.new_facet_source_order(),
-        )
+        try:
+            self.projection.merge_values(
+                runner.entity_id, self.new_producer_dot(), {
+                    "enabled": self.tracing_enabled,
+                    "admitted": admitted,
+                    "subscriber_count": subscriber_count,
+                    "journal_depth": journal_depth,
+                    "subscriber_drops": self.diagnostics["trace_subscriber_drops"],
+                    "resyncs": self.diagnostics["trace_resync_required"],
+                    "failures": self.diagnostics["trace_transport_failures"],
+                },
+                observer_meta="exact", source_entity_id=runner.entity_id,
+                source_epoch=runner.epoch, source_revision=runner.revision,
+                source_order=self.projection.new_facet_source_order(),
+            )
+        except Exception:
+            with self.diagnostics.suspend_notifications():
+                self.diagnostics["observability_facet_failures"] += 1
 
     def _trace_health_changed(
         self, admitted: bool, subscriber_count: int, journal_depth: int
@@ -630,9 +732,12 @@ class Runtime(ExecutionScope):
         self._root_context = root
         self.projection.bind_trace(root.trace_id)
         self._execution_token = set_execution_context(root)
-        for runner in (self._runtime_runner, self._worker_runner):
-            self.register_owner(runner.entity_id, epoch=runner.epoch)
-            self.projection.machines.register(
+        for runner, role in (
+            (self._runtime_runner, SemanticRole.RUNTIME),
+            (self._worker_runner, SemanticRole.WORKER_LANE),
+        ):
+            self.register_owner(runner.entity_id, epoch=runner.epoch, role=role)
+            runner._transition_sink = self.observe_machine(
                 runner.entity_id, runner.spec, epoch=runner.epoch,
             )
         self._runtime_handle = self._runtime_runner.activate(
@@ -645,8 +750,11 @@ class Runtime(ExecutionScope):
             self, owner_entity_id=self._worker_entity_id,
             owner_epoch=self._worker_runner.epoch,
         )
-        self.register_owner(self._observability_entity_id, epoch=self.observability_epoch)
-        self.projection.machines.register(
+        self.register_owner(
+            self._observability_entity_id, epoch=self.observability_epoch,
+            role=SemanticRole.INFRASTRUCTURE,
+        )
+        self._observability_runner._transition_sink = self.observe_machine(
             self._observability_entity_id, MACHINE_SPECS["observability"],
             epoch=self.observability_epoch,
         )
@@ -665,6 +773,7 @@ class Runtime(ExecutionScope):
             "task_started",
             TaskStarted(root, spec.name, spec.kind, dict(spec.metadata), spec.cancelable),
         )
+        await self.flush_observations()
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -714,7 +823,9 @@ class Runtime(ExecutionScope):
             raise WrongRuntimeLoop("Runtime-owned state was accessed from another loop")
         return loop
 
-    def register_owner(self, entity_id: str, *, epoch: int = 1) -> None:
+    def register_owner(
+        self, entity_id: str, *, epoch: int = 1, role: str | SemanticRole | None = None,
+    ) -> None:
         self._assert_loop()
         if epoch < 1:
             raise ValueError("owner epoch must be positive")
@@ -722,6 +833,208 @@ class Runtime(ExecutionScope):
         if current is not None and epoch <= current:
             raise StaleOwnerEpoch(f"owner {entity_id} already has epoch {current}")
         self._owner_epochs[entity_id] = epoch
+        if role is not None:
+            self._owner_roles[entity_id] = SemanticRole(role).value
+
+    def allocate_domain_entity_id(self, kind: str, *, hint: str | None = None) -> str:
+        """Allocate a Runtime-scoped domain execution identity at composition."""
+        base = hint or self.scope_id or (self._root_context.trace_id if self._root_context else "runtime")
+        key = (kind, str(base))
+        sequence = self._domain_entity_counts.get(key, 0) + 1
+        self._domain_entity_counts[key] = sequence
+        return f"{kind}:{base}" if sequence == 1 else f"{kind}:{base}:{sequence}"
+
+    def retire_domain_machine(self, entity_id: str, epoch: int) -> None:
+        self.projection.terminate_entity_epoch(entity_id, epoch)
+
+    def trace_entity_descriptors(self) -> list[dict[str, Any]]:
+        """Return bounded presentation metadata without exposing it to domain objects."""
+        machines = {
+            item.entity_id: item.machine_type
+            for item in self.projection.machines.snapshots()
+        }
+        facets = {item.owner_entity_id for item in self.projection.facets.snapshots()}
+        groups = {item.owner_entity_id for item in self.activity_groups.snapshots()}
+        controls = {item.owner_entity_id for item in self.projection.controls.snapshots()}
+        # Retain aliases for retired owners: archived/facet text can outlive an
+        # owner epoch and must never regress to its raw registered identifier.
+        entity_ids = (
+            set(self._trace_aliases) | set(self._owner_epochs) | set(machines)
+            | facets | groups | controls
+        )
+        descriptors = []
+        for entity_id in sorted(entity_ids):
+            alias = self._trace_aliases.get(entity_id)
+            if alias is None:
+                alias = f"@{len(self._trace_aliases) + 1}"
+                self._trace_aliases[entity_id] = alias
+            epoch = self._owner_epochs.get(entity_id, 1)
+            bound_role = self.observation_registry.entity_role(entity_id, epoch)
+            role = self._owner_roles.get(entity_id)
+            if role is None and bound_role is not None:
+                role = bound_role.value
+            if role is None:
+                role = machines.get(entity_id, "infrastructure")
+            kind = (
+                "machine" if entity_id in machines
+                else "facet-owner" if entity_id in facets
+                else "resource" if entity_id in groups or entity_id in controls
+                else "owner"
+            )
+            descriptors.append({
+                "entity_id": entity_id,
+                "alias": alias,
+                "role": role,
+                "kind": kind,
+            })
+        return descriptors
+
+    def bind_observation(
+        self, subject: object, *, entity_id: str, role: str | SemanticRole,
+        owner_epoch: int,
+        operation_policy: Mapping[str, Any] | None = None,
+        entity_role: str | SemanticRole | None = None,
+        runtime_root_utility: bool = False,
+    ) -> ObservationBinding:
+        """Compose a protocol object with Runtime-owned observation metadata."""
+        authoritative = operation_policy is not None
+        if operation_policy is None:
+            from .operation_policy import production_policy_for
+            operation_policy = production_policy_for(subject)
+            if operation_policy is not None:
+                authoritative = True
+            else:
+                # Compatibility for external/test components until Stage 7.
+                operation_policy = getattr(type(subject), "__observations__", {})
+        binding = self.observation_registry.bind(
+            subject, entity_id=entity_id, role=role, owner_epoch=owner_epoch,
+            operation_policy=operation_policy,
+            policy_is_authoritative=authoritative, entity_role=entity_role,
+            runtime_root_utility=runtime_root_utility,
+        )
+        if authoritative:
+            from .operation_policy import install_subject_operation_adapters
+            install_subject_operation_adapters(subject)
+        return binding
+
+    def compose_peer_runtime(self, peer: Any) -> tuple[list[Any], Any]:
+        """Runtime-side composition for peer state observation and owned media work."""
+        from . import domain_observation
+
+        handles = []
+        for runner, role, adapter, capture in (
+            (
+                peer._peer_runner, "peer-connection",
+                domain_observation.peer_lifecycle, domain_observation.capture_peer,
+            ),
+            (peer._signaling_runner, "signaling", domain_observation.signaling, None),
+        ):
+            runner.controller = self.transition_controller or runner.controller
+            runner._transition_sink = self.observe_machine(
+                runner.entity_id, runner.spec, epoch=runner.epoch,
+                facet_values=adapter, capture_effect=capture,
+                capture_subject=peer if capture is not None else None,
+            )
+            self.register_owner(runner.entity_id, epoch=runner.epoch, role=role)
+            handles.append(runner.activate(
+                self, owner_entity_id=runner.entity_id, owner_epoch=runner.epoch,
+            ))
+        self.bind_observation(
+            peer, entity_id=peer.entity_id, role="peer-connection",
+            owner_epoch=peer._peer_runner.epoch,
+        )
+        self.register_owner(
+            peer.media_send_entity_id, epoch=peer._media_send_epoch, role="media-send",
+        )
+        pump = self.start_pump(
+            peer._run_media_send_pump,
+            owner_entity_id=peer.media_send_entity_id,
+            owner_epoch=peer._media_send_epoch,
+            name=f"media-send:pump:{peer.media_send_entity_id}", kind="media",
+            failure=FailurePolicy.FAIL_CONNECTION,
+            metadata={
+                "mailbox_capacity": peer._media_send_mailbox.capacity,
+                "max_concurrency": peer._media_send_credits.maxsize,
+            },
+        )
+        return handles, pump
+
+    def compose_domain_runner(
+        self, subject: Any, runner: Any, *, role: str, adapter_name: str | None = None,
+        capture_name: str | None = None, bind: bool = True, activate: bool = True,
+        entity_role: str | None = None, commit_sink: Callable[[Any], None] | None = None,
+    ) -> Any:
+        """Externally attach execution-neutral observation to one domain runner."""
+        from . import domain_observation
+
+        adapter = getattr(domain_observation, adapter_name) if adapter_name else None
+        capture = getattr(domain_observation, capture_name) if capture_name else None
+        observed = self.observe_machine(
+            runner.entity_id, runner.spec, epoch=runner.epoch,
+            facet_values=adapter, capture_effect=capture,
+            capture_subject=subject if capture is not None else None,
+        )
+        if commit_sink is None:
+            runner._transition_sink = observed
+        else:
+            runner._transition_sink = lambda commit: (commit_sink(commit), observed(commit))
+        self.register_owner(runner.entity_id, epoch=runner.epoch, role=entity_role or role)
+        if bind:
+            self.bind_observation(
+                subject, entity_id=runner.entity_id, role=role,
+                entity_role=entity_role, owner_epoch=runner.epoch,
+            )
+        if not activate:
+            return None
+        if hasattr(runner, "activate"):
+            return runner.activate(
+                self, owner_entity_id=runner.entity_id, owner_epoch=runner.epoch,
+            )
+        raise TypeError("domain runner requires an explicit execution activation")
+
+    def compose_domain_machine(
+        self, runner: Any, *, queue_kind: str | None = None,
+    ) -> None:
+        facet_values = None
+        observer_meta = "exact"
+        failure_diagnostic = "facet_observation_failures"
+        if queue_kind is not None:
+            facet_values = lambda _commit, _effects: {"queue_kind": queue_kind}
+            observer_meta = "aggregate"
+            failure_diagnostic = "udp_queue_projection_failures"
+        runner._transition_sink = self.observe_machine(
+            runner.entity_id, runner.spec, epoch=runner.epoch,
+            facet_values=facet_values, observer_meta=observer_meta,
+            failure_diagnostic=failure_diagnostic,
+        )
+
+    def record_domain_evidence(
+        self, kind: str, snapshot: Any, *, subject: Any | None = None,
+    ) -> None:
+        """Translate an immutable domain evidence record into Runtime projection."""
+        from . import domain_observation
+
+        if kind != "peer-configuration" or subject is None:
+            raise ValueError(f"unsupported domain evidence kind: {kind}")
+        self.observe_snapshot(
+            snapshot, domain_observation.capture_peer_configuration(subject),
+        )
+
+    def compose_domain_subject(
+        self, subject: Any, *, entity_id: str, role: str, owner_epoch: int,
+        entity_role: str | None = None,
+    ) -> ObservationBinding:
+        return self.bind_observation(
+            subject, entity_id=entity_id, role=role, owner_epoch=owner_epoch,
+            entity_role=entity_role,
+        )
+
+    def execution_port(
+        self, owner_entity_id: str, owner_epoch: int,
+    ) -> RuntimeExecutionPort:
+        """Return an explicit execution capability for one live owner epoch."""
+        self.assert_owner_epoch(owner_entity_id, owner_epoch)
+        return RuntimeExecutionPort(self, owner_entity_id, owner_epoch)
 
     def assert_owner_epoch(self, entity_id: str, epoch: int) -> None:
         self._assert_loop()
@@ -751,6 +1064,7 @@ class Runtime(ExecutionScope):
             entity_id, epoch,
             preserve_activity=entity_id == self._runtime_entity_id,
         )
+        self.observation_registry.remove_owner(entity_id, epoch)
         self._owner_epochs.pop(entity_id, None)
 
     async def join_owner_children(self, entity_id: str, epoch: int) -> None:
@@ -1173,6 +1487,9 @@ class Runtime(ExecutionScope):
         self._owner_timers.clear()
         self._owner_resources.clear()
         self._owner_epochs.clear()
+        self._owner_roles.clear()
+        self._trace_aliases.clear()
+        self._domain_entity_counts.clear()
 
     @staticmethod
     async def _close_resource(resource: Any) -> None:

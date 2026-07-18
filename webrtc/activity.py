@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any
@@ -13,6 +14,13 @@ _CONTROL = 1
 _GROUP = 2
 _ROOT = 3
 _OVERFLOW_OPERATION_ID = 0
+
+
+def _activity_kind(policy: Any) -> str:
+    explicit = getattr(policy, "activity_kind", None)
+    if explicit in {"request", "long-running", "wait", "pump"}:
+        return explicit
+    return "long-running" if getattr(policy, "workflow", False) else "request"
 
 
 @dataclass(slots=True)
@@ -34,6 +42,8 @@ class ActivityGroupRecord:
     operation: str
     group: str
     owner_epoch: int = 1
+    owner_role: str = "component"
+    activity_kind: str = "request"
     calls: int = 0
     in_flight: int = 0
     successes: int = 0
@@ -61,6 +71,8 @@ class ActivityGroupSnapshot:
     task_id: str
     owner_entity_id: str
     owner_epoch: int
+    owner_role: str
+    activity_kind: str
     parent_ref_type: str
     parent_ref_id: int | str | None
     operation_id: int
@@ -117,6 +129,8 @@ class ActivityGroupSnapshot:
             "task_id": self.task_id,
             "owner_entity_id": self.owner_entity_id,
             "owner_epoch": self.owner_epoch,
+            "owner_role": self.owner_role,
+            "activity_kind": self.activity_kind,
             "parent_ref_type": self.parent_ref_type,
             "parent_ref_id": self.parent_ref_id,
             "operation_id": self.operation_id,
@@ -137,6 +151,10 @@ class ActivityGroupSnapshot:
             "revision": self.revision,
             "overflow": self.overflow,
             "exemplars": list(self.exemplars),
+            "live_age_ms": (
+                max(0.0, (time.monotonic_ns() - self.last_started_ns) / 1_000_000)
+                if self.in_flight and self.last_started_ns else None
+            ),
         }
 
 
@@ -189,7 +207,7 @@ class WorkerObservationDelta:
         if record is None:
             record = ActivityGroupRecord(
                 self._next_id, "", "", _GROUP, parent_ref_id,
-                policy.operation_id, policy.operation, policy.group, 1,
+                policy.operation_id, policy.operation, policy.group, 1, "component",
             )
             self._next_id -= 1
             self._by_key[key] = record
@@ -263,6 +281,7 @@ class ActivityGroupStore:
         owner_entity_id: str,
         parent_ref_id: int | str | None,
         owner_epoch: int = 1,
+        owner_role: str = "component",
     ) -> ActivityGroupRecord:
         self._assert_owner()
         parent_type = _GROUP if isinstance(parent_ref_id, int) else _ROOT
@@ -272,17 +291,21 @@ class ActivityGroupStore:
         if record is not None:
             return record
         if len(self._by_key) >= self.max_groups:
-            return self._resolve_overflow(policy, trace_id, owner_entity_id, owner_epoch)
+            return self._resolve_overflow(
+                policy, trace_id, owner_entity_id, owner_epoch, owner_role
+            )
         record = self._new_record(
             trace_id, owner_entity_id, parent_type, parent_ref_id,
             policy.operation_id, policy.operation, policy.group, False, owner_epoch,
+            owner_role,
         )
+        record.activity_kind = _activity_kind(policy)
         self._by_key[key] = record
         self._key_by_group[record.group_id] = key
         return record
 
     def _resolve_overflow(self, policy: Any, trace_id: str, owner_entity_id: str,
-                          owner_epoch: int):
+                          owner_epoch: int, owner_role: str):
         self.diagnostics["group_cardinality_overflow"] += 1
         key = (trace_id, owner_entity_id, owner_epoch, policy.group)
         record = self._overflow.get(key)
@@ -296,21 +319,23 @@ class ActivityGroupStore:
             return next(iter(self._overflow.values()))
         record = self._new_record(
             trace_id, owner_entity_id, _ROOT, None, _OVERFLOW_OPERATION_ID,
-            "__overflow__", policy.group, True, owner_epoch,
+            "__overflow__", policy.group, True, owner_epoch, owner_role,
         )
+        record.activity_kind = _activity_kind(policy)
         self._overflow[key] = record
         self._overflow_key_by_group[record.group_id] = key
         return record
 
     def _new_record(
         self, trace_id, owner_entity_id, parent_type, parent_id,
-        operation_id, operation, group, overflow, owner_epoch,
+        operation_id, operation, group, overflow, owner_epoch, owner_role,
     ) -> ActivityGroupRecord:
         group_id = self._next_group_id
         self._next_group_id += 1
         record = ActivityGroupRecord(
             group_id, trace_id, owner_entity_id, parent_type, parent_id,
             operation_id, operation, group, owner_epoch, overflow=overflow,
+            owner_role=owner_role,
         )
         self._records[group_id] = record
         self._owner_index.setdefault((owner_entity_id, owner_epoch), set()).add(group_id)
@@ -384,6 +409,7 @@ class ActivityGroupStore:
         trace_id: str,
         owner_entity_id: str,
         owner_epoch: int = 1,
+        owner_role: str = "component",
     ) -> None:
         if delta is None:
             return
@@ -403,6 +429,7 @@ class ActivityGroupStore:
             target = self.resolve(
                 policy, trace_id=trace_id, owner_entity_id=owner_entity_id,
                 owner_epoch=owner_epoch,
+                owner_role=owner_role,
                 parent_ref_id=parent,
             )
             resolved[local.group_id] = target.group_id
@@ -601,6 +628,8 @@ class ActivityGroupStore:
         return ActivityGroupSnapshot(
             record.group_id, record.trace_id, record.owner_entity_id,
             record.owner_entity_id, record.owner_epoch,
+            record.owner_role,
+            record.activity_kind,
             ref_names[record.parent_ref_type], record.parent_ref_id,
             record.operation_id, record.operation, record.group, record.calls,
             record.in_flight, record.successes, record.cancellations, record.errors,

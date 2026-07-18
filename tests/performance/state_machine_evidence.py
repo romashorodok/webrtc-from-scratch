@@ -22,7 +22,8 @@ from pathlib import Path
 from typing import Any
 
 from webrtc import Runtime
-from webrtc.performance import ObservedMeta, event_loop, performance, unobserved
+from webrtc.peer_components import AsyncLogDrain
+import webrtc.peer_components as peer_components
 from webrtc.peer_connection import PeerConnection
 
 
@@ -72,30 +73,35 @@ class Evidence:
     polling_waiter_tasks: int
 
 
-def _subject(observed: bool):
-    def invoke(self, value: int) -> int:
-        # A normal component call has useful work.  This calibration prevents
-        # a nanosecond wrapper microbenchmark from overstating production cost.
+class _EvidenceLogger:
+    def __init__(self) -> None:
+        self.checksum = 0
+
+    def write_events_sync(self, value: int) -> None:
         result = value
         for index in range(16_000):
             result = ((result * 33) ^ index) & 0xFFFFFFFF
-        return result
+        self.checksum ^= result
 
-    invoke = (
-        event_loop(performance(name="evidence.mixed", group="evidence")(invoke))
-        if observed else unobserved(invoke)
-    )
-    return ObservedMeta("EvidenceObserved" if observed else "EvidenceOff", (), {"invoke": invoke})()
+
+def _subject() -> AsyncLogDrain:
+    """Production allowlisted type without starting its unrelated drain service."""
+    return object.__new__(AsyncLogDrain)
 
 
 async def _call_sample(*, observed: bool, calls: int) -> tuple[Timing, int, int]:
-    subject = _subject(observed)
+    subject = _subject()
+    evidence_logger = _EvidenceLogger()
     lags: list[float] = []
     async with Runtime(scope_id=f"evidence-{'on' if observed else 'off'}",
                        tracing_enabled=observed) as runtime:
         start_sequence = runtime._producer_sequence
         aggregate_updates = 0
         original_begin, original_end = runtime.activity_groups.begin, runtime.activity_groups.end
+        runtime.register_owner("evidence:log-drain", epoch=1, role="log-drain")
+        runtime.bind_observation(
+            subject, entity_id="evidence:log-drain", role="log-drain", owner_epoch=1,
+        )
         def count_begin(*args: Any, **kwargs: Any):
             nonlocal aggregate_updates
             aggregate_updates += 1
@@ -115,26 +121,31 @@ async def _call_sample(*, observed: bool, calls: int) -> tuple[Timing, int, int]
         try:
             started_cpu = time.process_time_ns()
             started_wall = time.perf_counter_ns()
-            checksum = 0
+            original_logger = peer_components.get_logger
+            peer_components.get_logger = lambda: evidence_logger
             batch = 16
-            for start in range(0, calls, batch):
-                scheduled = time.perf_counter_ns()
-                future = asyncio.get_running_loop().create_future()
-                asyncio.get_running_loop().call_soon(
-                    lambda f=future, at=scheduled: f.set_result((time.perf_counter_ns() - at) / 1e6)
-                )
-                for value in range(start, min(calls, start + batch)):
-                    checksum ^= subject.invoke(value)
-                lags.append(await future)
-            cpu_ms = (time.process_time_ns() - started_cpu) / 1e6
-            wall_ms = (time.perf_counter_ns() - started_wall) / 1e6
+            try:
+                for start in range(0, calls, batch):
+                    scheduled = time.perf_counter_ns()
+                    future = asyncio.get_running_loop().create_future()
+                    asyncio.get_running_loop().call_soon(
+                        lambda f=future, at=scheduled: f.set_result((time.perf_counter_ns() - at) / 1e6)
+                    )
+                    for value in range(start, min(calls, start + batch)):
+                        subject.write_batch(value)
+                    lags.append(await future)
+                cpu_ms = (time.process_time_ns() - started_cpu) / 1e6
+                wall_ms = (time.perf_counter_ns() - started_wall) / 1e6
+            finally:
+                peer_components.get_logger = original_logger
         finally:
             if was_enabled:
                 gc.enable()
         dots = runtime._producer_sequence - start_sequence
         runtime.activity_groups.begin, runtime.activity_groups.end = original_begin, original_end
-        if checksum < 0:  # keep the workload result live
-            raise AssertionError(checksum)
+        if evidence_logger.checksum < 0:  # keep the workload result live
+            raise AssertionError(evidence_logger.checksum)
+        runtime.remove_owner("evidence:log-drain", 1)
     return Timing(cpu_ms, wall_ms, calls / max(wall_ms / 1000, sys.float_info.min),
                   _percentile(lags, 0.95)), dots, aggregate_updates
 
@@ -210,18 +221,28 @@ async def _full_peer_sample(observed: bool, calls: int) -> tuple[Timing, int, in
     started_wall = time.perf_counter_ns()
     steady = baseline
     polling = 0
-    subject = _subject(observed)
-    async with Runtime(scope_id=f"full-peer-evidence-{observed}", tracing_enabled=observed):
+    subject = _subject()
+    evidence_logger = _EvidenceLogger()
+    async with Runtime(scope_id=f"full-peer-evidence-{observed}", tracing_enabled=observed) as runtime:
+        runtime.register_owner("full-peer:evidence-log", epoch=1, role="log-drain")
+        runtime.bind_observation(
+            subject, entity_id="full-peer:evidence-log", role="log-drain", owner_epoch=1,
+        )
         async with PeerConnection(peer_id="full-peer-evidence"):
             # All protocol owners, inboxes and cleanup tasks are now runnable;
             # packet-rate evidence is isolated above to avoid network variance.
             steady = len(asyncio.all_tasks())
             polling = _polling_waiter_count()
-            checksum = 0
-            for value in range(calls):
-                checksum ^= subject.invoke(value)
-            if checksum < 0:
-                raise AssertionError(checksum)
+            original_logger = peer_components.get_logger
+            peer_components.get_logger = lambda: evidence_logger
+            try:
+                for value in range(calls):
+                    subject.write_batch(value)
+            finally:
+                peer_components.get_logger = original_logger
+            if evidence_logger.checksum < 0:
+                raise AssertionError(evidence_logger.checksum)
+        runtime.remove_owner("full-peer:evidence-log", 1)
     cpu_ms = (time.process_time_ns() - started_cpu) / 1e6
     wall_ms = (time.perf_counter_ns() - started_wall) / 1e6
     return (Timing(cpu_ms, wall_ms, 1000 / max(wall_ms, sys.float_info.min)),

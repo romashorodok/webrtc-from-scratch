@@ -51,7 +51,7 @@ def test_production_worker_lane_and_packet_queue_publish_live_state():
             queue.put_nowait(Packet(Address("127.0.0.1", 9), b"two"))
             await queue.get()
             await asyncio.sleep(0)
-            queue_owner = f"queue:scope:{queue.observability_id}"
+            queue_owner = runtime.telemetry_entity_id("queue", queue.entity_id)
             queue_facets = _facets(runtime, queue_owner)
             assert queue_facets["depth"] == 1
             assert queue_facets["high_water"] == 2
@@ -81,8 +81,8 @@ def test_same_kind_queues_have_stable_distinct_instance_entities():
             first.put_nowait(packet)
             second.put_nowait(packet)
             await asyncio.sleep(0)
-            first_owner = f"queue:scope:{first.observability_id}"
-            second_owner = f"queue:scope:{second.observability_id}"
+            first_owner = runtime.telemetry_entity_id("queue", first.entity_id)
+            second_owner = runtime.telemetry_entity_id("queue", second.entity_id)
             assert first_owner != second_owner
             assert _facets(runtime, first_owner)["depth"] == 1
             assert _facets(runtime, second_owner)["depth"] == 1
@@ -114,15 +114,15 @@ def test_srtp_sessions_and_streams_do_not_collapse_and_repeat_open_is_stable():
             another_stream = await first.open_stream(0x87654321)
 
             owners = {
-                f"media:scope:{first_stream.observability_id}",
-                f"media:scope:{second_stream.observability_id}",
-                f"media:scope:{another_stream.observability_id}",
+                runtime.telemetry_entity_id("media", first_stream.observability_id),
+                runtime.telemetry_entity_id("media", second_stream.observability_id),
+                runtime.telemetry_entity_id("media", another_stream.observability_id),
             }
             assert len(owners) == 3
             facets = [_facets(runtime, owner) for owner in owners]
             assert {item["stream_count"] for item in facets} == {1, 2}
             assert all(item["media_kind"] == "srtp_stream" for item in facets)
-            assert all(item["ssrc_id"].startswith("ssrc-") for item in facets)
+            assert all(item["ssrc_id"].startswith("telemetry:ssrc:") for item in facets)
             assert len({item["ssrc_id"] for item in facets}) == 3
             assert all("305419896" not in item["ssrc_id"] for item in facets)
 
@@ -146,6 +146,7 @@ def test_peer_sendonly_transceiver_and_tracing_health_use_production_paths():
     async def scenario():
         async with Runtime(scope_id="scope", trace_patch_cadence=60) as runtime:
             peer = PeerConnection()
+            peer.__compose_runtime__(runtime)
             assert runtime.projection.machines.get("peer:scope") is None
             assert peer._peer_runner.snapshot().state == "new"
 
@@ -168,6 +169,7 @@ def test_peer_sendonly_transceiver_and_tracing_health_use_production_paths():
             assert _facets(runtime, second_owner)["direction"] == "sendonly"
 
             another_peer = PeerConnection()
+            another_peer.__compose_runtime__(runtime)
             cross_peer = await another_peer.add_transceiver_from_kind(
                 RTPCodecKind.Audio, RTPTransceiverDirection.Sendonly
             )
@@ -190,6 +192,7 @@ def test_peer_sendonly_transceiver_and_tracing_health_use_production_paths():
             transceiver.stop()
             while transceiver._runner.snapshot().state != "stopped":
                 await asyncio.sleep(0)
+            await runtime.flush_observations()
             assert runtime.projection.machines.get(owner).state == "stopped"
             assert runtime.projection.machines.get(second_owner).state == "active"
             stopped_revisions = {

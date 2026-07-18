@@ -16,6 +16,9 @@ async def pump_trace_updates(
     subscription = runtime.trace_patch_subscribe(peer_id=peer_id)
     try:
         while True:
-            await send_json(await subscription.get())
+            message = await subscription.get()
+            await send_json(message)
+            if message.get("event") == "trace:terminal":
+                return
     finally:
         subscription.close()

@@ -9,6 +9,7 @@ from webrtc.transceiver import (
     RTPTransceiverDirection, TrackLocal, TrackRemote,
 )
 from webrtc.state_machine import StaleMachineAccess
+from webrtc.srtp import SessionAdmissionSnapshot
 
 
 class _SnapshotOwner:
@@ -28,9 +29,19 @@ class _Session:
             entity_id=f"srtp:{protocol}", machine_type="srtp-session",
             state="ready", revision=2, epoch=1, terminal=False,
         )
+        self._admission = SessionAdmissionSnapshot(
+            state="ready", keys_ready=True, accepting_packets=True,
+            accepting_streams=True,
+        )
 
     def lifecycle_snapshot(self):
         return self._snapshot
+
+    def admission_snapshot(self):
+        return self._admission
+
+    def _observation_revision(self):
+        return self._snapshot.revision
 
 
 class _Gatherer:
@@ -122,8 +133,7 @@ def test_stage5_transceiver_configuration_has_one_exact_machine_authority():
 
             replacement = transceiver.negotiated_snapshot
             replaced = await transceiver.apply_negotiated_snapshot(
-                replacement, expected_epoch=snapshot.epoch,
-                expected_revision=snapshot.revision,
+                replacement, expected_snapshot=replacement,
             )
             assert replaced.revision == snapshot.revision + 2
             assert all(
@@ -234,8 +244,9 @@ def test_stage5_sender_receiver_and_tracks_are_runtime_owned_lifecycles():
                 if receiver._runner.snapshot().state == "active":
                     break
                 await asyncio.sleep(0)
-            assert receiver._runner.snapshot().state == "active"
-            assert runtime.projection.machines.get("receiver:test").state == "active"
+                assert receiver._runner.snapshot().state == "active"
+                await runtime.flush_observations()
+                assert runtime.projection.machines.get("receiver:test").state == "active"
 
             await local.mute()
             assert local._runner.snapshot().state == "muted"

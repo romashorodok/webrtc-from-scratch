@@ -424,6 +424,58 @@ class ImmutableWorkerResult(Generic[T]):
     exception: BaseException | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeExecutionPort:
+    """Explicit entity-owned execution capability supplied by ``Runtime``.
+
+    The port deliberately contains no tracing or observation policy.  It is
+    therefore safe to use with tracing enabled or disabled without changing
+    scheduling, affinity, ownership, or stale-epoch checks.
+    """
+
+    runtime: Any
+    owner_entity_id: str
+    owner_epoch: int
+
+    def assert_event_loop(self) -> asyncio.AbstractEventLoop:
+        loop = self.runtime._assert_loop()
+        self.runtime.assert_owner_epoch(self.owner_entity_id, self.owner_epoch)
+        return loop
+
+    async def run_worker(
+        self, fn: Callable[..., T], *args: Any, name: str = "worker", **kwargs: Any,
+    ) -> T:
+        result = await self.runtime.call_worker(
+            fn, *args,
+            owner_entity_id=self.owner_entity_id,
+            owner_epoch=self.owner_epoch,
+            name=name,
+            **kwargs,
+        ).wait()
+        if result.outcome == "success":
+            return cast(T, result.value)
+        if result.exception is not None:
+            raise result.exception
+        raise RuntimeError(f"worker submission {result.outcome}")
+
+    def start_task(
+        self, factory: Callable[[], Awaitable[T]], *, name: str,
+        kind: str = "task", metadata: Mapping[str, Any] | None = None,
+        failure: FailurePolicy = FailurePolicy.REPORT,
+        cancelable: bool = True,
+    ) -> OwnedTaskHandle[T]:
+        return self.runtime.start_pump(
+            factory,
+            owner_entity_id=self.owner_entity_id,
+            owner_epoch=self.owner_epoch,
+            name=name,
+            kind=kind,
+            metadata=metadata,
+            failure=failure,
+            cancelable=cancelable,
+        )
+
+
 class TaskRegistry:
     """Event-loop-owned task and reconciliation index."""
 

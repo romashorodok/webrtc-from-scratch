@@ -120,7 +120,12 @@ def test_controller_traces_packet_before_branch_and_after_routing():
             conn, controller._pair,
         )
         recorder = PerformanceRecorder()
-        async with Runtime(scope_id="socket-ice"):
+        async with Runtime(scope_id="socket-ice") as runtime:
+            runtime.register_owner("candidate-pair:test", epoch=1)
+            runtime.bind_observation(
+                controller, entity_id="candidate-pair:test",
+                role="candidate-pair-controller", owner_epoch=1,
+            )
             with use_performance_recorder(recorder):
                 # Exercise the loop body directly; production starts this
                 # pump only through CandidatePairController.start_managed().

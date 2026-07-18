@@ -55,8 +55,7 @@ def test_sdp_create_and_set_description_events_are_decorated(monkeypatch):
         monkeypatch.setattr(pc, "_generate_unmatched_sdp", generate_unmatched_sdp)
 
         async with Runtime(scope_id="sdp-performance") as runtime:
-            pc._execution_scope = runtime
-            pc._ensure_machine_owners(runtime)
+            pc.__compose_runtime__(runtime)
             with use_performance_recorder(recorder):
                 desc = await pc.create_offer()
                 await pc.set_local_description(SessionDescriptionType.Offer, desc)
@@ -167,7 +166,7 @@ def test_peer_connection_public_media_send_helpers_wait_trace_and_preserve_order
         runtime = Runtime(scope_id="protocol-media-send")
         await runtime.__aenter__()
         pc = PeerConnection()
-        pc._ensure_machine_owners(runtime)
+        pc.__compose_runtime__(runtime)
         sent: list[tuple[str, bytes]] = []
         readiness_waits = 0
 
@@ -246,7 +245,7 @@ def test_peer_connection_public_media_send_reports_failures(monkeypatch):
         runtime = Runtime(scope_id="protocol-media-send-failure")
         await runtime.__aenter__()
         pc = PeerConnection()
-        pc._ensure_machine_owners(runtime)
+        pc.__compose_runtime__(runtime)
 
         async def ready(*_args, **_kwargs):
             return None

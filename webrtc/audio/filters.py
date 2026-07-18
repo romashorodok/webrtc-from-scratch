@@ -260,21 +260,6 @@ class VoiceActivityDetector:
         # Voice typically has: high energy AND moderate ZCR
         is_speech = energy > self.energy_threshold and zcr > self.zcr_threshold
 
-        # Debug logging (first 20 detections)
-        if not hasattr(self, '_debug_count'):
-            self._debug_count = 0
-        if self._debug_count < 20:
-            self._debug_count += 1
-            logger.debug(
-                Component.OPUS,
-                "VAD detection",
-                energy=round(energy, 4),
-                energy_threshold=self.energy_threshold,
-                zcr=round(zcr, 4),
-                zcr_threshold=self.zcr_threshold,
-                is_speech=is_speech,
-            )
-
         if is_speech:
             # Speech detected - reset hangover counter
             self.is_voice = True

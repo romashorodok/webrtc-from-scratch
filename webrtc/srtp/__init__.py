@@ -11,10 +11,14 @@ demuxing and packet routing.
 Based on RFC 3711: https://tools.ietf.org/html/rfc3711
 """
 
-from webrtc.srtp.session import Session, Stream, SessionKeys
+from webrtc.srtp.session import (
+    Session, SessionAdmissionSnapshot, SessionReadinessSnapshot, Stream, SessionKeys,
+)
 
 __all__ = [
     "Session",
+    "SessionAdmissionSnapshot",
+    "SessionReadinessSnapshot",
     "Stream",
     "SessionKeys",
 ]

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextvars import ContextVar
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
@@ -20,6 +21,35 @@ C = TypeVar("C")
 P = TypeVar("P")
 E = TypeVar("E")
 R = TypeVar("R")
+_observation_dispatch_active: ContextVar[bool] = ContextVar(
+    "state_machine_observation_dispatch_active", default=False,
+)
+
+
+class ObservationReentrancy(RuntimeError):
+    pass
+
+
+def begin_observation_dispatch():
+    return _observation_dispatch_active.set(True)
+
+
+def end_observation_dispatch(token) -> None:
+    _observation_dispatch_active.reset(token)
+
+
+def _reject_observation_reentrancy() -> None:
+    if _observation_dispatch_active.get():
+        raise ObservationReentrancy(
+            "observation dispatch cannot commit protocol state re-entrantly"
+        )
+
+
+def _dispatch_transition_sink(sink: Any, commit: Any, effects: Any) -> None:
+    if getattr(sink, "__accepts_effects__", False):
+        sink(commit, effects)
+    else:
+        sink(commit)
 
 
 class InvalidTransition(ValueError):
@@ -454,6 +484,7 @@ class AsyncStateMachineRunner(ABC, Generic[C]):
         self.commands: BoundedMailbox[C] = BoundedMailbox(mailbox_capacity)
         self.controller = controller or NullTransitionController()
         self._transition_sink = transition_sink
+        self._authority_sink: Callable[[TransitionCommit, Any], None] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._dedupe_capacity = dedupe_capacity
         self._seen: dict[tuple[int, int, int], TransitionCommit | _CachedFailure] = {}
@@ -549,6 +580,7 @@ class AsyncStateMachineRunner(ABC, Generic[C]):
         self, proposed: str | PreparedTransition[Any], cause: C | None = None
     ) -> TransitionCommit:
         """Validate and mutate synchronously in one event-loop turn."""
+        _reject_observation_reentrancy()
         self._assert_loop()
         prepared = proposed if isinstance(proposed, PreparedTransition) else PreparedTransition(
             self._state, proposed, None,
@@ -707,13 +739,18 @@ class AsyncStateMachineRunner(ABC, Generic[C]):
                         # commit. A broken projection must never stop the
                         # protocol owner that already committed the edge.
                         try:
-                            self._transition_sink(committed)
+                            _dispatch_transition_sink(
+                                self._transition_sink, committed, prepared.effects,
+                            )
                         except Exception:
                             pass
                     await self.controller.after_commit(
                         self._checkpoint(committed, "after_commit")
                     )
                     await self.after_commit(committed, prepared.effects)
+                    flush = getattr(self._transition_sink, "flush", None)
+                    if flush is not None:
+                        await flush()
                     if committed.to_state in self.spec.terminal:
                         await self.controller.terminal(
                             self._checkpoint(committed, "terminal")
@@ -762,6 +799,7 @@ class SynchronousStateReducer:
         self._state = spec.initial
         self._revision = 0
         self._transition_sink = transition_sink
+        self._authority_sink: Callable[[TransitionCommit, Any], None] | None = None
         self._changed = asyncio.Event()
 
     @property
@@ -778,7 +816,10 @@ class SynchronousStateReducer:
             self._state, self._state in self.spec.terminal,
         )
 
-    def transition(self, proposed_state: str, *, cause: str = "") -> TransitionCommit:
+    def transition(
+        self, proposed_state: str, *, cause: str = "", effect: Any = None,
+    ) -> TransitionCommit:
+        _reject_observation_reentrancy()
         previous = self._state
         self.spec.validate(previous, proposed_state)
         self._state = proposed_state
@@ -789,11 +830,13 @@ class SynchronousStateReducer:
         )
         changed, self._changed = self._changed, asyncio.Event()
         changed.set()
+        if self._authority_sink is not None:
+            self._authority_sink(commit, effect)
         if self._transition_sink is not None:
             # Synchronous reducers have the same commit boundary as async
             # owners: observability is best effort after the state mutation.
             try:
-                self._transition_sink(commit)
+                _dispatch_transition_sink(self._transition_sink, commit, effect)
             except Exception:
                 pass
         return commit
@@ -896,6 +939,7 @@ class InlineStateMachineRunner:
         raise NotImplementedError
 
     def commit(self, prepared, cause=None):
+        _reject_observation_reentrancy()
         del cause
         if isinstance(prepared, str):
             prepared = PreparedTransition(
@@ -947,9 +991,14 @@ class InlineStateMachineRunner:
                 await self.reconcile_terminal(prepared)
             committed = self.commit(prepared, command)
             if self._transition_sink is not None:
-                self._transition_sink(committed)
+                _dispatch_transition_sink(
+                    self._transition_sink, committed, prepared.effects,
+                )
             await self.controller.after_commit(self._checkpoint(committed, "after_commit"))
             await self.after_commit(committed, prepared.effects)
+            flush = getattr(self._transition_sink, "flush", None)
+            if flush is not None:
+                await flush()
             if committed.to_state in self.spec.terminal:
                 self.commands.close()
                 await self.controller.terminal(self._checkpoint(committed, "terminal"))

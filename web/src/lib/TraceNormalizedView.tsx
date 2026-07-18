@@ -1,7 +1,7 @@
 import { memo, useCallback, useMemo, useRef, useState } from "react";
 import * as d3 from "d3";
 import type {
-  GroupSnapshot, TraceCapture, TraceControl, TraceFacet, TraceMachine,
+  GroupSnapshot, TraceCapture, TraceControl, TraceEntity, TraceFacet, TraceMachine,
   TraceMachineTransition,
 } from "./trace";
 
@@ -20,6 +20,8 @@ export type TraceDataRow = {
   name: string;
   value: string;
   revision: number;
+  activityKind?: string;
+  liveAgeMs?: number | null;
 };
 
 export type TraceTopologyNode = {
@@ -31,6 +33,7 @@ export type TraceTopologyNode = {
 
 type NormalizedTraceViewProps = {
   machinesById: Map<string, TraceMachine>;
+  entitiesById?: Map<string, TraceEntity>;
   transitions: TraceMachineTransition[];
   controlsById: Map<string, TraceControl>;
   groupsById: Map<number, GroupSnapshot>;
@@ -101,6 +104,7 @@ export function formatOperationSummary(group: GroupSnapshot) {
 export function buildTraceDataRows(props: Omit<NormalizedTraceViewProps, "topologyVersion" | "valueVersion">) {
   const rows: TraceDataRow[] = [];
   for (const machine of props.machinesById.values()) {
+    const descriptor = props.entitiesById?.get(machine.entity_id);
     const cause = typeof machine.cause_id === "string" && props.machinesById.has(machine.cause_id)
       ? `machine:${machine.cause_id}`
       : null;
@@ -109,7 +113,9 @@ export function buildTraceDataRows(props: Omit<NormalizedTraceViewProps, "topolo
       ownerId: machine.entity_id,
       parentId: cause,
       kind: "machine",
-      name: `${machine.machine_type} · ${machine.entity_id}`,
+      name: descriptor?.role && descriptor.role !== machine.machine_type
+        ? `${machine.machine_type} (${descriptor.role}) · ${machine.entity_id}`
+        : `${machine.machine_type} · ${machine.entity_id}`,
       value: machine.state,
       revision: machine.revision,
     });
@@ -154,6 +160,8 @@ export function buildTraceDataRows(props: Omit<NormalizedTraceViewProps, "topolo
       name: operation || group.group,
       value: formatOperationSummary(group),
       revision: group.revision ?? 0,
+      activityKind: group.activity_kind ?? "request",
+      liveAgeMs: group.live_age_ms,
     });
     for (const [index, exemplar] of (group.exemplars ?? []).entries()) {
       const outcome = exemplar.outcome ?? exemplar.exception ?? exemplar.error;
@@ -213,20 +221,33 @@ export function filterTraceDataRows(rows: TraceDataRow[], query: string, kind: "
   );
 }
 
-export function formatNormalizedTraceExport(rows: TraceDataRow[]) {
+export function formatNormalizedTraceExport(
+  rows: TraceDataRow[], entitiesById: Map<string, TraceEntity> = new Map(),
+) {
   const kinds: TraceDataKind[] = [
     "machine", "transition", "control", "group", "facet", "capture", "failure", "diagnostic",
   ];
   const counts = new Map(kinds.map((kind) => [kind, 0]));
   for (const row of rows) counts.set(row.kind, (counts.get(row.kind) ?? 0) + 1);
 
-  const ownerAliases = new Map<string, string>();
+  const ownerAliases = new Map<string, string>(
+    [...entitiesById].map(([id, entity]) => [id, entity.alias]),
+  );
   for (const row of rows) {
     if (row.ownerId && !ownerAliases.has(row.ownerId)) {
       ownerAliases.set(row.ownerId, `@${ownerAliases.size + 1}`);
     }
   }
-  const owner = (row: TraceDataRow) => row.ownerId ? ` [${ownerAliases.get(row.ownerId)}]` : "";
+  const sanitize = createExportSanitizer(entitiesById);
+  const owner = (row: TraceDataRow) => {
+    if (!row.ownerId) return "";
+    const alias = ownerAliases.get(row.ownerId);
+    const entity = entitiesById.get(row.ownerId);
+    const semantic = entity
+      ? ` ${sanitize(entity.role)}${entity.kind === "machine" ? "" : `, ${sanitize(entity.kind)}`}`
+      : "";
+    return ` [${alias}]${semantic}`;
+  };
   const lines = [
     "WebRTC runtime trace (schema 2, compact LLM summary)",
     `${rows.length} records: ${kinds.flatMap((kind) => {
@@ -250,14 +271,14 @@ export function formatNormalizedTraceExport(rows: TraceDataRow[]) {
     if (!matching.length) continue;
     lines.push("", `${title}:`);
     if (kind === "group") {
-      appendOperationHierarchy(lines, matching, owner);
+      appendOperationHierarchy(lines, matching, owner, sanitize);
     } else if (kind === "transition") {
       appendGroupedExportRows(lines, matching, owner, (row) =>
-        sanitizeExportText(row.value.replace(/ · cause .*$/, "")),
+        sanitize(row.value.replace(/ · cause .*$/, "")),
       );
     } else if (kind === "facet" || kind === "diagnostic") {
       appendGroupedExportRows(lines, matching, owner, (row) =>
-        `${sanitizeExportText(row.name)}=${sanitizeExportText(row.value)}`,
+        `${sanitize(row.name)}=${sanitize(row.value)}`,
       );
     } else {
       for (const row of matching) {
@@ -267,7 +288,7 @@ export function formatNormalizedTraceExport(rows: TraceDataRow[]) {
             ? row.name.replace(/^\[CAPTURE #[^\]]+\] /, "")
             : row.name;
         const marker = kind === "capture" ? " [diagnostic capture]" : kind === "failure" ? " [failure exemplar]" : "";
-        lines.push(`- ${sanitizeExportText(name)}${owner(row)}: ${sanitizeExportText(row.value)}${marker}`);
+        lines.push(`- ${sanitize(name)}${owner(row)}: ${sanitize(row.value)}${marker}`);
       }
     }
   }
@@ -288,7 +309,9 @@ function appendGroupedExportRows(
     groups.set(key, group);
   }
   for (const group of groups.values()) {
-    const label = owner(group[0]).trim();
+    const first = group[0];
+    if (!first) continue;
+    const label = owner(first).trim();
     lines.push(`- ${label ? `${label}: ` : ""}${group.map(format).join("; ")}`);
   }
 }
@@ -297,6 +320,7 @@ function appendOperationHierarchy(
   lines: string[],
   rows: TraceDataRow[],
   owner: (row: TraceDataRow) => string,
+  sanitize: (value: string) => string,
 ) {
   const byId = new Map(rows.map((row) => [row.id, row]));
   const children = new Map<string, TraceDataRow[]>();
@@ -316,8 +340,9 @@ function appendOperationHierarchy(
     if (emitted.has(row.id)) return;
     emitted.add(row.id);
     lines.push(
-      `${"  ".repeat(depth)}- ${sanitizeExportText(row.name)}${depth === 0 ? owner(row) : ""}: ` +
-      sanitizeExportText(compactOperationExportValue(row.value)),
+      `${"  ".repeat(depth)}- ${sanitize(row.name)}${
+        depth === 0 || row.ownerId !== byId.get(row.parentId ?? "")?.ownerId ? owner(row) : ""
+      }: ` + sanitize(compactOperationExportValue(row)),
     );
     for (const child of children.get(row.id) ?? []) append(child, depth + 1);
   };
@@ -326,14 +351,56 @@ function appendOperationHierarchy(
   for (const row of rows) append(row, 0);
 }
 
-function sanitizeExportText(value: string) {
-  return value
-    .replace(/\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/gi, "<id>")
-    .replace(/\b[0-9a-f]{24,64}\b/gi, "<id>");
+type AliasTrie = { next: Map<string, AliasTrie>; alias?: string };
+
+function createExportSanitizer(entitiesById: Map<string, TraceEntity>) {
+  const root: AliasTrie = { next: new Map() };
+  for (const entity of entitiesById.values()) {
+    let node = root;
+    for (const character of entity.entity_id) {
+      let child = node.next.get(character);
+      if (!child) {
+        child = { next: new Map() };
+        node.next.set(character, child);
+      }
+      node = child;
+    }
+    node.alias = entity.alias;
+  }
+  return (value: string) => {
+    let sanitized = "";
+    const characters = [...value];
+    for (let index = 0; index < characters.length;) {
+      let node = root;
+      let cursor = index;
+      let alias: string | undefined;
+      let end = index;
+      while (cursor < characters.length) {
+        const child = node.next.get(characters[cursor]!);
+        if (!child) break;
+        node = child;
+        cursor += 1;
+        if (node.alias) {
+          alias = node.alias;
+          end = cursor;
+        }
+      }
+      if (alias) {
+        sanitized += alias;
+        index = end;
+      } else {
+        sanitized += characters[index];
+        index += 1;
+      }
+    }
+    return sanitized
+      .replace(/\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/gi, "<id>")
+      .replace(/\b[0-9a-f]{24,64}\b/gi, "<id>");
+  };
 }
 
-function compactOperationExportValue(value: string) {
-  const parts = value.split(" · ");
+function compactOperationExportValue(row: TraceDataRow) {
+  const parts = row.value.split(" · ");
   const compact: string[] = [];
   for (const part of parts) {
     if (/^\d+ calls$/.test(part)) compact.push(part);
@@ -345,7 +412,24 @@ function compactOperationExportValue(value: string) {
       if (failures.length) compact.push(failures.join(" / "));
     }
   }
-  return compact.join(" · ") || value;
+  const active = parts.some((part) => /^[1-9]\d* active$/.test(part));
+  const kind = ["pump", "wait", "long-running"].includes(row.activityKind ?? "")
+    ? row.activityKind! : "request";
+  if (kind !== "request") {
+    compact.unshift(`[${kind}${active ? " expected active" : ""}]`);
+  } else if (active) {
+    compact.unshift("[request unexpectedly active]");
+  }
+  if (active) compact.push(`live incomplete age ${boundedAge(row.liveAgeMs)}`);
+  return compact.join(" · ") || row.value;
+}
+
+function boundedAge(age: number | null | undefined) {
+  if (typeof age !== "number" || !Number.isFinite(age) || age < 0) return "unknown";
+  if (age < 1_000) return "<1s";
+  if (age < 10_000) return "1–10s";
+  if (age < 60_000) return "10–60s";
+  return "≥60s";
 }
 
 async function writeClipboardText(text: string) {
@@ -502,8 +586,8 @@ export function NormalizedTraceView(props: NormalizedTraceViewProps) {
   const selectedRow = selectedId ? rowsById.get(selectedId) ?? null : null;
   const captureRequest = selectedRow ? captureRequestForRow(selectedRow, props) : null;
   const exportText = useMemo(
-    () => exportOpen ? formatNormalizedTraceExport(rows) : "",
-    [exportOpen, rows],
+    () => exportOpen ? formatNormalizedTraceExport(rows, props.entitiesById ?? new Map()) : "",
+    [exportOpen, rows, props.entitiesById],
   );
 
   const installZoom = useCallback((svg: SVGSVGElement | null) => {

@@ -111,7 +111,7 @@ class TracePatchTransport:
         journal_limit: int = 128,
         max_batch_records: int = 256,
         max_batch_bytes: int = 256 * 1024,
-        health_callback=None, timer_factory=None,
+        health_callback=None, timer_factory=None, entity_provider=None,
     ) -> None:
         from collections import Counter
 
@@ -138,6 +138,7 @@ class TracePatchTransport:
         self._flush_handle = None
         self._timer_factory = timer_factory
         self._health_callback = health_callback
+        self._entity_provider = entity_provider
         self._published_diagnostics: dict[str, int] = dict(self.diagnostics)
         self._closed = False
 
@@ -324,6 +325,7 @@ class TracePatchTransport:
                 "trace_id": self.projection.trace_id,
                 "snapshot_sequence": self._sequence,
                 "server_monotonic_ms": self._monotonic_ms(),
+                "entities": self._entities(),
                 "machines": [self._machine(item) for item in self.projection.machines.snapshots()],
                 "transitions": [
                     self._transition(item)
@@ -374,6 +376,7 @@ class TracePatchTransport:
                 "trace_id": self.projection.trace_id,
                 "sequence": self._sequence,
                 "server_monotonic_ms": self._monotonic_ms(),
+                "entities": self._entities(),
                 "operation_strings": {
                     operation_id: names[operation_id]
                     for operation_id in operation_ids if operation_id in names
@@ -394,6 +397,15 @@ class TracePatchTransport:
             self._journal.popleft()
         self._broadcast(batch)
         return batch
+
+    def _entities(self) -> list[dict[str, Any]]:
+        if self._entity_provider is None:
+            return []
+        try:
+            return list(self._entity_provider())
+        except Exception:
+            self.diagnostics["trace_entity_metadata_failures"] += 1
+            return []
 
     def _broadcast(self, batch: dict[str, Any]) -> None:
         head = self._journal[0][0]

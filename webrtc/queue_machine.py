@@ -6,7 +6,6 @@ import asyncio
 from typing import Generic, TypeVar
 
 from .runtime_services import current_execution_scope
-from .state_machine import MachineSnapshot
 
 T = TypeVar("T")
 
@@ -25,12 +24,8 @@ class RuntimeOwnedQueue(Generic[T]):
         self._revision = 0
         self._pending_puts: set[asyncio.Task[object]] = set()
         self._pending_gets: set[asyncio.Task[object]] = set()
-        self._high_water = 0
-        self._enqueued = 0
-        self._dequeued = 0
-        self._facets_pending = False
         if self._runtime is not None:
-            self._publish()
+            self._record_packet_activity(exact=True)
 
     @property
     def maxsize(self) -> int:
@@ -103,52 +98,18 @@ class RuntimeOwnedQueue(Generic[T]):
         return item
 
     def _record_packet_activity(self, *, enqueued: int = 0,
-                                dequeued: int = 0) -> None:
-        """Record hot-path metrics without doing projection work inline."""
-        self._enqueued += enqueued
-        self._dequeued += dequeued
-        self._high_water = max(self._high_water, self._queue.qsize())
-        if self._runtime is None or self._facets_pending:
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        if loop.is_closed():
-            return
-        self._facets_pending = True
-        loop.call_soon(self._flush_facets)
-
-    def _flush_facets(self) -> None:
-        self._facets_pending = False
-        try:
-            self._publish()
-        except Exception:
-            # Queue operation success must never depend on observability.
-            diagnostics = getattr(self._runtime, "diagnostics", None)
-            if diagnostics is not None:
-                with diagnostics.suspend_notifications():
-                    diagnostics["queue_facet_publish_failures"] += 1
-
-    def _publish(self, revision: int | None = None) -> None:
+                                dequeued: int = 0,
+                                exact: bool = False) -> None:
+        """Send a value sample to the Runtime telemetry reducer."""
         if self._runtime is None:
             return
-        depth = self._queue.qsize()
-        self._high_water = max(self._high_water, depth)
-        source_revision = self._revision if revision is None else revision
-        source = MachineSnapshot(
-            self.entity_id, "queue", 1, source_revision,
-            self._state, self._state == "closed",
-        )
-        self._runtime.observe_facets(
-            source, {
-                "depth": depth, "capacity": self.maxsize,
-                "high_water": self._high_water, "queue_kind": self.queue_kind,
-                "enqueued_packets": self._enqueued,
-                "dequeued_packets": self._dequeued,
-            },
-            observer_meta="aggregate",
-            failure_diagnostic="queue_facet_publish_failures",
+        self._runtime.record_queue_activity(
+            entity_id=self.entity_id, queue_kind=self.queue_kind,
+            depth=self._queue.qsize(), capacity=self.maxsize,
+            deltas={
+                "enqueued_packets": enqueued,
+                "dequeued_packets": dequeued,
+            }, exact=exact,
         )
 
     async def close(self) -> None:
@@ -163,4 +124,4 @@ class RuntimeOwnedQueue(Generic[T]):
             self._queue.get_nowait()
         self._state = "closed"
         self._revision += 1
-        self._flush_facets()
+        self._record_packet_activity(exact=True)

@@ -11,7 +11,7 @@ export function ClientPage() {
     toasts,
     dismissToast,
     requestTraceCapture,
-    machinesById, transitions, controlsById, groupsById, facetsById, capturesById, operationNamesById,
+    machinesById, entitiesById, transitions, controlsById, groupsById, facetsById, capturesById, operationNamesById,
     diagnostics, topologyVersion, valueVersion,
     videoRef,
   } = useClientSession();
@@ -55,6 +55,7 @@ export function ClientPage() {
 
       <TraceOverlay
         machinesById={machinesById}
+        entitiesById={entitiesById}
         transitions={transitions}
         controlsById={controlsById}
         groupsById={groupsById}

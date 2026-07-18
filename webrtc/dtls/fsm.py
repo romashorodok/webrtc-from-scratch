@@ -1,20 +1,19 @@
 import asyncio
 from contextlib import suppress
 import logging
-import uuid
+import secrets
 import time
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Protocol
 
 from webrtc.dtls.certificate import Certificate
-from webrtc.performance import ObservedComponent, event_loop
 from webrtc.queue_machine import RuntimeOwnedQueue
 from webrtc.runtime_services import FailurePolicy, current_execution_scope
 from webrtc.machine_specs import MACHINE_SPECS
 from webrtc.state_machine import (
     AsyncStateMachineRunner, BoundedMailbox, PreparedTransition,
-    TransitionCommit,
+    TransitionCommit, _dispatch_transition_sink,
 )
 from webrtc.tracing import measure_perf_async
 
@@ -123,7 +122,7 @@ FLIGHT_TRANSITIONS: dict[Flight, FlightTransition] = {
 }
 
 
-class FSM(ObservedComponent):
+class FSM:
     def __init__(
         self,
         remote: DTLSRemote,
@@ -147,22 +146,22 @@ class FSM(ObservedComponent):
 
         scope = current_execution_scope()
         self._transition_controller = getattr(scope, "transition_controller", None)
-        self._projection = getattr(scope, "projection", None)
-        root = getattr(scope, "root_context", None)
-        identity = getattr(scope, "scope_id", None) or getattr(root, "trace_id", None)
-        self.entity_id = f"dtls-handshake-phase:{identity or id(self)}"
         self._runtime = scope if hasattr(scope, "start_machine") else None
+        self.entity_id = (
+            self._runtime.allocate_domain_entity_id("dtls-handshake-phase")
+            if self._runtime is not None
+            else f"dtls-handshake-phase:{secrets.token_hex(6)}"
+        )
         self._runner = _HandshakePhaseRunner(
             self, entity_id=self.entity_id, mailbox_capacity=16,
             controller=self._transition_controller,
-            transition_sink=(self._runtime.observe_transition
-                             if self._runtime is not None else None),
+            transition_sink=None,
         )
         self.commands: BoundedMailbox[FSMCommand] = self._runner.commands
-        if self._projection is not None:
-            self._projection.machines.register(self.entity_id, DTLS_PHASE_SPEC)
         if self._runtime is not None:
-            self._runtime.register_owner(self.entity_id, epoch=self._runner.epoch)
+            self._runtime.compose_domain_runner(
+                self, self._runner, role="dtls-handshake", activate=False,
+            )
             self._runner_handle = self._runtime.start_machine(
                 self._runner, owner_entity_id=self.entity_id,
                 owner_epoch=self._runner.epoch,
@@ -189,7 +188,6 @@ class FSM(ObservedComponent):
     def transition_revision(self) -> int:
         return self._runner.snapshot().revision
 
-    @event_loop
     def get_srtp_keying_material(self) -> SRTPKeyingMaterial | None:
         """
         Get SRTP keying material after handshake completion.
@@ -220,13 +218,11 @@ class FSM(ObservedComponent):
         while self._runner.snapshot().state != "finished":
             await asyncio.sleep(0.001)
 
-    @event_loop
     def _reset_retransmit_state(self) -> None:
         """Reset retransmission state after successful flight transition."""
         self._retransmit_timeout = INITIAL_RETRANSMIT_TIMEOUT
         self._retransmit_count = 0
 
-    @event_loop
     def _increase_retransmit_timeout(self) -> None:
         """Implement exponential backoff for retransmission timer (RFC 6347)."""
         self._retransmit_timeout = min(
@@ -235,7 +231,6 @@ class FSM(ObservedComponent):
         )
         self._retransmit_count += 1
 
-    @event_loop
     def _check_handshake_timeout(self) -> bool:
         """
         Check if the overall handshake timeout has been exceeded.
@@ -249,7 +244,6 @@ class FSM(ObservedComponent):
         elapsed = time.time() - self._handshake_start_time
         return elapsed > HANDSHAKE_TIMEOUT
 
-    @event_loop
     def _is_duplicate_flight(self, flight: Flight) -> bool:
         """
         Detect if the received flight is a duplicate (retransmission from peer).
@@ -268,7 +262,6 @@ class FSM(ObservedComponent):
     async def dispatch(self):
         metadata = {
             "flow_direction": "rx",
-            "operation_id": uuid.uuid4().hex,
             "flight": self.flight.name,
             "fsm_state": self.handshake_state.name,
         }
@@ -406,7 +399,6 @@ class FSM(ObservedComponent):
             return FSMState.Finished
         return FSMState.Waiting
 
-    @event_loop
     def _complete_handshake(self, keying_material: SRTPKeyingMaterial) -> None:
         """
         Complete the handshake and derive SRTP keying material.
@@ -552,12 +544,17 @@ class FSM(ObservedComponent):
             self._runner._checkpoint(preview, "before_commit")
         )
         committed = self._runner.commit(prepared, command)
-        if self._runtime is not None:
-            self._runtime.observe_transition(committed)
+        if self._runner._transition_sink is not None:
+            _dispatch_transition_sink(
+                self._runner._transition_sink, committed, effects,
+            )
         await self._runner.controller.after_commit(
             self._runner._checkpoint(committed, "after_commit")
         )
         await self._runner.after_commit(committed, effects)
+        flush = getattr(self._runner._transition_sink, "flush", None)
+        if flush is not None:
+            await flush()
         if proposed is FSMState.Finished:
             await self._runner.controller.terminal(
                 self._runner._checkpoint(committed, "terminal")
@@ -582,7 +579,7 @@ class FSM(ObservedComponent):
 # TODO: Validate epoch
 # TODO: Anti-replay protection
 # TODO: Decrypt
-class DTLSConn(ObservedComponent):
+class DTLSConn:
     def __init__(
         self,
         remote: DTLSRemote,
@@ -593,14 +590,19 @@ class DTLSConn(ObservedComponent):
         self.record_layer_chan = layer_chan
 
         scope = current_execution_scope()
-        identity = getattr(scope, "scope_id", None) or id(self)
+        identity = secrets.token_hex(6)
         self.handshake_message_chan: RuntimeOwnedQueue[Message] = RuntimeOwnedQueue(
             64, entity_id=f"dtls-handshake-messages:{identity}:{id(self)}",
             queue_kind="dtls-handshake-messages",
         )
         self.fsm = FSM(remote, certificate, self.handshake_message_chan, flight)
+        if self.fsm._runtime is not None:
+            self.fsm._runtime.compose_domain_subject(
+                self, entity_id=self.fsm.entity_id, role="dtls-connection",
+                entity_role="dtls-handshake",
+                owner_epoch=self.fsm._runner.epoch,
+            )
 
-    @event_loop
     def get_srtp_keying_material(self) -> SRTPKeyingMaterial | None:
         """Get SRTP keying material after handshake completion."""
         return self.fsm.get_srtp_keying_material()
@@ -609,7 +611,6 @@ class DTLSConn(ObservedComponent):
         """Wait for handshake to complete."""
         return await self.fsm.wait_handshake_complete(timeout)
 
-    @event_loop
     def __handle_encrypted_message(
         self, layer: RecordLayer, raw: bytes, message: EncryptedHandshakeMessage
     ):

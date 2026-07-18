@@ -115,6 +115,7 @@ def test_srtp_delivery_facets_aggregate_and_publish_health_transitions():
             scope_id="scope", trace_patch_cadence=60,
             srtp_delivery_facet_cadence=60,
         ) as runtime:
+            delivery_owner = runtime.telemetry_entity_id("srtp-delivery", "rtp")
             for ssrc in range(100):
                 runtime.record_srtp_delivery(
                     protocol="rtp", stream_id="rtp", delivered=True
@@ -122,14 +123,14 @@ def test_srtp_delivery_facets_aggregate_and_publish_health_transitions():
 
             # Packet-rate success does not revise projection state per packet.
             assert not any(
-                item.owner_entity_id == "queue:scope:rtp"
+                item.owner_entity_id == delivery_owner
                 for item in runtime.projection.facets.snapshots()
             )
             runtime.trace_patch_flush()
             facets = {
                 item.facet_id.rsplit(":", 1)[-1]: item
                 for item in runtime.projection.facets.snapshots()
-                if item.owner_entity_id == "queue:scope:rtp"
+                if item.owner_entity_id == delivery_owner
             }
             assert facets["delivered_packets"].value == 100
             assert facets["dropped_packets"].value == 0
@@ -144,7 +145,7 @@ def test_srtp_delivery_facets_aggregate_and_publish_health_transitions():
             facets = {
                 item.facet_id.rsplit(":", 1)[-1]: item
                 for item in runtime.projection.facets.snapshots()
-                if item.owner_entity_id == "queue:scope:rtp"
+                if item.owner_entity_id == delivery_owner
             }
             assert facets["delivered_packets"].value == 100
             assert facets["dropped_packets"].value == 1
@@ -165,7 +166,7 @@ def test_srtp_delivery_facets_aggregate_and_publish_health_transitions():
             facets = {
                 item.facet_id.rsplit(":", 1)[-1]: item
                 for item in runtime.projection.facets.snapshots()
-                if item.owner_entity_id == "queue:scope:rtp"
+                if item.owner_entity_id == delivery_owner
             }
             assert facets["delivered_packets"].value == 101
             assert facets["delivery_health"].value == "healthy"
@@ -180,6 +181,7 @@ def test_srtp_delivery_facets_publish_on_their_cadence():
         async with Runtime(
             scope_id="scope", srtp_delivery_facet_cadence=0.001
         ) as runtime:
+            delivery_owner = runtime.telemetry_entity_id("srtp-delivery", "rtp")
             runtime.record_srtp_delivery(
                 protocol="rtp", stream_id="rtp", delivered=True
             )
@@ -189,7 +191,7 @@ def test_srtp_delivery_facets_publish_on_their_cadence():
             await asyncio.sleep(0.01)
             delivered = next(
                 item for item in runtime.projection.facets.snapshots()
-                if item.facet_id == "queue:scope:rtp:delivered_packets"
+                if item.facet_id == f"{delivery_owner}:delivered_packets"
             )
             assert delivered.value == 2
             assert delivered.revision == 1

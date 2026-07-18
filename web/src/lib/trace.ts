@@ -40,6 +40,8 @@ export type GroupSnapshot = {
   task_id: string;
   owner_entity_id?: string;
   owner_epoch?: number;
+  owner_role?: string;
+  activity_kind?: "request" | "long-running" | "wait" | "pump" | string;
   parent_ref_type?: string;
   parent_ref_id?: number | string | null;
   operation_id?: number;
@@ -60,6 +62,14 @@ export type GroupSnapshot = {
   revision?: number;
   overflow?: boolean;
   exemplars?: Array<Record<string, unknown>>;
+  live_age_ms?: number | null;
+};
+
+export type TraceEntity = {
+  entity_id: string;
+  alias: string;
+  role: string;
+  kind: "machine" | "resource" | "facet-owner" | "owner" | string;
 };
 
 export type TraceMachine = {
@@ -199,6 +209,7 @@ export type TraceState = {
   sequence: number | null;
   serverMonotonicMs: number | null;
   machinesById: Map<string, TraceMachine>;
+  entitiesById: Map<string, TraceEntity>;
   transitions: TraceMachineTransition[];
   transitionJournalLimit: number;
   controlsById: Map<string, TraceControl>;
@@ -224,6 +235,7 @@ export type TraceState = {
   resyncRequired: boolean;
   resyncRequestVersion: number;
   resyncReason: string | null;
+  terminal: boolean;
 };
 
 export type TraceStateAction = {
@@ -254,6 +266,7 @@ export function createInitialTraceState(): TraceState {
     sequence: null,
     serverMonotonicMs: null,
     machinesById: new Map(),
+    entitiesById: new Map(),
     transitions: [],
     transitionJournalLimit: DEFAULT_TRANSITION_JOURNAL_LIMIT,
     controlsById: new Map(),
@@ -279,6 +292,7 @@ export function createInitialTraceState(): TraceState {
     resyncRequired: false,
     resyncRequestVersion: 0,
     resyncReason: null,
+    terminal: false,
   };
 }
 
@@ -296,6 +310,7 @@ type Schema2Snapshot = {
   snapshot_sequence: number;
   server_monotonic_ms?: number;
   machines?: TraceMachine[];
+  entities?: TraceEntity[];
   transitions?: TraceMachineTransition[];
   transition_journal_limit?: number;
   controls?: TraceControl[];
@@ -304,6 +319,8 @@ type Schema2Snapshot = {
   captures?: TraceCapture[];
   operation_strings?: Record<string, string>;
   diagnostics?: Record<string, number>;
+  terminal?: boolean;
+  sequence?: number;
 };
 
 type Schema2Patch = {
@@ -311,6 +328,7 @@ type Schema2Patch = {
   trace_id: string;
   sequence: number;
   server_monotonic_ms?: number;
+  entities?: TraceEntity[];
   operation_strings?: Record<string, string>;
   events?: Array<{
     type?: string;
@@ -322,12 +340,12 @@ type Schema2Patch = {
 };
 
 type Schema2Envelope = {
-  event: "trace:snapshot" | "trace:batch" | "trace:resync_required";
+  event: "trace:snapshot" | "trace:batch" | "trace:resync_required" | "trace:terminal";
   data: Schema2Snapshot | Schema2Patch;
 };
 
 function schema2Envelope(input: TraceEventInput | undefined): Schema2Envelope | null {
-  if (!input || !["trace:snapshot", "trace:batch", "trace:resync_required"].includes(input.event)) {
+  if (!input || !["trace:snapshot", "trace:batch", "trace:resync_required", "trace:terminal"].includes(input.event)) {
     return null;
   }
   const data = parseJson<Record<string, unknown>>(input.data);
@@ -348,8 +366,8 @@ function reduceNormalizedTraceState(
     }
     return requestTraceResync(state, "server_requested_resync");
   }
-  if (event === "trace:snapshot") {
-    return replaceNormalizedSnapshot(state, data as Schema2Snapshot);
+  if (event === "trace:snapshot" || event === "trace:terminal") {
+    return replaceNormalizedSnapshot(state, data as Schema2Snapshot, event === "trace:terminal");
   }
 
   const patch = data as Schema2Patch;
@@ -367,6 +385,7 @@ function reduceNormalizedTraceState(
   }
 
   let machinesById = state.machinesById;
+  const entitiesById = normalizeEntities(patch.entities, state.entitiesById);
   let transitions = state.transitions;
   let controlsById = state.controlsById;
   let groupsById = state.groupsById;
@@ -381,8 +400,8 @@ function reduceNormalizedTraceState(
   let controlArchive = state.controlArchive;
   let facetArchive = state.facetArchive;
   let diagnostics = state.diagnostics;
-  let topologyChanged = false;
-  let valueChanged = false;
+  let topologyChanged = entitiesById !== state.entitiesById;
+  let valueChanged = topologyChanged;
 
   for (const operation of patch.events ?? []) {
     switch (operation.type) {
@@ -555,7 +574,7 @@ function reduceNormalizedTraceState(
     schema: 2,
     sequence: patch.sequence,
     serverMonotonicMs: finiteNumber(patch.server_monotonic_ms),
-    machinesById, transitions, controlsById, groupsById, facetsById, capturesById, operationNamesById,
+    machinesById, entitiesById, transitions, controlsById, groupsById, facetsById, capturesById, operationNamesById,
     ...indexes,
     groups: groupsById === state.groupsById ? state.groups : [...groupsById.values()],
     groupArchive, machineArchive, controlArchive, facetArchive,
@@ -570,8 +589,11 @@ function reduceNormalizedTraceState(
   };
 }
 
-function replaceNormalizedSnapshot(state: TraceState, snapshot: Schema2Snapshot): TraceState {
+function replaceNormalizedSnapshot(
+  state: TraceState, snapshot: Schema2Snapshot, terminal = false,
+): TraceState {
   const machinesById = new Map((snapshot.machines ?? []).map((item) => [item.entity_id, item]));
+  const entitiesById = normalizeEntities(snapshot.entities, new Map());
   const controlsById = new Map((snapshot.controls ?? []).map((item) => [item.handle_id, item]));
   const groupsById = new Map(
     (snapshot.groups ?? []).flatMap((item) => typeof item.group_id === "number" ? [[item.group_id, item] as const] : []),
@@ -587,9 +609,10 @@ function replaceNormalizedSnapshot(state: TraceState, snapshot: Schema2Snapshot)
     ...state,
     schema: 2,
     traceId: snapshot.trace_id,
-    sequence: snapshot.snapshot_sequence,
+    sequence: terminal && Number.isSafeInteger(snapshot.sequence)
+      ? snapshot.sequence! : snapshot.snapshot_sequence,
     serverMonotonicMs: finiteNumber(snapshot.server_monotonic_ms),
-    machinesById, transitions, transitionJournalLimit,
+    machinesById, entitiesById, transitions, transitionJournalLimit,
     controlsById, groupsById, facetsById, capturesById,
     operationNamesById: mergeOperationNames(new Map(), snapshot.operation_strings),
     ...buildNormalizedIndexes(controlsById, groupsById, facetsById),
@@ -601,6 +624,7 @@ function replaceNormalizedSnapshot(state: TraceState, snapshot: Schema2Snapshot)
     removedFacetRevisions: new Map(),
     resyncRequired: false,
     resyncReason: null,
+    terminal: terminal || snapshot.terminal === true,
     topologyVersion: state.topologyVersion + 1,
     valueVersion: state.valueVersion + 1,
     commitVersion: state.commitVersion + 1,
@@ -612,6 +636,26 @@ function transitionLimit(value: number | undefined) {
     return DEFAULT_TRANSITION_JOURNAL_LIMIT;
   }
   return Math.min(value!, MAX_TRANSITION_JOURNAL_LIMIT);
+}
+
+function normalizeEntities(
+  entities: TraceEntity[] | undefined,
+  previous: Map<string, TraceEntity>,
+) {
+  if (!Array.isArray(entities)) return previous;
+  const normalized = new Map<string, TraceEntity>();
+  for (const entity of entities.slice(0, 4096)) {
+    if (!entity || typeof entity.entity_id !== "string" || !entity.entity_id) continue;
+    if (typeof entity.alias !== "string" || !/^@\d{1,6}$/.test(entity.alias)) continue;
+    if (typeof entity.role !== "string" || !/^[a-z0-9-]{1,64}$/.test(entity.role)) continue;
+    if (typeof entity.kind !== "string" || !/^[a-z0-9-]{1,32}$/.test(entity.kind)) continue;
+    normalized.set(entity.entity_id, entity);
+  }
+  if (normalized.size === previous.size && [...normalized].every(([id, entity]) => {
+    const old = previous.get(id);
+    return old?.alias === entity.alias && old.role === entity.role && old.kind === entity.kind;
+  })) return previous;
+  return normalized;
 }
 
 function validMachineTransition(record: TraceMachineTransition) {

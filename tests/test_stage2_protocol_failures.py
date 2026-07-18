@@ -4,7 +4,7 @@ import pytest
 import webrtc_rs
 
 from webrtc.config import DebugConfig, LogLevel
-from webrtc.dtls.dtlstransport import DTLSTransport
+from webrtc.dtls.dtlstransport import DTLSTransport, DTLSTransportSnapshot
 from webrtc.lifecycle import TransportCondition
 from webrtc.logger import get_logger
 from webrtc.peer_connection import ICEGatherer, PeerConnection
@@ -85,8 +85,11 @@ def test_dtls_wait_handshake_raises_stored_failure():
         transport._DTLSTransport__handshake_complete = asyncio.Event()
         transport._DTLSTransport__handshake_complete.set()
         transport._DTLSTransport__handshake_failed = failure
+        transport._authority = DTLSTransportSnapshot(state="failed")
         transport._runner = type("Runner", (), {
-            "snapshot": lambda self: type("Snapshot", (), {"state": "failed"})()
+            "snapshot": lambda self: (_ for _ in ()).throw(AssertionError(
+                "DTLS wait read the generic machine snapshot"
+            ))
         })()
 
         with pytest.raises(RuntimeError, match="handshake failed"):
