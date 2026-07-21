@@ -19,7 +19,6 @@ from webrtc.dtls.prf import SRTPKeyingMaterial
 from webrtc.srtp import Session as SrtpSession, Stream as SrtpStream
 from webrtc.logger import get_logger, Component
 from webrtc.config import get_config
-from webrtc.peer_context import spawn_peer_task
 
 logger = logging.getLogger("webrtc.dtls.transport")
 
@@ -149,12 +148,8 @@ class DTLSTransport:
         wlogger.info(Component.DTLS, f"Starting DTLS handshake as {'client' if is_client else 'server'}")
 
         # Start handshake processing
-        spawn_peer_task(
-            self._run_handshake(is_client),
-            name="dtls:handshake",
-            component="dtls",
-            kind="dtls",
-        )
+        loop = asyncio.get_running_loop()
+        loop.create_task(self._run_handshake(is_client))
         wlogger.debug(Component.DTLS, "Handshake task created")
 
     async def _run_handshake(self, is_client: bool):
@@ -169,12 +164,7 @@ class DTLSTransport:
         try:
             # Start FSM processing
             wlogger.debug(Component.DTLS, "Creating handle_inbound_record_layers task")
-            spawn_peer_task(
-                self.__dtls_conn.handle_inbound_record_layers(),
-                name="dtls:handle-inbound-record-layers",
-                component="dtls",
-                kind="dtls",
-            )
+            asyncio.create_task(self.__dtls_conn.handle_inbound_record_layers())
 
             # Dispatch initial state
             wlogger.debug(Component.DTLS, "Dispatching initial FSM state")
@@ -254,18 +244,8 @@ class DTLSTransport:
             wlogger.info(Component.DTLS, "SRTP sessions initialized")
 
             # Start internal receive loops to route incoming packets to streams
-            spawn_peer_task(
-                self._rtp_receive_loop(),
-                name="dtls:rtp-receive-loop",
-                component="dtls",
-                kind="dtls",
-            )
-            spawn_peer_task(
-                self._rtcp_receive_loop(),
-                name="dtls:rtcp-receive-loop",
-                component="dtls",
-                kind="dtls",
-            )
+            asyncio.create_task(self._rtp_receive_loop())
+            asyncio.create_task(self._rtcp_receive_loop())
 
         except Exception as e:
             wlogger.error(Component.DTLS, "Failed to initialize SRTP", error=str(e))

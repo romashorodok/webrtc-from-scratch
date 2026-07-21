@@ -14,7 +14,6 @@ from . import dtls
 
 import socket
 from .utils import AsyncEventEmitter, impl_protocol, current_ntp_time
-from .peer_context import get_active_peer_context, spawn_peer_task
 
 from .session_description import (
     Origin,
@@ -394,21 +393,15 @@ class PeerConnection(AsyncEventEmitter):
 
             print(f"[PC] on NOMINATE_TRANSPORT: starting DTLS as {dtls_role}")
             self._transport = transport
-            if peer_context := get_active_peer_context():
-                peer_context._set_selected_transport(transport)
 
             # Start DTLS with the nominated transport
             self._dtls_transport.start(dtls_role, transport)
             print(f"[PC] DTLS transport started, creating handshake routines")
-            spawn_peer_task(
-                dtls_ice_pair_queue_handshake_routine(transport, self._dtls_transport),
-                name="dtls:ice-pair-queue-handshake",
-                component="dtls",
+            self.__loop.create_task(
+                dtls_ice_pair_queue_handshake_routine(transport, self._dtls_transport)
             )
-            spawn_peer_task(
-                dtls_ice_pair_dequeue_handshake_routine(transport, self._dtls_transport),
-                name="dtls:ice-pair-dequeue-handshake",
-                component="dtls",
+            self.__loop.create_task(
+                dtls_ice_pair_dequeue_handshake_routine(transport, self._dtls_transport)
             )
 
             # OBSOLETE: This loop was stealing 50% of packets from DTLSTransport._rtp_receive_loop()
@@ -421,28 +414,21 @@ class PeerConnection(AsyncEventEmitter):
             #         pkt = await transport.recv_rtp()
             #         await self._dtls_transport.write_rtp_bytes(pkt.data)
             #
+            # self.__loop.create_task(run_rtp_recv_loop())
             print(
                 "[PeerConnection] Skipping obsolete run_rtp_recv_loop - DTLSTransport._rtp_receive_loop handles this"
             )
 
-        spawn_peer_task(
-            pair_ctrl.start(),
-            name="ice:candidate-pair-controller",
-            component="ice",
-        )
+        self.__loop.create_task(pair_ctrl.start())
 
+        # self.__loop.create_task(dtls_transport.start(dtls_role))
         # self.dtls_transports.append(dtls_transport)
 
     def start(self):
         self.gatherer.on(
             ICEGathererEvent.CANDIDATE_PAIR_CONTROLLER, self.__on_ice_pair_controller
         )
-        spawn_peer_task(
-            self.gatherer.start(),
-            name="ice:gatherer-start",
-            component="ice",
-            kind="lifecycle",
-        )
+        self.__loop.create_task(self.gatherer.start())
 
     async def add_transceiver_from_track(
         self, track: TrackLocal, direction: RTPTransceiverDirection
@@ -755,11 +741,7 @@ class PeerConnection(AsyncEventEmitter):
         self.__media_fingerprints.extend(desc.get_media_fingerprints())
 
         for transceiver in self._transceivers:
-            spawn_peer_task(
-                transceiver.start_srtp_streams(),
-                name="srtp:start-streams",
-                component="srtp",
-            )
+            self.__loop.create_task(transceiver.start_srtp_streams())
 
     def __get_sdp_role(self) -> ConnectionRole:
         role = self.gatherer.get_role()

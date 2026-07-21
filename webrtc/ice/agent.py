@@ -25,7 +25,6 @@ from .stun_message import stun_message_parse_attrs, stun_message_parse_header
 from webrtc.utils import impl_protocol, AsyncEventEmitter, Handler_T
 from webrtc.logger import get_logger, Component
 from webrtc.config import get_config
-from webrtc.peer_context import spawn_peer_task
 
 from .candidate_base import (
     CandidateBase,
@@ -737,12 +736,8 @@ class Agent(AsyncEventEmitter):
             match candidate_type:
                 case CandidateType.Host:
                     coros.append(
-                        spawn_peer_task(
-                            self._gather_host_candidate(),
-                            name="ice:gather-host-candidate",
-                            component="ice",
-                            kind="ice",
-                            loop=self._loop,
+                        asyncio.ensure_future(
+                            self._gather_host_candidate(), loop=self._loop
                         )
                     )
                 case _:
@@ -870,13 +865,7 @@ class Agent(AsyncEventEmitter):
         remotes = self._remote_candidates.get(net_type)
         if remotes:
             for remote in remotes:
-                spawn_peer_task(
-                    self._add_candidate_pair(local, remote),
-                    name="ice:add-candidate-pair",
-                    component="ice",
-                    kind="ice",
-                    loop=self._loop,
-                )
+                self._loop.create_task(self._add_candidate_pair(local, remote))
 
     async def _add_remote_candidate(self, remote: CandidateBase):
         # print("add remote candidate befre lock")
@@ -902,25 +891,13 @@ class Agent(AsyncEventEmitter):
         locals = self._local_candidates.get(net_type)
         if locals:
             for local in locals:
-                spawn_peer_task(
-                    self._add_candidate_pair(local, remote),
-                    name="ice:add-candidate-pair",
-                    component="ice",
-                    kind="ice",
-                    loop=self._loop,
-                )
+                self._loop.create_task(self._add_candidate_pair(local, remote))
 
     def add_remote_candidate(self, candidate_raw: str):
         remote = parse_candidate_str(candidate_raw)
         if not remote:
             return
-        spawn_peer_task(
-            self._add_remote_candidate(remote),
-            name="ice:add-remote-candidate",
-            component="ice",
-            kind="ice",
-            loop=self._loop,
-        )
+        self._loop.create_task(self._add_remote_candidate(remote))
 
     def get_local_credentials(self) -> tuple[str, str]:
         return (self._local_ufrag, self._local_pwd)

@@ -5,7 +5,6 @@ from typing import override, Any
 from webrtc.utils.types import impl_protocol
 from webrtc.logger import get_logger, Component
 from webrtc.config import get_config
-from webrtc.runtime import get_default_runtime
 
 from .interface import Interface
 from .types import (
@@ -147,6 +146,19 @@ class UDPMux:
         self._local_candidate = local_candidate
         self._interface_handler = interface_handler
 
+    # TODO: This so bad must looks like that on recv side
+    # This approach hold in event loop while True which never end
+    """
+        await self._loop.run_in_executor(
+                self._executor,
+                self._candidate.on_inbound_pkt,
+                self._local_ufrag,
+                transport,
+                pkt,
+                addr
+            )
+    """
+
     def intercept(self, remote: CandidateProtocol) -> MuxConnProtocol:
         interceptor = Interceptor()
         address = (remote.address, remote.port)
@@ -180,13 +192,12 @@ class MultiUDPMux:
 
         for interface in self._interfaces:
             coros.append(
-                get_default_runtime().trace_awaitable(
+                asyncio.ensure_future(
                     self._loop.create_datagram_endpoint(
                         lambda iface=interface: InterfaceMuxUDPHandler(iface, port),
                         local_addr=(interface.address.value, port),
                     ),
-                    name=f"udp:create-datagram-endpoint:{interface.address.value}",
-                    kind="network",
+                    loop=self._loop,
                 )
             )
 

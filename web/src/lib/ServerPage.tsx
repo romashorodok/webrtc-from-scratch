@@ -1,19 +1,7 @@
-import { TraceOverlay } from "./TraceOverlay";
 import { useServerSession } from "./useServerSession";
 
 export function ServerPage() {
-  const {
-    clearCompletedTraces,
-    clearFailedTraces,
-    createOffer,
-    deleteTrace,
-    status,
-    toasts,
-    dismissToast,
-    summaries,
-    traces,
-    videoRef,
-  } = useServerSession();
+  const { createOffer, status, videoRef } = useServerSession();
 
   return (
     <section className="demo-card">
@@ -29,18 +17,6 @@ export function ServerPage() {
         <span className="status-label">Status</span>
         <span className="status-value">{status}</span>
       </div>
-      {toasts.length > 0 ? (
-        <div className="toast-stack" aria-live="polite">
-          {toasts.map((toast, index) => (
-            <div className="toast toast--error" key={`${toast}-${index}`}>
-              <span>{toast}</span>
-              <button type="button" onClick={() => dismissToast(index)} aria-label="Dismiss error">
-                ×
-              </button>
-            </div>
-          ))}
-        </div>
-      ) : null}
 
       <div className="media-panel">
         <video ref={videoRef} controls autoPlay playsInline muted={false} />
@@ -51,14 +27,6 @@ export function ServerPage() {
           Create Offer
         </button>
       </div>
-
-      <TraceOverlay
-        traces={traces}
-        onClearCompleted={clearCompletedTraces}
-        onClearFailed={clearFailedTraces}
-        onDeleteTrace={deleteTrace}
-        summaries={summaries}
-      />
     </section>
   );
 }

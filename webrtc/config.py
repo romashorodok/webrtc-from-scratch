@@ -64,12 +64,6 @@ class DebugConfig:
     # File output
     log_to_file: bool = False
     log_file_path: str = "/tmp/webrtc_debug.log"
-    log_max: int = 4096
-    log_flush_interval: float = 0.1
-    log_flush_max_batch: int = 128
-
-    # Runtime lifecycle
-    peer_shutdown_timeout: float = 2.0
 
     # Color output (for terminal)
     use_colors: bool = True

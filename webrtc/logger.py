@@ -266,26 +266,6 @@ class WebRTCLogger:
             self._log_file.close()
             self._log_file = None
 
-    def write_events_sync(self, events: list[Any]):
-        """Write pre-built lifecycle/log events from PeerContext queues."""
-        for event in events:
-            component = getattr(event, "component", Component.PEER_CONNECTION)
-            if isinstance(component, str):
-                try:
-                    component = Component(component)
-                except ValueError:
-                    component = Component.PEER_CONNECTION
-
-            level = getattr(event, "level", LogLevel.INFO)
-            if isinstance(level, str):
-                try:
-                    level = LogLevel[level.upper()]
-                except KeyError:
-                    level = LogLevel.INFO
-
-            message = getattr(event, "message", None) or str(event)
-            self._log(component, level, message)
-
 
 # Global logger instance
 _logger: Optional[WebRTCLogger] = None

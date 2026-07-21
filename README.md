@@ -52,10 +52,6 @@ uv add --editable git+https://github.com/romashorodok/webrtc-from-scratch/tree/m
 ## Architecture
 ![](./docs/architecture_sendrecv.png)
 
-## Docs
-
-- [Trace viewer product requirements](./docs/tracing.md)
-
 ## Credits
 
 ### [pion/webrtc](https://github.com/pion/webrtc)
