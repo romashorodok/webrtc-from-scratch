@@ -245,7 +245,7 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
                 send_time_cache.add(pkt.extensions.transport_sequence_number)
                 await asyncio.to_thread(pc._transport.sendto, encoded)
 
-    asyncio.run_coroutine_threadsafe(rtcp_handler(), loop)
+    # asyncio.run_coroutine_threadsafe(rtcp_handler(), loop)
     rw_loop.run_until_complete(encode())
 
 
