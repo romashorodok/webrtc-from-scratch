@@ -8,7 +8,7 @@ import platform
 import sys
 import sysconfig
 
-COMPILER_VERSION = "wrtc-pymeta-compiler/0.1"
+COMPILER_VERSION = "wrtc-pymeta-compiler/0.3"
 OPTIMIZATION_MODE = "release"
 
 METADATA_ATTRIBUTES = {

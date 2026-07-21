@@ -38,14 +38,18 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["webrtc*", "packages*"]
+include = ["webrtc*", "packages*", "pymeta*"]
 
 [tool.setuptools.package-data]
 "webrtc.compiler" = [
     "native_compiler/CMakeLists.txt",
     "native_compiler/main.c",
-    "native_compiler/kernel_e_extension.c.in",
+    "native_compiler/generator.c",
+    "native_compiler/generator.h",
 ]
+
+[tool.setuptools.exclude-package-data]
+"webrtc.compiler" = ["native_compiler/kernel_e_extension.c.in"]
 
 [tool.maturin]
 module-name = "builder"

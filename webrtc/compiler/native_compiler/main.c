@@ -5,7 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "kernel_e_template.h"
+#include "compiler_core.h"
+#include "generator.h"
+#include "lowering.h"
 
 #ifndef WRTC_PYTHON_EXECUTABLE
 #error "WRTC_PYTHON_EXECUTABLE is required"
@@ -13,8 +15,6 @@
 #ifndef WRTC_PYTHON_VERSION
 #error "WRTC_PYTHON_VERSION is required"
 #endif
-
-#define ACCEPTED_AST "2d4616724d8fedc1fa4879bd911bafdfbf551b58f23ab4f9f91e3b0ab2e068b9"
 
 typedef struct { const char *source; const char *output; int json; } Options;
 
@@ -55,22 +55,6 @@ static int write_file(const char *path, const char *data) {
     if (file == NULL) return -1;
     ok = fwrite(data, 1, length, file) == length && fclose(file) == 0;
     return ok ? 0 : -1;
-}
-
-static char *replace_all(char *input, const char *token, const char *value) {
-    const size_t token_n = strlen(token), value_n = strlen(value); size_t count = 0, input_n = strlen(input), out_n;
-    const char *scan = input; char *found, *output, *at;
-    while ((found = strstr(scan, token)) != NULL) { count++; scan = found + token_n; }
-    if (count == 0) return input;
-    if (value_n >= token_n) out_n = input_n + count * (value_n - token_n);
-    else out_n = input_n - count * (token_n - value_n);
-    output = malloc(out_n + 1u); if (output == NULL) { free(input); return NULL; }
-    scan = input; at = output;
-    while ((found = strstr(scan, token)) != NULL) {
-        size_t prefix = (size_t)(found - scan); memcpy(at, scan, prefix); at += prefix;
-        memcpy(at, value, value_n); at += value_n; scan = found + token_n;
-    }
-    strcpy(at, scan); free(input); return output;
 }
 
 static char *copy_utf8(PyObject *object) {
@@ -144,12 +128,12 @@ static int py_call(const char *module_name, const char *name, PyObject *args, Py
 }
 
 static int run_command(const char *const *items) {
-    PyObject *list = PyList_New(0), *args = NULL, *kwargs = NULL; int i, status = -1;
+    PyObject *list = PyList_New(0), *args = NULL, *kwargs = NULL, *completed = NULL; int i, status = -1;
     if (list == NULL) return -1;
     for (i = 0; items[i] != NULL; i++) { PyObject *item = PyUnicode_DecodeFSDefault(items[i]); if (item == NULL || PyList_Append(list, item) < 0) { Py_XDECREF(item); goto done; } Py_DECREF(item); }
     args = PyTuple_Pack(1, list); kwargs = Py_BuildValue("{s:O,s:O}", "check", Py_True, "capture_output", Py_True);
-    if (args != NULL && kwargs != NULL && py_call("subprocess", "run", args, kwargs, NULL) == 0) status = 0;
-done: Py_XDECREF(kwargs); Py_XDECREF(args); Py_DECREF(list); return status;
+    if (args != NULL && kwargs != NULL && py_call("subprocess", "run", args, kwargs, &completed) == 0) status = 0;
+done: Py_XDECREF(completed); Py_XDECREF(kwargs); Py_XDECREF(args); Py_DECREF(list); return status;
 }
 
 static char *run_command_output(const char *const *items) {
@@ -217,17 +201,8 @@ static int replace_path(const char *source, const char *destination) {
 done: Py_XDECREF(b); Py_XDECREF(a); return status;
 }
 
-static int smoke_import(const char *artifact, const char *module) {
-    PyObject *globals = PyDict_New(), *a = PyUnicode_DecodeFSDefault(artifact), *m = PyUnicode_FromString(module), *ran; int status = -1;
-    const char *code = "import importlib.util\ns=importlib.util.spec_from_file_location(MODULE,ARTIFACT)\nx=importlib.util.module_from_spec(s)\ns.loader.exec_module(x)\nassert tuple(x.__pymeta_functions__)==('packetize_av1_frame',)\n";
-    if (globals == NULL || a == NULL || m == NULL) goto done;
-    if (PyDict_SetItemString(globals, "__builtins__", PyEval_GetBuiltins()) < 0 || PyDict_SetItemString(globals, "ARTIFACT", a) < 0 || PyDict_SetItemString(globals, "MODULE", m) < 0) goto done;
-    ran = PyRun_String(code, Py_file_input, globals, globals); if (ran != NULL) { Py_DECREF(ran); status = 0; }
-done: Py_XDECREF(m); Py_XDECREF(a); Py_XDECREF(globals); return status;
-}
-
 static int emit_json(const char *artifact, const char *source, const char *source_hash,
-                     const char *semantic, const char *module) {
+                     const char *semantic, const char *module, PyObject *exports) {
     PyObject *mapping = PyDict_New(), *functions = NULL, *json = NULL, *dumps = NULL, *serialized = NULL;
     PyObject *value = NULL; const char *text; int status = -1;
     if (mapping == NULL) goto done;
@@ -235,7 +210,7 @@ static int emit_json(const char *artifact, const char *source, const char *sourc
     PUT_STRING("artifact_path", artifact); PUT_STRING("source_path", source);
     PUT_STRING("source_sha256", source_hash); PUT_STRING("semantic_sha256", semantic); PUT_STRING("module_name", module);
 #undef PUT_STRING
-    functions = Py_BuildValue("[s]", "packetize_av1_frame"); if (functions == NULL || PyDict_SetItemString(mapping, "public_functions", functions) < 0) goto done;
+    functions = PySequence_List(exports); if (functions == NULL || PyDict_SetItemString(mapping, "public_functions", functions) < 0) goto done;
     json = PyImport_ImportModule("json"); if (json == NULL) goto done;
     dumps = PyObject_GetAttrString(json, "dumps"); if (dumps == NULL) goto done;
     serialized = PyObject_CallOneArg(dumps, mapping); if (serialized == NULL) goto done;
@@ -245,11 +220,11 @@ done: Py_XDECREF(value); Py_XDECREF(serialized); Py_XDECREF(dumps); Py_XDECREF(j
 
 static int compile_module(const Options *o) {
     char *source = NULL, *semantic = NULL, *source_hash = NULL, *stem = NULL, *module = NULL, *suffix = NULL;
-    char *revision = NULL, *target = NULL, *arch = NULL, *template = NULL, *temp = NULL;
+    char *revision = NULL, *target = NULL, *arch = NULL, *temp = NULL;
     char *absolute_source = NULL, *absolute_output = NULL;
     char c_path[4096], cmake_path[4096], build_path[4096], built[4096], destination[4096], python_option[4096];
-    size_t source_n = 0, template_n = 0; int status = -1; const char *configure[11], *build[7];
-    static const char *cmake_format = "cmake_minimum_required(VERSION 3.25)\nproject(pymeta_extension LANGUAGES C)\nif(CMAKE_CROSSCOMPILING)\n message(FATAL_ERROR \"native extension cross-compiling is unsupported\")\nendif()\nfind_package(Python3 %s EXACT REQUIRED COMPONENTS Interpreter Development.Module)\nadd_library(native MODULE generated.c)\ntarget_compile_features(native PRIVATE c_std_17)\ntarget_link_libraries(native PRIVATE Python3::Module)\nset_target_properties(native PROPERTIES PREFIX \"\" OUTPUT_NAME \"%s\" SUFFIX \"%s\" C_STANDARD 17 C_STANDARD_REQUIRED YES C_EXTENSIONS NO C_VISIBILITY_PRESET hidden)\nif(NOT MSVC)\n target_compile_options(native PRIVATE -O3 -fvisibility=hidden)\nendif()\n";
+    size_t source_n = 0; int status = -1; const char *configure[11], *build[7]; PyObject *exports = NULL; WrtcCompilerCore *core = NULL; WrtcLoweringProgram *program = NULL; FILE *generated = NULL;
+    static const char *cmake_format = "cmake_minimum_required(VERSION 3.25)\nproject(pymeta_extension LANGUAGES C)\nif(CMAKE_CROSSCOMPILING)\n message(FATAL_ERROR \"native extension cross-compiling is unsupported\")\nendif()\nfind_package(Python3 %s EXACT REQUIRED COMPONENTS Interpreter Development.Module)\nadd_library(native MODULE generated.c)\ntarget_compile_features(native PRIVATE c_std_17)\ntarget_link_libraries(native PRIVATE Python3::Module)\nset_target_properties(native PROPERTIES PREFIX \"\" OUTPUT_NAME \"%s\" SUFFIX \"%s\" C_STANDARD 17 C_STANDARD_REQUIRED YES C_EXTENSIONS NO C_VISIBILITY_PRESET hidden)\nif(MSVC)\n target_compile_options(native PRIVATE /W4 /WX)\nelse()\n target_compile_options(native PRIVATE -O3 -fvisibility=hidden -Wall -Wextra -Wconversion -Werror)\nendif()\n";
     char *cmake_text = NULL;
     absolute_source = absolute_path(o->source); absolute_output = absolute_path(o->output); if (absolute_source == NULL || absolute_output == NULL) goto done;
     if (strchr(absolute_source, '"') != NULL || strchr(absolute_output, '"') != NULL) {
@@ -261,35 +236,49 @@ static int compile_module(const Options *o) {
     source = read_file(absolute_source, &source_n); if (source == NULL) { PyErr_SetFromErrnoWithFilename(PyExc_OSError, absolute_source); goto done; }
     semantic = semantic_hash(source, source_n, absolute_source); source_hash = hash_bytes(source, source_n);
     if (semantic == NULL || source_hash == NULL) goto done;
-    if (strcmp(semantic, ACCEPTED_AST) != 0) { PyErr_SetString(PyExc_ValueError, "the required function graph is not supported by the C17 backend"); goto done; }
+    if (wrtc_compiler_core_analyze(source, source_n, absolute_source, &core) < 0) goto done;
+    exports = Py_NewRef(core->exports);
+    if (exports == NULL || wrtc_lowering_build(core, &program) < 0) goto done;
     stem = module_stem(absolute_source); if (stem == NULL || !valid_identifier(stem)) { PyErr_SetString(PyExc_ValueError, "source stem must be a valid non-keyword Python identifier"); goto done; }
     module = malloc(strlen(stem) + 8u); if (module == NULL) goto done; (void)sprintf(module, "%s_native", stem);
     { PyObject *sc = PyImport_ImportModule("sysconfig"), *v = NULL; if (sc != NULL) v = PyObject_CallMethod(sc, "get_config_var", "s", "EXT_SUFFIX"); if (v != NULL && v != Py_None) suffix = copy_utf8(v); Py_XDECREF(v); Py_XDECREF(sc); }
     revision = python_fact("sys", "version", 0); target = python_fact("sysconfig", "get_platform", 1); arch = python_fact("platform", "machine", 1);
     if (suffix == NULL || revision == NULL || target == NULL || arch == NULL) goto done;
-    template_n = sizeof WRTC_EXTENSION_TEMPLATE - 1u; template = malloc(template_n + 1u); if (template == NULL) goto done;
-    memcpy(template, WRTC_EXTENSION_TEMPLATE, template_n + 1u);
-    template = replace_all(template, "WRTC_MODULE_NAME_TOKEN", module); template = replace_all(template, "WRTC_SOURCE_HASH_TOKEN", source_hash);
-    template = replace_all(template, "WRTC_SEMANTIC_HASH_TOKEN", semantic); template = replace_all(template, "WRTC_CPYTHON_TOKEN", revision);
-    template = replace_all(template, "WRTC_TARGET_TOKEN", target); template = replace_all(template, "WRTC_ARCH_TOKEN", arch);
-    template = replace_all(template, "WRTC_OPT_TOKEN", "release"); template = replace_all(template, "WRTC_COMPILER_TOKEN", "wrtc-pymeta-compiler/0.1");
-    if (template == NULL) goto done;
     if (make_dirs(absolute_output) < 0) goto done; temp = make_temp(absolute_output, module); if (temp == NULL) goto done;
     (void)snprintf(c_path, sizeof c_path, "%s/generated.c", temp); (void)snprintf(cmake_path, sizeof cmake_path, "%s/CMakeLists.txt", temp);
     (void)snprintf(build_path, sizeof build_path, "%s/build", temp); (void)snprintf(built, sizeof built, "%s/%s%s", build_path, module, suffix);
     (void)snprintf(destination, sizeof destination, "%s/%s%s", absolute_output, module, suffix); (void)snprintf(python_option, sizeof python_option, "-DPython3_EXECUTABLE=%s", WRTC_PYTHON_EXECUTABLE);
     cmake_text = malloc(strlen(cmake_format) + strlen(WRTC_PYTHON_VERSION) + strlen(module) + strlen(suffix) + 1u); if (cmake_text == NULL) goto done;
     (void)sprintf(cmake_text, cmake_format, WRTC_PYTHON_VERSION, module, suffix);
-    if (write_file(c_path, template) < 0 || write_file(cmake_path, cmake_text) < 0) { PyErr_SetFromErrno(PyExc_OSError); goto done; }
+    generated = fopen(c_path, "wb");
+    if (generated == NULL) { PyErr_SetFromErrnoWithFilename(PyExc_OSError, c_path); goto done; }
+    if (wrtc_emit_extension(generated, module, program, source_hash, semantic, revision, target, arch) < 0) {
+        (void)fclose(generated); generated = NULL; PyErr_SetString(PyExc_OSError, "could not emit generated C17 source"); goto done;
+    }
+    if (fclose(generated) != 0) { generated = NULL; PyErr_SetFromErrnoWithFilename(PyExc_OSError, c_path); goto done; }
+    generated = NULL;
+    if (write_file(cmake_path, cmake_text) < 0) { PyErr_SetFromErrno(PyExc_OSError); goto done; }
     configure[0]="cmake"; configure[1]="-S"; configure[2]=temp; configure[3]="-B"; configure[4]=build_path; configure[5]="-DCMAKE_BUILD_TYPE=Release"; configure[6]=python_option; configure[7]=NULL;
     build[0]="cmake"; build[1]="--build"; build[2]=build_path; build[3]="--config"; build[4]="Release"; build[5]=NULL;
-    if (run_command(configure) < 0 || run_command(build) < 0 || audit_exports(built, module) < 0 || smoke_import(built, module) < 0 || replace_path(built, destination) < 0) goto done;
-    if (o->json) { if (emit_json(destination, absolute_source, source_hash, semantic, module) < 0) goto done; }
+    if (run_command(configure) < 0 || run_command(build) < 0 || audit_exports(built, module) < 0 || replace_path(built, destination) < 0) goto done;
+    if (o->json) { if (emit_json(destination, absolute_source, source_hash, semantic, module, exports) < 0) goto done; }
     else (void)printf("%s\n", destination);
     status = 0;
 done:
+    if (generated != NULL) fclose(generated);
     { PyObject *type = NULL, *value = NULL, *traceback = NULL; if (status < 0) PyErr_Fetch(&type, &value, &traceback); cleanup(temp); if (status < 0) PyErr_Restore(type, value, traceback); }
-    free(cmake_text); free(temp); free(template); free(arch); free(target); free(revision); free(suffix); free(module); free(stem); free(source_hash); free(semantic); free(source); free(absolute_output); free(absolute_source); return status;
+    Py_XDECREF(exports); wrtc_lowering_free(program); wrtc_compiler_core_free(core); free(cmake_text); free(temp); free(arch); free(target); free(revision); free(suffix); free(module); free(stem); free(source_hash); free(semantic); free(source); free(absolute_output); free(absolute_source); return status;
+}
+
+static void print_error(void) {
+    PyObject *type = NULL, *value = NULL, *traceback = NULL, *text = NULL;
+    const char *message = NULL;
+    PyErr_Fetch(&type, &value, &traceback); PyErr_NormalizeException(&type, &value, &traceback);
+    if (value != NULL) text = PyObject_Str(value);
+    if (text != NULL) message = PyUnicode_AsUTF8(text);
+    if (message != NULL) (void)fprintf(stderr, "%s\n", message);
+    else { PyErr_Restore(type, value, traceback); type = value = traceback = NULL; PyErr_Print(); }
+    Py_XDECREF(text); Py_XDECREF(traceback); Py_XDECREF(value); Py_XDECREF(type);
 }
 
 int main(int argc, char **argv) {
@@ -299,5 +288,5 @@ int main(int argc, char **argv) {
     init = PyConfig_SetBytesString(&config, &config.program_name, WRTC_PYTHON_EXECUTABLE);
     if (!PyStatus_Exception(init)) init = Py_InitializeFromConfig(&config); PyConfig_Clear(&config);
     if (PyStatus_Exception(init)) Py_ExitStatusException(init);
-    result = compile_module(&o); if (result < 0) PyErr_Print(); if (Py_FinalizeEx() < 0) return 120; return result < 0 ? 1 : 0;
+    result = compile_module(&o); if (result < 0) print_error(); if (Py_FinalizeEx() < 0) return 120; return result < 0 ? 1 : 0;
 }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import importlib.util
 import os
 import subprocess
 import sys
@@ -33,6 +34,37 @@ class CCompilerBuild:
     executable: Path
     artifact: Path
     output_dir: Path
+
+
+def _compile_fixture(
+    build: CCompilerBuild, tmp_path: Path, name: str, source_text: str
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    source = tmp_path / f"{name}.py"
+    source.write_text(source_text, encoding="utf-8")
+    output = tmp_path / f"{name}-output"
+    completed = subprocess.run(
+        [
+            str(build.executable),
+            "--source",
+            str(source),
+            "--output",
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        env=_compiler_environment(),
+    )
+    return completed, output
+
+
+def _load_fixture(artifact: Path, module_name: str) -> object:
+    spec = importlib.util.spec_from_file_location(module_name, artifact)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 @pytest.fixture(scope="module")
@@ -274,32 +306,123 @@ def test_c_compiled_dispatch_never_calls_python_implementation(
     assert runtime.packetize_av1_frame(b"", 3, 0, 0, 7, 8) == ((), 7, 8)
 
 
-def test_c_compiler_rejects_unsupported_module_without_partial_outputs(
+def test_c_compiler_accepts_explicit_exports_and_shared_private_helpers(
     c_compiler_build: CCompilerBuild, tmp_path: Path
 ) -> None:
-    source = tmp_path / "unsupported.py"
-    source.write_text(
-        "__all__ = ['identity']\n\ndef identity(value: int) -> int:\n    return value\n",
-        encoding="utf-8",
-    )
-    output = tmp_path / "rejected-output"
-    completed = subprocess.run(
-        [
-            str(c_compiler_build.executable),
-            "--source",
-            str(source),
-            "--output",
-            str(output),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=tmp_path,
-        env=_compiler_environment(),
+    completed, output = _compile_fixture(
+        c_compiler_build,
+        tmp_path,
+        "generic_explicit",
+        '''"""Generic compiler fixture."""
+import pymeta
+from pymeta import required
+
+__all__ = ["increment", "encode"]
+
+def _offset(value: int) -> int:
+    return value + 1
+
+@required
+@pymeta.region("increment", value=pymeta.u64)
+def increment(value: int) -> int:
+    """Increment through a shared private helper."""
+    return _offset(value)
+
+@pymeta.region("encode", value=pymeta.buffer(maximum=1024))
+def encode(value: bytes) -> bytes:
+    return value + bytes([_offset(32)])
+''',
     )
 
+    assert completed.returncode == 0, completed.stderr
+    artifact = Path(completed.stdout.strip())
+    assert artifact.parent == output
+    native = _load_fixture(artifact, "generic_explicit_native")
+    assert native.increment(4) == 5
+    assert native.encode(b"x") == b"x!"
+    assert tuple(native.__all__) == ("increment", "encode")
+    assert tuple(native.__pymeta_functions__) == ("increment", "encode")
+    assert not hasattr(native, "_offset")
+    assert str(inspect.signature(native.increment)) == "(value: int) -> int"
+    assert native.increment.__doc__ == "Increment through a shared private helper."
+
+
+def test_c_compiler_discovers_implicit_public_functions(
+    c_compiler_build: CCompilerBuild, tmp_path: Path
+) -> None:
+    completed, _ = _compile_fixture(
+        c_compiler_build,
+        tmp_path,
+        "generic_implicit",
+        "import pymeta\n\n"
+        "@pymeta.region('first', value=pymeta.u64)\n"
+        "def first(value: int) -> int:\n"
+        "    return value * 2\n\n"
+        "def _private(value: int) -> int:\n"
+        "    return value - 1\n\n"
+        "@pymeta.region('second', value=pymeta.u64)\n"
+        "def second(value: int) -> int:\n"
+        "    return _private(value)\n",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    native = _load_fixture(Path(completed.stdout.strip()), "generic_implicit_native")
+    assert tuple(native.__all__) == ("first", "second")
+    assert native.first(6) == 12
+    assert native.second(6) == 5
+    assert not hasattr(native, "_private")
+
+
+@pytest.mark.parametrize(
+    ("name", "source_text", "location", "message"),
+    (
+        (
+            "duplicate_exports",
+            "__all__ = ['run', 'run']\n\ndef run() -> int:\n    return 1\n",
+            "1:1",
+            "__all__ contains duplicate names",
+        ),
+        (
+            "missing_export",
+            "__all__ = ['missing']\n",
+            "1:1",
+            "exported name 'missing' is missing",
+        ),
+        (
+            "unsafe_import",
+            "import os\n\ndef run() -> int:\n    return 1\n",
+            "1:1",
+            "unsafe import is not supported",
+        ),
+        (
+            "reachable_lambda",
+            "def run(value: int) -> int:\n    transform = lambda item: item\n    return transform(value)\n",
+            "2:17",
+            "unsupported reachable operation Lambda",
+        ),
+        (
+            "recursive_graph",
+            "def run(value: int) -> int:\n    return run(value)\n",
+            "1:1",
+            "recursive function graph is not supported",
+        ),
+    ),
+)
+def test_c_compiler_reports_stable_frontend_diagnostics_without_artifacts(
+    c_compiler_build: CCompilerBuild,
+    tmp_path: Path,
+    name: str,
+    source_text: str,
+    location: str,
+    message: str,
+) -> None:
+    completed, output = _compile_fixture(
+        c_compiler_build, tmp_path, name, source_text
+    )
+
+    source = tmp_path / f"{name}.py"
     assert completed.returncode != 0
-    assert "not supported" in completed.stderr.lower()
+    assert completed.stderr.strip() == f"{source}:{location}: error: {message}"
     assert not output.exists() or not any(output.rglob("*"))
 
 

@@ -21,6 +21,8 @@ no result and therefore cannot commit either sequence value.
 
 from dataclasses import dataclass
 
+import pymeta
+
 __all__ = ["packetize_av1_frame"]
 
 _MAX_FRAME_SIZE = 16 * 1024 * 1024
@@ -32,6 +34,11 @@ _OBU_TYPE_SEQUENCE_HEADER = 1
 _IGNORED_OBU_TYPES = (2, 8, 15)
 
 
+@pymeta.record(
+    header=pymeta.u8,
+    extension_header=pymeta.u8,
+    payload=pymeta.buffer(maximum=_MAX_FRAME_SIZE),
+)
 @dataclass(frozen=True, slots=True)
 class _Obu:
     header: int
@@ -47,6 +54,13 @@ class _Obu:
         return self.header_size + len(self.payload)
 
 
+@pymeta.record(
+    first_obu_index=pymeta.u64,
+    num_obu_elements=pymeta.u64,
+    first_obu_offset=pymeta.u64,
+    last_obu_size=pymeta.u64,
+    packet_size=pymeta.u64,
+)
 @dataclass(slots=True)
 class _PacketMetadata:
     first_obu_index: int
@@ -56,6 +70,17 @@ class _PacketMetadata:
     packet_size: int = 0
 
 
+@pymeta.required
+@pymeta.effects(pymeta.Effect.ALLOCATE, pymeta.Effect.READ, pymeta.Effect.RAISE)
+@pymeta.region(
+    "packetize_av1_frame",
+    frame=pymeta.buffer(maximum=_MAX_FRAME_SIZE),
+    fragmentation_limit=pymeta.u16,
+    timestamp=pymeta.u32,
+    ssrc=pymeta.u32,
+    current_rtp_sequence=pymeta.Integer(16, overflow=pymeta.Overflow.WRAP),
+    current_twcc_sequence=pymeta.Integer(16, overflow=pymeta.Overflow.WRAP),
+)
 def packetize_av1_frame(
     frame: bytes,
     fragmentation_limit: int,
