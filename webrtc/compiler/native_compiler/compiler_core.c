@@ -86,8 +86,10 @@ static char *decorator_name(PyObject *node) {
         if (base == NULL || field == NULL) goto done;
         left = decorator_name(base); right = PyUnicode_AsUTF8(field);
         if (left != NULL && right != NULL) {
-            result = malloc(strlen(left) + strlen(right) + 2u);
-            if (result != NULL) (void)sprintf(result, "%s.%s", left, right);
+            size_t result_size = strlen(left) + strlen(right) + 2u;
+            result = malloc(result_size);
+            if (result != NULL)
+                (void)snprintf(result, result_size, "%s.%s", left, right);
         }
 done: free(left); Py_XDECREF(field); Py_XDECREF(base); return result;
     }

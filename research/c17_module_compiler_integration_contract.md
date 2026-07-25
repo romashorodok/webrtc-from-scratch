@@ -4,25 +4,28 @@
 
 This contract defines the process boundary between a C17
   `wrtc-pymeta-compiler-c` executable, its pinned CPython installation, generated
-extension modules, and the Python runtime loader. It does not define typed IR
-or Kernel E lowering.
+extension modules, and the Python runtime loader. Compiler version 0.3 performs
+direct CPython AST traversal, reachable same-module call analysis, typed IR
+lowering, and generation of private native helpers. Python source is never
+embedded, compiled, evaluated, imported, or executed by a generated artifact.
 
 ## Current Implementation Status
 
-The repository currently implements a **Kernel E-specific vertical slice**, not
-the general single-module compiler described by the target specification.
-This distinction is intentional and testable:
+The repository implements a bounded single-module compiler with Kernel E as
+its acceptance module. The source remains the semantic authority and PyMeta is
+compile-time metadata only:
 
 | Area | Current state |
 | --- | --- |
 | Compiler host | Implemented in C17 and linked to one explicitly selected CPython installation. |
 | Build and CLI | CMake target and `--source`/`--output` workflow implemented; the Python console entry is only a build-and-launch packaging adapter. |
 | Artifact model | One source produces one importable extension with no retained generated C, object, manifest, registry sidecar, or per-function library. |
-| Kernel E backend | Native packetization, public callable metadata, embedded compatibility metadata, registry, loading, and media dispatch are implemented. |
-| Source acceptance | Bounded to the exact normalized AST hash of `webrtc/compiler/kernel_e.py`; any semantic source change fails the complete build. |
-| Discovery and call graph | Not implemented generally. Public names, helpers, constants, signatures, and generated registry contents are fixed by the Kernel E backend template. |
-| Semantic compiler | Typed IR, ownership/effect/bounds/exception analysis, cross-module internalization, and general lowering are not implemented. |
-| Optimization | Release C compilation and hidden visibility are implemented. Whole-module IR optimization, proven bounds-check removal, escape analysis, LTO policy, and general helper inlining are not. |
+| Frontend | The C host parses with its pinned CPython, walks the AST directly, discovers `__all__`, records and functions, validates reachable syntax, and constructs a same-module call graph. It does not execute source. |
+| Typed lowering | Reachable functions lower to source-correlated IR with refined scalar widths/ranges, aggregate shapes, record indices, ownership/cleanup information and resolved direct-call targets. |
+| Generation | Public CPython wrappers, metadata, constants and registry entries are generated from IR. Private calls are generated native helpers rather than Python callables. |
+| Kernel E backend | Native packetization, public callable metadata, embedded compatibility metadata, registry, loading, and media dispatch are implemented through the general frontend/lowering path. |
+| Source acceptance | Support is bounded by reachable syntax and type rules. Unsupported reachable nodes reject the whole module with a source-correlated diagnostic; there is no accepted-AST hash gate. |
+| Optimization | Release C compilation and hidden visibility are implemented. Version 0.3 still uses insufficiently specialized generated aggregate containers; typed storage specialization, escape analysis and scalar replacement are the next backend milestone. |
 | Platform verification | Current local acceptance covers the active host. The required macOS/Linux matrix, pinned CPython fork/revision matrix, free-threaded ABI, ASan, and UBSan runs remain outstanding. |
 
 The research target CPython revision is
@@ -30,30 +33,18 @@ The research target CPython revision is
 The current developer build has not established the required release and
 free-threaded verification matrix against that revision.
 
-The embedded file `kernel_e_extension.c.in` is therefore a backend template,
-not evidence that arbitrary Python functions are translated to C. Tests and
-documentation must describe this as a vertical slice until general discovery,
-analysis, and lowering replace the accepted-AST gate and fixed template.
-
 ## Ordered Next Milestones
 
-1. Replace the accepted-AST equality gate with C-owned CPython AST traversal,
-   `__all__`/public-function discovery, duplicate/export validation, and a
-   reachable same-module call graph. Initially support a deliberately small
-   syntax subset and fail the whole module for any unsupported reachable node.
-2. Introduce typed semantic IR with source spans and deterministic diagnostics.
-   Lower constants, scalar integers/booleans, bytes/buffers, tuples/fixed
-   records, branches, loops, direct calls, and the required exception paths.
-3. Generate module initialization, callable wrappers, function metadata,
-   constants, and `__pymeta_functions__` from discovered IR instead of the
-   Kernel E template. Keep private helpers as hidden direct C calls.
-4. Port Kernel E onto the general lowering path, then delete the fixed template
-   and the accepted AST hash. Differentially test every discovered export and
-   prove that no wrapper or helper calls its Python implementation.
-5. Harden publication and validation: installed-driver parity, concurrent and
+1. Specialize the generated backend from typed IR: concrete scalar/span/builder,
+   record, fixed-tuple and typed-vector storage; direct operators and loops;
+   ownership-aware cleanup; scalar replacement; and boundary-only boxing.
+2. Delete the transitional tagged aggregate implementation after every
+   reachable Kernel E operation uses typed lowering, then bump compatibility
+   metadata to compiler 0.4.
+3. Harden publication and validation: installed-driver parity, concurrent and
    failed replacement tests, independent mutation of embedded fields, signal
    cleanup strategy, toolchain identity, LTO/dead stripping, and export audits.
-6. Run optimized, ASan, UBSan, free-threaded, media-integration, and full
+4. Run optimized, ASan, UBSan, free-threaded, media-integration, and full
    regression matrices on macOS arm64 and Linux x86-64 using the pinned CPython
    revision before claiming the complete compiler specification.
 

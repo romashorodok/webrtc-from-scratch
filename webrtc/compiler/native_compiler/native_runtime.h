@@ -30,6 +30,8 @@ typedef struct {
     size_t capacity;
     size_t item_size;
     WrtcAllocator *allocator;
+    void (*destroy_item)(void *item, void *context);
+    void *destroy_context;
 } WrtcVector;
 
 typedef struct {
@@ -69,6 +71,9 @@ int wrtc_byte_vector_write_u32be(WrtcByteVector *vector, size_t offset,
 
 int wrtc_vector_init(WrtcVector *vector, size_t item_size,
                      WrtcAllocator *allocator);
+int wrtc_vector_init_with_destructor(
+    WrtcVector *vector, size_t item_size, WrtcAllocator *allocator,
+    void (*destroy_item)(void *item, void *context), void *destroy_context);
 void wrtc_vector_clear(WrtcVector *vector);
 int wrtc_vector_reserve(WrtcVector *vector, size_t capacity);
 int wrtc_vector_append(WrtcVector *vector, const void *value);

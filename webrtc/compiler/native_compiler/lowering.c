@@ -1284,6 +1284,90 @@ static int resolve_attributes(WrtcLoweredFunction *function,
     return 0;
 }
 
+static WrtcStorageKind storage_for(WrtcTypeKind type, int owned,
+                                   size_t record_index) {
+    if (record_index != SIZE_MAX || type == WRTC_TYPE_RECORD)
+        return WRTC_STORAGE_RECORD;
+    switch (type) {
+        case WRTC_TYPE_BOOL:
+        case WRTC_TYPE_INT:
+            return WRTC_STORAGE_SCALAR;
+        case WRTC_TYPE_BYTES:
+        case WRTC_TYPE_BUFFER:
+            return owned ? WRTC_STORAGE_BYTE_BUILDER : WRTC_STORAGE_BYTE_SPAN;
+        case WRTC_TYPE_BYTE_VECTOR:
+            return WRTC_STORAGE_BYTE_BUILDER;
+        case WRTC_TYPE_LIST:
+            return WRTC_STORAGE_TYPED_VECTOR;
+        case WRTC_TYPE_TUPLE:
+            return WRTC_STORAGE_FIXED_TUPLE;
+        case WRTC_TYPE_NONE:
+            return WRTC_STORAGE_NONE;
+        default:
+            return WRTC_STORAGE_PYOBJECT;
+    }
+}
+
+static size_t literal_element_count(const WrtcLoweredFunction *function,
+                                    const WrtcLoweringOp *operation) {
+    size_t index, count = 0u;
+    if (strcmp(operation->syntax_kind, "List") != 0 &&
+        strcmp(operation->syntax_kind, "Tuple") != 0) return 0u;
+    for (index = 0u; index < operation->operand_count; index++) {
+        const WrtcLoweringOp *item =
+            &function->operations[operation->operands[index]];
+        if (item->role != NULL && strcmp(item->role, "elts") == 0) count++;
+    }
+    return count;
+}
+
+static void finalize_storage_and_ownership(WrtcLoweredFunction *function) {
+    size_t index;
+    for (index = 0u; index < function->parameter_count; index++) {
+        WrtcLoweredParameter *parameter = &function->parameters[index];
+        parameter->ownership = function->is_public ?
+            WRTC_OWNERSHIP_BOUNDARY_OWNED : WRTC_OWNERSHIP_BORROWED;
+        parameter->storage = storage_for(parameter->refined_type, 0,
+                                         parameter->record_index);
+    }
+    for (index = 0u; index < function->operation_count; index++) {
+        WrtcLoweringOp *operation = &function->operations[index];
+        operation->ownership = operation->owns_value ? WRTC_OWNERSHIP_OWNED :
+                                                       WRTC_OWNERSHIP_BORROWED;
+        operation->storage = storage_for(operation->type,
+                                         (int)operation->owns_value,
+                                         operation->record_index);
+        operation->capacity_hint = literal_element_count(function, operation);
+        operation->cleanup_on_error = operation->owns_value;
+        if (operation->kind == WRTC_LOWER_OP_FOR) {
+            const WrtcLoweringOp *iterator =
+                child_with_role(function, operation, "iter");
+            operation->direct_loop = iterator != NULL &&
+                (storage_for(iterator->type, (int)iterator->owns_value,
+                             iterator->record_index) == WRTC_STORAGE_TYPED_VECTOR ||
+                 storage_for(iterator->type, (int)iterator->owns_value,
+                             iterator->record_index) == WRTC_STORAGE_FIXED_TUPLE ||
+                 (iterator->kind == WRTC_LOWER_OP_BUILTIN_CALL &&
+                  iterator->symbol != NULL &&
+                  (strcmp(iterator->symbol, "range") == 0 ||
+                   strcmp(iterator->symbol, "enumerate") == 0)));
+        }
+        if (operation->storage == WRTC_STORAGE_FIXED_TUPLE &&
+            strcmp(operation->syntax_kind, "Tuple") == 0) {
+            operation->scalar_replaced = 1u;
+        }
+    }
+    for (index = 0u; index < function->local_count; index++) {
+        WrtcLoweredLocal *local = &function->locals[index];
+        local->ownership = local->owns_value ? WRTC_OWNERSHIP_OWNED :
+                                              WRTC_OWNERSHIP_BORROWED;
+        local->storage = storage_for(local->type, (int)local->owns_value,
+                                     local->record_index);
+        local->scalar_replaced = local->storage == WRTC_STORAGE_RECORD ||
+                                 local->storage == WRTC_STORAGE_FIXED_TUPLE;
+    }
+}
+
 static void infer_function_types(WrtcLoweredFunction *function,
                                  const WrtcCompilerCore *core) {
     size_t pass;
@@ -1617,6 +1701,7 @@ int wrtc_lowering_build(const WrtcCompilerCore *core, WrtcLoweringProgram **out)
                 resolve_attributes(function, program) < 0) {
                 wrtc_lowering_free(program); return -1;
             }
+            finalize_storage_and_ownership(function);
         }
     }
     *out = program;

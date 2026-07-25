@@ -523,7 +523,7 @@ Measure:
 - Startup, artifact validation, shutdown, and close races.
 
 Use at least seven paired isolated samples and five alternating AB/BA
-end-to-end samples after warmup.
+end-to-end samples, each with a 30-second warmup and 120-second timed interval.
 
 ## Correctness and Safety Suite
 

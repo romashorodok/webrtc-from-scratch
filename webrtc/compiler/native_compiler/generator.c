@@ -22,6 +22,45 @@ static int string_or_null(FILE *file, const char *value) {
     return value == NULL ? (fputs("NULL", file) < 0 ? -1 : 0) : quoted(file, value);
 }
 
+static const char *binary_token(const char *name) {
+    if (name == NULL) return NULL;
+    if (strcmp(name, "Add") == 0) return "NV_OP_ADD";
+    if (strcmp(name, "Sub") == 0) return "NV_OP_SUB";
+    if (strcmp(name, "Mult") == 0) return "NV_OP_MULT";
+    if (strcmp(name, "FloorDiv") == 0) return "NV_OP_FLOOR_DIV";
+    if (strcmp(name, "Mod") == 0) return "NV_OP_MOD";
+    if (strcmp(name, "LShift") == 0) return "NV_OP_LSHIFT";
+    if (strcmp(name, "RShift") == 0) return "NV_OP_RSHIFT";
+    if (strcmp(name, "BitAnd") == 0) return "NV_OP_BIT_AND";
+    if (strcmp(name, "BitOr") == 0) return "NV_OP_BIT_OR";
+    if (strcmp(name, "And") == 0) return "NV_OP_AND";
+    if (strcmp(name, "Or") == 0) return "NV_OP_OR";
+    return NULL;
+}
+
+static const char *unary_token(const char *name) {
+    if (name == NULL) return NULL;
+    if (strcmp(name, "Not") == 0) return "NV_OP_NOT";
+    if (strcmp(name, "Invert") == 0) return "NV_OP_INVERT";
+    if (strcmp(name, "USub") == 0) return "NV_OP_USUB";
+    return NULL;
+}
+
+static const char *compare_token(const char *name) {
+    if (name == NULL) return NULL;
+    if (strcmp(name, "In") == 0) return "NV_OP_IN";
+    if (strcmp(name, "NotIn") == 0) return "NV_OP_NOT_IN";
+    if (strcmp(name, "Is") == 0) return "NV_OP_IS";
+    if (strcmp(name, "IsNot") == 0) return "NV_OP_IS_NOT";
+    if (strcmp(name, "Eq") == 0) return "NV_OP_EQ";
+    if (strcmp(name, "NotEq") == 0) return "NV_OP_NOT_EQ";
+    if (strcmp(name, "Lt") == 0) return "NV_OP_LT";
+    if (strcmp(name, "LtE") == 0) return "NV_OP_LTE";
+    if (strcmp(name, "Gt") == 0) return "NV_OP_GT";
+    if (strcmp(name, "GtE") == 0) return "NV_OP_GTE";
+    return NULL;
+}
+
 static const WrtcLoweringOp *child(const WrtcLoweredFunction *function,
                                    const WrtcLoweringOp *operation,
                                    const char *role, size_t ordinal) {
@@ -247,24 +286,26 @@ static int emit_expression(FILE *file, const WrtcLoweringProgram *program,
         if (left == NULL) left = child(function, operation, "values", 0u);
         if (right == NULL) right = child(function, operation, "values", 1u);
         operator_name = binary_operator(function, operation);
-        if (left == NULL || right == NULL || operator_name == NULL)
+        if (left == NULL || right == NULL || binary_token(operator_name) == NULL)
             return fputs("nv_fail(\"incomplete native binary\")", file) < 0 ? -1 : 0;
         if (fputs("nv_binary_checked(", file) < 0 ||
             emit_expression(file, program, function, left) < 0 || fputc(',', file) == EOF ||
             emit_expression(file, program, function, right) < 0 || fputc(',', file) == EOF ||
-            quoted(file, operator_name) < 0 || fputc(')', file) == EOF) return -1;
+            fputs(binary_token(operator_name), file) < 0 || fputc(')', file) == EOF) return -1;
         return 0;
     }
     if (operation->kind == WRTC_LOWER_OP_COMPARE) {
         const WrtcLoweringOp *comparator = child(function, operation, "comparators", 0u);
         const WrtcLoweringOp *operator_node = child(function, operation, "ops", 0u);
         left = child(function, operation, "left", 0u);
-        if (left == NULL || comparator == NULL || operator_node == NULL)
+        if (left == NULL || comparator == NULL || operator_node == NULL ||
+            compare_token(operator_node->syntax_kind) == NULL)
             return fputs("nv_fail(\"incomplete native compare\")", file) < 0 ? -1 : 0;
         if (fputs("nv_compare(", file) < 0 ||
             emit_expression(file, program, function, left) < 0 || fputc(',', file) == EOF ||
             emit_expression(file, program, function, comparator) < 0 || fputc(',', file) == EOF ||
-            quoted(file, operator_node->syntax_kind) < 0 || fputc(')', file) == EOF) return -1;
+            fputs(compare_token(operator_node->syntax_kind), file) < 0 ||
+            fputc(')', file) == EOF) return -1;
         return 0;
     }
     if (operation->kind == WRTC_LOWER_OP_BRANCH &&
@@ -290,8 +331,8 @@ static int emit_expression(FILE *file, const WrtcLoweringProgram *program,
             if (item->role != NULL && strcmp(item->role, "op") == 0)
                 operator_name = item->syntax_kind;
         }
-        if (argument == NULL || operator_name == NULL) return fputs("nv_fail(\"incomplete native unary\")", file) < 0 ? -1 : 0;
-        if (fputs("nv_unary(", file) < 0 || emit_expression(file, program, function, argument) < 0 || fputc(',', file) == EOF || quoted(file, operator_name) < 0 || fputc(')', file) == EOF) return -1;
+        if (argument == NULL || unary_token(operator_name) == NULL) return fputs("nv_fail(\"incomplete native unary\")", file) < 0 ? -1 : 0;
+        if (fputs("nv_unary(", file) < 0 || emit_expression(file, program, function, argument) < 0 || fputc(',', file) == EOF || fputs(unary_token(operator_name), file) < 0 || fputc(')', file) == EOF) return -1;
         return 0;
     }
     if (operation->kind == WRTC_LOWER_OP_SUBSCRIPT) {
@@ -492,9 +533,10 @@ static int emit_statement(FILE *file, const WrtcLoweringProgram *program,
                                     binary_operator(function, statement) : NULL;
             if (fprintf(file, "v_%s=", target->symbol) < 0) return -1;
             if (augmented != NULL) {
-                if (fprintf(file, "nv_binary(v_%s,", target->symbol) < 0 ||
+                if (binary_token(augmented) == NULL ||
+                    fprintf(file, "nv_binary(v_%s,", target->symbol) < 0 ||
                     emit_expression(file, program, function, value) < 0 ||
-                    fputc(',', file) == EOF || quoted(file, augmented) < 0 ||
+                    fputc(',', file) == EOF || fputs(binary_token(augmented), file) < 0 ||
                     fputc(')', file) == EOF) return -1;
             } else if (emit_expression(file, program, function, value) < 0) return -1;
             if (fputs(";if(v_", file) < 0 || fputs(target->symbol, file) < 0 ||
@@ -548,7 +590,8 @@ static int emit_statement(FILE *file, const WrtcLoweringProgram *program,
                   fprintf(file, ",nv_int(%zuu)),", field) < 0)) ||
                 emit_expression(file, program, function, value) < 0) return -1;
             if (augmented != NULL &&
-                (fputc(',', file) == EOF || quoted(file, augmented) < 0 ||
+                (binary_token(augmented) == NULL || fputc(',', file) == EOF ||
+                 fputs(binary_token(augmented), file) < 0 ||
                  fputc(')', file) == EOF)) return -1;
             if (fputs(")<0)return nv_error();\n", file) < 0) return -1;
             }
@@ -596,6 +639,70 @@ static int emit_statement(FILE *file, const WrtcLoweringProgram *program,
         const WrtcLoweringOp *iterator = child(function, statement, "iter", 0u);
         const WrtcLoweringOp *loop_target = child(function, statement, "target", 0u);
         size_t id = op_index(function, statement);
+        if (iterator != NULL && loop_target != NULL &&
+            iterator->kind == WRTC_LOWER_OP_BUILTIN_CALL &&
+            iterator->symbol != NULL && strcmp(iterator->symbol, "range") == 0 &&
+            loop_target->symbol != NULL) {
+            const WrtcLoweringOp *first = child(function, iterator, "args", 0u);
+            const WrtcLoweringOp *second = child(function, iterator, "args", 1u);
+            const WrtcLoweringOp *third = child(function, iterator, "args", 2u);
+            if (first == NULL || fprintf(file, "{uint64_t rs_%zu=", id) < 0)
+                return -1;
+            if (second == NULL) {
+                if (fputs("0u, re_", file) < 0 || fprintf(file, "%zu=", id) < 0 ||
+                    emit_expression(file, program, function, first) < 0)
+                    return -1;
+            } else {
+                if (emit_expression(file, program, function, first) < 0 ||
+                    fprintf(file, ".i,re_%zu=", id) < 0 ||
+                    emit_expression(file, program, function, second) < 0)
+                    return -1;
+            }
+            if (fprintf(file, ".i,rp_%zu=", id) < 0) return -1;
+            if (third == NULL) {
+                if (fputs("1u", file) < 0) return -1;
+            } else if (emit_expression(file, program, function, third) < 0 ||
+                       fputs(".i", file) < 0) return -1;
+            if (fprintf(file, ",ri_%zu;for(ri_%zu=rs_%zu;ri_%zu<re_%zu;ri_%zu+=rp_%zu){v_%s=nv_int(ri_%zu);",
+                        id, id, id, id, id, id, id, loop_target->symbol, id) < 0)
+                return -1;
+            for (i = 0u; i < statement->operand_count; i++) {
+                const WrtcLoweringOp *nested =
+                    &function->operations[statement->operands[i]];
+                if (nested->role != NULL && strcmp(nested->role, "body") == 0 &&
+                    emit_statement(file, program, function, nested) < 0) return -1;
+            }
+            return fputs("}}\n", file) < 0 ? -1 : 0;
+        }
+        if (iterator != NULL && loop_target != NULL &&
+            iterator->kind == WRTC_LOWER_OP_BUILTIN_CALL &&
+            iterator->symbol != NULL && strcmp(iterator->symbol, "enumerate") == 0 &&
+            strcmp(loop_target->syntax_kind, "Tuple") == 0) {
+            const WrtcLoweringOp *source = child(function, iterator, "args", 0u);
+            size_t target_number = 0u;
+            if (source == NULL || fprintf(file, "{Nv it_%zu=", id) < 0 ||
+                emit_expression(file, program, function, source) < 0 ||
+                fprintf(file, ";size_t li_%zu;if(it_%zu.kind!=NV_TUPLE)return nv_fail(\"enumerate requires native container\");for(li_%zu=0;li_%zu<it_%zu.tuple.n;li_%zu++){",
+                        id, id, id, id, id, id) < 0) return -1;
+            for (i = 0u; i < loop_target->operand_count; i++) {
+                const WrtcLoweringOp *part =
+                    &function->operations[loop_target->operands[i]];
+                if (part->role == NULL || strcmp(part->role, "elts") != 0 ||
+                    part->symbol == NULL) continue;
+                if (fprintf(file, target_number == 0u ?
+                            "v_%s=nv_int(li_%zu);" :
+                            "v_%s=it_%zu.tuple.v[li_%zu];",
+                            part->symbol, id, id) < 0) return -1;
+                target_number++;
+            }
+            for (i = 0u; i < statement->operand_count; i++) {
+                const WrtcLoweringOp *nested =
+                    &function->operations[statement->operands[i]];
+                if (nested->role != NULL && strcmp(nested->role, "body") == 0 &&
+                    emit_statement(file, program, function, nested) < 0) return -1;
+            }
+            return fputs("}}\n", file) < 0 ? -1 : 0;
+        }
         if (iterator == NULL || loop_target == NULL ||
             fprintf(file, "{Nv it_%zu=", id) < 0 ||
             emit_expression(file, program, function, iterator) < 0 ||
@@ -735,28 +842,26 @@ int wrtc_emit_extension(FILE *file, const char *module,
     size_t i, j, public_count = 0u;
     static const char runtime[] =
         "#define PY_SSIZE_T_CLEAN\n#include <Python.h>\n#include <structmember.h>\n#include <stddef.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
-        "typedef enum{NV_ERROR,NV_NONE,NV_INT,NV_BYTES,NV_TUPLE,NV_TYPE,NV_STR}NvKind;typedef struct Nv Nv;typedef struct{Nv*v;size_t n;}NvTuple;struct Nv{NvKind kind;uint64_t i;const uint8_t*p;size_t n;void*owner;NvTuple tuple;};static int nv_truth(Nv);static Nv nv_raise(PyObject*,Nv);"
+        "typedef enum{NV_ERROR,NV_NONE,NV_INT,NV_BYTES,NV_TUPLE,NV_TYPE,NV_STR}NvKind;typedef enum{NV_OP_ADD,NV_OP_SUB,NV_OP_MULT,NV_OP_FLOOR_DIV,NV_OP_MOD,NV_OP_LSHIFT,NV_OP_RSHIFT,NV_OP_BIT_AND,NV_OP_BIT_OR,NV_OP_AND,NV_OP_OR,NV_OP_NOT,NV_OP_INVERT,NV_OP_USUB,NV_OP_IN,NV_OP_NOT_IN,NV_OP_IS,NV_OP_IS_NOT,NV_OP_EQ,NV_OP_NOT_EQ,NV_OP_LT,NV_OP_LTE,NV_OP_GT,NV_OP_GTE}NvOp;typedef struct Nv Nv;typedef struct{Nv*v;size_t n;}NvTuple;struct Nv{NvKind kind;uint64_t i;const uint8_t*p;size_t n;void*owner;NvTuple tuple;};typedef struct{void**v;size_t n,cap;}NvArena;static _Thread_local NvArena*nv_active;static int nv_track(void*p){NvArena*a=nv_active;void**grown;size_t cap;if(!a||!p)return 0;if(a->n==a->cap){cap=a->cap?a->cap*2u:32u;if(cap<a->cap||cap>SIZE_MAX/sizeof(*grown)){PyErr_NoMemory();return -1;}grown=PyMem_Realloc(a->v,cap*sizeof(*grown));if(!grown){PyErr_NoMemory();return -1;}a->v=grown;a->cap=cap;}a->v[a->n++]=p;return 0;}static void*nv_alloc(size_t n,int zero){void*p=zero?PyMem_Calloc(n?n:1u,1u):PyMem_Malloc(n?n:1u);if(!p){PyErr_NoMemory();return NULL;}if(nv_track(p)<0){PyMem_Free(p);return NULL;}return p;}static void*nv_realloc(void*p,size_t n){NvArena*a=nv_active;void*q;size_t i;if(!a)return PyMem_Realloc(p,n?n:1u);if(!p){q=PyMem_Malloc(n?n:1u);if(!q){PyErr_NoMemory();return NULL;}if(nv_track(q)<0){PyMem_Free(q);return NULL;}return q;}for(i=a->n;i>0u;i--)if(a->v[i-1u]==p){q=PyMem_Realloc(p,n?n:1u);if(!q){PyErr_NoMemory();return NULL;}a->v[i-1u]=q;return q;}PyErr_SetString(PyExc_RuntimeError,\"native allocation owner is not tracked\");return NULL;}static void nv_arena_clear(NvArena*a){size_t i;for(i=0;i<a->n;i++)PyMem_Free(a->v[i]);PyMem_Free(a->v);a->v=NULL;a->n=a->cap=0u;nv_active=NULL;}static int nv_truth(Nv);static Nv nv_raise(PyObject*,Nv);static Nv nv_error(void);"
         "static Nv nv_none(void){Nv v={NV_NONE,0,NULL,0,NULL,{NULL,0}};return v;}static Nv nv_int(uint64_t x){Nv v=nv_none();v.kind=NV_INT;v.i=x;return v;}"
         "static Nv nv_fail(const char*s){Nv v=nv_none();v.kind=NV_ERROR;PyErr_SetString(PyExc_NotImplementedError,s);return v;}"
-        "static Nv nv_borrow(const uint8_t*p,size_t n){Nv v=nv_none();v.kind=NV_BYTES;v.p=p;v.n=n;return v;}static Nv nv_literal(const char*p,size_t n){return nv_borrow((const uint8_t*)p,n);}static Nv nv_byte(Nv x){uint8_t*p;if(x.kind!=NV_INT)return nv_fail(\"byte item is not native int\");p=PyMem_Malloc(1);if(!p){PyErr_NoMemory();return(Nv){NV_ERROR,0,NULL,0,NULL,{NULL,0}};}*p=(uint8_t)x.i;{Nv v=nv_borrow(p,1);v.owner=p;return v;}}"
-        "static Nv nv_bytearray(Nv x){size_t n=x.kind==NV_NONE?0u:x.kind==NV_INT?(size_t)x.i:x.kind==NV_BYTES?x.n:0u;uint8_t*p=PyMem_Calloc(n?n:1u,1u);Nv v;if(!p){PyErr_NoMemory();return(Nv){NV_ERROR,0,NULL,0,NULL,{NULL,0}};}if(x.kind==NV_BYTES&&n)memcpy(p,x.p,n);v=nv_borrow(p,n);v.owner=p;return v;}"
-        "static Nv nv_bytes(Nv x){uint8_t*p;if(x.kind!=NV_BYTES)return nv_fail(\"bytes conversion requires native bytes\");p=PyMem_Malloc(x.n?x.n:1);if(!p){PyErr_NoMemory();return(Nv){NV_ERROR,0,NULL,0,NULL,{NULL,0}};}memcpy(p,x.p,x.n);x.p=p;x.owner=p;return x;}"
-        "static Nv nv_binary(Nv x,Nv y,const char*op){if(strcmp(op,\"And\")==0)return nv_truth(x)?y:x;if(strcmp(op,\"Or\")==0)return nv_truth(x)?x:y;if(x.kind==NV_INT&&y.kind==NV_INT){if(strcmp(op,\"Add\")==0)return nv_int(x.i+y.i);if(strcmp(op,\"Sub\")==0)return nv_int(x.i-y.i);if(strcmp(op,\"Mult\")==0)return nv_int(x.i*y.i);if(strcmp(op,\"BitAnd\")==0)return nv_int(x.i&y.i);if(strcmp(op,\"BitOr\")==0)return nv_int(x.i|y.i);if(strcmp(op,\"LShift\")==0)return nv_int(y.i<64u?x.i<<y.i:0u);if(strcmp(op,\"RShift\")==0)return nv_int(y.i<64u?x.i>>y.i:0u);if(strcmp(op,\"FloorDiv\")==0)return y.i?nv_int(x.i/y.i):nv_fail(\"integer division by zero\");if(strcmp(op,\"Mod\")==0)return y.i?nv_int(x.i%y.i):nv_fail(\"integer modulo by zero\");}if(strcmp(op,\"Add\")==0&&x.kind==NV_BYTES&&y.kind==NV_BYTES){size_t n=x.n+y.n;uint8_t*p;if(n<x.n){PyErr_NoMemory();return(Nv){NV_ERROR,0,NULL,0,NULL,{NULL,0}};}p=PyMem_Malloc(n?n:1);if(!p){PyErr_NoMemory();return(Nv){NV_ERROR,0,NULL,0,NULL,{NULL,0}};}memcpy(p,x.p,x.n);memcpy(p+x.n,y.p,y.n);x.p=p;x.n=n;x.owner=p;return x;}PyErr_Format(PyExc_NotImplementedError,\"unsupported typed native binary %s (%d,%d)\",op,(int)x.kind,(int)y.kind);return(Nv){NV_ERROR,0,NULL,0,NULL,{NULL,0}};}"
-        "static Nv nv_binary_checked(Nv x,Nv y,const char*op){if(x.kind==NV_ERROR)return x;if(y.kind==NV_ERROR)return y;return nv_binary(x,y,op);}"
-        "static Nv nv_tuple(const Nv*x,size_t n){Nv*v=PyMem_Malloc((n?n:1)*sizeof(*v));Nv r=nv_none();if(!v){PyErr_NoMemory();r.kind=NV_ERROR;return r;}if(n&&x)memcpy(v,x,n*sizeof(*v));else if(n)memset(v,0,n*sizeof(*v));r.kind=NV_TUPLE;r.tuple.v=v;r.tuple.n=n;r.owner=v;return r;}"
-        "static Nv nv_error(void){Nv v=nv_none();v.kind=NV_ERROR;return v;}static int nv_append(Nv*v,Nv x){if(v->kind==NV_BYTES&&x.kind==NV_INT){uint8_t*p=PyMem_Realloc(v->owner,v->n+1u);if(!p){PyErr_NoMemory();return -1;}p[v->n++]=(uint8_t)x.i;v->p=p;v->owner=p;return 0;}if(v->kind==NV_TUPLE){Nv*p=PyMem_Realloc(v->tuple.v,(v->tuple.n+1u)*sizeof(*p));if(!p){PyErr_NoMemory();return -1;}v->tuple.v=p;v->owner=p;p[v->tuple.n++]=x;return 0;}nv_fail(\"append requires native collection\");return -1;}static int nv_extend(Nv*v,Nv x){uint8_t*p;if(v->kind!=NV_BYTES||x.kind!=NV_BYTES){nv_fail(\"extend requires native bytes\");return -1;}p=PyMem_Realloc(v->owner,v->n+x.n);if(!p&&v->n+x.n){PyErr_NoMemory();return -1;}memcpy(p+v->n,x.p,x.n);v->n+=x.n;v->p=p;v->owner=p;return 0;}"
+        "static Nv nv_borrow(const uint8_t*p,size_t n){Nv v=nv_none();v.kind=NV_BYTES;v.p=p;v.n=n;return v;}static Nv nv_literal(const char*p,size_t n){return nv_borrow((const uint8_t*)p,n);}static Nv nv_byte(Nv x){uint8_t*p;if(x.kind!=NV_INT)return nv_fail(\"byte item is not native int\");p=nv_alloc(1u,0);if(!p)return nv_error();*p=(uint8_t)x.i;{Nv v=nv_borrow(p,1);v.owner=p;v.i=1u;return v;}}"
+        "static Nv nv_bytearray(Nv x){size_t n=x.kind==NV_NONE?0u:x.kind==NV_INT?(size_t)x.i:x.kind==NV_BYTES?x.n:0u;uint8_t*p=n?(uint8_t*)nv_alloc(n,1):NULL;Nv v;if(n&&!p)return nv_error();if(x.kind==NV_BYTES&&n)memcpy(p,x.p,n);v=nv_borrow(p,n);v.owner=p;v.i=n;return v;}"
+        "static Nv nv_bytes(Nv x){if(x.kind!=NV_BYTES)return nv_fail(\"bytes conversion requires native bytes\");return x;}"
+        "static Nv nv_binary(Nv x,Nv y,NvOp op){if(op==NV_OP_AND)return nv_truth(x)?y:x;if(op==NV_OP_OR)return nv_truth(x)?x:y;if(x.kind==NV_INT&&y.kind==NV_INT){switch(op){case NV_OP_ADD:return nv_int(x.i+y.i);case NV_OP_SUB:return nv_int(x.i-y.i);case NV_OP_MULT:return nv_int(x.i*y.i);case NV_OP_BIT_AND:return nv_int(x.i&y.i);case NV_OP_BIT_OR:return nv_int(x.i|y.i);case NV_OP_LSHIFT:return nv_int(y.i<64u?x.i<<y.i:0u);case NV_OP_RSHIFT:return nv_int(y.i<64u?x.i>>y.i:0u);case NV_OP_FLOOR_DIV:return y.i?nv_int(x.i/y.i):nv_fail(\"integer division by zero\");case NV_OP_MOD:return y.i?nv_int(x.i%y.i):nv_fail(\"integer modulo by zero\");default:break;}}if(op==NV_OP_ADD&&x.kind==NV_BYTES&&y.kind==NV_BYTES){size_t n=x.n+y.n;uint8_t*p;if(n<x.n){PyErr_NoMemory();return nv_error();}p=nv_alloc(n?n:1u,0);if(!p)return nv_error();memcpy(p,x.p,x.n);memcpy(p+x.n,y.p,y.n);x.p=p;x.n=n;x.owner=p;x.i=n;return x;}PyErr_Format(PyExc_NotImplementedError,\"unsupported typed native binary (%d,%d,%d)\",(int)x.kind,(int)y.kind,(int)op);return nv_error();}"
+        "static Nv nv_binary_checked(Nv x,Nv y,NvOp op){if(x.kind==NV_ERROR)return x;if(y.kind==NV_ERROR)return y;return nv_binary(x,y,op);}"
+        "static Nv nv_tuple(const Nv*x,size_t n){Nv*v=n?(Nv*)nv_alloc(n*sizeof(*v),0):NULL;Nv r=nv_none();if(n&&!v)return nv_error();if(n&&x)memcpy(v,x,n*sizeof(*v));r.kind=NV_TUPLE;r.tuple.v=v;r.tuple.n=n;r.owner=v;r.i=n;return r;}"
+        "static int nv_reserve(Nv*v,size_t need,size_t item){size_t cap=(size_t)v->i;void*p;if(need<=cap)return 0;cap=cap?cap:4u;while(cap<need){size_t next=cap+cap/2u+1u;if(next<=cap){PyErr_NoMemory();return -1;}cap=next;}if(cap>SIZE_MAX/item){PyErr_NoMemory();return -1;}p=nv_realloc(v->owner,cap*item);if(!p)return -1;v->owner=p;v->i=cap;if(v->kind==NV_BYTES)v->p=(const uint8_t*)p;else v->tuple.v=(Nv*)p;return 0;}static Nv nv_error(void){Nv v=nv_none();v.kind=NV_ERROR;return v;}static int nv_append(Nv*v,Nv x){if(v->kind==NV_BYTES&&x.kind==NV_INT){if(v->owner==NULL&&v->n!=0u)return nv_fail(\"cannot append to borrowed bytes\").kind==NV_ERROR?-1:-1;if(nv_reserve(v,v->n+1u,sizeof(uint8_t))<0)return -1;((uint8_t*)v->p)[v->n++]=(uint8_t)x.i;return 0;}if(v->kind==NV_TUPLE){if(nv_reserve(v,v->tuple.n+1u,sizeof(Nv))<0)return -1;v->tuple.v[v->tuple.n++]=x;return 0;}nv_fail(\"append requires native collection\");return -1;}static int nv_extend(Nv*v,Nv x){size_t need;if(v->kind!=NV_BYTES||x.kind!=NV_BYTES){nv_fail(\"extend requires native bytes\");return -1;}if(x.n>SIZE_MAX-v->n){PyErr_NoMemory();return -1;}need=v->n+x.n;if(nv_reserve(v,need,sizeof(uint8_t))<0)return -1;memcpy((uint8_t*)v->p+v->n,x.p,x.n);v->n=need;return 0;}"
         "static int nv_set(Nv*v,size_t i,Nv x){if(v->kind!=NV_TUPLE||i>=v->tuple.n){nv_fail(\"native record field out of range\");return -1;}v->tuple.v[i]=x;return 0;}"
         "static Nv nv_any_field_eq(Nv v,size_t field,Nv expected){size_t i;if(v.kind!=NV_TUPLE)return nv_fail(\"any requires native container\");for(i=0;i<v.tuple.n;i++){Nv item=v.tuple.v[i];if(item.kind==NV_TUPLE&&field<item.tuple.n&&item.tuple.v[field].kind==expected.kind&&item.tuple.v[field].i==expected.i)return nv_int(1u);}return nv_int(0u);}"
         "static int nv_store(Nv*v,Nv i,Nv x){uint8_t*p=(uint8_t*)v->p;if(v->kind!=NV_BYTES||i.kind!=NV_INT||x.kind!=NV_INT||i.i>=v->n){nv_fail(\"invalid native byte store\");return -1;}p[i.i]=(uint8_t)x.i;return 0;}static int nv_store_slice(Nv*v,Nv lower,Nv upper,Nv x){size_t a=lower.kind==NV_NONE?0u:(size_t)lower.i,b=upper.kind==NV_NONE?v->n:(size_t)upper.i;uint8_t*p=(uint8_t*)v->p;if(v->kind!=NV_BYTES||x.kind!=NV_BYTES||b<a||b>v->n||x.n!=b-a){nv_fail(\"invalid native byte slice store\");return -1;}memcpy(p+a,x.p,x.n);return 0;}static Nv nv_to_bytes(Nv x,Nv length){size_t n,i;Nv v;if(x.kind!=NV_INT||length.kind!=NV_INT||length.i>8u)return nv_fail(\"invalid native endian write\");n=(size_t)length.i;v=nv_bytearray(nv_int(n));if(v.kind==NV_ERROR)return v;for(i=0;i<n;i++)((uint8_t*)v.p)[n-i-1u]=(uint8_t)(x.i>>(8u*i));return v;}"
         "static Nv nv_pop(Nv*v){if(v->kind!=NV_TUPLE||v->tuple.n==0u)return nv_fail(\"pop from empty list\");return v->tuple.v[--v->tuple.n];}"
-        "static Nv nv_enumerate(Nv x){Nv r;size_t i;if(x.kind!=NV_TUPLE)return nv_fail(\"enumerate requires native container\");r=nv_tuple(NULL,x.tuple.n);if(r.kind==NV_ERROR)return r;for(i=0;i<x.tuple.n;i++){Nv pair[2]={nv_int(i),x.tuple.v[i]};r.tuple.v[i]=nv_tuple(pair,2);if(r.tuple.v[i].kind==NV_ERROR)return r.tuple.v[i];}return r;}"
-        "static Nv nv_range(const Nv*a,size_t n){uint64_t start=0,stop,step=1,k,count;Nv r;if(n<1||n>3)return nv_fail(\"range argument count\");if(n==1)stop=a[0].i;else{start=a[0].i;stop=a[1].i;if(n==3)step=a[2].i;}if(step==0)return nv_fail(\"range step is zero\");count=stop>start?(stop-start+step-1u)/step:0u;r=nv_tuple(NULL,(size_t)count);if(r.kind==NV_ERROR)return r;for(k=0;k<count;k++)r.tuple.v[k]=nv_int(start+k*step);return r;}"
         "static Nv nv_min(Nv a,Nv b){if(a.kind!=NV_INT||b.kind!=NV_INT)return nv_fail(\"min requires native ints\");return (int64_t)a.i<=(int64_t)b.i?a:b;}static Nv nv_max(Nv a,Nv b){if(a.kind!=NV_INT||b.kind!=NV_INT)return nv_fail(\"max requires native ints\");return (int64_t)a.i>=(int64_t)b.i?a:b;}"
         "static Nv nv_ints(const char*s){Nv a[32],r;size_t n=0;char*e;while(*s&&n<32){while(*s&&(*s<'0'||*s>'9'))s++;if(!*s)break;a[n++]=nv_int(strtoull(s,&e,10));s=e;}r=nv_tuple(a,n);return r;}"
-        "static Nv nv_str(const char*s){Nv v=nv_none();v.kind=NV_STR;v.p=(const uint8_t*)s;v.n=strlen(s);return v;}static Nv nv_type(NvKind k){Nv v=nv_none();v.kind=NV_TYPE;v.i=(uint64_t)k;return v;}static Nv nv_typeof(Nv v){return nv_type(v.kind);}static int nv_truth(Nv v){return v.kind==NV_INT?v.i!=0u:(v.kind==NV_BYTES||v.kind==NV_STR)?v.n!=0u:v.kind==NV_TUPLE?v.tuple.n!=0u:v.kind!=NV_NONE&&v.kind!=NV_ERROR;}static Nv nv_bool(Nv v){return nv_int((uint64_t)nv_truth(v));}static Nv nv_len(Nv v){if(v.kind==NV_BYTES||v.kind==NV_STR)return nv_int(v.n);if(v.kind==NV_TUPLE)return nv_int(v.tuple.n);return nv_fail(\"len requires native container\");}static Nv nv_unary(Nv v,const char*op){if(strcmp(op,\"Not\")==0)return nv_bool((Nv){NV_INT,(uint64_t)!nv_truth(v),NULL,0,NULL,{NULL,0}});if(v.kind!=NV_INT)return nv_fail(\"unary requires native int\");if(strcmp(op,\"Invert\")==0)return nv_int(~v.i);if(strcmp(op,\"USub\")==0)return nv_int(0u-v.i);return v;}static Nv nv_compare(Nv x,Nv y,const char*op){int r=0;size_t i;if(strcmp(op,\"In\")==0||strcmp(op,\"NotIn\")==0){if(y.kind==NV_TUPLE)for(i=0;i<y.tuple.n;i++)if(y.tuple.v[i].kind==x.kind&&y.tuple.v[i].i==x.i){r=1;break;}if(strcmp(op,\"NotIn\")==0)r=!r;return nv_int((uint64_t)r);}if(strcmp(op,\"Is\")==0||strcmp(op,\"Eq\")==0)r=x.kind==y.kind&&x.i==y.i&&x.p==y.p;if(strcmp(op,\"IsNot\")==0||strcmp(op,\"NotEq\")==0)r=!(x.kind==y.kind&&x.i==y.i&&x.p==y.p);if(x.kind==NV_INT&&y.kind==NV_INT){if(strcmp(op,\"Lt\")==0)r=x.i<y.i;else if(strcmp(op,\"LtE\")==0)r=x.i<=y.i;else if(strcmp(op,\"Gt\")==0)r=x.i>y.i;else if(strcmp(op,\"GtE\")==0)r=x.i>=y.i;}return nv_int((uint64_t)r);}"
+        "static Nv nv_str(const char*s){Nv v=nv_none();v.kind=NV_STR;v.p=(const uint8_t*)s;v.n=strlen(s);return v;}static Nv nv_type(NvKind k){Nv v=nv_none();v.kind=NV_TYPE;v.i=(uint64_t)k;return v;}static Nv nv_typeof(Nv v){return nv_type(v.kind);}static int nv_truth(Nv v){return v.kind==NV_INT?v.i!=0u:(v.kind==NV_BYTES||v.kind==NV_STR)?v.n!=0u:v.kind==NV_TUPLE?v.tuple.n!=0u:v.kind!=NV_NONE&&v.kind!=NV_ERROR;}static Nv nv_bool(Nv v){return nv_int((uint64_t)nv_truth(v));}static Nv nv_len(Nv v){if(v.kind==NV_BYTES||v.kind==NV_STR)return nv_int(v.n);if(v.kind==NV_TUPLE)return nv_int(v.tuple.n);return nv_fail(\"len requires native container\");}static Nv nv_unary(Nv v,NvOp op){if(op==NV_OP_NOT)return nv_int((uint64_t)!nv_truth(v));if(v.kind!=NV_INT)return nv_fail(\"unary requires native int\");if(op==NV_OP_INVERT)return nv_int(~v.i);if(op==NV_OP_USUB)return nv_int(0u-v.i);return v;}static Nv nv_compare(Nv x,Nv y,NvOp op){int r=0;size_t i;if(op==NV_OP_IN||op==NV_OP_NOT_IN){if(y.kind==NV_TUPLE)for(i=0;i<y.tuple.n;i++)if(y.tuple.v[i].kind==x.kind&&y.tuple.v[i].i==x.i){r=1;break;}if(op==NV_OP_NOT_IN)r=!r;return nv_int((uint64_t)r);}if(op==NV_OP_IS||op==NV_OP_EQ)r=x.kind==y.kind&&x.i==y.i&&x.p==y.p;if(op==NV_OP_IS_NOT||op==NV_OP_NOT_EQ)r=!(x.kind==y.kind&&x.i==y.i&&x.p==y.p);if(x.kind==NV_INT&&y.kind==NV_INT){if(op==NV_OP_LT)r=x.i<y.i;else if(op==NV_OP_LTE)r=x.i<=y.i;else if(op==NV_OP_GT)r=x.i>y.i;else if(op==NV_OP_GTE)r=x.i>=y.i;}return nv_int((uint64_t)r);}"
         "static Nv nv_get(Nv v,Nv index){if(index.kind!=NV_INT)return nv_fail(\"native index is not int\");if(v.kind==NV_BYTES){if(index.i>=v.n)return nv_raise(PyExc_IndexError,nv_str(\"index out of range\"));return nv_int(v.p[index.i]);}if(v.kind==NV_TUPLE){if(index.i>=v.tuple.n)return nv_raise(PyExc_IndexError,nv_str(\"tuple index out of range\"));return v.tuple.v[index.i];}return nv_fail(\"native value is not subscriptable\");}static Nv nv_slice(Nv v,Nv lower,Nv upper){size_t a=lower.kind==NV_NONE?0u:(size_t)lower.i,b=upper.kind==NV_NONE?(v.kind==NV_BYTES?v.n:v.tuple.n):(size_t)upper.i;if(b<a)b=a;if(v.kind==NV_BYTES){if(b>v.n)b=v.n;return nv_borrow(v.p+a,b-a);}if(v.kind==NV_TUPLE){if(b>v.tuple.n)b=v.tuple.n;return nv_tuple(v.tuple.v+a,b-a);}return nv_fail(\"native value is not sliceable\");}"
-        "static Nv nv_format(const Nv*x,size_t n){size_t i,total=0,pos=0;uint8_t*p;char number[32];for(i=0;i<n;i++){if(x[i].kind==NV_STR)total+=x[i].n;else if(x[i].kind==NV_INT)total+=(size_t)snprintf(number,sizeof(number),\"%llu\",(unsigned long long)x[i].i);else return nv_fail(\"unsupported formatted native value\");}p=PyMem_Malloc(total+1u);if(!p){PyErr_NoMemory();return(Nv){NV_ERROR,0,NULL,0,NULL,{NULL,0}};}for(i=0;i<n;i++){size_t m;if(x[i].kind==NV_STR){memcpy(p+pos,x[i].p,x[i].n);pos+=x[i].n;}else{m=(size_t)snprintf(number,sizeof(number),\"%llu\",(unsigned long long)x[i].i);memcpy(p+pos,number,m);pos+=m;}}p[pos]=0;{Nv v=nv_str((const char*)p);v.owner=p;return v;}}static Nv nv_raise(PyObject*t,Nv message){Nv v=nv_none();v.kind=NV_ERROR;if(message.kind!=NV_STR)PyErr_SetString(PyExc_RuntimeError,\"native exception message is not a string\");else PyErr_SetString(t,(const char*)message.p);if(message.owner)PyMem_Free(message.owner);return v;}"
-        "static void nv_clear(Nv*v){size_t i;if(v->kind==NV_TUPLE)for(i=0;i<v->tuple.n;i++)nv_clear(&v->tuple.v[i]);if(v->owner)PyMem_Free(v->owner);*v=nv_none();}"
+        "static Nv nv_format(const Nv*x,size_t n){size_t i,total=0,pos=0;uint8_t*p;char number[32];for(i=0;i<n;i++){if(x[i].kind==NV_STR)total+=x[i].n;else if(x[i].kind==NV_INT)total+=(size_t)snprintf(number,sizeof(number),\"%llu\",(unsigned long long)x[i].i);else return nv_fail(\"unsupported formatted native value\");}p=nv_alloc(total+1u,0);if(!p)return nv_error();for(i=0;i<n;i++){size_t m;if(x[i].kind==NV_STR){memcpy(p+pos,x[i].p,x[i].n);pos+=x[i].n;}else{m=(size_t)snprintf(number,sizeof(number),\"%llu\",(unsigned long long)x[i].i);memcpy(p+pos,number,m);pos+=m;}}p[pos]=0;{Nv v=nv_str((const char*)p);v.owner=p;return v;}}static Nv nv_raise(PyObject*t,Nv message){Nv v=nv_none();v.kind=NV_ERROR;if(message.kind!=NV_STR)PyErr_SetString(PyExc_RuntimeError,\"native exception message is not a string\");else PyErr_SetString(t,(const char*)message.p);if(message.owner&&!nv_active)PyMem_Free(message.owner);return v;}"
+        "static void nv_clear(Nv*v){size_t i;if(nv_active){*v=nv_none();return;}if(v->kind==NV_TUPLE)for(i=0;i<v->tuple.n;i++)nv_clear(&v->tuple.v[i]);if(v->owner)PyMem_Free(v->owner);*v=nv_none();}"
         "static PyObject*nv_box(Nv*v){PyObject*o=NULL;if(v->kind==NV_NONE)o=Py_NewRef(Py_None);else if(v->kind==NV_INT)o=PyLong_FromUnsignedLongLong(v->i);else if(v->kind==NV_BYTES)o=PyBytes_FromStringAndSize((const char*)v->p,(Py_ssize_t)v->n);else if(v->kind==NV_TUPLE){size_t i;o=PyTuple_New((Py_ssize_t)v->tuple.n);if(o)for(i=0;i<v->tuple.n;i++){PyObject*x=nv_box(&v->tuple.v[i]);if(!x){Py_DECREF(o);o=NULL;break;}PyTuple_SET_ITEM(o,(Py_ssize_t)i,x);}}else if(!PyErr_Occurred())PyErr_SetString(PyExc_RuntimeError,\"native helper failed\");return o;}"
         "typedef struct{const char*name,*doc,*ret;const char*const*params,*const*annotations;size_t nparams;}Fn;typedef struct{PyObject_HEAD vectorcallfunc vectorcall;size_t index;PyObject*name,*qualname,*doc,*annotations,*signature;}Callable;static PyTypeObject*callable_type;"
         "static int add_string(PyObject*m,const char*n,const char*v){PyObject*o=PyUnicode_FromString(v);if(!o)return -1;return PyModule_AddObject(m,n,o);}"
@@ -805,7 +910,7 @@ int wrtc_emit_extension(FILE *file, const char *module,
     for (i = 0u; i < program->function_count; i++) {
         const WrtcLoweredFunction *f = &program->functions[i];
         if (!f->is_public) continue;
-        if (fprintf(file, "static PyObject*dispatch_%zu(PyObject*const*a,size_t n){Nv v[%zu],r;PyObject*o;", i, f->parameter_count ? f->parameter_count : 1u) < 0) return -1;
+        if (fprintf(file, "static PyObject*dispatch_%zu(PyObject*const*a,size_t n){Nv v[%zu],r;NvArena arena={NULL,0u,0u};PyObject*o;", i, f->parameter_count ? f->parameter_count : 1u) < 0) return -1;
         if (fprintf(file, "if(n!=%zu){PyErr_Format(PyExc_TypeError,\"%s() takes %zu arguments (%%zu given)\",n);return NULL;}", f->parameter_count, f->name, f->parameter_count) < 0) return -1;
         for (j = 0u; j < f->parameter_count; j++) {
             const WrtcLoweredParameter *p = &f->parameters[j];
@@ -816,7 +921,7 @@ int wrtc_emit_extension(FILE *file, const char *module,
                 if (fprintf(file, "if(!PyBytes_CheckExact(a[%zu])){PyErr_SetString(PyExc_TypeError,\"%s must be bytes\");return NULL;}v[%zu]=nv_borrow((const uint8_t*)PyBytes_AS_STRING(a[%zu]),(size_t)PyBytes_GET_SIZE(a[%zu]));", j, p->name, j, j, j) < 0) return -1;
             } else if (fprintf(file, "return(PyErr_SetString(PyExc_TypeError,\"unsupported public native parameter type\"),NULL);") < 0) return -1;
         }
-        if (fprintf(file, "r=nh_%zu(v);if(r.kind==NV_ERROR)return NULL;o=nv_box(&r);nv_clear(&r);return o;}\n", i) < 0) return -1;
+        if (fprintf(file, "nv_active=&arena;r=nh_%zu(v);if(r.kind==NV_ERROR){nv_arena_clear(&arena);return NULL;}o=nv_box(&r);nv_clear(&r);nv_arena_clear(&arena);return o;}\n", i) < 0) return -1;
     }
     if (fputs("static PyObject*invoke(PyObject*self,PyObject*const*a,size_t n,PyObject*k){Callable*c=(Callable*)self;if(k){PyErr_SetString(PyExc_TypeError,\"keyword arguments are not supported\");return NULL;}switch(c->index){", file) < 0) return -1;
     for (i = 0u; i < program->function_count; i++)
@@ -824,7 +929,7 @@ int wrtc_emit_extension(FILE *file, const char *module,
     if (fputs("default:PyErr_SetString(PyExc_RuntimeError,\"invalid native callable\");return NULL;}}", file) < 0) return -1;
     if (fputs("static void destroy(PyObject*self){Callable*c=(Callable*)self;Py_XDECREF(c->name);Py_XDECREF(c->qualname);Py_XDECREF(c->doc);Py_XDECREF(c->annotations);Py_XDECREF(c->signature);Py_TYPE(self)->tp_free(self);}static PyMemberDef members[]={{\"__name__\",Py_T_OBJECT_EX,offsetof(Callable,name),READONLY,NULL},{\"__qualname__\",Py_T_OBJECT_EX,offsetof(Callable,qualname),READONLY,NULL},{\"__doc__\",Py_T_OBJECT_EX,offsetof(Callable,doc),READONLY,NULL},{\"__annotations__\",Py_T_OBJECT_EX,offsetof(Callable,annotations),READONLY,NULL},{\"__signature__\",Py_T_OBJECT_EX,offsetof(Callable,signature),READONLY,NULL},{NULL,0,0,0,NULL}};static PyType_Slot slots[]={{Py_tp_dealloc,destroy},{Py_tp_members,members},{Py_tp_call,PyVectorcall_Call},{0,NULL}};static PyType_Spec spec={\"pymeta.NativeCallable\",sizeof(Callable),0,Py_TPFLAGS_DEFAULT|Py_TPFLAGS_HAVE_VECTORCALL|Py_TPFLAGS_IMMUTABLETYPE,slots};static PyObject*make_callable(size_t i){Callable*c=(Callable*)callable_type->tp_alloc(callable_type,0);if(!c)return NULL;c->vectorcall=invoke;c->index=i;c->name=PyUnicode_FromString(functions[i].name);c->qualname=Py_XNewRef(c->name);c->doc=PyUnicode_FromString(functions[i].doc);c->annotations=PyDict_New();c->signature=c->annotations?make_signature(&functions[i],c->annotations):NULL;if(!c->name||!c->qualname||!c->doc||!c->annotations||!c->signature)return Py_DECREF(c),NULL;return(PyObject*)c;}\n", file) < 0) return -1;
     if (fputs("static struct PyModuleDef module_def={PyModuleDef_HEAD_INIT,", file) < 0 || quoted(file, module) < 0 || fputs(",NULL,-1,NULL,NULL,NULL,NULL,NULL};\n#if defined(_WIN32)\n__declspec(dllexport)\n#else\n__attribute__((visibility(\"default\")))\n#endif\nPyMODINIT_FUNC PyInit_", file) < 0 || fputs(module, file) < 0 || fprintf(file, "(void){PyObject*module=NULL,*all=NULL,*registry=NULL,*types=NULL,*factory=NULL,*proxy=NULL,*callable=NULL,*constant=NULL;Nv constant_native=nv_none();size_t pos=0;module=PyModule_Create(&module_def);if(!module)goto error;callable_type=(PyTypeObject*)PyType_FromSpec(&spec);if(!callable_type)goto error;callable_type->tp_vectorcall_offset=offsetof(Callable,vectorcall);all=PyTuple_New(%zu);registry=PyDict_New();if(!all||!registry)goto error;\n", public_count) < 0) return -1;
-    if (fputs("(void)&nv_none;(void)&nv_int;(void)&nv_fail;(void)&nv_borrow;(void)&nv_literal;(void)&nv_byte;(void)&nv_bytearray;(void)&nv_bytes;(void)&nv_binary;(void)&nv_binary_checked;(void)&nv_tuple;(void)&nv_error;(void)&nv_append;(void)&nv_extend;(void)&nv_set;(void)&nv_any_field_eq;(void)&nv_store;(void)&nv_store_slice;(void)&nv_to_bytes;(void)&nv_pop;(void)&nv_enumerate;(void)&nv_range;(void)&nv_ints;(void)&nv_min;(void)&nv_max;(void)&nv_str;(void)&nv_type;(void)&nv_typeof;(void)&nv_truth;(void)&nv_bool;(void)&nv_len;(void)&nv_unary;(void)&nv_compare;(void)&nv_get;(void)&nv_slice;(void)&nv_format;(void)&nv_raise;(void)&nv_clear;(void)&nv_box;", file) < 0) return -1;
+    if (fputs("(void)&nv_none;(void)&nv_int;(void)&nv_fail;(void)&nv_borrow;(void)&nv_literal;(void)&nv_byte;(void)&nv_bytearray;(void)&nv_bytes;(void)&nv_binary;(void)&nv_binary_checked;(void)&nv_tuple;(void)&nv_error;(void)&nv_append;(void)&nv_extend;(void)&nv_set;(void)&nv_any_field_eq;(void)&nv_store;(void)&nv_store_slice;(void)&nv_to_bytes;(void)&nv_pop;(void)&nv_ints;(void)&nv_min;(void)&nv_max;(void)&nv_str;(void)&nv_type;(void)&nv_typeof;(void)&nv_truth;(void)&nv_bool;(void)&nv_len;(void)&nv_unary;(void)&nv_compare;(void)&nv_get;(void)&nv_slice;(void)&nv_format;(void)&nv_raise;(void)&nv_clear;(void)&nv_box;", file) < 0) return -1;
     for (i = 0u; i < program->function_count; i++)
         if (fprintf(file, "(void)&nh_%zu;", i) < 0) return -1;
     for (i = 0u; i < program->record_count; i++)

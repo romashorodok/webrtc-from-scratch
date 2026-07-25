@@ -181,6 +181,9 @@ interpreted source more effectively than an independent Python-subset parser.
 
 ## H02: Mypy Types Enable Profitable Unboxing Without Custom Types
 
+Status: not yet accepted. The preliminary Kernel E evidence is recorded in
+[the compiler 0.3 benchmark report](kernel_e_v0.3_benchmark_evidence.md).
+
 ### Claim to test
 
 Standard annotations and inferred types are sufficient to unbox hot local
@@ -287,6 +290,10 @@ Candidates:
 - Packet objects should instead be eliminated entirely by fusion.
 
 ## H06: Escape Analysis Can Eliminate Temporary Python Objects
+
+Status: not yet accepted. The allocation regression in
+[the compiler 0.3 benchmark report](kernel_e_v0.3_benchmark_evidence.md) is
+evidence that this hypothesis has not yet been demonstrated.
 
 ### Claim to test
 
@@ -496,8 +503,9 @@ Measure:
 - Startup, import, compilation, cache, and shutdown costs.
 - Memory per peer and code/variant cache size.
 
-Use at least five alternating AB/BA end-to-end samples after warmup. Isolated
-compiler benchmarks require at least seven paired samples.
+Use at least five alternating AB/BA end-to-end samples, each with a 30-second
+warmup and 120-second timed interval. Isolated compiler benchmarks require at
+least seven paired samples.
 
 ## Compatibility Suite
 

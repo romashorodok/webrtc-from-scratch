@@ -6,6 +6,24 @@
 #include <stddef.h>
 
 typedef enum {
+    WRTC_OWNERSHIP_BORROWED = 0,
+    WRTC_OWNERSHIP_OWNED,
+    WRTC_OWNERSHIP_MOVED,
+    WRTC_OWNERSHIP_BOUNDARY_OWNED
+} WrtcOwnershipState;
+
+typedef enum {
+    WRTC_STORAGE_NONE = 0,
+    WRTC_STORAGE_SCALAR,
+    WRTC_STORAGE_BYTE_SPAN,
+    WRTC_STORAGE_BYTE_BUILDER,
+    WRTC_STORAGE_RECORD,
+    WRTC_STORAGE_FIXED_TUPLE,
+    WRTC_STORAGE_TYPED_VECTOR,
+    WRTC_STORAGE_PYOBJECT
+} WrtcStorageKind;
+
+typedef enum {
     WRTC_LOWER_OP_BRANCH = 0,
     WRTC_LOWER_OP_FOR,
     WRTC_LOWER_OP_WHILE,
@@ -54,6 +72,12 @@ typedef struct {
     unsigned bit_width;
     unsigned is_signed : 1;
     unsigned wraps : 1;
+    WrtcOwnershipState ownership;
+    WrtcStorageKind storage;
+    size_t capacity_hint;
+    unsigned direct_loop : 1;
+    unsigned scalar_replaced : 1;
+    unsigned cleanup_on_error : 1;
 } WrtcLoweringOp;
 
 typedef struct WrtcTypeShape {
@@ -80,6 +104,8 @@ typedef struct {
     WrtcTypeKind element_type;
     size_t element_record_index;
     unsigned is_signed : 1;
+    WrtcOwnershipState ownership;
+    WrtcStorageKind storage;
     WrtcSourceSpan span;
 } WrtcLoweredParameter;
 
@@ -93,6 +119,10 @@ typedef struct {
     unsigned is_signed : 1;
     unsigned wraps : 1;
     unsigned owns_value : 1;
+    WrtcOwnershipState ownership;
+    WrtcStorageKind storage;
+    size_t capacity_hint;
+    unsigned scalar_replaced : 1;
     WrtcSourceSpan span;
 } WrtcLoweredLocal;
 

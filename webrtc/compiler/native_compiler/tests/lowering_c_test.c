@@ -59,6 +59,8 @@ int main(void) {
     CHECK(strcmp(entry->parameters[0].name, "frame") == 0);
     CHECK(entry->parameters[0].boxed_type == WRTC_TYPE_BYTES);
     CHECK(entry->parameters[0].refined_type == WRTC_TYPE_BUFFER);
+    CHECK(entry->parameters[0].storage == WRTC_STORAGE_BYTE_SPAN);
+    CHECK(entry->parameters[0].ownership == WRTC_OWNERSHIP_BOUNDARY_OWNED);
     CHECK(entry->parameters[0].maximum_length == 16u * 1024u * 1024u);
     CHECK(entry->parameters[1].bit_width == 16u && entry->parameters[1].has_range);
     CHECK(entry->parameters[2].bit_width == 32u && entry->parameters[2].has_range);
@@ -105,6 +107,8 @@ int main(void) {
                 CHECK(local->type == WRTC_TYPE_LIST);
                 CHECK(local->element_type == WRTC_TYPE_RECORD);
                 CHECK(local->element_record_index == 0u);
+                CHECK(local->storage == WRTC_STORAGE_TYPED_VECTOR);
+                CHECK(local->ownership == WRTC_OWNERSHIP_OWNED);
                 found_typed_obus = 1;
             }
         }
@@ -156,6 +160,7 @@ int main(void) {
             if (strcmp(serialize->locals[n].name, "output") == 0) {
                 CHECK(serialize->locals[n].type == WRTC_TYPE_BYTE_VECTOR);
                 CHECK(serialize->locals[n].owns_value);
+                CHECK(serialize->locals[n].storage == WRTC_STORAGE_BYTE_BUILDER);
                 found_mutable_output = 1;
             }
         CHECK(found_mutable_output);
@@ -172,6 +177,11 @@ int main(void) {
             CHECK(op->syntax_kind != NULL && op->span.line > 0);
             CHECK(op->symbol == NULL || strstr(op->symbol, "pymeta") == NULL);
             CHECK(op->subtree_end > n && op->subtree_end <= function->operation_count);
+            if (op->kind == WRTC_LOWER_OP_FOR) CHECK(op->direct_loop);
+            if (op->owns_value) {
+                CHECK(op->ownership == WRTC_OWNERSHIP_OWNED);
+                CHECK(op->cleanup_on_error);
+            }
             for (operand_index = 0u; operand_index < op->operand_count; operand_index++) {
                 size_t child = op->operands[operand_index];
                 CHECK(child > n && child < op->subtree_end);

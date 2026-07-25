@@ -195,6 +195,13 @@ int wrtc_byte_vector_write_u32be(WrtcByteVector *vector, size_t offset,
 
 int wrtc_vector_init(WrtcVector *vector, size_t item_size,
                      WrtcAllocator *allocator) {
+    return wrtc_vector_init_with_destructor(vector, item_size, allocator,
+                                            NULL, NULL);
+}
+
+int wrtc_vector_init_with_destructor(
+    WrtcVector *vector, size_t item_size, WrtcAllocator *allocator,
+    void (*destroy_item)(void *item, void *context), void *destroy_context) {
     if (item_size == 0u) {
         PyErr_SetString(PyExc_ValueError, "vector item size must be positive");
         return -1;
@@ -202,16 +209,26 @@ int wrtc_vector_init(WrtcVector *vector, size_t item_size,
     memset(vector, 0, sizeof(*vector));
     vector->item_size = item_size;
     vector->allocator = use_allocator(allocator);
+    vector->destroy_item = destroy_item;
+    vector->destroy_context = destroy_context;
     return 0;
 }
 
 void wrtc_vector_clear(WrtcVector *vector) {
-    size_t item_size = vector->item_size;
+    size_t index, item_size = vector->item_size;
     WrtcAllocator *allocator = vector->allocator;
+    void (*destroy_item)(void *, void *) = vector->destroy_item;
+    void *destroy_context = vector->destroy_context;
+    if (destroy_item != NULL)
+        for (index = 0u; index < vector->length; index++)
+            destroy_item((unsigned char *)vector->data + index * item_size,
+                         destroy_context);
     PyMem_Free(vector->data);
     memset(vector, 0, sizeof(*vector));
     vector->item_size = item_size;
     vector->allocator = use_allocator(allocator);
+    vector->destroy_item = destroy_item;
+    vector->destroy_context = destroy_context;
 }
 
 int wrtc_vector_reserve(WrtcVector *vector, size_t capacity) {

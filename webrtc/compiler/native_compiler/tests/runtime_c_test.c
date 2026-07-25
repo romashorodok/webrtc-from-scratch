@@ -14,6 +14,12 @@ typedef struct {
     WrtcByteSpan value;
 } NeutralRecord;
 
+static void count_destroy(void *item, void *context) {
+    size_t *count = context;
+    (void)item;
+    (*count)++;
+}
+
 static int check_error(PyObject *type, const char *message) {
     PyObject *actual_type = NULL, *value = NULL, *traceback = NULL, *text = NULL;
     int result = 0;
@@ -32,7 +38,7 @@ int main(void) {
     WrtcAllocator allocator; WrtcByteVector bytes, moved;
     WrtcByteVectorVector vectors; WrtcVector records;
     WrtcByteSpan span, slice; NeutralRecord record, popped_record;
-    size_t size_value; uint8_t u8; uint16_t u16; uint32_t u32; uint64_t u64;
+    size_t size_value, destroys = 0u, allocations; uint8_t u8; uint16_t u16; uint32_t u32; uint64_t u64;
     PyObject *object; unsigned char input[] = {1u, 2u, 3u, 4u};
     Py_Initialize(); wrtc_allocator_init(&allocator);
     CHECK(wrtc_size_add(SIZE_MAX, 1u, &size_value) < 0);
@@ -61,6 +67,22 @@ int main(void) {
     CHECK(wrtc_vector_at(&records, 1u) == NULL);
     CHECK(wrtc_vector_pop(&records, &popped_record) == 0);
     CHECK(popped_record.identifier == 42u && popped_record.value.length == 4u);
+    wrtc_vector_clear(&records);
+    wrtc_allocator_disable_failures(&allocator);
+    CHECK(wrtc_vector_init_with_destructor(&records, sizeof(record), &allocator,
+                                           count_destroy, &destroys) == 0);
+    CHECK(wrtc_vector_reserve(&records, 100u) == 0);
+    allocations = allocator.allocation_count;
+    for (size_value = 0u; size_value < 100u; size_value++)
+        CHECK(wrtc_vector_append(&records, &record) == 0);
+    CHECK(allocator.allocation_count == allocations);
+    wrtc_vector_clear(&records);
+    CHECK(destroys == 100u);
+    wrtc_allocator_disable_failures(&allocator);
+    CHECK(wrtc_vector_init(&records, sizeof(record), &allocator) == 0);
+    for (size_value = 0u; size_value < 100u; size_value++)
+        CHECK(wrtc_vector_append(&records, &record) == 0);
+    CHECK(allocator.allocation_count < 12u);
     wrtc_byte_vector_vector_init(&vectors, &allocator);
     moved = bytes;
     CHECK(wrtc_byte_vector_vector_append_move(&vectors, &moved) == 0);

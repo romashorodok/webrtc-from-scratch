@@ -240,7 +240,7 @@ static int compile_module(const Options *o) {
     exports = Py_NewRef(core->exports);
     if (exports == NULL || wrtc_lowering_build(core, &program) < 0) goto done;
     stem = module_stem(absolute_source); if (stem == NULL || !valid_identifier(stem)) { PyErr_SetString(PyExc_ValueError, "source stem must be a valid non-keyword Python identifier"); goto done; }
-    module = malloc(strlen(stem) + 8u); if (module == NULL) goto done; (void)sprintf(module, "%s_native", stem);
+    { size_t module_size = strlen(stem) + 8u; module = malloc(module_size); if (module == NULL) goto done; (void)snprintf(module, module_size, "%s_native", stem); }
     { PyObject *sc = PyImport_ImportModule("sysconfig"), *v = NULL; if (sc != NULL) v = PyObject_CallMethod(sc, "get_config_var", "s", "EXT_SUFFIX"); if (v != NULL && v != Py_None) suffix = copy_utf8(v); Py_XDECREF(v); Py_XDECREF(sc); }
     revision = python_fact("sys", "version", 0); target = python_fact("sysconfig", "get_platform", 1); arch = python_fact("platform", "machine", 1);
     if (suffix == NULL || revision == NULL || target == NULL || arch == NULL) goto done;
@@ -249,7 +249,7 @@ static int compile_module(const Options *o) {
     (void)snprintf(build_path, sizeof build_path, "%s/build", temp); (void)snprintf(built, sizeof built, "%s/%s%s", build_path, module, suffix);
     (void)snprintf(destination, sizeof destination, "%s/%s%s", absolute_output, module, suffix); (void)snprintf(python_option, sizeof python_option, "-DPython3_EXECUTABLE=%s", WRTC_PYTHON_EXECUTABLE);
     cmake_text = malloc(strlen(cmake_format) + strlen(WRTC_PYTHON_VERSION) + strlen(module) + strlen(suffix) + 1u); if (cmake_text == NULL) goto done;
-    (void)sprintf(cmake_text, cmake_format, WRTC_PYTHON_VERSION, module, suffix);
+    (void)snprintf(cmake_text, strlen(cmake_format) + strlen(WRTC_PYTHON_VERSION) + strlen(module) + strlen(suffix) + 1u, cmake_format, WRTC_PYTHON_VERSION, module, suffix);
     generated = fopen(c_path, "wb");
     if (generated == NULL) { PyErr_SetFromErrnoWithFilename(PyExc_OSError, c_path); goto done; }
     if (wrtc_emit_extension(generated, module, program, source_hash, semantic, revision, target, arch) < 0) {

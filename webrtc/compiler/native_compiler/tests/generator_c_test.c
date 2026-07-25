@@ -48,6 +48,13 @@ int main(void) {
     CHECK(strstr(text, "static PyObject*eval(") == NULL);
     CHECK(strstr(text, "PyNumber_Add") == NULL);
     CHECK(strstr(text, "static Nv nh_0") != NULL);
+    CHECK(strstr(text, "static Nv nv_range") == NULL);
+    CHECK(strstr(text, "static Nv nv_enumerate") == NULL);
+    CHECK(strstr(text, "strcmp(op") == NULL);
+    CHECK(strstr(text, "NvArena arena") != NULL);
+    CHECK(strstr(text, "nv_arena_clear(&arena)") != NULL);
+    CHECK(strstr(text, "cap+cap/2u+1u") != NULL);
+    CHECK(strstr(text, "PyMem_Realloc(v->owner,v->n+1u)") == NULL);
     CHECK(strstr(text, "WebRTC") == NULL && strstr(text, "RTP") == NULL &&
           strstr(text, "Obu") == NULL && strstr(text, "PacketMetadata") == NULL);
     free(text);

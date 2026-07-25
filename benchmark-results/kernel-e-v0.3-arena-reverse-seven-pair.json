@@ -1,0 +1,824 @@
+{
+  "acceptance": {
+    "allocation_blocks_at_most_110_percent": true,
+    "allocation_bytes_at_most_110_percent": true,
+    "bootstrap_resamples": 10000,
+    "cpu_improvement_at_least_5_percent": false,
+    "event_loop_p99_regression_at_most_1_ms": true,
+    "paired_bootstrap_upper_below_zero": true,
+    "paired_cpu_difference_95_percent_upper_us_per_frame": -6.2733333333335395,
+    "workload_parity": true
+  },
+  "aggregate": {
+    "native-required": {
+      "allocation_live_blocks_median": 552.0,
+      "allocation_live_bytes_median": 563503.0,
+      "allocation_peak_traced_bytes_median": 594272.0,
+      "cpu_microseconds_per_frame_mean": 4529.051428571429,
+      "cpu_microseconds_per_frame_median": 4512.133333333333,
+      "cpu_microseconds_per_frame_stdev": 108.36540391719844,
+      "event_loop_lag_max_ms_median": 94.67758881510235,
+      "event_loop_lag_p99_ms_median": 1.4635935658589005,
+      "frames_per_second_mean": 30.148112454871114,
+      "frames_per_second_median": 30.19132779413472,
+      "frames_per_second_stdev": 0.07956183064746374,
+      "machine_cpu_percent_mean": 3.413557971719719,
+      "machine_cpu_percent_median": 3.384241538315909,
+      "machine_cpu_percent_stdev": 0.08224192768575896,
+      "packets_per_second_mean": 223.09603216604626,
+      "packets_per_second_median": 223.4158256765969,
+      "packets_per_second_stdev": 0.588757546791227,
+      "process_cpu_percent_mean": 13.654231886878875,
+      "process_cpu_percent_median": 13.536966153263636,
+      "process_cpu_percent_stdev": 0.3289677107430358,
+      "process_cpu_seconds_mean": 0.6793577142857143,
+      "process_cpu_seconds_median": 0.67682,
+      "process_cpu_seconds_stdev": 0.01625481058757978
+    },
+    "native_relative_to_python_percent": {
+      "allocation_live_blocks": -3.157894736842104,
+      "cpu_microseconds_per_frame": -3.133332283784629,
+      "event_loop_lag_p99_ms": -6.897071767321716,
+      "frames_per_second": -0.004695435808754755
+    },
+    "python": {
+      "allocation_live_blocks_median": 570.0,
+      "allocation_live_bytes_median": 565047.0,
+      "allocation_peak_traced_bytes_median": 577828.0,
+      "cpu_microseconds_per_frame_mean": 4583.9971428571425,
+      "cpu_microseconds_per_frame_median": 4658.086666666667,
+      "cpu_microseconds_per_frame_stdev": 145.08163540302718,
+      "event_loop_lag_max_ms_median": 91.19031194131821,
+      "event_loop_lag_p99_ms_median": 1.5720166848041117,
+      "frames_per_second_mean": 30.191726955573174,
+      "frames_per_second_median": 30.192745475117402,
+      "frames_per_second_stdev": 0.003325288651889794,
+      "machine_cpu_percent_mean": 3.459973924199477,
+      "machine_cpu_percent_median": 3.5160106281926176,
+      "machine_cpu_percent_stdev": 0.10965645549150053,
+      "packets_per_second_mean": 223.41877947124146,
+      "packets_per_second_median": 223.42631651586876,
+      "packets_per_second_stdev": 0.024607136023985583,
+      "process_cpu_percent_mean": 13.839895696797909,
+      "process_cpu_percent_median": 14.06404251277047,
+      "process_cpu_percent_stdev": 0.43862582196600214,
+      "process_cpu_seconds_mean": 0.6875995714285714,
+      "process_cpu_seconds_median": 0.698713,
+      "process_cpu_seconds_stdev": 0.021762245310454092
+    }
+  },
+  "artifact": "/private/var/folders/h2/tl02_6wx4ds_ym0fbddgbtg80000gn/T/kernel-e-benchmark-7ssnmgzs/artifact/kernel_e_native.cpython-313-darwin.so",
+  "artifact_sha256": "21eea488da4a77f67ec2c8c4f205af2b620b581a88e48a7f0c38f4ae58f47885",
+  "config": {
+    "allocation_calls": 64,
+    "bitrate_bps_per_peer": 2000000,
+    "corpus_seed": 1262834254,
+    "duration_seconds": 5.0,
+    "frames_per_second": 30,
+    "mtu": 1200,
+    "network_profile": "deterministic-null-sink",
+    "packet_loss_ppm": 0,
+    "peer_count": 1,
+    "ticker_interval_seconds": 0.001,
+    "warmup_seconds": 2.0
+  },
+  "logical_cpu_count": 4,
+  "machine": "x86_64",
+  "pair_orders": [
+    [
+      "python",
+      "native-required"
+    ],
+    [
+      "native-required",
+      "python"
+    ],
+    [
+      "python",
+      "native-required"
+    ],
+    [
+      "native-required",
+      "python"
+    ],
+    [
+      "python",
+      "native-required"
+    ],
+    [
+      "native-required",
+      "python"
+    ],
+    [
+      "python",
+      "native-required"
+    ]
+  ],
+  "platform": "macOS-13.7.8-x86_64-i386-64bit-Mach-O",
+  "python": "3.13.13 (main, Apr 21 2026, 21:18:19) [Clang 14.0.3 (clang-1403.0.22.14.1)]",
+  "samples": [
+    {
+      "allocations": {
+        "live_blocks": 570,
+        "live_bytes": 565047,
+        "observable_output_copy_bytes": 545013,
+        "peak_traced_bytes": 577828,
+        "probe_calls": 64
+      },
+      "checksum": 16543496491276483074,
+      "corpus_frame_sizes": [
+        5002,
+        6669,
+        8336,
+        10002,
+        11669
+      ],
+      "corpus_sha256": "112c804f69f8bbf79635b7c672b952eb763c00cfa086b32fa098d6209f63954b",
+      "cpu_microseconds_per_frame": 4689.1466666666665,
+      "event_loop_lag_ms": {
+        "max": 94.32935016229749,
+        "p50": 0.3261462552472949,
+        "p95": 0.6643185333814472,
+        "p99": 1.8695951730478555,
+        "sample_count": 4674
+      },
+      "frames": 150,
+      "frames_per_second": 30.19414906084903,
+      "implementation": {
+        "compiler_version": null,
+        "file": "/Users/user/proj/webrtc-from-scratch/webrtc/compiler/kernel_e.py",
+        "module": "webrtc.compiler.kernel_e",
+        "optimization": null,
+        "semantic_sha256": null,
+        "source_sha256": null
+      },
+      "input_bytes": 1250340,
+      "machine_cpu_percent": 3.5396198355379176,
+      "mode": "python",
+      "network_accepted_bytes": 1273350,
+      "network_accepted_packets": 1110,
+      "observable_output_copy_bytes": 1273350,
+      "packet_output_bytes": 1273350,
+      "packets": 1110,
+      "packets_per_second": 223.4367030502828,
+      "pair": 1,
+      "position": 1,
+      "process_cpu_percent": 14.15847934215167,
+      "process_cpu_seconds": 0.703372,
+      "wall_seconds": 4.967849887
+    },
+    {
+      "allocations": {
+        "live_blocks": 552,
+        "live_bytes": 563503,
+        "observable_output_copy_bytes": 545013,
+        "peak_traced_bytes": 594272,
+        "probe_calls": 64
+      },
+      "checksum": 16543496491276483074,
+      "corpus_frame_sizes": [
+        5002,
+        6669,
+        8336,
+        10002,
+        11669
+      ],
+      "corpus_sha256": "112c804f69f8bbf79635b7c672b952eb763c00cfa086b32fa098d6209f63954b",
+      "cpu_microseconds_per_frame": 4512.133333333333,
+      "event_loop_lag_ms": {
+        "max": 78.31041415920481,
+        "p50": 0.3267075808253139,
+        "p95": 0.6821457936894149,
+        "p99": 1.7947960877791047,
+        "sample_count": 4691
+      },
+      "frames": 150,
+      "frames_per_second": 29.99534537029799,
+      "implementation": {
+        "compiler_version": "wrtc-pymeta-compiler/0.3",
+        "file": "/private/var/folders/h2/tl02_6wx4ds_ym0fbddgbtg80000gn/T/kernel-e-benchmark-7ssnmgzs/artifact/kernel_e_native.cpython-313-darwin.so",
+        "module": "kernel_e_native",
+        "optimization": "release",
+        "semantic_sha256": "ef5dac2098ec6493c2e19c6cb4d8ca73c09aef7c7198bbc00f8aa272007f304e",
+        "source_sha256": "7ff340182200648bd2de50b62e8a3989a366ffc06cfc4ed51243b526ef00cd8e"
+      },
+      "input_bytes": 1250340,
+      "machine_cpu_percent": 3.3835749422541808,
+      "mode": "native-required",
+      "network_accepted_bytes": 1273350,
+      "network_accepted_packets": 1110,
+      "observable_output_copy_bytes": 1273350,
+      "packet_output_bytes": 1273350,
+      "packets": 1110,
+      "packets_per_second": 221.96555574020513,
+      "pair": 1,
+      "position": 2,
+      "process_cpu_percent": 13.534299769016723,
+      "process_cpu_seconds": 0.67682,
+      "wall_seconds": 5.000775892
+    },
+    {
+      "allocations": {
+        "live_blocks": 552,
+        "live_bytes": 563503,
+        "observable_output_copy_bytes": 545013,
+        "peak_traced_bytes": 594272,
+        "probe_calls": 64
+      },
+      "checksum": 16543496491276483074,
+      "corpus_frame_sizes": [
+        5002,
+        6669,
+        8336,
+        10002,
+        11669
+      ],
+      "corpus_sha256": "112c804f69f8bbf79635b7c672b952eb763c00cfa086b32fa098d6209f63954b",
+      "cpu_microseconds_per_frame": 4424.96,
+      "event_loop_lag_ms": {
+        "max": 94.84517606324516,
+        "p50": 0.3233093593735248,
+        "p95": 0.6115727592259645,
+        "p99": 1.329779188381508,
+        "sample_count": 4700
+      },
+      "frames": 150,
+      "frames_per_second": 30.193375453779158,
+      "implementation": {
+        "compiler_version": "wrtc-pymeta-compiler/0.3",
+        "file": "/private/var/folders/h2/tl02_6wx4ds_ym0fbddgbtg80000gn/T/kernel-e-benchmark-7ssnmgzs/artifact/kernel_e_native.cpython-313-darwin.so",
+        "module": "kernel_e_native",
+        "optimization": "release",
+        "semantic_sha256": "ef5dac2098ec6493c2e19c6cb4d8ca73c09aef7c7198bbc00f8aa272007f304e",
+        "source_sha256": "7ff340182200648bd2de50b62e8a3989a366ffc06cfc4ed51243b526ef00cd8e"
+      },
+      "input_bytes": 1250340,
+      "machine_cpu_percent": 3.340111966198865,
+      "mode": "native-required",
+      "network_accepted_bytes": 1273350,
+      "network_accepted_packets": 1110,
+      "observable_output_copy_bytes": 1273350,
+      "packet_output_bytes": 1273350,
+      "packets": 1110,
+      "packets_per_second": 223.43097835796576,
+      "pair": 2,
+      "position": 1,
+      "process_cpu_percent": 13.36044786479546,
+      "process_cpu_seconds": 0.663744,
+      "wall_seconds": 4.967977172
+    },
+    {
+      "allocations": {
+        "live_blocks": 570,
+        "live_bytes": 565047,
+        "observable_output_copy_bytes": 545013,
+        "peak_traced_bytes": 577828,
+        "probe_calls": 64
+      },
+      "checksum": 16543496491276483074,
+      "corpus_frame_sizes": [
+        5002,
+        6669,
+        8336,
+        10002,
+        11669
+      ],
+      "corpus_sha256": "112c804f69f8bbf79635b7c672b952eb763c00cfa086b32fa098d6209f63954b",
+      "cpu_microseconds_per_frame": 4431.233333333334,
+      "event_loop_lag_ms": {
+        "max": 87.15256644063629,
+        "p50": 0.32120977994054556,
+        "p95": 0.6600746419280767,
+        "p99": 1.672600454185158,
+        "sample_count": 4700
+      },
+      "frames": 150,
+      "frames_per_second": 30.193138368485286,
+      "implementation": {
+        "compiler_version": null,
+        "file": "/Users/user/proj/webrtc-from-scratch/webrtc/compiler/kernel_e.py",
+        "module": "webrtc.compiler.kernel_e",
+        "optimization": null,
+        "semantic_sha256": null,
+        "source_sha256": null
+      },
+      "input_bytes": 1250340,
+      "machine_cpu_percent": 3.3448210294094407,
+      "mode": "python",
+      "network_accepted_bytes": 1273350,
+      "network_accepted_packets": 1110,
+      "observable_output_copy_bytes": 1273350,
+      "packet_output_bytes": 1273350,
+      "packets": 1110,
+      "packets_per_second": 223.42922392679114,
+      "pair": 2,
+      "position": 2,
+      "process_cpu_percent": 13.379284117637763,
+      "process_cpu_seconds": 0.664685,
+      "wall_seconds": 4.968016182
+    },
+    {
+      "allocations": {
+        "live_blocks": 570,
+        "live_bytes": 565047,
+        "observable_output_copy_bytes": 545013,
+        "peak_traced_bytes": 577828,
+        "probe_calls": 64
+      },
+      "checksum": 16543496491276483074,
+      "corpus_frame_sizes": [
+        5002,
+        6669,
+        8336,
+        10002,
+        11669
+      ],
+      "corpus_sha256": "112c804f69f8bbf79635b7c672b952eb763c00cfa086b32fa098d6209f63954b",
+      "cpu_microseconds_per_frame": 4397.24,
+      "event_loop_lag_ms": {
+        "max": 100.51304320222698,
+        "p50": 0.3199733037035912,
+        "p95": 0.6275319028645754,
+        "p99": 1.6394571284763515,
+        "sample_count": 4662
+      },
+      "frames": 150,
+      "frames_per_second": 30.184540377555706,
+      "implementation": {
+        "compiler_version": null,
+        "file": "/Users/user/proj/webrtc-from-scratch/webrtc/compiler/kernel_e.py",
+        "module": "webrtc.compiler.kernel_e",
+        "optimization": null,
+        "semantic_sha256": null,
+        "source_sha256": null
+      },
+      "input_bytes": 1250340,
+      "machine_cpu_percent": 3.318216708245076,
+      "mode": "python",
+      "network_accepted_bytes": 1273350,
+      "network_accepted_packets": 1110,
+      "observable_output_copy_bytes": 1273350,
+      "packet_output_bytes": 1273350,
+      "packets": 1110,
+      "packets_per_second": 223.36559879391223,
+      "pair": 3,
+      "position": 1,
+      "process_cpu_percent": 13.272866832980304,
+      "process_cpu_seconds": 0.659586,
+      "wall_seconds": 4.969431309
+    },
+    {
+      "allocations": {
+        "live_blocks": 552,
+        "live_bytes": 563503,
+        "observable_output_copy_bytes": 545013,
+        "peak_traced_bytes": 594272,
+        "probe_calls": 64
+      },
+      "checksum": 16543496491276483074,
+      "corpus_frame_sizes": [
+        5002,
+        6669,
+        8336,
+        10002,
+        11669
+      ],
+      "corpus_sha256": "112c804f69f8bbf79635b7c672b952eb763c00cfa086b32fa098d6209f63954b",
+      "cpu_microseconds_per_frame": 4725.78,
+      "event_loop_lag_ms": {
+        "max": 73.45795704168268,
+        "p50": 0.3256142372265458,
+        "p95": 0.5893431080039591,
+        "p99": 1.4635935658589005,
+        "sample_count": 4735
+      },
+      "frames": 150,
+      "frames_per_second": 30.194841855264613,
+      "implementation": {
+        "compiler_version": "wrtc-pymeta-compiler/0.3",
+        "file": "/private/var/folders/h2/tl02_6wx4ds_ym0fbddgbtg80000gn/T/kernel-e-benchmark-7ssnmgzs/artifact/kernel_e_native.cpython-313-darwin.so",
+        "module": "kernel_e_native",
+        "optimization": "release",
+        "semantic_sha256": "ef5dac2098ec6493c2e19c6cb4d8ca73c09aef7c7198bbc00f8aa272007f304e",
+        "source_sha256": "7ff340182200648bd2de50b62e8a3989a366ffc06cfc4ed51243b526ef00cd8e"
+      },
+      "input_bytes": 1250340,
+      "machine_cpu_percent": 3.5673544935693102,
+      "mode": "native-required",
+      "network_accepted_bytes": 1273350,
+      "network_accepted_packets": 1110,
+      "observable_output_copy_bytes": 1273350,
+      "packet_output_bytes": 1273350,
+      "packets": 1110,
+      "packets_per_second": 223.44182972895814,
+      "pair": 3,
+      "position": 2,
+      "process_cpu_percent": 14.269417974277241,
+      "process_cpu_seconds": 0.708867,
+      "wall_seconds": 4.967735904
+    },
+    {
+      "allocations": {
+        "live_blocks": 552,
+        "live_bytes": 563503,
+        "observable_output_copy_bytes": 545013,
+        "peak_traced_bytes": 594272,
+        "probe_calls": 64
+      },
+      "checksum": 16543496491276483074,
+      "corpus_frame_sizes": [
+        5002,
+        6669,
+        8336,
+        10002,
+        11669
+      ],
+      "corpus_sha256": "112c804f69f8bbf79635b7c672b952eb763c00cfa086b32fa098d6209f63954b",
+      "cpu_microseconds_per_frame": 4408.6866666666665,
+      "event_loop_lag_ms": {
+        "max": 97.61345258448273,
+        "p50": 0.3160702181048691,
+        "p95": 0.5897086230106652,
+        "p99": 1.533357659354806,
+        "sample_count": 4712
+      },
+      "frames": 150,
+      "frames_per_second": 30.18850273481631,
+      "implementation": {
+        "compiler_version": "wrtc-pymeta-compiler/0.3",
+        "file": "/private/var/folders/h2/tl02_6wx4ds_ym0fbddgbtg80000gn/T/kernel-e-benchmark-7ssnmgzs/artifact/kernel_e_native.cpython-313-darwin.so",
+        "module": "kernel_e_native",
+        "optimization": "release",
+        "semantic_sha256": "ef5dac2098ec6493c2e19c6cb4d8ca73c09aef7c7198bbc00f8aa272007f304e",
+        "source_sha256": "7ff340182200648bd2de50b62e8a3989a366ffc06cfc4ed51243b526ef00cd8e"
+      },
+      "input_bytes": 1250340,
+      "machine_cpu_percent": 3.327291237340371,
+      "mode": "native-required",
+      "network_accepted_bytes": 1273350,
+      "network_accepted_packets": 1110,
+      "observable_output_copy_bytes": 1273350,
+      "packet_output_bytes": 1273350,
+      "packets": 1110,
+      "packets_per_second": 223.3949202376407,
+      "pair": 4,
+      "position": 1,
+      "process_cpu_percent": 13.309164949361485,
+      "process_cpu_seconds": 0.661303,
+      "wall_seconds": 4.968779052
+    },
+    {
+      "allocations": {
+        "live_blocks": 570,
+        "live_bytes": 565047,
+        "observable_output_copy_bytes": 545013,
+        "peak_traced_bytes": 577828,
+        "probe_calls": 64
+      },
+      "checksum": 16543496491276483074,
+      "corpus_frame_sizes": [
+        5002,
+        6669,
+        8336,
+        10002,
+        11669
+      ],
+      "corpus_sha256": "112c804f69f8bbf79635b7c672b952eb763c00cfa086b32fa098d6209f63954b",
+      "cpu_microseconds_per_frame": 4469.02,
+      "event_loop_lag_ms": {
+        "max": 93.68611083482392,
+        "p50": 0.31701542320661247,
+        "p95": 0.5931994819547981,
+        "p99": 1.5720166848041117,
+        "sample_count": 4636
+      },
+      "frames": 150,
+      "frames_per_second": 30.194133015172735,
+      "implementation": {
+        "compiler_version": null,
+        "file": "/Users/user/proj/webrtc-from-scratch/webrtc/compiler/kernel_e.py",
+        "module": "webrtc.compiler.kernel_e",
+        "optimization": null,
+        "semantic_sha256": null,
+        "source_sha256": null
+      },
+      "input_bytes": 1250340,
+      "machine_cpu_percent": 3.3734546081866816,
+      "mode": "python",
+      "network_accepted_bytes": 1273350,
+      "network_accepted_packets": 1110,
+      "observable_output_copy_bytes": 1273350,
+      "packet_output_bytes": 1273350,
+      "packets": 1110,
+      "packets_per_second": 223.43658431227826,
+      "pair": 4,
+      "position": 2,
+      "process_cpu_percent": 13.493818432746727,
+      "process_cpu_seconds": 0.670353,
+      "wall_seconds": 4.967852527
+    },
+    {
+      "allocations": {
+        "live_blocks": 570,
+        "live_bytes": 565047,
+        "observable_output_copy_bytes": 545013,
+        "peak_traced_bytes": 577828,
+        "probe_calls": 64
+      },
+      "checksum": 16543496491276483074,
+      "corpus_frame_sizes": [
+        5002,
+        6669,
+        8336,
+        10002,
+        11669
+      ],
+      "corpus_sha256": "112c804f69f8bbf79635b7c672b952eb763c00cfa086b32fa098d6209f63954b",
+      "cpu_microseconds_per_frame": 4658.086666666667,
+      "event_loop_lag_ms": {
+        "max": 86.19041720521636,
+        "p50": 0.32087709405459464,
+        "p95": 0.591086398344487,
+        "p99": 1.4314057771116495,
+        "sample_count": 4744
+      },
+      "frames": 150,
+      "frames_per_second": 30.192745475117402,
+      "implementation": {
+        "compiler_version": null,
+        "file": "/Users/user/proj/webrtc-from-scratch/webrtc/compiler/kernel_e.py",
+        "module": "webrtc.compiler.kernel_e",
+        "optimization": null,
+        "semantic_sha256": null,
+        "source_sha256": null
+      },
+      "input_bytes": 1250340,
+      "machine_cpu_percent": 3.5160106281926176,
+      "mode": "python",
+      "network_accepted_bytes": 1273350,
+      "network_accepted_packets": 1110,
+      "observable_output_copy_bytes": 1273350,
+      "packet_output_bytes": 1273350,
+      "packets": 1110,
+      "packets_per_second": 223.42631651586876,
+      "pair": 5,
+      "position": 1,
+      "process_cpu_percent": 14.06404251277047,
+      "process_cpu_seconds": 0.698713,
+      "wall_seconds": 4.96808083
+    },
+    {
+      "allocations": {
+        "live_blocks": 552,
+        "live_bytes": 563503,
+        "observable_output_copy_bytes": 545013,
+        "peak_traced_bytes": 594272,
+        "probe_calls": 64
+      },
+      "checksum": 16543496491276483074,
+      "corpus_frame_sizes": [
+        5002,
+        6669,
+        8336,
+        10002,
+        11669
+      ],
+      "corpus_sha256": "112c804f69f8bbf79635b7c672b952eb763c00cfa086b32fa098d6209f63954b",
+      "cpu_microseconds_per_frame": 4483.7266666666665,
+      "event_loop_lag_ms": {
+        "max": 72.33232719590887,
+        "p50": 0.3166171663906425,
+        "p95": 0.575741840293631,
+        "p99": 1.2835640518460423,
+        "sample_count": 4771
+      },
+      "frames": 150,
+      "frames_per_second": 30.19132779413472,
+      "implementation": {
+        "compiler_version": "wrtc-pymeta-compiler/0.3",
+        "file": "/private/var/folders/h2/tl02_6wx4ds_ym0fbddgbtg80000gn/T/kernel-e-benchmark-7ssnmgzs/artifact/kernel_e_native.cpython-313-darwin.so",
+        "module": "kernel_e_native",
+        "optimization": "release",
+        "semantic_sha256": "ef5dac2098ec6493c2e19c6cb4d8ca73c09aef7c7198bbc00f8aa272007f304e",
+        "source_sha256": "7ff340182200648bd2de50b62e8a3989a366ffc06cfc4ed51243b526ef00cd8e"
+      },
+      "input_bytes": 1250340,
+      "machine_cpu_percent": 3.384241538315909,
+      "mode": "native-required",
+      "network_accepted_bytes": 1273350,
+      "network_accepted_packets": 1110,
+      "observable_output_copy_bytes": 1273350,
+      "packet_output_bytes": 1273350,
+      "packets": 1110,
+      "packets_per_second": 223.4158256765969,
+      "pair": 5,
+      "position": 2,
+      "process_cpu_percent": 13.536966153263636,
+      "process_cpu_seconds": 0.672559,
+      "wall_seconds": 4.968314114
+    },
+    {
+      "allocations": {
+        "live_blocks": 552,
+        "live_bytes": 563503,
+        "observable_output_copy_bytes": 545013,
+        "peak_traced_bytes": 594272,
+        "probe_calls": 64
+      },
+      "checksum": 16543496491276483074,
+      "corpus_frame_sizes": [
+        5002,
+        6669,
+        8336,
+        10002,
+        11669
+      ],
+      "corpus_sha256": "112c804f69f8bbf79635b7c672b952eb763c00cfa086b32fa098d6209f63954b",
+      "cpu_microseconds_per_frame": 4569.26,
+      "event_loop_lag_ms": {
+        "max": 94.67758881510235,
+        "p50": 0.3212557639926672,
+        "p95": 0.5924865254200995,
+        "p99": 1.4587638434022665,
+        "sample_count": 4667
+      },
+      "frames": 150,
+      "frames_per_second": 30.079030770401904,
+      "implementation": {
+        "compiler_version": "wrtc-pymeta-compiler/0.3",
+        "file": "/private/var/folders/h2/tl02_6wx4ds_ym0fbddgbtg80000gn/T/kernel-e-benchmark-7ssnmgzs/artifact/kernel_e_native.cpython-313-darwin.so",
+        "module": "kernel_e_native",
+        "optimization": "release",
+        "semantic_sha256": "ef5dac2098ec6493c2e19c6cb4d8ca73c09aef7c7198bbc00f8aa272007f304e",
+        "source_sha256": "7ff340182200648bd2de50b62e8a3989a366ffc06cfc4ed51243b526ef00cd8e"
+      },
+      "input_bytes": 1250340,
+      "machine_cpu_percent": 3.435972803449165,
+      "mode": "native-required",
+      "network_accepted_bytes": 1273350,
+      "network_accepted_packets": 1110,
+      "observable_output_copy_bytes": 1273350,
+      "packet_output_bytes": 1273350,
+      "packets": 1110,
+      "packets_per_second": 222.5848277009741,
+      "pair": 6,
+      "position": 1,
+      "process_cpu_percent": 13.74389121379666,
+      "process_cpu_seconds": 0.685389,
+      "wall_seconds": 4.986862813
+    },
+    {
+      "allocations": {
+        "live_blocks": 570,
+        "live_bytes": 565047,
+        "observable_output_copy_bytes": 545013,
+        "peak_traced_bytes": 577828,
+        "probe_calls": 64
+      },
+      "checksum": 16543496491276483074,
+      "corpus_frame_sizes": [
+        5002,
+        6669,
+        8336,
+        10002,
+        11669
+      ],
+      "corpus_sha256": "112c804f69f8bbf79635b7c672b952eb763c00cfa086b32fa098d6209f63954b",
+      "cpu_microseconds_per_frame": 4736.253333333333,
+      "event_loop_lag_ms": {
+        "max": 82.11018267320469,
+        "p50": 0.31813039095140994,
+        "p95": 0.6034469115547836,
+        "p99": 1.4852932945359498,
+        "sample_count": 4731
+      },
+      "frames": 150,
+      "frames_per_second": 30.191618321474014,
+      "implementation": {
+        "compiler_version": null,
+        "file": "/Users/user/proj/webrtc-from-scratch/webrtc/compiler/kernel_e.py",
+        "module": "webrtc.compiler.kernel_e",
+        "optimization": null,
+        "semantic_sha256": null,
+        "source_sha256": null
+      },
+      "input_bytes": 1250340,
+      "machine_cpu_percent": 3.574878822845226,
+      "mode": "python",
+      "network_accepted_bytes": 1273350,
+      "network_accepted_packets": 1110,
+      "observable_output_copy_bytes": 1273350,
+      "packet_output_bytes": 1273350,
+      "packets": 1110,
+      "packets_per_second": 223.4179755789077,
+      "pair": 6,
+      "position": 2,
+      "process_cpu_percent": 14.299515291380905,
+      "process_cpu_seconds": 0.710438,
+      "wall_seconds": 4.968266305
+    },
+    {
+      "allocations": {
+        "live_blocks": 570,
+        "live_bytes": 565047,
+        "observable_output_copy_bytes": 545013,
+        "peak_traced_bytes": 577828,
+        "probe_calls": 64
+      },
+      "checksum": 16543496491276483074,
+      "corpus_frame_sizes": [
+        5002,
+        6669,
+        8336,
+        10002,
+        11669
+      ],
+      "corpus_sha256": "112c804f69f8bbf79635b7c672b952eb763c00cfa086b32fa098d6209f63954b",
+      "cpu_microseconds_per_frame": 4707.0,
+      "event_loop_lag_ms": {
+        "max": 91.19031194131821,
+        "p50": 0.3186259127687663,
+        "p95": 0.5854802730027586,
+        "p99": 1.5334122290369123,
+        "sample_count": 4704
+      },
+      "frames": 150,
+      "frames_per_second": 30.191764070358033,
+      "implementation": {
+        "compiler_version": null,
+        "file": "/Users/user/proj/webrtc-from-scratch/webrtc/compiler/kernel_e.py",
+        "module": "webrtc.compiler.kernel_e",
+        "optimization": null,
+        "semantic_sha256": null,
+        "source_sha256": null
+      },
+      "input_bytes": 1250340,
+      "machine_cpu_percent": 3.552815836979381,
+      "mode": "python",
+      "network_accepted_bytes": 1273350,
+      "network_accepted_packets": 1110,
+      "observable_output_copy_bytes": 1273350,
+      "packet_output_bytes": 1273350,
+      "packets": 1110,
+      "packets_per_second": 223.41905412064943,
+      "pair": 7,
+      "position": 1,
+      "process_cpu_percent": 14.211263347917525,
+      "process_cpu_seconds": 0.70605,
+      "wall_seconds": 4.968242321
+    },
+    {
+      "allocations": {
+        "live_blocks": 552,
+        "live_bytes": 563503,
+        "observable_output_copy_bytes": 545013,
+        "peak_traced_bytes": 594272,
+        "probe_calls": 64
+      },
+      "checksum": 16543496491276483074,
+      "corpus_frame_sizes": [
+        5002,
+        6669,
+        8336,
+        10002,
+        11669
+      ],
+      "corpus_sha256": "112c804f69f8bbf79635b7c672b952eb763c00cfa086b32fa098d6209f63954b",
+      "cpu_microseconds_per_frame": 4578.8133333333335,
+      "event_loop_lag_ms": {
+        "max": 100.27184040518478,
+        "p50": 0.3231484442949295,
+        "p95": 0.6000633584335446,
+        "p99": 1.588375132996589,
+        "sample_count": 4682
+      },
+      "frames": 150,
+      "frames_per_second": 30.194363205403114,
+      "implementation": {
+        "compiler_version": "wrtc-pymeta-compiler/0.3",
+        "file": "/private/var/folders/h2/tl02_6wx4ds_ym0fbddgbtg80000gn/T/kernel-e-benchmark-7ssnmgzs/artifact/kernel_e_native.cpython-313-darwin.so",
+        "module": "kernel_e_native",
+        "optimization": "release",
+        "semantic_sha256": "ef5dac2098ec6493c2e19c6cb4d8ca73c09aef7c7198bbc00f8aa272007f304e",
+        "source_sha256": "7ff340182200648bd2de50b62e8a3989a366ffc06cfc4ed51243b526ef00cd8e"
+      },
+      "input_bytes": 1250340,
+      "machine_cpu_percent": 3.45635882091023,
+      "mode": "native-required",
+      "network_accepted_bytes": 1273350,
+      "network_accepted_packets": 1110,
+      "observable_output_copy_bytes": 1273350,
+      "packet_output_bytes": 1273350,
+      "packets": 1110,
+      "packets_per_second": 223.43828771998307,
+      "pair": 7,
+      "position": 2,
+      "process_cpu_percent": 13.82543528364092,
+      "process_cpu_seconds": 0.686822,
+      "wall_seconds": 4.967814654
+    }
+  ],
+  "schema": "wrtc-kernel-e-benchmark/1",
+  "source": "/Users/user/proj/webrtc-from-scratch/webrtc/compiler/kernel_e.py",
+  "source_sha256": "7ff340182200648bd2de50b62e8a3989a366ffc06cfc4ed51243b526ef00cd8e"
+}
