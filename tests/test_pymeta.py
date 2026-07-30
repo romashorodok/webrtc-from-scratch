@@ -71,6 +71,32 @@ def test_record_metadata_preserves_class_construction_and_field_order() -> None:
     )
 
 
+def test_native_class_and_preferred_region_metadata_are_behavior_neutral() -> None:
+    declared_effects = pymeta.effects(
+        pymeta.Effect.ALLOCATE,
+        pymeta.Effect.RAISE,
+        pymeta.Effect.READ,
+        pymeta.Effect.WRITE,
+    )
+
+    @pymeta.native_class(
+        pymeta.compact_object, gc=pymeta.tracked, weakrefs=False
+    )
+    class Loop:
+        @pymeta.region(pymeta.preferred, effects=declared_effects)
+        def _run_once(self) -> int:
+            return 7
+
+    class_metadata = pymeta.metadata(Loop)
+    method_metadata = pymeta.metadata(Loop._run_once)
+    assert class_metadata.native_layout == pymeta.compact_object
+    assert class_metadata.gc == pymeta.tracked
+    assert class_metadata.weakrefs is False
+    assert method_metadata.region == pymeta.preferred
+    assert method_metadata.mapping == {"effects": declared_effects}
+    assert Loop()._run_once() == 7
+
+
 @pytest.mark.parametrize(
     ("factory", "message"),
     (

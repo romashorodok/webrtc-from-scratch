@@ -24,7 +24,8 @@ compile-time metadata only:
 | Typed lowering | Reachable functions lower to source-correlated IR with refined scalar widths/ranges, aggregate shapes, record indices, ownership/cleanup information and resolved direct-call targets. |
 | Generation | Public CPython wrappers, metadata, constants and registry entries are generated from IR. Private calls are generated native helpers rather than Python callables. |
 | Kernel E backend | Native packetization, public callable metadata, embedded compatibility metadata, registry, loading, and media dispatch are implemented through the general frontend/lowering path. |
-| Source acceptance | Support is bounded by reachable syntax and type rules. Unsupported reachable nodes reject the whole module with a source-correlated diagnostic; there is no accepted-AST hash gate. |
+| Source acceptance | The generic function backend is bounded by reachable syntax and type rules and has no accepted-AST hash gate. The specialized event-loop profile uses its reviewed semantic AST hash because its C emitter implements exactly that pinned scheduling method. |
+| Native event loop | A bounded compiler profile recognizes the reviewed `event_loop.py` semantic AST and emits a CPython heap type derived from `asyncio.SelectorEventLoop`. Its `_run_once` is a native C method; the generated module does not embed or execute Python source. General native-class lowering remains future work. |
 | Optimization | Release C compilation and hidden visibility are implemented. Version 0.3 still uses insufficiently specialized generated aggregate containers; typed storage specialization, escape analysis and scalar replacement are the next backend milestone. |
 | Platform verification | Current local acceptance covers the active host. The required macOS/Linux matrix, pinned CPython fork/revision matrix, free-threaded ABI, ASan, and UBSan runs remain outstanding. |
 
@@ -137,6 +138,7 @@ The extension contains string attributes with these exact meanings:
 | `__pymeta_semantic_sha256__` | SHA-256 of the location-free CPython AST normalization |
 | `__pymeta_compiler_version__` | stable compiler protocol/version string |
 | `__pymeta_cpython_revision__` | exact selected CPython `sys.version` |
+| `__pymeta_cpython_source_revision__` | pinned CPython source revision whose scheduling semantics are implemented |
 | `__pymeta_target__` | selected CPython `sysconfig.get_platform()` |
 | `__pymeta_architecture__` | selected CPython `platform.machine()` |
 | `__pymeta_optimization__` | normalized mode, currently `release` |
@@ -165,6 +167,11 @@ Python-callable.
   dispatcher strongly retains the imported extension. A failure leaves the
   previous dispatcher unchanged; there is no Python fallback in
   `native-required` mode.
+
+The production event-loop facade uses an automatic variant of this rule. It
+accepts only the complete native factory/type/method surface and otherwise
+calls `asyncio.new_event_loop()` directly. It never selects the interpreted
+custom-loop oracle.
 
 ## macOS and Linux
 

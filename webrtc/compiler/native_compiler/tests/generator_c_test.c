@@ -30,7 +30,8 @@ int main(void) {
     CHECK(file != NULL);
     CHECK(wrtc_emit_extension(file, "fixture_native", program,
                               "source-hash", "semantic-hash", "revision",
-                              "target", "architecture") == 0);
+                              "target", "architecture", ".fixture.so",
+                              NULL) == 0);
     CHECK(fflush(file) == 0 && fseek(file, 0, SEEK_END) == 0);
     length = ftell(file);
     CHECK(length > 0 && fseek(file, 0, SEEK_SET) == 0);
@@ -40,6 +41,10 @@ int main(void) {
     text[length] = '\0';
     CHECK(strstr(text, "PyInit_fixture_native") != NULL);
     CHECK(strstr(text, "wrtc-pymeta-compiler/0.3") != NULL);
+    CHECK(strstr(text, "__pymeta_cache_tag__") != NULL);
+    CHECK(strstr(text, "__pymeta_abi_flags__") != NULL);
+    CHECK(strstr(text, "__pymeta_extension_suffix__") != NULL);
+    CHECK(strstr(text, ".fixture.so") != NULL);
     CHECK(strstr(text, "source_bytes") == NULL);
     CHECK(strstr(text, "Py_CompileString") == NULL);
     CHECK(strstr(text, "PyEval_EvalCode") == NULL);

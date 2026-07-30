@@ -26,7 +26,7 @@ import time
 import tracemalloc
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -35,9 +35,23 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from webrtc.compiler import kernel_e, runtime  # noqa: E402
 from webrtc.compiler.module_compiler import compile_module  # noqa: E402
+from webrtc.compiler.native_artifact import load_native_artifact  # noqa: E402
+from webrtc.event_loop.compile_policy import (  # noqa: E402
+    DEVELOPMENT_REQUIREMENTS,
+    NATIVE_CLASS,
+    NATIVE_FACTORY,
+    NATIVE_REQUIREMENTS,
+    require_compatible_host,
+)
+from webrtc.event_loop.loop import new_event_loop as reference_loop_factory  # noqa: E402
 
 
 Mode = Literal["python", "native-required"]
+EventLoopMode = Literal[
+    "reference",
+    "compiled-required",
+    "compiled-development",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +237,70 @@ async def _paced_workload(
     return counters, lag_samples
 
 
+def _event_loop_factory(
+    mode: EventLoopMode,
+    artifact: Path | None,
+) -> tuple[Callable[[], asyncio.AbstractEventLoop], dict[str, Any]]:
+    if mode == "reference":
+        if artifact is not None:
+            raise ValueError("reference event-loop mode does not accept an artifact")
+        return reference_loop_factory, {
+            "module": "webrtc.event_loop.loop",
+            "class": "WebRTCSelectorEventLoop",
+            "mode": "reference",
+        }
+    if mode not in ("compiled-required", "compiled-development"):
+        raise ValueError(f"unsupported event-loop mode: {mode}")
+    if artifact is None:
+        raise ValueError(f"{mode} event-loop mode needs an artifact")
+
+    if mode == "compiled-required":
+        require_compatible_host()
+        requirements = NATIVE_REQUIREMENTS
+    else:
+        requirements = DEVELOPMENT_REQUIREMENTS
+    artifact = artifact.expanduser().resolve()
+    native = load_native_artifact(artifact, requirements)
+    loop_type = getattr(native, NATIVE_CLASS)
+    native_factory = getattr(native, NATIVE_FACTORY)
+
+    def checked_factory() -> asyncio.AbstractEventLoop:
+        loop = native_factory()
+        if type(loop) is not loop_type:
+            if isinstance(loop, asyncio.AbstractEventLoop):
+                loop.close()
+            raise RuntimeError(
+                "compiled event-loop factory did not return its exported native class"
+            )
+        return loop
+
+    return checked_factory, {
+        "module": loop_type.__module__,
+        "class": loop_type.__qualname__,
+        "mode": mode,
+        "artifact": str(artifact),
+        "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        "production_compatible": mode == "compiled-required",
+    }
+
+
+def _run_on_event_loop(
+    coroutine: Any,
+    loop_factory: Callable[[], asyncio.AbstractEventLoop],
+    implementation: dict[str, Any],
+) -> tuple[tuple[Counters, list[float]], dict[str, Any]]:
+    """Run one isolated workload on the already-resolved explicit loop path."""
+    with asyncio.Runner(loop_factory=loop_factory) as runner:
+        loop = runner.get_loop()
+        if (
+            type(loop).__module__ != implementation["module"]
+            or type(loop).__qualname__ != implementation["class"]
+        ):
+            raise RuntimeError("asyncio.Runner did not use the requested event loop")
+        result = runner.run(coroutine)
+    return result, implementation
+
+
 def _percentile(values: list[float], percentile: float) -> float:
     if not values:
         return 0.0
@@ -272,14 +350,26 @@ def _allocation_probe(
 
 
 def run_worker(
-    mode: Mode, artifact: Path | None, config: BenchmarkConfig
+    mode: Mode,
+    artifact: Path | None,
+    config: BenchmarkConfig,
+    *,
+    event_loop_mode: EventLoopMode = "reference",
+    event_loop_artifact: Path | None = None,
 ) -> dict[str, Any]:
     config.validate()
     _configure_mode(mode, artifact)
     implementation = runtime.loaded_kernel_e_module()
+    loop_factory, event_loop_implementation = _event_loop_factory(
+        event_loop_mode, event_loop_artifact
+    )
     corpus = build_corpus(config)
     if config.warmup_seconds:
-        asyncio.run(_paced_workload(config, corpus, config.warmup_seconds))
+        _run_on_event_loop(
+            _paced_workload(config, corpus, config.warmup_seconds),
+            loop_factory,
+            event_loop_implementation,
+        )
     gc.collect()
     gc_was_enabled = gc.isenabled()
     if gc_was_enabled:
@@ -287,8 +377,10 @@ def run_worker(
     try:
         cpu_start = time.process_time_ns()
         wall_start = time.perf_counter_ns()
-        counters, lag = asyncio.run(
-            _paced_workload(config, corpus, config.duration_seconds)
+        (counters, lag), event_loop_implementation = _run_on_event_loop(
+            _paced_workload(config, corpus, config.duration_seconds),
+            loop_factory,
+            event_loop_implementation,
         )
         wall_seconds = (time.perf_counter_ns() - wall_start) / 1_000_000_000
         cpu_seconds = (time.process_time_ns() - cpu_start) / 1_000_000_000
@@ -337,13 +429,18 @@ def run_worker(
                     implementation, "__pymeta_optimization__", None
                 ),
             },
+            "event_loop": event_loop_implementation,
         }
     )
     return result
 
 
 def _run_worker_process(
-    mode: Mode, artifact: Path | None, config_path: Path
+    mode: Mode,
+    artifact: Path | None,
+    config_path: Path,
+    event_loop_mode: EventLoopMode,
+    event_loop_artifact: Path | None,
 ) -> dict[str, Any]:
     command = [
         sys.executable,
@@ -352,9 +449,13 @@ def _run_worker_process(
         mode,
         "--config-json",
         str(config_path),
+        "--event-loop",
+        event_loop_mode,
     ]
     if artifact is not None:
         command.extend(("--artifact", str(artifact)))
+    if event_loop_artifact is not None:
+        command.extend(("--event-loop-artifact", str(event_loop_artifact)))
     completed = subprocess.run(
         command,
         cwd=REPOSITORY_ROOT,
@@ -415,11 +516,29 @@ def _paired_bootstrap_upper_bound(
 
 
 def run_controller(
-    config: BenchmarkConfig, pairs: int, artifact: Path | None
+    config: BenchmarkConfig,
+    pairs: int,
+    artifact: Path | None,
+    *,
+    event_loop_mode: EventLoopMode = "reference",
+    event_loop_artifact: Path | None = None,
 ) -> dict[str, Any]:
     config.validate()
     if pairs < 7:
         raise ValueError("isolated benchmark requires at least seven AB/BA pairs")
+    if event_loop_mode == "reference" and event_loop_artifact is not None:
+        raise ValueError("reference event-loop mode does not accept an artifact")
+    if (
+        event_loop_mode in ("compiled-required", "compiled-development")
+        and event_loop_artifact is None
+    ):
+        raise ValueError(f"{event_loop_mode} event-loop mode needs an artifact")
+    if event_loop_mode not in (
+        "reference",
+        "compiled-required",
+        "compiled-development",
+    ):
+        raise ValueError(f"unsupported event-loop mode: {event_loop_mode}")
     source = Path(kernel_e.__file__).resolve()
     source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
     with tempfile.TemporaryDirectory(prefix="kernel-e-benchmark-") as temporary:
@@ -440,7 +559,13 @@ def run_controller(
             )
             orders.append(list(order))
             for position, mode in enumerate(order):
-                sample = _run_worker_process(mode, artifact, config_path)
+                sample = _run_worker_process(
+                    mode,
+                    artifact,
+                    config_path,
+                    event_loop_mode,
+                    event_loop_artifact,
+                )
                 sample["pair"] = pair_index + 1
                 sample["position"] = position + 1
                 samples.append(sample)
@@ -469,6 +594,8 @@ def run_controller(
                     f"Python/native workload parity failed for {field}: "
                     f"{sample[field]!r} != {reference[field]!r}"
                 )
+        if sample["event_loop"] != reference["event_loop"]:
+            raise RuntimeError("benchmark workers used different event-loop artifacts")
     for sample in native_samples:
         embedded_source_hash = sample["implementation"]["source_sha256"]
         if embedded_source_hash != source_hash:
@@ -506,6 +633,7 @@ def run_controller(
         "machine": platform.machine(),
         "logical_cpu_count": os.cpu_count(),
         "config": asdict(config),
+        "event_loop": reference["event_loop"],
         "pair_orders": orders,
         "samples": samples,
         "aggregate": {
@@ -555,6 +683,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--packet-loss-ppm", type=int, default=0)
     parser.add_argument("--allocation-calls", type=int, default=64)
     parser.add_argument("--artifact", type=Path)
+    parser.add_argument(
+        "--event-loop",
+        choices=("reference", "compiled-required", "compiled-development"),
+        default="reference",
+    )
+    parser.add_argument("--event-loop-artifact", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--worker", choices=("python", "native-required"))
     parser.add_argument("--config-json", type=Path)
@@ -567,7 +701,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.config_json is None:
             raise SystemExit("--worker requires --config-json")
         config = BenchmarkConfig(**json.loads(args.config_json.read_text()))
-        result = run_worker(args.worker, args.artifact, config)
+        result = run_worker(
+            args.worker,
+            args.artifact,
+            config,
+            event_loop_mode=args.event_loop,
+            event_loop_artifact=args.event_loop_artifact,
+        )
     else:
         config = BenchmarkConfig(
             duration_seconds=args.duration,
@@ -579,7 +719,13 @@ def main(argv: list[str] | None = None) -> int:
             allocation_calls=args.allocation_calls,
             packet_loss_ppm=args.packet_loss_ppm,
         )
-        result = run_controller(config, args.pairs, args.artifact)
+        result = run_controller(
+            config,
+            args.pairs,
+            args.artifact,
+            event_loop_mode=args.event_loop,
+            event_loop_artifact=args.event_loop_artifact,
+        )
     rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output is not None and not args.worker:
         args.output.parent.mkdir(parents=True, exist_ok=True)

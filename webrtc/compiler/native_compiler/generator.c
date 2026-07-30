@@ -838,7 +838,8 @@ int wrtc_emit_extension(FILE *file, const char *module,
                         const WrtcLoweringProgram *program,
                         const char *source_hash, const char *semantic_hash,
                         const char *revision, const char *target,
-                        const char *architecture) {
+                        const char *architecture, const char *extension_suffix,
+                        PyObject *artifact_metadata) {
     size_t i, j, public_count = 0u;
     static const char runtime[] =
         "#define PY_SSIZE_T_CLEAN\n#include <Python.h>\n#include <structmember.h>\n#include <stddef.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
@@ -966,6 +967,33 @@ int wrtc_emit_extension(FILE *file, const char *module,
         if (fprintf(file, "callable=make_callable(%zu);if(!callable)goto error;if(PyModule_AddObjectRef(module,", i) < 0 || quoted(file, program->functions[i].name) < 0 || fputs(",callable)<0||PyDict_SetItemString(registry,", file) < 0 || quoted(file, program->functions[i].name) < 0 || fputs(",callable)<0)goto error;PyTuple_SET_ITEM(all,(Py_ssize_t)pos++,PyUnicode_FromString(", file) < 0 || quoted(file, program->functions[i].name) < 0 || fputs("));Py_CLEAR(callable);\n", file) < 0) return -1;
     }
     if (fputs("if(PyModule_AddObjectRef(module,\"__all__\",all)<0)goto error;types=PyImport_ImportModule(\"types\");factory=types?PyObject_GetAttrString(types,\"MappingProxyType\"):NULL;proxy=factory?PyObject_CallOneArg(factory,registry):NULL;if(!proxy||PyModule_AddObjectRef(module,\"__pymeta_functions__\",proxy)<0)goto error;", file) < 0) return -1;
-    if (emit_meta_string(file,"__pymeta_source_sha256__",source_hash)<0 || emit_meta_string(file,"__pymeta_semantic_sha256__",semantic_hash)<0 || emit_meta_string(file,"__pymeta_compiler_version__","wrtc-pymeta-compiler/0.3")<0 || emit_meta_string(file,"__pymeta_cpython_revision__",revision)<0 || emit_meta_string(file,"__pymeta_target__",target)<0 || emit_meta_string(file,"__pymeta_architecture__",architecture)<0 || emit_meta_string(file,"__pymeta_optimization__","release")<0) return -1;
+    if (emit_meta_string(file,"__pymeta_source_sha256__",source_hash)<0 || emit_meta_string(file,"__pymeta_semantic_sha256__",semantic_hash)<0 || emit_meta_string(file,"__pymeta_compiler_version__","wrtc-pymeta-compiler/0.3")<0 || emit_meta_string(file,"__pymeta_cpython_revision__",revision)<0 || emit_meta_string(file,"__pymeta_cpython_source_revision__","070700ed4d95c16855603cecab3f41f3b587f973")<0 || emit_meta_string(file,"__pymeta_target__",target)<0 || emit_meta_string(file,"__pymeta_architecture__",architecture)<0) return -1;
+    if (fputs("constant=PySys_GetObject(\"implementation\");constant=constant?PyObject_GetAttrString(constant,\"cache_tag\"):NULL;if(constant==Py_None){Py_DECREF(constant);constant=PyUnicode_FromString(\"\");}if(!constant||PyModule_AddObject(module,\"__pymeta_cache_tag__\",constant)<0)goto error;constant=NULL;",file)<0) return -1;
+    if (fputs("constant=PySys_GetObject(\"abiflags\");constant=constant?Py_NewRef(constant):PyUnicode_FromString(\"\");if(!constant||PyModule_AddObject(module,\"__pymeta_abi_flags__\",constant)<0)goto error;constant=NULL;",file)<0) return -1;
+    if (emit_meta_string(file,"__pymeta_extension_suffix__",extension_suffix)<0) return -1;
+    if (emit_meta_string(file,"__pymeta_optimization__","release")<0) return -1;
+    if (artifact_metadata != NULL) {
+        PyObject *key, *value;
+        Py_ssize_t position = 0;
+        while (PyDict_Next(artifact_metadata, &position, &key, &value)) {
+            const char *key_text = PyUnicode_AsUTF8(key);
+            const char *value_text = PyUnicode_AsUTF8(value);
+            char *attribute;
+            size_t length;
+            if (key_text == NULL || value_text == NULL) return -1;
+            length = strlen(key_text) + sizeof "__pymeta___";
+            attribute = malloc(length);
+            if (attribute == NULL) {
+                PyErr_NoMemory();
+                return -1;
+            }
+            (void)snprintf(attribute, length, "__pymeta_%s__", key_text);
+            if (emit_meta_string(file, attribute, value_text) < 0) {
+                free(attribute);
+                return -1;
+            }
+            free(attribute);
+        }
+    }
     return fputs("Py_DECREF(all);Py_DECREF(registry);Py_DECREF(types);Py_DECREF(factory);Py_DECREF(proxy);return module;error:nv_clear(&constant_native);Py_XDECREF(constant);Py_XDECREF(callable);Py_XDECREF(all);Py_XDECREF(registry);Py_XDECREF(types);Py_XDECREF(factory);Py_XDECREF(proxy);Py_XDECREF(module);return NULL;}\n", file) < 0 ? -1 : 0;
 }

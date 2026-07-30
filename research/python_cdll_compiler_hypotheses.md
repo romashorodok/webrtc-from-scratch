@@ -341,6 +341,13 @@ A native worker and bounded SPSC rings can integrate with the existing asyncio
 event loop through one notification file descriptor, eliminating
 `run_in_executor`, native-to-Python callbacks, and one Future per packet.
 
+This Track B hypothesis is intentionally limited to connecting a completion
+ring to an existing Python event loop.  A drop-in
+`asyncio.SelectorEventLoop` subclass is a CPython-extension type: it depends on
+CPython object ownership, heap-type inheritance, bound methods, exceptions,
+contexts, and the selected interpreter ABI.  Compiling such a loop therefore
+belongs to the CPython native-module track and is not an expansion of H19.
+
 ```text
 Python submits descriptor -> native input ring
 native processes work     -> completion ring

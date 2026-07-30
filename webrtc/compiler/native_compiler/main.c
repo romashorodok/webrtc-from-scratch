@@ -8,6 +8,8 @@
 #include "compiler_core.h"
 #include "generator.h"
 #include "lowering.h"
+#include "native_class.h"
+#include "native_class_generator.h"
 
 #ifndef WRTC_PYTHON_EXECUTABLE
 #error "WRTC_PYTHON_EXECUTABLE is required"
@@ -16,7 +18,12 @@
 #error "WRTC_PYTHON_VERSION is required"
 #endif
 
-typedef struct { const char *source; const char *output; int json; } Options;
+typedef struct {
+    const char *source;
+    const char *output;
+    const char *metadata;
+    int json;
+} Options;
 
 static int usage(const char *p, const char *error) {
     if (error != NULL) (void)fprintf(stderr, "%s: %s\n", p, error);
@@ -25,16 +32,18 @@ static int usage(const char *p, const char *error) {
 }
 
 static int options(int argc, char **argv, Options *o) {
-    int i; o->source = NULL; o->output = NULL; o->json = 0;
+    int i; o->source = NULL; o->output = NULL; o->metadata = NULL; o->json = 0;
     for (i = 1; i < argc; i++) {
         const int source = strcmp(argv[i], "--source") == 0;
         const int output = strcmp(argv[i], "--output") == 0;
+        const int metadata = strcmp(argv[i], "--metadata-json") == 0;
         if (strcmp(argv[i], "--help") == 0) return usage(argv[0], NULL);
         if (strcmp(argv[i], "--result-json") == 0) { o->json = 1; continue; }
-        if (!source && !output) return usage(argv[0], "unknown argument");
+        if (!source && !output && !metadata) return usage(argv[0], "unknown argument");
         if (++i >= argc) return usage(argv[0], "path argument is missing");
         if (source) { if (o->source != NULL) return usage(argv[0], "duplicate --source"); o->source = argv[i]; }
         if (output) { if (o->output != NULL) return usage(argv[0], "duplicate --output"); o->output = argv[i]; }
+        if (metadata) { if (o->metadata != NULL) return usage(argv[0], "duplicate --metadata-json"); o->metadata = argv[i]; }
     }
     if (o->source == NULL || o->output == NULL) return usage(argv[0], "--source and --output are required");
     return -1;
@@ -48,6 +57,44 @@ static char *read_file(const char *path, size_t *length) {
     if (data == NULL) { fclose(file); return NULL; }
     if (fread(data, 1, (size_t)end, file) != (size_t)end) { free(data); fclose(file); return NULL; }
     data[end] = '\0'; *length = (size_t)end; fclose(file); return data;
+}
+
+static PyObject *read_metadata(const char *path) {
+    char *source;
+    size_t length;
+    PyObject *json = NULL, *loads = NULL, *text = NULL, *result = NULL;
+    PyObject *key, *value;
+    Py_ssize_t position = 0;
+    if (path == NULL) return PyDict_New();
+    source = read_file(path, &length);
+    if (source == NULL) {
+        PyErr_SetFromErrnoWithFilename(PyExc_OSError, path);
+        return NULL;
+    }
+    json = PyImport_ImportModule("json");
+    loads = json == NULL ? NULL : PyObject_GetAttrString(json, "loads");
+    text = PyUnicode_DecodeUTF8(source, (Py_ssize_t)length, "strict");
+    free(source);
+    if (loads != NULL && text != NULL) result = PyObject_CallOneArg(loads, text);
+    Py_XDECREF(text);
+    Py_XDECREF(loads);
+    Py_XDECREF(json);
+    if (result == NULL) return NULL;
+    if (!PyDict_CheckExact(result)) {
+        Py_DECREF(result);
+        PyErr_SetString(PyExc_ValueError,
+                        "--metadata-json must contain a JSON object");
+        return NULL;
+    }
+    while (PyDict_Next(result, &position, &key, &value))
+        if (!PyUnicode_CheckExact(key) || !PyUnicode_CheckExact(value)) {
+            Py_DECREF(result);
+            PyErr_SetString(
+                PyExc_ValueError,
+                "--metadata-json keys and values must all be strings");
+            return NULL;
+        }
+    return result;
 }
 
 static int write_file(const char *path, const char *data) {
@@ -119,6 +166,55 @@ static char *python_fact(const char *module_name, const char *attribute, int cal
 done: Py_XDECREF(result); Py_XDECREF(value); Py_DECREF(module); return copy;
 }
 
+static PyObject *project_source_set(const char *entry) {
+    static const char discovery[] =
+        "import ast as _a\n"
+        "from pathlib import Path as _P\n"
+        "def _wrtc_sources(entry):\n"
+        "    pending=[_P(entry).resolve()]; seen=set(); result=[]\n"
+        "    while pending:\n"
+        "        path=pending.pop()\n"
+        "        if path in seen: continue\n"
+        "        seen.add(path); result.append(str(path))\n"
+        "        tree=_a.parse(path.read_text(encoding='utf-8'), filename=str(path))\n"
+        "        for node in _a.walk(tree):\n"
+        "            if not isinstance(node, _a.ImportFrom): continue\n"
+        "            names=[]\n"
+        "            if node.module: names.append(node.module)\n"
+        "            elif node.level: names.extend(x.name for x in node.names)\n"
+        "            for name in names:\n"
+        "                parts=name.split('.') if name else []\n"
+        "                candidates=[]\n"
+        "                if node.level:\n"
+        "                    base=path.parent\n"
+        "                    for _ in range(node.level-1): base=base.parent\n"
+        "                    candidates.append(base.joinpath(*parts).with_suffix('.py'))\n"
+        "                    candidates.append(base.joinpath(*parts,'__init__.py'))\n"
+        "                else:\n"
+        "                    for base in path.parents:\n"
+        "                        candidates.append(base.joinpath(*parts).with_suffix('.py'))\n"
+        "                        candidates.append(base.joinpath(*parts,'__init__.py'))\n"
+        "                for candidate in candidates:\n"
+        "                    if candidate.is_file(): pending.append(candidate.resolve()); break\n"
+        "    return tuple(result)\n";
+    PyObject *globals = PyDict_New();
+    PyObject *result = NULL, *function = NULL, *argument = NULL;
+    if (globals == NULL ||
+        PyDict_SetItemString(globals, "__builtins__", PyEval_GetBuiltins()) < 0)
+        goto done;
+    result = PyRun_String(discovery, Py_file_input, globals, globals);
+    if (result == NULL) goto done;
+    Py_CLEAR(result);
+    function = PyDict_GetItemString(globals, "_wrtc_sources");
+    argument = PyUnicode_DecodeFSDefault(entry);
+    if (function != NULL && argument != NULL)
+        result = PyObject_CallOneArg(function, argument);
+done:
+    Py_XDECREF(argument);
+    Py_XDECREF(globals);
+    return result;
+}
+
 static int py_call(const char *module_name, const char *name, PyObject *args, PyObject *kwargs, PyObject **out) {
     PyObject *module = PyImport_ImportModule(module_name), *function = NULL, *result = NULL;
     if (module == NULL) return -1; function = PyObject_GetAttrString(module, name);
@@ -132,7 +228,21 @@ static int run_command(const char *const *items) {
     if (list == NULL) return -1;
     for (i = 0; items[i] != NULL; i++) { PyObject *item = PyUnicode_DecodeFSDefault(items[i]); if (item == NULL || PyList_Append(list, item) < 0) { Py_XDECREF(item); goto done; } Py_DECREF(item); }
     args = PyTuple_Pack(1, list); kwargs = Py_BuildValue("{s:O,s:O}", "check", Py_True, "capture_output", Py_True);
-    if (args != NULL && kwargs != NULL && py_call("subprocess", "run", args, kwargs, &completed) == 0) status = 0;
+    if (args != NULL && kwargs != NULL &&
+        py_call("subprocess", "run", args, kwargs, &completed) == 0) {
+        status = 0;
+    } else if (PyErr_Occurred()) {
+        PyObject *type = NULL, *value = NULL, *traceback = NULL;
+        PyObject *stderr_value = NULL;
+        PyErr_Fetch(&type, &value, &traceback);
+        if (value != NULL)
+            stderr_value = PyObject_GetAttrString(value, "stderr");
+        if (stderr_value != NULL && PyBytes_Check(stderr_value))
+            PySys_WriteStderr("%s", PyBytes_AS_STRING(stderr_value));
+        Py_XDECREF(stderr_value);
+        PyErr_Clear();
+        PyErr_Restore(type, value, traceback);
+    }
 done: Py_XDECREF(completed); Py_XDECREF(kwargs); Py_XDECREF(args); Py_DECREF(list); return status;
 }
 
@@ -223,7 +333,7 @@ static int compile_module(const Options *o) {
     char *revision = NULL, *target = NULL, *arch = NULL, *temp = NULL;
     char *absolute_source = NULL, *absolute_output = NULL;
     char c_path[4096], cmake_path[4096], build_path[4096], built[4096], destination[4096], python_option[4096];
-    size_t source_n = 0; int status = -1; const char *configure[11], *build[7]; PyObject *exports = NULL; WrtcCompilerCore *core = NULL; WrtcLoweringProgram *program = NULL; FILE *generated = NULL;
+    size_t source_n = 0; int status = -1, native_emit = 0; const char *configure[11], *build[7]; PyObject *exports = NULL, *capability_report = NULL, *source_set = NULL, *artifact_metadata = NULL; WrtcCompilerCore *core = NULL; WrtcLoweringProgram *program = NULL; WrtcNativeClassProgram *native_classes = NULL; FILE *generated = NULL;
     static const char *cmake_format = "cmake_minimum_required(VERSION 3.25)\nproject(pymeta_extension LANGUAGES C)\nif(CMAKE_CROSSCOMPILING)\n message(FATAL_ERROR \"native extension cross-compiling is unsupported\")\nendif()\nfind_package(Python3 %s EXACT REQUIRED COMPONENTS Interpreter Development.Module)\nadd_library(native MODULE generated.c)\ntarget_compile_features(native PRIVATE c_std_17)\ntarget_link_libraries(native PRIVATE Python3::Module)\nset_target_properties(native PROPERTIES PREFIX \"\" OUTPUT_NAME \"%s\" SUFFIX \"%s\" C_STANDARD 17 C_STANDARD_REQUIRED YES C_EXTENSIONS NO C_VISIBILITY_PRESET hidden)\nif(MSVC)\n target_compile_options(native PRIVATE /W4 /WX)\nelse()\n target_compile_options(native PRIVATE -O3 -fvisibility=hidden -Wall -Wextra -Wconversion -Werror)\nendif()\n";
     char *cmake_text = NULL;
     absolute_source = absolute_path(o->source); absolute_output = absolute_path(o->output); if (absolute_source == NULL || absolute_output == NULL) goto done;
@@ -234,12 +344,101 @@ static int compile_module(const Options *o) {
         PyErr_SetString(PyExc_ValueError, "source or output path exceeds the bounded compiler path limit"); goto done;
     }
     source = read_file(absolute_source, &source_n); if (source == NULL) { PyErr_SetFromErrnoWithFilename(PyExc_OSError, absolute_source); goto done; }
+    artifact_metadata = read_metadata(o->metadata);
+    if (artifact_metadata == NULL) goto done;
     semantic = semantic_hash(source, source_n, absolute_source); source_hash = hash_bytes(source, source_n);
     if (semantic == NULL || source_hash == NULL) goto done;
-    if (wrtc_compiler_core_analyze(source, source_n, absolute_source, &core) < 0) goto done;
-    exports = Py_NewRef(core->exports);
-    if (exports == NULL || wrtc_lowering_build(core, &program) < 0) goto done;
     stem = module_stem(absolute_source); if (stem == NULL || !valid_identifier(stem)) { PyErr_SetString(PyExc_ValueError, "source stem must be a valid non-keyword Python identifier"); goto done; }
+    if (wrtc_native_class_analyze(source, source_n, absolute_source,
+                                  &native_classes) < 0) goto done;
+    source_set = project_source_set(absolute_source);
+    if (source_set == NULL) goto done;
+    {
+        Py_ssize_t dependency_index;
+        const Py_ssize_t dependency_count = PySequence_Size(source_set);
+        for (dependency_index = 0; dependency_index < dependency_count;
+             dependency_index++) {
+            PyObject *dependency =
+                PySequence_GetItem(source_set, dependency_index);
+            const char *dependency_path =
+                dependency == NULL ? NULL : PyUnicode_AsUTF8(dependency);
+            char *dependency_source = NULL;
+            size_t dependency_length = 0u;
+            WrtcNativeClassProgram *dependency_program = NULL;
+            if (dependency_path == NULL) {
+                Py_XDECREF(dependency);
+                goto done;
+            }
+            if (strcmp(dependency_path, absolute_source) != 0) {
+                dependency_source =
+                    read_file(dependency_path, &dependency_length);
+                if (dependency_source == NULL ||
+                    wrtc_native_class_analyze(
+                        dependency_source, dependency_length, dependency_path,
+                        &dependency_program) < 0 ||
+                    wrtc_native_class_merge(
+                        native_classes, dependency_program) < 0) {
+                    free(dependency_source);
+                    wrtc_native_class_free(dependency_program);
+                    Py_DECREF(dependency);
+                    goto done;
+                }
+                free(dependency_source);
+                wrtc_native_class_free(dependency_program);
+            }
+            Py_DECREF(dependency);
+        }
+    }
+    wrtc_native_class_resolve_calls(native_classes);
+    native_emit = wrtc_native_class_can_emit(native_classes);
+    if (wrtc_native_class_requires_lowering(native_classes) && !native_emit) {
+        PyObject *rendered;
+        const char *report_text;
+        capability_report = wrtc_native_class_capability_report(
+            native_classes, absolute_source);
+        rendered = capability_report == NULL ? NULL : PyObject_Repr(capability_report);
+        report_text = rendered == NULL ? NULL : PyUnicode_AsUTF8(rendered);
+        PyErr_Format(
+            PyExc_NotImplementedError,
+            "%s:%d:%d: error: native-class lowering requested for %s; "
+            "this backend cannot completely lower this native class set; "
+            "capability_report=%s",
+            absolute_source, native_classes->classes[0].span.line,
+            native_classes->classes[0].span.column,
+            native_classes->classes[0].name,
+            report_text == NULL ? "<unavailable>" : report_text);
+        Py_XDECREF(rendered);
+        goto done;
+    }
+    if (native_emit) {
+        size_t export_index;
+        exports = PyTuple_New((Py_ssize_t)(
+            native_classes->class_count + native_classes->factory_count));
+        if (exports == NULL) goto done;
+        for (export_index = 0u; export_index < native_classes->class_count;
+             export_index++) {
+            PyObject *name = PyUnicode_FromString(
+                native_classes->classes[export_index].name);
+            if (name == NULL) goto done;
+            PyTuple_SET_ITEM(exports, (Py_ssize_t)export_index, name);
+        }
+        for (export_index = 0u;
+             export_index < native_classes->factory_count; export_index++) {
+            PyObject *name = PyUnicode_FromString(
+                native_classes->factories[export_index].name);
+            if (name == NULL) goto done;
+            PyTuple_SET_ITEM(
+                exports,
+                (Py_ssize_t)(native_classes->class_count + export_index),
+                name);
+        }
+    } else {
+        if (wrtc_compiler_core_analyze(source, source_n, absolute_source,
+                                       &core) < 0) goto done;
+        exports = Py_NewRef(core->exports);
+        if (exports == NULL || wrtc_lowering_build(core, &program) < 0)
+            goto done;
+    }
     { size_t module_size = strlen(stem) + 8u; module = malloc(module_size); if (module == NULL) goto done; (void)snprintf(module, module_size, "%s_native", stem); }
     { PyObject *sc = PyImport_ImportModule("sysconfig"), *v = NULL; if (sc != NULL) v = PyObject_CallMethod(sc, "get_config_var", "s", "EXT_SUFFIX"); if (v != NULL && v != Py_None) suffix = copy_utf8(v); Py_XDECREF(v); Py_XDECREF(sc); }
     revision = python_fact("sys", "version", 0); target = python_fact("sysconfig", "get_platform", 1); arch = python_fact("platform", "machine", 1);
@@ -252,7 +451,13 @@ static int compile_module(const Options *o) {
     (void)snprintf(cmake_text, strlen(cmake_format) + strlen(WRTC_PYTHON_VERSION) + strlen(module) + strlen(suffix) + 1u, cmake_format, WRTC_PYTHON_VERSION, module, suffix);
     generated = fopen(c_path, "wb");
     if (generated == NULL) { PyErr_SetFromErrnoWithFilename(PyExc_OSError, c_path); goto done; }
-    if (wrtc_emit_extension(generated, module, program, source_hash, semantic, revision, target, arch) < 0) {
+    if ((native_emit
+             ? wrtc_emit_native_class_extension(
+                   generated, module, native_classes, source_hash, semantic,
+                   revision, target, arch, suffix, artifact_metadata)
+             : wrtc_emit_extension(generated, module, program, source_hash,
+                                   semantic, revision, target, arch,
+                                   suffix, artifact_metadata)) < 0) {
         (void)fclose(generated); generated = NULL; PyErr_SetString(PyExc_OSError, "could not emit generated C17 source"); goto done;
     }
     if (fclose(generated) != 0) { generated = NULL; PyErr_SetFromErrnoWithFilename(PyExc_OSError, c_path); goto done; }
@@ -267,7 +472,7 @@ static int compile_module(const Options *o) {
 done:
     if (generated != NULL) fclose(generated);
     { PyObject *type = NULL, *value = NULL, *traceback = NULL; if (status < 0) PyErr_Fetch(&type, &value, &traceback); cleanup(temp); if (status < 0) PyErr_Restore(type, value, traceback); }
-    Py_XDECREF(exports); wrtc_lowering_free(program); wrtc_compiler_core_free(core); free(cmake_text); free(temp); free(arch); free(target); free(revision); free(suffix); free(module); free(stem); free(source_hash); free(semantic); free(source); free(absolute_output); free(absolute_source); return status;
+    Py_XDECREF(artifact_metadata); Py_XDECREF(source_set); Py_XDECREF(capability_report); Py_XDECREF(exports); wrtc_native_class_free(native_classes); wrtc_lowering_free(program); wrtc_compiler_core_free(core); free(cmake_text); free(temp); free(arch); free(target); free(revision); free(suffix); free(module); free(stem); free(source_hash); free(semantic); free(source); free(absolute_output); free(absolute_source); return status;
 }
 
 static void print_error(void) {

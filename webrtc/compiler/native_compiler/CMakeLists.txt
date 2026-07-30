@@ -8,14 +8,37 @@ if(CMAKE_CROSSCOMPILING)
 endif()
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Embed Development.Module)
+find_package(Threads REQUIRED)
 
-add_library(wrtc-compiler-core STATIC compiler_core.c lowering.c native_runtime.c generator.c)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/boxed_executor.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/native_storage.c")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/boxed_executor.c"
+  WRTC_BOXED_EXECUTOR_HEX HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1,"
+  WRTC_BOXED_EXECUTOR_BYTES "${WRTC_BOXED_EXECUTOR_HEX}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/boxed_executor_source.h"
+  "static const unsigned char wrtc_boxed_executor_source[]={"
+  "${WRTC_BOXED_EXECUTOR_BYTES}0};\n")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/native_storage.c"
+  WRTC_NATIVE_STORAGE_HEX HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1,"
+  WRTC_NATIVE_STORAGE_BYTES "${WRTC_NATIVE_STORAGE_HEX}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/native_storage_source.h"
+  "static const unsigned char wrtc_native_storage_source[]={"
+  "${WRTC_NATIVE_STORAGE_BYTES}0};\n")
+
+add_library(wrtc-compiler-core STATIC boxed_codegen.c boxed_executor.c
+  boxed_module.c compiler_core.c lowering.c native_runtime.c generator.c
+  native_class.c native_class_generator.c native_operation.c native_storage.c
+  native_storage_codegen.c statement_ir.c)
 target_compile_features(wrtc-compiler-core PUBLIC c_std_17)
 set_target_properties(wrtc-compiler-core PROPERTIES
   C_STANDARD 17 C_STANDARD_REQUIRED YES C_EXTENSIONS NO
 )
 target_link_libraries(wrtc-compiler-core PUBLIC Python3::Python)
-target_include_directories(wrtc-compiler-core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_include_directories(wrtc-compiler-core PUBLIC
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
 
 add_executable(wrtc-pymeta-compiler-c main.c)
 target_compile_features(wrtc-pymeta-compiler-c PRIVATE c_std_17)
@@ -72,7 +95,86 @@ if(BUILD_TESTING)
   target_link_libraries(generator_c_test PRIVATE wrtc-compiler-core)
   add_test(NAME generator_c_test COMMAND generator_c_test)
 
-  foreach(test_target frontend_c_test ir_c_test runtime_c_test lowering_c_test generator_c_test)
+  add_executable(native_class_c_test tests/native_class_c_test.c)
+  target_link_libraries(native_class_c_test PRIVATE wrtc-compiler-core)
+  add_test(NAME native_class_c_test COMMAND native_class_c_test)
+
+  add_executable(statement_ir_c_test tests/statement_ir_c_test.c)
+  target_link_libraries(statement_ir_c_test PRIVATE wrtc-compiler-core)
+  add_test(NAME statement_ir_c_test COMMAND statement_ir_c_test)
+
+  add_executable(boxed_executor_c_test tests/boxed_executor_c_test.c)
+  target_link_libraries(boxed_executor_c_test PRIVATE wrtc-compiler-core)
+  add_test(NAME boxed_executor_c_test COMMAND boxed_executor_c_test)
+
+  add_executable(boxed_codegen_c_test tests/boxed_codegen_c_test.c)
+  target_link_libraries(boxed_codegen_c_test PRIVATE wrtc-compiler-core)
+  get_filename_component(WRTC_BOXED_PACKAGE_SOURCE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../event_loop/scheduler.py" ABSOLUTE)
+  target_compile_definitions(boxed_codegen_c_test PRIVATE
+    WRTC_BOXED_PACKAGE_SOURCE="${WRTC_BOXED_PACKAGE_SOURCE}"
+  )
+  add_test(NAME boxed_codegen_c_test COMMAND boxed_codegen_c_test)
+
+  add_executable(native_storage_c_test tests/native_storage_c_test.c)
+  target_link_libraries(native_storage_c_test PRIVATE wrtc-compiler-core)
+  add_test(NAME native_storage_c_test COMMAND native_storage_c_test)
+
+  add_executable(native_storage_codegen_c_test
+    tests/native_storage_codegen_c_test.c)
+  target_link_libraries(native_storage_codegen_c_test PRIVATE
+    wrtc-compiler-core)
+  add_test(NAME native_storage_codegen_c_test
+    COMMAND native_storage_codegen_c_test)
+
+  add_executable(native_atomic_c_test tests/native_atomic_c_test.c)
+  target_link_libraries(native_atomic_c_test PRIVATE
+    wrtc-compiler-core Threads::Threads)
+  add_test(NAME native_atomic_c_test COMMAND native_atomic_c_test)
+
+  add_executable(native_mpsc_c_test tests/native_mpsc_c_test.c)
+  target_link_libraries(native_mpsc_c_test PRIVATE
+    wrtc-compiler-core Threads::Threads)
+  add_test(NAME native_mpsc_c_test COMMAND native_mpsc_c_test)
+
+  add_executable(native_spsc_c_test tests/native_spsc_c_test.c)
+  target_link_libraries(native_spsc_c_test PRIVATE
+    wrtc-compiler-core Threads::Threads)
+  add_test(NAME native_spsc_c_test COMMAND native_spsc_c_test)
+
+  add_executable(mpsc_proof_c_test tests/mpsc_proof_c_test.c)
+  target_link_libraries(mpsc_proof_c_test PRIVATE wrtc-compiler-core)
+  get_filename_component(WRTC_MPSC_PROOF_SOURCE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../event_loop/mpsc_proof_fixture.py"
+    ABSOLUTE)
+  target_compile_definitions(mpsc_proof_c_test PRIVATE
+    WRTC_MPSC_PROOF_SOURCE="${WRTC_MPSC_PROOF_SOURCE}"
+  )
+  add_test(NAME mpsc_proof_c_test COMMAND mpsc_proof_c_test)
+
+  add_executable(native_operation_c_test tests/native_operation_c_test.c)
+  target_link_libraries(native_operation_c_test PRIVATE wrtc-compiler-core)
+  get_filename_component(WRTC_LOOP_SOURCE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../event_loop/loop.py" ABSOLUTE)
+  get_filename_component(WRTC_SCHEDULER_SOURCE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../event_loop/scheduler.py" ABSOLUTE)
+  target_compile_definitions(native_operation_c_test PRIVATE
+    WRTC_LOOP_SOURCE="${WRTC_LOOP_SOURCE}"
+    WRTC_SCHEDULER_SOURCE="${WRTC_SCHEDULER_SOURCE}"
+  )
+  add_test(NAME native_operation_c_test COMMAND native_operation_c_test)
+
+  add_executable(capability_report_c_test tests/capability_report_c_test.c)
+  target_link_libraries(capability_report_c_test PRIVATE wrtc-compiler-core)
+  get_filename_component(WRTC_CAPABILITY_SOURCE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../event_loop/capability_fixture.py"
+    ABSOLUTE)
+  target_compile_definitions(capability_report_c_test PRIVATE
+    WRTC_CAPABILITY_SOURCE="${WRTC_CAPABILITY_SOURCE}"
+  )
+  add_test(NAME capability_report_c_test COMMAND capability_report_c_test)
+
+  foreach(test_target frontend_c_test ir_c_test runtime_c_test lowering_c_test generator_c_test native_class_c_test statement_ir_c_test boxed_executor_c_test boxed_codegen_c_test native_storage_c_test native_storage_codegen_c_test native_atomic_c_test native_mpsc_c_test native_spsc_c_test mpsc_proof_c_test native_operation_c_test capability_report_c_test)
     set_target_properties(${test_target} PROPERTIES
       C_STANDARD 17 C_STANDARD_REQUIRED YES C_EXTENSIONS NO
     )
