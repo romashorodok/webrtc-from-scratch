@@ -3,6 +3,7 @@
 #include "native_operation.h"
 #include "native_storage.h"
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -527,6 +528,84 @@ static unsigned atomic_uint_width(PyObject *node) {
     }
     Py_DECREF(fields);
     return result;
+}
+
+static unsigned representation_width(PyObject *node,
+                                     const char *representation_name) {
+    PyObject *value = NULL, *slice = NULL, *raw = NULL;
+    PyObject *fields;
+    Py_ssize_t index, count;
+    unsigned result = 0u;
+    long width;
+    if (node == NULL) return 0u;
+    if (is_kind(node, "Subscript")) {
+        value = attr(node, "value");
+        slice = attr(node, "slice");
+        if (value != NULL && final_name_is(value, representation_name) &&
+            slice != NULL && is_kind(slice, "Constant"))
+            raw = attr(slice, "value");
+        width = raw != NULL && PyLong_CheckExact(raw)
+                    ? PyLong_AsLong(raw) : 0;
+        if (!PyErr_Occurred() && width > 0 && width <= 64)
+            result = (unsigned)width;
+        else
+            PyErr_Clear();
+        Py_XDECREF(raw);
+        Py_XDECREF(slice);
+        Py_XDECREF(value);
+        if (result != 0u) return result;
+    }
+    fields = attr(node, "_fields");
+    if (fields == NULL) {
+        PyErr_Clear();
+        return 0u;
+    }
+    count = PySequence_Size(fields);
+    for (index = 0; index < count && result == 0u; index++) {
+        PyObject *field = PySequence_GetItem(fields, index);
+        const char *name = field == NULL ? NULL : PyUnicode_AsUTF8(field);
+        PyObject *child = name == NULL ? NULL : attr(node, name);
+        Py_XDECREF(field);
+        if (child == NULL) continue;
+        if (PyList_Check(child) || PyTuple_Check(child)) {
+            Py_ssize_t item_index, item_count = PySequence_Size(child);
+            for (item_index = 0; item_index < item_count && result == 0u;
+                 item_index++) {
+                PyObject *item = PySequence_GetItem(child, item_index);
+                result = representation_width(item, representation_name);
+                Py_XDECREF(item);
+            }
+        } else
+            result = representation_width(child, representation_name);
+        Py_DECREF(child);
+    }
+    Py_DECREF(fields);
+    return result;
+}
+
+static WrtcWorkerRecordFieldKind worker_record_field_kind(
+    PyObject *annotation, unsigned *width) {
+    const unsigned uint_width = representation_width(annotation, "uint");
+    const unsigned sint_width = representation_width(annotation, "sint");
+    const unsigned float_width = representation_width(annotation, "float_");
+    if (width != NULL) *width = 0u;
+    if (uint_width != 0u) {
+        if (width != NULL) *width = uint_width;
+        return WRTC_WORKER_FIELD_UINT;
+    }
+    if (sint_width != 0u) {
+        if (width != NULL) *width = sint_width;
+        return WRTC_WORKER_FIELD_SINT;
+    }
+    if (float_width == 32u || float_width == 64u) {
+        if (width != NULL) *width = float_width;
+        return WRTC_WORKER_FIELD_FLOAT;
+    }
+    if (expression_contains(annotation, "buffer") &&
+        (expression_contains(annotation, "read") ||
+         expression_contains(annotation, "readonly")))
+        return WRTC_WORKER_FIELD_READONLY_BUFFER;
+    return WRTC_WORKER_FIELD_UNSUPPORTED;
 }
 
 static WrtcTypeKind annotation_type(PyObject *annotation) {
@@ -1219,17 +1298,43 @@ int wrtc_native_class_analyze(const char *source, size_t source_length,
             record->filename = copy_text(filename);
             record->span = span_of(node);
             record->representation_proven = 1u;
+            record->fields =
+                calloc((size_t)member_count, sizeof(*record->fields));
+            if (member_count != 0 && record->fields == NULL) {
+                free(record_abi);
+                Py_XDECREF(members);
+                Py_DECREF(node);
+                Py_CLEAR(body);
+                wrtc_native_class_free(program);
+                program = NULL;
+                PyErr_NoMemory();
+                goto parse_error;
+            }
             for (member_index = 0; member_index < member_count;
                  member_index++) {
                 PyObject *member = PySequence_GetItem(members, member_index);
                 if (member != NULL && is_kind(member, "AnnAssign")) {
                     PyObject *annotation = attr(member, "annotation");
+                    PyObject *target = attr(member, "target");
+                    WrtcWorkerRecordFieldIR *field =
+                        &record->fields[record->field_count];
+                    field->name =
+                        target != NULL && is_kind(target, "Name")
+                            ? node_name(target) : NULL;
+                    field->declared_type =
+                        annotation_declared_type(annotation);
+                    field->span = span_of(member);
+                    field->kind =
+                        worker_record_field_kind(annotation, &field->width);
+                    field->noescape =
+                        expression_contains(annotation, "lifetime") ||
+                        expression_contains(annotation, "noescape");
+                    field->immutable =
+                        field->kind != WRTC_WORKER_FIELD_READONLY_BUFFER ||
+                        (field->declared_type != NULL &&
+                         strcmp(field->declared_type, "bytes") == 0);
                     record->field_count++;
-                    if (annotation == NULL ||
-                        !(expression_contains(annotation, "uint") ||
-                          expression_contains(annotation, "sint") ||
-                          expression_contains(annotation, "float_") ||
-                          expression_contains(annotation, "buffer"))) {
+                    if (field->kind == WRTC_WORKER_FIELD_UNSUPPORTED) {
                         /*
                          * CPython-native queues may retain an exact Python
                          * record as one owned object.  Its non-native fields
@@ -1238,6 +1343,7 @@ int wrtc_native_class_analyze(const char *source, size_t source_length,
                          */
                         record->boxed_field_count++;
                     }
+                    Py_XDECREF(target);
                     Py_XDECREF(annotation);
                 }
                 Py_XDECREF(member);
@@ -1257,6 +1363,25 @@ int wrtc_native_class_analyze(const char *source, size_t source_length,
                 record->abi_declared &&
                 (record->boxed_field_count == 0u ||
                  record->boxed_ownership_proven);
+            record->worker_abi_eligible =
+                record->abi_declared &&
+                record->boxed_field_count == 0u &&
+                record->field_count != 0u &&
+                record->boxed_ownership_proven;
+            if (record->worker_abi_eligible) {
+                size_t field_index;
+                for (field_index = 0u;
+                     field_index < record->field_count; field_index++) {
+                    const WrtcWorkerRecordFieldIR *field =
+                        &record->fields[field_index];
+                    if (field->name == NULL ||
+                        (field->kind == WRTC_WORKER_FIELD_READONLY_BUFFER &&
+                         (!field->noescape || !field->immutable))) {
+                        record->worker_abi_eligible = 0u;
+                        break;
+                    }
+                }
+            }
             free(record_abi);
             Py_XDECREF(members);
         }
@@ -1583,6 +1708,144 @@ done:
 static int region_owner_is(const WrtcNativeRegionIR *region,
                            const char *owner) {
     return region->owner != NULL && strcmp(region->owner, owner) == 0;
+}
+
+static const WrtcTypedRecordIR *worker_record_for_type(
+    const WrtcNativeClassProgram *program, const char *type_name) {
+    char final_name[256];
+    size_t index;
+    if (final_type_name(type_name, final_name, sizeof final_name) == NULL)
+        return NULL;
+    for (index = 0u; index < program->record_count; index++)
+        if (strcmp(program->records[index].name, final_name) == 0)
+            return &program->records[index];
+    return NULL;
+}
+
+static int worker_call_is_record_constructor(
+    const WrtcNativeClassProgram *program, const char *target) {
+    const WrtcTypedRecordIR *record =
+        worker_record_for_type(program, target);
+    return record != NULL && record->worker_abi_eligible;
+}
+
+static int worker_region_reachable(
+    const WrtcNativeClassProgram *program, size_t class_index,
+    size_t region_index, size_t region_stride, unsigned char *visiting,
+    const char **reason) {
+    const WrtcNativeRegionIR *region =
+        &program->classes[class_index].regions[region_index];
+    size_t call_index;
+    const size_t flat_index = class_index * region_stride + region_index;
+    if (region->policy != WRTC_REGION_REQUIRED) {
+        *reason = "reachable worker callee is not a required region";
+        return 0;
+    }
+    /* A recursion cycle is safe only after every edge resolves exactly. */
+    if (visiting[flat_index] != 0u) return 1;
+    visiting[flat_index] = 1u;
+    for (call_index = 0u; call_index < region->call_count; call_index++) {
+        const WrtcNativeCallEdgeIR *edge = &region->calls[call_index];
+        if (worker_call_is_record_constructor(program, edge->target))
+            continue;
+        if (!edge->resolved || !edge->required_callee ||
+            !edge->exact_receiver) {
+            *reason =
+                edge->target != NULL &&
+                        strstr(edge->target, "_processor") != NULL
+                    ? "worker reaches constructor-injected Python "
+                      "_processor callable"
+                    : "worker reaches an unresolved or dynamic Python call";
+            return 0;
+        }
+        if (!worker_region_reachable(
+                program, edge->target_class, edge->target_region,
+                region_stride, visiting, reason))
+            return 0;
+    }
+    return 1;
+}
+
+static void finalize_worker_proofs(WrtcNativeClassProgram *program) {
+    size_t class_index, region_index;
+    size_t region_stride = 1u, visiting_size;
+    unsigned char *visiting;
+    if (program != NULL)
+        for (class_index = 0u; class_index < program->class_count;
+             class_index++)
+            if (program->classes[class_index].region_count > region_stride)
+                region_stride =
+                    program->classes[class_index].region_count;
+    if (program == NULL ||
+        program->class_count > SIZE_MAX / region_stride) {
+        PyErr_NoMemory();
+        return;
+    }
+    visiting_size = program->class_count * region_stride;
+    visiting = visiting_size == 0u ? NULL : calloc(visiting_size, 1u);
+    if (visiting_size != 0u && visiting == NULL) {
+        PyErr_Clear();
+        return;
+    }
+    for (class_index = 0u; class_index < program->class_count;
+         class_index++) {
+        WrtcNativeClassIR *class_ir = &program->classes[class_index];
+        for (region_index = 0u; region_index < class_ir->region_count;
+             region_index++) {
+            WrtcNativeRegionIR *region = &class_ir->regions[region_index];
+            const WrtcTypedRecordIR *input = NULL, *output;
+            const char *reason = NULL;
+            size_t parameter_index;
+            if ((region->capabilities & WRTC_REGION_OWNED_SHARD) == 0u)
+                continue;
+            for (parameter_index = 0u;
+                 region->signature != NULL &&
+                 parameter_index < region->signature->parameter_count;
+                 parameter_index++) {
+                const WrtcPyParameterIR *parameter =
+                    &region->signature->parameters[parameter_index];
+                if (strcmp(parameter->name, "self") != 0) {
+                    input = worker_record_for_type(
+                        program, parameter->annotation);
+                    break;
+                }
+            }
+            output = worker_record_for_type(program, region->result_type);
+            region->worker_record_abi_proven =
+                input != NULL && output != NULL &&
+                input->worker_abi_eligible &&
+                output->worker_abi_eligible;
+            memset(visiting, 0, visiting_size);
+            region->worker_reachability_proven =
+                worker_region_reachable(
+                    program, class_index, region_index,
+                    region_stride, visiting, &reason) ? 1u : 0u;
+            /*
+             * Record packing/moving/materialization is emitted by the
+             * generic worker ABI runtime.  Body emission is a separate
+             * proof and intentionally remains false until a portable worker
+             * kernel emitter exists for every reachable statement.
+             */
+            region->worker_emission_complete = 0u;
+            region->worker_python_free =
+                region->worker_record_abi_proven &&
+                region->worker_reachability_proven &&
+                region->worker_emission_complete;
+            free(region->worker_rejection_reason);
+            if (!region->worker_reachability_proven)
+                region->worker_rejection_reason = copy_text(
+                    reason == NULL
+                        ? "worker call reachability is unproven" : reason);
+            else if (!region->worker_record_abi_proven)
+                region->worker_rejection_reason = copy_text(
+                    "worker input/result records are not fully native ABI "
+                    "records");
+            else if (!region->worker_emission_complete)
+                region->worker_rejection_reason = copy_text(
+                    "python-independent worker body emitter is unavailable");
+        }
+    }
+    free(visiting);
 }
 
 /*
@@ -1941,6 +2204,7 @@ void wrtc_native_class_resolve_calls(WrtcNativeClassProgram *program) {
     }
     finalize_mpsc_proofs(program);
     finalize_spsc_proofs(program);
+    finalize_worker_proofs(program);
 }
 
 static int dict_set_owned(PyObject *mapping, const char *name, PyObject *value) {
@@ -2507,6 +2771,44 @@ PyObject *wrtc_native_class_capability_report(
     for (class_index = 0u; class_index < program->record_count; class_index++) {
         const WrtcTypedRecordIR *record = &program->records[class_index];
         PyObject *record_report = PyDict_New();
+        PyObject *record_fields = PyList_New(0);
+        size_t record_field_index;
+        if (record_fields == NULL) {
+            Py_XDECREF(record_report);
+            goto error;
+        }
+        for (record_field_index = 0u;
+             record_field_index < record->field_count;
+             record_field_index++) {
+            const WrtcWorkerRecordFieldIR *field =
+                &record->fields[record_field_index];
+            static const char *const kinds[] = {
+                "unsupported", "uint", "sint", "float",
+                "readonly_buffer"};
+            PyObject *field_report = PyDict_New();
+            if (field_report == NULL ||
+                dict_set_owned(
+                    field_report, "name",
+                    field->name == NULL
+                        ? Py_NewRef(Py_None)
+                        : PyUnicode_FromString(field->name)) < 0 ||
+                dict_set_owned(
+                    field_report, "representation",
+                    PyUnicode_FromString(kinds[(size_t)field->kind])) < 0 ||
+                dict_set_owned(field_report, "width",
+                               PyLong_FromUnsignedLong(field->width)) < 0 ||
+                dict_set_owned(field_report, "noescape",
+                               PyBool_FromLong(field->noescape)) < 0 ||
+                dict_set_owned(field_report, "immutable",
+                               PyBool_FromLong(field->immutable)) < 0 ||
+                PyList_Append(record_fields, field_report) < 0) {
+                Py_XDECREF(field_report);
+                Py_DECREF(record_fields);
+                Py_XDECREF(record_report);
+                goto error;
+            }
+            Py_DECREF(field_report);
+        }
         if (record_report == NULL ||
             dict_set_owned(record_report, "name",
                            PyUnicode_FromString(record->name)) < 0 ||
@@ -2530,10 +2832,17 @@ PyObject *wrtc_native_class_capability_report(
             dict_set_owned(record_report, "exact_runtime_type_guard",
                            PyBool_FromLong(
                                record->exact_runtime_type_guard)) < 0 ||
+            dict_set_owned(record_report, "worker_abi_eligible",
+                           PyBool_FromLong(
+                               record->worker_abi_eligible)) < 0 ||
+            PyDict_SetItemString(record_report, "fields",
+                                 record_fields) < 0 ||
             PyList_Append(records, record_report) < 0) {
+            Py_DECREF(record_fields);
             Py_XDECREF(record_report);
             goto error;
         }
+        Py_DECREF(record_fields);
         Py_DECREF(record_report);
     }
     for (class_index = 0u; class_index < program->class_count; class_index++) {
@@ -2859,6 +3168,9 @@ PyObject *wrtc_native_class_capability_report(
                                     WRTC_REGION_MPSC) != 0u
                                        ? "mpsc_contract_unproven"
                                        : (region->capabilities &
+                                          WRTC_REGION_OWNED_SHARD) != 0u
+                                             ? "worker_contract_unproven"
+                                       : (region->capabilities &
                                           WRTC_REGION_SPSC) != 0u
                                              ? "spsc_contract_unproven"
                                        : "native_concurrency_unproven")
@@ -2878,7 +3190,11 @@ PyObject *wrtc_native_class_capability_report(
                           ? "native-field operation proof succeeded, but one "
                             "or more source sites have no generic emitted hook"
                     : unproven_concurrency
-                    ? ((region->capabilities & WRTC_REGION_MPSC) != 0u
+                    ? ((region->capabilities &
+                        WRTC_REGION_OWNED_SHARD) != 0u &&
+                               region->worker_rejection_reason != NULL
+                           ? region->worker_rejection_reason
+                       : (region->capabilities & WRTC_REGION_MPSC) != 0u
                            ? mpsc_rejection_reason(class_ir)
                            : (region->capabilities & WRTC_REGION_SPSC) != 0u
                                  ? spsc_rejection_reason(class_ir)
@@ -3094,6 +3410,21 @@ PyObject *wrtc_native_class_capability_report(
                 dict_set_owned(proofs, "worker_python_free",
                                PyBool_FromLong(
                                    region->worker_python_free)) < 0 ||
+                dict_set_owned(proofs, "worker_record_abi",
+                               PyBool_FromLong(
+                                   region->worker_record_abi_proven)) < 0 ||
+                dict_set_owned(proofs, "worker_reachability",
+                               PyBool_FromLong(
+                                   region->worker_reachability_proven)) < 0 ||
+                dict_set_owned(proofs, "worker_emission_complete",
+                               PyBool_FromLong(
+                                   region->worker_emission_complete)) < 0 ||
+                dict_set_owned(
+                    proofs, "worker_rejection_reason",
+                    region->worker_rejection_reason == NULL
+                        ? Py_NewRef(Py_None)
+                        : PyUnicode_FromString(
+                              region->worker_rejection_reason)) < 0 ||
                 dict_set_owned(proofs, "typed_worker_records",
                                PyBool_FromLong(
                                    region->typed_worker_records)) < 0 ||
@@ -3169,6 +3500,7 @@ void wrtc_native_class_free(WrtcNativeClassProgram *program) {
             free(class_ir->regions[index].shard_workers);
             free(class_ir->regions[index].result_type);
             free(class_ir->regions[index].direct_call_target);
+            free(class_ir->regions[index].worker_rejection_reason);
             for (call_index = 0u;
                  call_index < class_ir->regions[index].call_count;
                  call_index++)
@@ -3181,6 +3513,15 @@ void wrtc_native_class_free(WrtcNativeClassProgram *program) {
         free(class_ir->regions);
     }
     for (class_index = 0u; class_index < program->record_count; class_index++) {
+        size_t field_index;
+        for (field_index = 0u;
+             field_index < program->records[class_index].field_count;
+             field_index++) {
+            free(program->records[class_index].fields[field_index].name);
+            free(program->records[class_index].fields[field_index]
+                     .declared_type);
+        }
+        free(program->records[class_index].fields);
         free(program->records[class_index].name);
         free(program->records[class_index].filename);
     }

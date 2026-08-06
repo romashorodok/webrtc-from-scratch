@@ -31,7 +31,7 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/native_storage_source.h"
 add_library(wrtc-compiler-core STATIC boxed_codegen.c boxed_executor.c
   boxed_module.c compiler_core.c lowering.c native_runtime.c generator.c
   native_class.c native_class_generator.c native_operation.c native_storage.c
-  native_storage_codegen.c statement_ir.c)
+  native_storage_codegen.c native_worker_record.c statement_ir.c)
 target_compile_features(wrtc-compiler-core PUBLIC c_std_17)
 set_target_properties(wrtc-compiler-core PROPERTIES
   C_STANDARD 17 C_STANDARD_REQUIRED YES C_EXTENSIONS NO
@@ -142,6 +142,13 @@ if(BUILD_TESTING)
     wrtc-compiler-core Threads::Threads)
   add_test(NAME native_spsc_c_test COMMAND native_spsc_c_test)
 
+  add_executable(native_worker_record_c_test
+    tests/native_worker_record_c_test.c)
+  target_link_libraries(native_worker_record_c_test PRIVATE
+    wrtc-compiler-core Threads::Threads)
+  add_test(NAME native_worker_record_c_test
+    COMMAND native_worker_record_c_test)
+
   add_executable(mpsc_proof_c_test tests/mpsc_proof_c_test.c)
   target_link_libraries(mpsc_proof_c_test PRIVATE wrtc-compiler-core)
   get_filename_component(WRTC_MPSC_PROOF_SOURCE
@@ -174,7 +181,7 @@ if(BUILD_TESTING)
   )
   add_test(NAME capability_report_c_test COMMAND capability_report_c_test)
 
-  foreach(test_target frontend_c_test ir_c_test runtime_c_test lowering_c_test generator_c_test native_class_c_test statement_ir_c_test boxed_executor_c_test boxed_codegen_c_test native_storage_c_test native_storage_codegen_c_test native_atomic_c_test native_mpsc_c_test native_spsc_c_test mpsc_proof_c_test native_operation_c_test capability_report_c_test)
+  foreach(test_target frontend_c_test ir_c_test runtime_c_test lowering_c_test generator_c_test native_class_c_test statement_ir_c_test boxed_executor_c_test boxed_codegen_c_test native_storage_c_test native_storage_codegen_c_test native_atomic_c_test native_mpsc_c_test native_spsc_c_test native_worker_record_c_test mpsc_proof_c_test native_operation_c_test capability_report_c_test)
     set_target_properties(${test_target} PROPERTIES
       C_STANDARD 17 C_STANDARD_REQUIRED YES C_EXTENSIONS NO
     )

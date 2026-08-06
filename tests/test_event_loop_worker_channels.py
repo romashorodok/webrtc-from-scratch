@@ -26,6 +26,11 @@ def test_worker_channel_metadata_is_bounded_spsc() -> None:
     assert pymeta.metadata(PacketWorker.publish_result).required
     assert pymeta.metadata(PacketWorker.drain_results).required
     assert pymeta.metadata(PacketWorker.close_channels).required
+    packet_hints = get_type_hints(OwnedPacket, include_extras=True)
+    payload = repr(packet_hints["payload"]).lower()
+    assert "buffer" in payload
+    assert "read" in payload
+    assert "lifetime.call" in payload
 
 
 def test_reference_bounded_queue_capacity_one_close_and_drain() -> None:

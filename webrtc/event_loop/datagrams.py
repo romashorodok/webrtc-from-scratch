@@ -6,7 +6,7 @@ import socket
 
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Annotated, Protocol
 
 import pymeta
 
@@ -103,7 +103,10 @@ class PacketView:
 @dataclass(frozen=True, slots=True)
 class OwnedPacket:
     peer_id: object
-    payload: bytes
+    payload: Annotated[
+        bytes,
+        pymeta.buffer[pymeta.u8] | pymeta.read | pymeta.lifetime.call,
+    ]
     address: object = None
 
 

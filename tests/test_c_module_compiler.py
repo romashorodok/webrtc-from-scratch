@@ -1576,9 +1576,91 @@ def test_native_concurrency_rejection_reports_unproven_safety_contract(
     assert "'ownership_transfer': True" in completed.stderr
     assert "'typed_worker_records': False" in completed.stderr
     assert "'worker_python_free': False" in completed.stderr
+    assert "'worker_record_abi': False" in completed.stderr
+    assert "'worker_reachability': False" in completed.stderr
+    assert "'worker_emission_complete': False" in completed.stderr
     assert "'node_reclamation': False" in completed.stderr
     assert "'memory_ordering': 'not_proven'" in completed.stderr
-    assert "native concurrency emission requires complete" in completed.stderr
+    assert "worker reaches an unresolved or dynamic Python call" in completed.stderr
+    assert not output.exists()
+
+
+def test_owned_shard_proves_native_records_and_calls_but_not_missing_emitter(
+    c_compiler_build: CCompilerBuild, tmp_path: Path
+) -> None:
+    completed, output = _compile_fixture(
+        c_compiler_build,
+        tmp_path,
+        "portable_worker_component",
+        "from dataclasses import dataclass\n"
+        "from typing import Annotated\n"
+        "import pymeta\n"
+        "@pymeta.record(abi='packet.v1')\n"
+        "@dataclass(frozen=True, slots=True)\n"
+        "class Packet:\n"
+        "    peer_id: Annotated[int, pymeta.uint[64]]\n"
+        "    payload: Annotated[bytes, pymeta.buffer[pymeta.u8] | "
+        "pymeta.read | pymeta.lifetime.call]\n"
+        "@pymeta.record(abi='result.v1')\n"
+        "@dataclass(frozen=True, slots=True)\n"
+        "class Result:\n"
+        "    peer_id: Annotated[int, pymeta.uint[64]]\n"
+        "    value: Annotated[int, pymeta.uint[32]]\n"
+        "@pymeta.native_class(pymeta.compact_object, "
+        "gc=pymeta.tracked, weakrefs=False)\n"
+        "class Worker:\n"
+        "    @pymeta.region(pymeta.required, "
+        "effects=pymeta.effects(owner='worker', allocate=pymeta.never, "
+        "suspend=pymeta.never))\n"
+        "    def transform(self, packet: Packet) -> Result:\n"
+        "        return Result(packet.peer_id, 1)\n"
+        "    @pymeta.region(pymeta.required, "
+        "execute=pymeta.owned_shard(key='packet.peer_id', "
+        "workers='config.workers', input=pymeta.spsc, "
+        "output=pymeta.spsc, ordered=True), "
+        "effects=pymeta.effects(owner='worker', "
+        "noescape={'packet.payload'}, allocate=pymeta.never, "
+        "suspend=pymeta.never))\n"
+        "    def process(self, packet: Packet) -> Result:\n"
+        "        return self.transform(packet)\n",
+    )
+
+    assert completed.returncode != 0
+    assert "'worker_abi_eligible': True" in completed.stderr
+    assert "'worker_record_abi': True" in completed.stderr
+    assert "'worker_reachability': True" in completed.stderr
+    assert "'worker_emission_complete': False" in completed.stderr
+    assert "'worker_python_free': False" in completed.stderr
+    assert "worker body emitter is unavailable" in completed.stderr
+    assert not output.exists()
+
+
+def test_owned_shard_rejects_constructor_injected_python_processor(
+    c_compiler_build: CCompilerBuild, tmp_path: Path
+) -> None:
+    completed, output = _compile_fixture(
+        c_compiler_build,
+        tmp_path,
+        "dynamic_worker_component",
+        "import pymeta\n"
+        "@pymeta.native_class(pymeta.compact_object, "
+        "gc=pymeta.tracked, weakrefs=False)\n"
+        "class Worker:\n"
+        "    @pymeta.region(pymeta.required, "
+        "execute=pymeta.owned_shard(key='packet.peer_id', "
+        "workers='config.workers', input=pymeta.spsc, "
+        "output=pymeta.spsc, ordered=True), "
+        "effects=pymeta.effects(owner='worker', "
+        "noescape={'packet.payload'}, allocate=pymeta.never, "
+        "suspend=pymeta.never))\n"
+        "    def process(self, packet):\n"
+        "        return self._processor(packet)\n",
+    )
+
+    assert completed.returncode != 0
+    assert "'worker_reachability': False" in completed.stderr
+    assert "constructor-injected Python _processor callable" in completed.stderr
+    assert "'worker_python_free': False" in completed.stderr
     assert not output.exists()
 
 

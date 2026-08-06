@@ -120,6 +120,7 @@ typedef struct {
     char *shard_workers;
     char *result_type;
     char *direct_call_target;
+    char *worker_rejection_reason;
     WrtcPySuiteIR *body;
     WrtcPySignatureIR *signature;
     WrtcNativeCallEdgeIR *calls;
@@ -148,6 +149,9 @@ typedef struct {
     unsigned shutdown_interaction_proven : 1;
     unsigned worker_python_free : 1;
     unsigned typed_worker_records : 1;
+    unsigned worker_record_abi_proven : 1;
+    unsigned worker_reachability_proven : 1;
+    unsigned worker_emission_complete : 1;
     unsigned direct_callee_resolved : 1;
     unsigned direct_callee_fused : 1;
 } WrtcNativeRegionIR;
@@ -161,16 +165,36 @@ typedef struct {
     WrtcPySignatureIR *signature;
 } WrtcNativeFactoryIR;
 
+typedef enum {
+    WRTC_WORKER_FIELD_UNSUPPORTED = 0,
+    WRTC_WORKER_FIELD_UINT,
+    WRTC_WORKER_FIELD_SINT,
+    WRTC_WORKER_FIELD_FLOAT,
+    WRTC_WORKER_FIELD_READONLY_BUFFER
+} WrtcWorkerRecordFieldKind;
+
+typedef struct {
+    char *name;
+    char *declared_type;
+    WrtcSourceSpan span;
+    WrtcWorkerRecordFieldKind kind;
+    unsigned width;
+    unsigned noescape : 1;
+    unsigned immutable : 1;
+} WrtcWorkerRecordFieldIR;
+
 typedef struct {
     char *name;
     char *filename;
     WrtcSourceSpan span;
+    WrtcWorkerRecordFieldIR *fields;
     size_t field_count;
     size_t boxed_field_count;
     unsigned abi_declared : 1;
     unsigned representation_proven : 1;
     unsigned boxed_ownership_proven : 1;
     unsigned exact_runtime_type_guard : 1;
+    unsigned worker_abi_eligible : 1;
 } WrtcTypedRecordIR;
 
 typedef struct {
