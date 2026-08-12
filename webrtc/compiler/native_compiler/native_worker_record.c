@@ -21,8 +21,12 @@ void wrtc_native_worker_record_release(WrtcNativeWorkerRecord *record) {
     size_t index;
     if (record == NULL) return;
     for (index = 0u; index < record->value_count; index++)
-        if (record->values[index].kind == WRTC_WORKER_ABI_READONLY_BYTES)
-            Py_CLEAR(record->values[index].as.bytes_value.reactor_owner);
+        if (record->values[index].kind == WRTC_WORKER_ABI_READONLY_BYTES) {
+            PyObject *owner = (PyObject *)
+                record->values[index].as.bytes_value.reactor_owner;
+            Py_XDECREF(owner);
+            record->values[index].as.bytes_value.reactor_owner = NULL;
+        }
     free(record->values);
     memset(record, 0, sizeof(*record));
 }
@@ -151,7 +155,8 @@ PyObject *wrtc_native_worker_record_materialize(
         else if (value->kind == WRTC_WORKER_ABI_FLOAT)
             item = PyFloat_FromDouble(value->as.float_value);
         else if (value->kind == WRTC_WORKER_ABI_READONLY_BYTES)
-            item = Py_NewRef(value->as.bytes_value.reactor_owner);
+            item = Py_NewRef(
+                (PyObject *)value->as.bytes_value.reactor_owner);
         if (item == NULL) {
             Py_DECREF(arguments);
             return NULL;

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import socket
 import threading
 from typing import get_type_hints
 
@@ -172,6 +173,38 @@ def test_datagram_drain_is_packet_budget_bounded_and_reschedules() -> None:
         # schedules the next bounded activation.
         assert transport.rescheduled == 0
     finally:
+        loop.close()
+
+
+def test_datagram_registration_generation_rejects_stale_ready_callback() -> None:
+    loop = WebRTCSelectorEventLoop()
+
+    class Protocol:
+        def datagram_received(self, data: bytes, address: object) -> None:
+            del data, address
+
+    first_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    second_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        first = loop._datagrams.register(loop, first_socket, Protocol())
+        descriptor = first._descriptor
+        generation = first._generation
+        loop._datagrams.unregister(first)
+        assert not loop._datagrams._is_current(first, generation)
+
+        # Calling the already-queued callback is harmless after removal.  It
+        # cannot receive from or remove a replacement registration.
+        loop._datagrams.drain_socket(loop, first, generation)
+        assert descriptor not in loop._datagrams._registrations
+
+        second = loop._datagrams.register(loop, second_socket, Protocol())
+        second_generation = second._generation
+        loop._datagrams.drain_socket(loop, first, generation)
+        assert loop._datagrams._is_current(second, second_generation)
+        loop._datagrams.unregister(second)
+    finally:
+        first_socket.close()
+        second_socket.close()
         loop.close()
 
 

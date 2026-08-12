@@ -2,8 +2,12 @@
 #include "boxed_codegen.h"
 #include "boxed_module.h"
 #include "native_operation.h"
+#include "native_kernel.h"
+#include "native_reactor.h"
+#include "native_reactor_codegen.h"
 #include "native_storage.h"
 #include "native_storage_codegen.h"
+#include "native_worker_codegen.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -30,8 +34,316 @@ static int quote(FILE *file, const char *value) {
 }
 
 static int compatible_base(const char *base) {
-    return base != NULL && strcmp(base, "builtins.object") != 0 &&
-           strchr(base, '.') != NULL;
+    return base == NULL || strcmp(base, "object") == 0 ||
+           strcmp(base, "builtins.object") == 0 || strchr(base, '.') != NULL;
+}
+
+static int object_base(const char *base) {
+    return base == NULL || strcmp(base, "object") == 0 ||
+           strcmp(base, "builtins.object") == 0;
+}
+
+static int class_has_globals(const WrtcNativeClassIR *class_ir) {
+    /* Every emitted type needs its live defining-module dictionary so that
+     * guarded class-global substitution can compare against the original
+     * source type instead of freezing a copied global. */
+    return class_ir != NULL;
+}
+
+static int emit_python_method_fallback_copy(
+    FILE *file, const WrtcNativeClassIR *class_ir, size_t class_index) {
+    size_t index;
+    if (fprintf(
+            file,
+            "static int pm%zu(PyObject*d,PyObject*s){PyObject*m=NULL,*items=NULL;"
+            "Py_ssize_t i,n;if(!d||!s)return -1;m=PyObject_GetAttrString(s,"
+            "\"__dict__\");if(!m)return -1;items=PyMapping_Items(m);"
+            "Py_DECREF(m);if(!items)return -1;n=PyList_GET_SIZE(items);"
+            "for(i=0;i<n;i++){PyObject*p=PyList_GET_ITEM(items,i),"
+            "*k=PyTuple_GET_ITEM(p,0),*v=PyTuple_GET_ITEM(p,1);"
+            "const char*z;if(!PyUnicode_CheckExact(k))continue;"
+            "z=PyUnicode_AsUTF8(k);if(!z){Py_DECREF(items);return -1;}"
+            "if((z[0]=='_'&&z[1]=='_')",
+            class_index) < 0)
+        return -1;
+    for (index = 0u; index < class_ir->field_count; index++)
+        if (fputs("||strcmp(z,", file) < 0 ||
+            quote(file, class_ir->fields[index].name) < 0 ||
+            fputs(")==0", file) < 0)
+            return -1;
+    for (index = 0u; index < class_ir->region_count; index++)
+        if (fputs("||strcmp(z,", file) < 0 ||
+            quote(file, class_ir->regions[index].name) < 0 ||
+            fputs(")==0", file) < 0)
+            return -1;
+    return fputs(
+               ")continue;if(PyDict_SetItem(PyType_GetDict((PyTypeObject*)d),k,v)<0){Py_DECREF(items);"
+               "return -1;}}Py_DECREF(items);PyType_Modified((PyTypeObject*)d);"
+               "return 0;}\n",
+               file) < 0
+               ? -1
+               : 0;
+}
+
+static int program_has_constructors(
+    const WrtcNativeClassProgram *program) {
+    size_t index;
+    for (index = 0u; index < program->class_count; index++)
+        if (program->classes[index].custom_constructor) return 1;
+    return 0;
+}
+
+static int program_has_workers(const WrtcNativeClassProgram *program) {
+    size_t class_index, region_index;
+    for (class_index = 0u; class_index < program->class_count; class_index++)
+        for (region_index = 0u;
+             region_index < program->classes[class_index].region_count;
+             region_index++)
+            if ((program->classes[class_index].regions[region_index]
+                     .capabilities & WRTC_REGION_OWNED_SHARD) != 0u)
+                return 1;
+    return 0;
+}
+
+static const WrtcNativeRegionIR *owned_worker_region(
+    const WrtcNativeClassIR *class_ir, size_t *region_index) {
+    size_t index;
+    for (index = 0u; index < class_ir->region_count; index++)
+        if ((class_ir->regions[index].capabilities & WRTC_REGION_OWNED_SHARD) != 0u) {
+            if (region_index != NULL) *region_index = index;
+            return &class_ir->regions[index];
+        }
+    return NULL;
+}
+
+static size_t worker_queue_field(const WrtcNativeClassIR *class_ir,
+                                 const char *owner) {
+    size_t index;
+    for (index = 0u; index < class_ir->field_count; index++)
+        if (class_ir->fields[index].storage_kind == WRTC_NATIVE_FIELD_SPSC &&
+            class_ir->fields[index].owner != NULL &&
+            strcmp(class_ir->fields[index].owner, owner) == 0)
+            return index;
+    return SIZE_MAX;
+}
+
+static const WrtcPyExprIR *assignment_target_for_rhs(
+    const WrtcPySuiteIR *suite, const char *rhs_name) {
+    size_t index;
+    if (suite == NULL) return NULL;
+    for (index = 0u; index < suite->statement_count; index++) {
+        const WrtcPyStmtIR *statement = &suite->statements[index];
+        const WrtcPyExprIR *rhs;
+        if (statement->kind != WRTC_PY_STMT_ASSIGN ||
+            statement->expression_count < 2u) continue;
+        rhs = &statement->expressions[0];
+        if (rhs->kind == WRTC_PY_EXPR_NAME && rhs->operation != NULL &&
+            strcmp(rhs->operation, rhs_name) == 0)
+            return &statement->expressions[1];
+    }
+    return NULL;
+}
+
+static const WrtcPyExprIR *worker_thread_target(
+    const WrtcNativeClassIR *class_ir) {
+    size_t index;
+    const WrtcPySuiteIR *suite = class_ir->constructor_body;
+    if (suite == NULL) return NULL;
+    for (index = 0u; index < suite->statement_count; index++) {
+        const WrtcPyStmtIR *statement = &suite->statements[index];
+        const WrtcPyExprIR *rhs, *callee;
+        if (statement->kind != WRTC_PY_STMT_ASSIGN ||
+            statement->expression_count < 2u) continue;
+        rhs = &statement->expressions[0];
+        if (rhs->kind != WRTC_PY_EXPR_CALL || rhs->child_count == 0u) continue;
+        callee = &rhs->children[0];
+        if (callee->kind == WRTC_PY_EXPR_ATTRIBUTE && callee->operation != NULL &&
+            strcmp(callee->operation, "Thread") == 0)
+            return &statement->expressions[1];
+    }
+    return NULL;
+}
+
+static size_t class_field_index(const WrtcNativeClassIR *class_ir,
+                                const char *name) {
+    size_t index;
+    for (index = 0u; index < class_ir->field_count; index++)
+        if (strcmp(class_ir->fields[index].name, name) == 0) return index;
+    return SIZE_MAX;
+}
+
+static size_t worker_processor_field(const WrtcNativeClassIR *class_ir) {
+    size_t index;
+    const WrtcPySignatureIR *signature = class_ir->constructor_signature;
+    if (signature == NULL) return SIZE_MAX;
+    for (index = 0u; index < signature->parameter_count; index++) {
+        const WrtcPyParameterIR *parameter = &signature->parameters[index];
+        const WrtcPyExprIR *target;
+        if ((parameter->annotation == NULL ||
+             strstr(parameter->annotation, "Callable") == NULL ||
+             strstr(parameter->annotation, "None") == NULL) &&
+            (!parameter->has_default || parameter->default_expression == NULL ||
+             strcmp(parameter->default_expression, "None") != 0)) continue;
+        target = assignment_target_for_rhs(class_ir->constructor_body,
+                                           parameter->name);
+        if (target != NULL && target->kind == WRTC_PY_EXPR_ATTRIBUTE &&
+            target->operation != NULL)
+            return class_field_index(class_ir, target->operation);
+    }
+    return SIZE_MAX;
+}
+
+static size_t worker_callback_field(const WrtcNativeClassIR *class_ir,
+                                    size_t processor_field) {
+    size_t index;
+    const WrtcPySignatureIR *signature = class_ir->constructor_signature;
+    if (signature == NULL) return SIZE_MAX;
+    for (index = 0u; index < signature->parameter_count; index++) {
+        const WrtcPyParameterIR *parameter = &signature->parameters[index];
+        const WrtcPyExprIR *target;
+        size_t field;
+        if (parameter->annotation == NULL ||
+            strstr(parameter->annotation, "Callable") == NULL) continue;
+        target = assignment_target_for_rhs(class_ir->constructor_body,
+                                           parameter->name);
+        if (target == NULL || target->kind != WRTC_PY_EXPR_ATTRIBUTE ||
+            target->operation == NULL) continue;
+        field = class_field_index(class_ir, target->operation);
+        if (field != SIZE_MAX && field != processor_field) return field;
+    }
+    return SIZE_MAX;
+}
+
+static size_t worker_loop_field(const WrtcNativeClassIR *class_ir,
+                                const WrtcNativeRegionIR *region) {
+    const char *start, *end;
+    char *name;
+    size_t result;
+    (void)class_ir;
+    if (region == NULL || region->shard_workers == NULL ||
+        strncmp(region->shard_workers, "self.", 5u) != 0) return SIZE_MAX;
+    start = region->shard_workers + 5u;
+    end = strchr(start, '.');
+    if (end == NULL) end = start + strlen(start);
+    name = malloc((size_t)(end - start) + 1u);
+    if (name == NULL) return SIZE_MAX;
+    memcpy(name, start, (size_t)(end - start));
+    name[end - start] = '\0';
+    result = class_field_index(class_ir, name);
+    free(name);
+    return result;
+}
+
+static size_t worker_thread_field(const WrtcNativeClassIR *class_ir) {
+    const WrtcPyExprIR *target = worker_thread_target(class_ir);
+    if (target == NULL || target->kind != WRTC_PY_EXPR_ATTRIBUTE ||
+        target->operation == NULL) return SIZE_MAX;
+    return class_field_index(class_ir, target->operation);
+}
+
+static const WrtcTypedRecordIR *generated_record_type(
+    const WrtcNativeClassProgram *, const char *, size_t *);
+static const WrtcTypedRecordIR *worker_input_record_generated(
+    const WrtcNativeClassProgram *, const WrtcNativeRegionIR *, size_t *);
+
+static size_t worker_capacity_field(const WrtcNativeClassIR *class_ir,
+                                    size_t input_field) {
+    const char *path, *name;
+    if (input_field >= class_ir->field_count) return SIZE_MAX;
+    path = class_ir->fields[input_field].queue_capacity;
+    if (path == NULL || strncmp(path, "self.", 5u) != 0 ||
+        strchr(path + 5u, '.') != NULL) return SIZE_MAX;
+    name = path + 5u;
+    return class_field_index(class_ir, name);
+}
+
+static int worker_attachment_shape(
+    const WrtcNativeClassProgram *program,
+    const WrtcNativeClassIR *class_ir) {
+    const WrtcNativeRegionIR *region = owned_worker_region(class_ir, NULL);
+    size_t input_field, output_field, processor_field;
+    if (region == NULL) return 1;
+    input_field = worker_queue_field(class_ir, "worker");
+    output_field = worker_queue_field(class_ir, "reactor");
+    processor_field = worker_processor_field(class_ir);
+    return input_field != SIZE_MAX && output_field != SIZE_MAX &&
+           worker_thread_field(class_ir) != SIZE_MAX &&
+           worker_capacity_field(class_ir, input_field) != SIZE_MAX &&
+           processor_field != SIZE_MAX &&
+           worker_callback_field(class_ir, processor_field) != SIZE_MAX &&
+           worker_loop_field(class_ir, region) != SIZE_MAX &&
+           worker_input_record_generated(program, region, NULL) != NULL &&
+           generated_record_type(program, region->result_type, NULL) != NULL;
+}
+
+static const WrtcTypedRecordIR *generated_record_type(
+    const WrtcNativeClassProgram *program, const char *name,
+    size_t *record_index) {
+    size_t index;
+    const char *short_name;
+    if (name == NULL) return NULL;
+    short_name = strrchr(name, '.');
+    short_name = short_name == NULL ? name : short_name + 1;
+    for (index = 0u; index < program->record_count; index++)
+        if (strcmp(program->records[index].name, short_name) == 0) {
+            if (record_index != NULL) *record_index = index;
+            return &program->records[index];
+        }
+    return NULL;
+}
+
+static const WrtcTypedRecordIR *worker_input_record_generated(
+    const WrtcNativeClassProgram *program,
+    const WrtcNativeRegionIR *region, size_t *record_index) {
+    size_t index;
+    if (region == NULL || region->signature == NULL) return NULL;
+    for (index = 0u; index < region->signature->parameter_count; index++) {
+        const WrtcPyParameterIR *parameter =
+            &region->signature->parameters[index];
+        if (strcmp(parameter->name, "self") != 0)
+            return generated_record_type(program, parameter->annotation,
+                                         record_index);
+    }
+    return NULL;
+}
+
+static const char *worker_abi_kind(WrtcWorkerRecordFieldKind kind) {
+    switch (kind) {
+        case WRTC_WORKER_FIELD_UINT: return "WRTC_WORKER_ABI_UINT";
+        case WRTC_WORKER_FIELD_SINT: return "WRTC_WORKER_ABI_SINT";
+        case WRTC_WORKER_FIELD_FLOAT: return "WRTC_WORKER_ABI_FLOAT";
+        case WRTC_WORKER_FIELD_READONLY_BUFFER:
+            return "WRTC_WORKER_ABI_READONLY_BYTES";
+        default: return NULL;
+    }
+}
+
+static int emit_worker_abis(FILE *file,
+                            const WrtcNativeClassProgram *program) {
+    size_t record_index, field_index;
+    for (record_index = 0u; record_index < program->record_count;
+         record_index++) {
+        const WrtcTypedRecordIR *record = &program->records[record_index];
+        if (!record->worker_abi_eligible) continue;
+        if (fprintf(file, "static const WrtcNativeWorkerAbiField waif%zu[]={",
+                    record_index) < 0) return -1;
+        for (field_index = 0u; field_index < record->field_count;
+             field_index++) {
+            const WrtcWorkerRecordFieldIR *field = &record->fields[field_index];
+            const char *kind = worker_abi_kind(field->kind);
+            if (kind == NULL || fputc('{', file) == EOF ||
+                quote(file, field->name) < 0 ||
+                fprintf(file, ",%s,%u},", kind, field->width) < 0)
+                return -1;
+        }
+        if (fputs("};static const WrtcNativeWorkerAbi wai", file) < 0 ||
+            fprintf(file, "%zu={", record_index) < 0 ||
+            quote(file, record->abi) < 0 ||
+            fprintf(file, ",waif%zu,%zu};", record_index,
+                    record->field_count) < 0)
+            return -1;
+    }
+    return fputc('\n', file) == EOF ? -1 : 0;
 }
 
 static int expression_has_super(const WrtcPyExprIR *expression) {
@@ -111,16 +423,22 @@ int wrtc_native_class_can_emit(const WrtcNativeClassProgram *program) {
          * Never manufacture a Python method or silently omit one.
          */
         if (!class_ir->compact_object || !class_ir->gc_tracked ||
-            class_ir->weakrefs || class_ir->custom_constructor ||
-            !compatible_base(class_ir->base))
+            class_ir->weakrefs || class_ir->custom_new ||
+            class_ir->region_count == 0u ||
+            (class_ir->custom_constructor &&
+             (class_ir->constructor_body == NULL ||
+              class_ir->constructor_signature == NULL)) ||
+            !compatible_base(class_ir->base)) {
             return 0;
+        }
         for (field_index = 0u; field_index < class_ir->field_count;
              field_index++) {
             const WrtcNativeFieldIR *field = &class_ir->fields[field_index];
             if (field->name == NULL ||
                 (field->storage_kind != WRTC_NATIVE_FIELD_PYOBJECT &&
-                 !wrtc_native_storage_field_eligible(field, NULL)))
+                 !wrtc_native_storage_field_eligible(field, NULL))) {
                 return 0;
+            }
             if (field->storage_kind != WRTC_NATIVE_FIELD_PYOBJECT)
                 has_storage = 1;
         }
@@ -128,14 +446,27 @@ int wrtc_native_class_can_emit(const WrtcNativeClassProgram *program) {
              field_index++) {
             const WrtcNativeRegionIR *region =
                 &class_ir->regions[field_index];
-            const unsigned unsupported =
-                WRTC_REGION_OWNED_SHARD | WRTC_REGION_TYPED_RECORD |
-                WRTC_REGION_PACKET_POOL;
+            /* An owned shard is emit-able only when its constructor fields,
+             * typed records, queues, executor kernel, and reactor adapter can
+             * all be connected structurally. */
+            unsigned unsupported =
+                worker_attachment_shape(program, class_ir)
+                    ? 0u : WRTC_REGION_OWNED_SHARD;
+            if ((region->capabilities & WRTC_REGION_PACKET_POOL) != 0u &&
+                !region->reactor_hook_emission_complete)
+                unsupported |= WRTC_REGION_PACKET_POOL;
             if (region->body == NULL || region->signature == NULL ||
                 (region->capabilities & unsupported) != 0u ||
+                ((region->selector_runtime_lowering_available ||
+                  region->datagram_runtime_lowering_available) &&
+                 !region->reactor_hook_emission_complete) ||
+                (((region->capabilities & WRTC_REGION_OWNED_SHARD) != 0u) &&
+                 !region->worker_emission_complete) ||
                 !mpsc_contract_complete(region) ||
-                !spsc_contract_complete(region))
+                (((region->capabilities & WRTC_REGION_OWNED_SHARD) == 0u) &&
+                !spsc_contract_complete(region))) {
                 return 0;
+            }
         }
         if (class_ir->region_count != 0u) {
             char *module_name = wrtc_boxed_module_name(class_ir->filename);
@@ -154,8 +485,9 @@ int wrtc_native_class_can_emit(const WrtcNativeClassProgram *program) {
         if (factory->name == NULL || factory->target_class == NULL ||
             factory->body == NULL || factory->signature == NULL ||
             statements_have_super(factory->body->statements,
-                                  factory->body->statement_count))
+                                  factory->body->statement_count)) {
             return 0;
+        }
         module_name = wrtc_boxed_module_name(factory->filename);
         if (module_name == NULL) {
             PyErr_Clear();
@@ -163,8 +495,9 @@ int wrtc_native_class_can_emit(const WrtcNativeClassProgram *program) {
         }
         free(module_name);
     }
-    if (program->factory_name != NULL && program->factory_count == 0u)
+    if (program->factory_name != NULL && program->factory_count == 0u) {
         return 0;
+    }
     if (has_storage) {
         size_t proof_index;
         if (wrtc_native_operation_prove(program, &operations) < 0 ||
@@ -211,6 +544,10 @@ int wrtc_native_class_can_emit(const WrtcNativeClassProgram *program) {
                 kind != WRTC_NATIVE_OP_SPSC_QSIZE &&
                 kind != WRTC_NATIVE_OP_SPSC_EMPTY &&
                 kind != WRTC_NATIVE_OP_SPSC_CLOSE &&
+                kind != WRTC_NATIVE_OP_SELECTOR_REGISTER &&
+                kind != WRTC_NATIVE_OP_SELECTOR_IS_CURRENT &&
+                kind != WRTC_NATIVE_OP_SELECTOR_OWNER &&
+                kind != WRTC_NATIVE_OP_SELECTOR_REMOVE &&
                 kind != WRTC_NATIVE_OP_ATOMIC_COMPARE_EXCHANGE) {
                 wrtc_native_operation_table_free(operations);
                 return 0;
@@ -287,7 +624,9 @@ static int emit_storage_accessor(FILE *file,
         field->storage_kind == WRTC_NATIVE_FIELD_FIFO ? 2 :
         field->storage_kind == WRTC_NATIVE_FIELD_MIN_HEAP ? 3 :
         field->storage_kind == WRTC_NATIVE_FIELD_ATOMIC_UINT32 ? 4 :
-        field->storage_kind == WRTC_NATIVE_FIELD_MPSC ? 5 : 6;
+        field->storage_kind == WRTC_NATIVE_FIELD_MPSC ? 5 :
+        field->storage_kind == WRTC_NATIVE_FIELD_SPSC ? 6 :
+        field->storage_kind == WRTC_NATIVE_FIELD_SELECTOR ? 7 : 8;
     if (fprintf(file,
                 "static NSO**np%zu_%zu(PyObject*self){H%zu*d=(H%zu*)"
                 "PyObject_GetTypeData(self,dt(self,%zu));return(NSO**)&d->f%zu;}"
@@ -312,7 +651,7 @@ static int emit_storage_accessor(FILE *file,
                (fputs("return wrtc_native_heap_get(&o->u.h,", file) < 0 ||
                quote(file, field->name) < 0 || fputs(");}", file) < 0)) {
         return -1;
-    } else if ((kind == 4 || kind == 5 || kind == 6) &&
+    } else if (kind >= 4 && kind <= 8 &&
                fputs("return Py_NewRef((PyObject*)o);}", file) < 0) {
         return -1;
     }
@@ -374,6 +713,20 @@ static int emit_storage_accessor(FILE *file,
             return -1;
         }
         free(record_module);
+    } else if (kind == 7 || kind == 8) {
+        if (fputs(kind == 7
+                      ? "wrtc_native_selector_destroy(o->u.r);"
+                      : "wrtc_native_packet_pool_destroy(o->u.b);",
+                  file) < 0 ||
+            fputs("o->u.r=NULL;Py_CLEAR(*p);return 0;}return nri(self,p,",
+                  file) < 0 ||
+            fprintf(file, "%d,", kind) < 0 ||
+            quote(file, field->reactor_capacity) < 0 ||
+            fputc(',', file) == EOF ||
+            quote(file, field->packet_buffer_size == NULL
+                            ? "0" : field->packet_buffer_size) < 0 ||
+            fputs(");}", file) < 0)
+            return -1;
     }
     return 0;
 }
@@ -400,6 +753,13 @@ static size_t fused_call_count(const WrtcNativeClassProgram *program) {
                 if (program->classes[class_index]
                         .regions[region_index].calls[call_index].fused)
                     count++;
+    return count;
+}
+
+static size_t emitted_region_count(const WrtcNativeClassProgram *program) {
+    size_t class_index, count = 0u;
+    for (class_index = 0u; class_index < program->class_count; class_index++)
+        count += program->classes[class_index].region_count;
     return count;
 }
 
@@ -502,6 +862,46 @@ static int emit_fused_call_case(
     return 0;
 }
 
+static int emit_reactor_call_case(FILE *file,
+                                  const WrtcNativeCallEdgeIR *edge,
+                                  size_t hook_index) {
+    const char *method;
+    if (edge == NULL || edge->reactor_hook == WRTC_REACTOR_HOOK_NONE ||
+        !edge->reactor_hook_shape_proven || edge->target == NULL)
+        return 0;
+    method = strrchr(edge->target, '.');
+    method = method == NULL ? edge->target : method + 1;
+    if (fputs("if(e->kind==WRTC_PY_EXPR_CALL&&e->child_count>0u&&"
+              "e->children[0].kind==WRTC_PY_EXPR_ATTRIBUTE&&"
+              "e->children[0].child_count==1u&&"
+              "e->children[0].operation!=NULL&&strcmp("
+              "e->children[0].operation,",
+              file) < 0 ||
+        quote(file, method) < 0 ||
+        fprintf(file,
+                ")==0&&e->positional_count==%zuu&&"
+                "e->keyword_count==0u){PyObject*recv=NULL,*callable=NULL,"
+                "*args=NULL,*kwargs=NULL,*result=NULL;size_t i;*h=1;"
+                "recv=wrtc_boxed_hook_evaluate("
+                "&e->children[0].children[0],f);if(!recv)return NULL;"
+                "callable=PyObject_GetAttrString(recv,",
+                edge->positional_count) < 0 ||
+        quote(file, method) < 0 ||
+        fprintf(file,
+                ");if(!callable)goto rdone%zu;args=PyTuple_New(%zu);"
+                "kwargs=PyDict_New();if(!args||!kwargs)goto rdone%zu;"
+                "for(i=0u;i<e->positional_count;i++){PyObject*v="
+                "wrtc_boxed_hook_evaluate(&e->children[1u+i],f);"
+                "if(!v)goto rdone%zu;PyTuple_SET_ITEM(args,(Py_ssize_t)i,v);}"
+                "result=wrtc_reactor_guarded_call(callable,args,kwargs);"
+                "rdone%zu:Py_XDECREF(kwargs);Py_XDECREF(args);"
+                "Py_XDECREF(callable);Py_XDECREF(recv);return result;}",
+                hook_index, edge->positional_count, hook_index,
+                hook_index, hook_index) < 0)
+        return -1;
+    return 0;
+}
+
 static int emit_region_hooks(
     FILE *file, const WrtcNativeClassProgram *program,
     const WrtcNativeOperationTable *table, size_t class_index,
@@ -511,7 +911,7 @@ static int emit_region_hooks(
         &program->classes[class_index].regions[region_index];
     if (fprintf(file,
                 "static PyObject*ne%zu_%zu(void*c,const WrtcPyExprIR*e,"
-                "void*f,int*h){(void)c;*h=0;",
+                "void*f,int*h){(void)c;(void)e;(void)f;*h=0;",
                 class_index, region_index) < 0)
         return -1;
     for (operation_index = 0u;
@@ -561,6 +961,10 @@ static int emit_region_hooks(
             case WRTC_NATIVE_OP_SPSC_QSIZE:
             case WRTC_NATIVE_OP_SPSC_EMPTY:
             case WRTC_NATIVE_OP_SPSC_CLOSE:
+            case WRTC_NATIVE_OP_SELECTOR_REGISTER:
+            case WRTC_NATIVE_OP_SELECTOR_IS_CURRENT:
+            case WRTC_NATIVE_OP_SELECTOR_OWNER:
+            case WRTC_NATIVE_OP_SELECTOR_REMOVE:
                 runtime_expression = "&e->children[0].children[0]";
                 break;
             default:
@@ -802,17 +1206,59 @@ static int emit_region_hooks(
                 if (fputs("return nqc(o,NULL);}", file) < 0)
                     return -1;
                 break;
+            case WRTC_NATIVE_OP_SELECTOR_REGISTER:
+                if (fputs("{PyObject*a=PyTuple_New(3);size_t i;if(!a)"
+                          "return NULL;for(i=0u;i<3u;i++){v="
+                          "wrtc_boxed_hook_evaluate(&e->children[1u+i],f);"
+                          "if(!v){Py_DECREF(a);return NULL;}PyTuple_SET_ITEM("
+                          "a,(Py_ssize_t)i,v);}r=nrr(o,a);Py_DECREF(a);"
+                          "return r;}}", file) < 0)
+                    return -1;
+                break;
+            case WRTC_NATIVE_OP_SELECTOR_IS_CURRENT:
+                if (fputs("v=wrtc_boxed_hook_evaluate(&e->children[1],f);"
+                          "if(!v)return NULL;r=nrc(o,v);Py_DECREF(v);"
+                          "return r;}", file) < 0)
+                    return -1;
+                break;
+            case WRTC_NATIVE_OP_SELECTOR_OWNER:
+                if (fputs("v=wrtc_boxed_hook_evaluate(&e->children[1],f);"
+                          "if(!v)return NULL;r=nro(o,v);Py_DECREF(v);"
+                          "return r;}", file) < 0)
+                    return -1;
+                break;
+            case WRTC_NATIVE_OP_SELECTOR_REMOVE:
+                if (fputs("v=wrtc_boxed_hook_evaluate(&e->children[1],f);"
+                          "if(!v)return NULL;r=nrd(o,v);Py_DECREF(v);"
+                          "return r;}", file) < 0)
+                    return -1;
+                break;
             default:
                 return -1;
         }
     }
     for (operation_index = 0u; operation_index < region->call_count;
-         operation_index++)
+         operation_index++) {
+        if (emit_reactor_call_case(
+                file, &region->calls[operation_index], operation_index) < 0)
+            return -1;
         if (emit_fused_call_case(
                 file, &region->calls[operation_index],
                 fused_call_index(program, class_index, region_index,
                                  operation_index)) < 0)
             return -1;
+    }
+    if ((region->capabilities & WRTC_REGION_HANDLE_RUN) != 0u &&
+        fputs("if(e->kind==WRTC_PY_EXPR_CALL&&e->child_count==1u&&"
+              "e->positional_count==0u&&e->keyword_count==0u&&"
+              "e->children[0].kind==WRTC_PY_EXPR_ATTRIBUTE&&"
+              "e->children[0].operation&&strcmp(e->children[0].operation,"
+              "\"_run\")==0&&e->children[0].child_count==1u){PyObject*v;"
+              "*h=1;v=wrtc_boxed_hook_evaluate(&e->children[0].children[0],f);"
+              "if(!v)return NULL;{PyObject*r=whr((PyObject*)c,v);Py_DECREF(v);"
+              "return r;}}",
+              file) < 0)
+        return -1;
     if (fputs("return NULL;}", file) < 0 ||
         fprintf(file,
                 "static int na%zu_%zu(void*c,const WrtcPyExprIR*e,PyObject*v,"
@@ -841,7 +1287,7 @@ static int emit_region_hooks(
                field->storage_kind == WRTC_NATIVE_FIELD_FIFO ? 2 : 3;
         if (fputs("if(", file) < 0 ||
             emit_span_test(file, operation->span) < 0 ||
-            fputs("){PyObject*r=NULL,*q=NULL;NSO**p=NULL;NSO*o;*h=1;",
+            fputs("){PyObject*r=NULL,*q=NULL;NSO**p=NULL;NSO*o;(void)q;*h=1;",
                   file) < 0)
             return -1;
         if (operation->kind == WRTC_NATIVE_OP_SLICE_ASSIGN) {
@@ -926,6 +1372,35 @@ static int emit_class(FILE *file, const char *module,
                             field_index) < 0)
             return -1;
     if (fprintf(file, "}H%zu;\n", class_index) < 0) return -1;
+    if (object_base(class_ir->base)) {
+        if (fprintf(file,
+                    "static int ct%zu(PyObject*self,visitproc visit,void*arg){"
+                    "H%zu*d=(H%zu*)PyObject_GetTypeData(self,dt(self,%zu));"
+                    "int z;(void)d;(void)visit;(void)arg;(void)z;",
+                    class_index, class_index, class_index, class_index) < 0)
+            return -1;
+        for (field_index = 0u; field_index < class_ir->field_count;
+             field_index++)
+            if (fprintf(file,
+                        "if(d->f%zu&&(z=visit(d->f%zu,arg))!=0)return z;",
+                        field_index, field_index) < 0)
+                return -1;
+        if (fprintf(file,
+                    "return 0;}static int cc%zu(PyObject*self){H%zu*d="
+                    "(H%zu*)PyObject_GetTypeData(self,dt(self,%zu));(void)d;",
+                    class_index, class_index, class_index, class_index) < 0)
+            return -1;
+        for (field_index = 0u; field_index < class_ir->field_count;
+             field_index++)
+            if (fprintf(file, "Py_CLEAR(d->f%zu);", field_index) < 0)
+                return -1;
+        if (fprintf(file,
+                    "return 0;}static void cd%zu(PyObject*self){"
+                    "PyObject_GC_UnTrack(self);(void)cc%zu(self);"
+                    "Py_TYPE(self)->tp_free(self);}\n",
+                    class_index, class_index) < 0)
+            return -1;
+    }
     for (field_index = 0u; field_index < class_ir->field_count; field_index++)
         if (class_ir->fields[field_index].storage_kind !=
                 WRTC_NATIVE_FIELD_PYOBJECT &&
@@ -933,6 +1408,31 @@ static int emit_class(FILE *file, const char *module,
                                   &class_ir->fields[field_index],
                                   field_index) < 0)
             return -1;
+    for (field_index = 0u; field_index < class_ir->field_count; field_index++) {
+        const WrtcNativeFieldIR *field = &class_ir->fields[field_index];
+        if (field->storage_kind != WRTC_NATIVE_FIELD_PYOBJECT ||
+            !field->exact_type)
+            continue;
+        if (fprintf(file,
+                    "static PyObject*eg%zu_%zu(PyObject*self,void*unused){"
+                    "H%zu*d=(H%zu*)PyObject_GetTypeData(self,dt(self,%zu));"
+                    "(void)unused;if(!d->f%zu){PyErr_SetString(PyExc_AttributeError,",
+                    class_index, field_index, class_index, class_index,
+                    class_index, field_index) < 0 ||
+            quote(file, field->name) < 0 ||
+            fprintf(file,
+                    ");return NULL;}return Py_NewRef(d->f%zu);}"
+                    "static int es%zu_%zu(PyObject*self,PyObject*v,void*unused){"
+                    "H%zu*d=(H%zu*)PyObject_GetTypeData(self,dt(self,%zu));"
+                    "(void)unused;if(!v){PyErr_SetString(PyExc_AttributeError,"
+                    "\"exact component field cannot be deleted\");return -1;}"
+                    "if(d->f%zu){PyErr_SetString(PyExc_AttributeError,"
+                    "\"exact component field is immutable after initialization\");"
+                    "return -1;}d->f%zu=Py_NewRef(v);return 0;}\n",
+                    field_index, class_index, field_index, class_index,
+                    class_index, class_index, field_index, field_index) < 0)
+            return -1;
+    }
     for (region_index = 0u; region_index < class_ir->region_count;
          region_index++) {
         char hook_argument[64] = "";
@@ -942,6 +1442,10 @@ static int emit_class(FILE *file, const char *module,
              call_index < class_ir->regions[region_index].call_count;
              call_index++)
             if (class_ir->regions[region_index].calls[call_index].fused)
+                has_hooks = 1;
+            else if (class_ir->regions[region_index]
+                         .calls[call_index].reactor_hook !=
+                     WRTC_REACTOR_HOOK_NONE)
                 has_hooks = 1;
         if (has_hooks &&
             emit_region_hooks(file, program, operations, class_index,
@@ -978,6 +1482,26 @@ static int emit_class(FILE *file, const char *module,
                     hook_argument) < 0)
             return -1;
     }
+    if (class_ir->custom_constructor &&
+        fprintf(file,
+                "static int ci%zu(PyObject*self,PyObject*args,PyObject*kwargs){"
+                "PyObject*full=NULL,*locals=NULL,*result=NULL;Py_ssize_t i,n;"
+                "WCC context={self,%zu};WrtcBoxedNativeHooks hooks={&context,"
+                "wce,NULL};if(!g%zu_globals||cg%zu(self)<0)return -1;"
+                "n=PyTuple_GET_SIZE(args);"
+                "full=PyTuple_New(n+1);if(!full)return -1;PyTuple_SET_ITEM("
+                "full,0,Py_NewRef(self));for(i=0;i<n;i++)PyTuple_SET_ITEM("
+                "full,i+1,Py_NewRef(PyTuple_GET_ITEM(args,i)));"
+                "if(wrtc_boxed_bind(&c%zu_sig,full,kwargs,&locals)<0)goto done;"
+                "if(wrtc_boxed_execute_with_hooks(&c%zu_suite,g%zu_globals,"
+                "locals,&hooks,&result)<0)goto done;if(result!=Py_None){"
+                "PyErr_Format(PyExc_TypeError,\"__init__() should return None,"
+                " not '%%s'\",Py_TYPE(result)->tp_name);Py_CLEAR(result);}"
+                "done:Py_XDECREF(result);Py_XDECREF(locals);Py_DECREF(full);"
+                "return PyErr_Occurred()?-1:0;}\n",
+                class_index, class_index, class_index, class_index,
+                class_index, class_index, class_index) < 0)
+        return -1;
     if (fprintf(file, "static PyMethodDef mm%zu[]={", class_index) < 0)
         return -1;
     for (region_index = 0u; region_index < class_ir->region_count;
@@ -1000,7 +1524,8 @@ static int emit_class(FILE *file, const char *module,
         (void)snprintf(hidden, sizeof hidden, "__pymeta_storage_%zu",
                        field_index);
         if (fputc('{', file) == EOF ||
-            quote(file, field->storage_kind == WRTC_NATIVE_FIELD_PYOBJECT
+            quote(file, field->storage_kind == WRTC_NATIVE_FIELD_PYOBJECT &&
+                                  !field->exact_type
                             ? field->name : hidden) < 0 ||
             fprintf(file, ",T_OBJECT_EX,offsetof(H%zu,f%zu),"
                           "Py_RELATIVE_OFFSET%s,NULL},",
@@ -1017,10 +1542,17 @@ static int emit_class(FILE *file, const char *module,
         return -1;
     for (field_index = 0u; field_index < class_ir->field_count; field_index++) {
         const WrtcNativeFieldIR *field = &class_ir->fields[field_index];
-        if (field->storage_kind == WRTC_NATIVE_FIELD_PYOBJECT) continue;
+        if (field->storage_kind == WRTC_NATIVE_FIELD_PYOBJECT &&
+            !field->exact_type)
+            continue;
         if (fputc('{', file) == EOF || quote(file, field->name) < 0 ||
-            fprintf(file, ",(getter)ng%zu_%zu,(setter)ns%zu_%zu,NULL,NULL},",
-                    class_index, field_index, class_index, field_index) < 0)
+            fprintf(file, ",(getter)%s%zu_%zu,(setter)%s%zu_%zu,NULL,NULL},",
+                    field->storage_kind == WRTC_NATIVE_FIELD_PYOBJECT
+                        ? "eg" : "ng",
+                    class_index, field_index,
+                    field->storage_kind == WRTC_NATIVE_FIELD_PYOBJECT
+                        ? "es" : "ns",
+                    class_index, field_index) < 0)
             return -1;
     }
     if (fputs("{NULL,NULL,NULL,NULL,NULL}};", file) < 0) return -1;
@@ -1028,14 +1560,27 @@ static int emit_class(FILE *file, const char *module,
                 "static PyType_Slot sl%zu[]={"
                 "{Py_tp_new,(void*)PyType_GenericNew},"
                 "{Py_tp_members,(void*)mb%zu},{Py_tp_methods,(void*)mm%zu},"
-                "{Py_tp_getset,(void*)gs%zu},"
+                "{Py_tp_getset,(void*)gs%zu},",
+                class_index, class_index, class_index, class_index) < 0)
+        return -1;
+    if (class_ir->custom_constructor &&
+        fprintf(file, "{Py_tp_init,(void*)ci%zu},", class_index) < 0)
+        return -1;
+    if (object_base(class_ir->base) &&
+        fprintf(file,
+                "{Py_tp_traverse,(void*)ct%zu},{Py_tp_clear,(void*)cc%zu},"
+                "{Py_tp_dealloc,(void*)cd%zu},",
+                class_index, class_index, class_index) < 0)
+        return -1;
+    if (fprintf(file,
                 "{0,NULL}};static PyType_Spec sp%zu={",
-                class_index, class_index, class_index, class_index,
                 class_index) < 0 ||
         fprintf(file, "\"%s.%s\"", module, class_ir->name) < 0 ||
         fprintf(file, ",-(Py_ssize_t)sizeof(H%zu),0,Py_TPFLAGS_DEFAULT|"
-                      "Py_TPFLAGS_BASETYPE,sl%zu};\n",
-                class_index, class_index) < 0)
+                      "Py_TPFLAGS_BASETYPE%s,sl%zu};\n",
+                class_index,
+                object_base(class_ir->base) ? "|Py_TPFLAGS_HAVE_GC" : "",
+                class_index) < 0)
         return -1;
     return 0;
 }
@@ -1061,27 +1606,77 @@ static int program_has_storage(const WrtcNativeClassProgram *program) {
     return 0;
 }
 
+static int program_has_reactor_hooks(
+    const WrtcNativeClassProgram *program) {
+    size_t class_index, region_index;
+    for (class_index = 0u; class_index < program->class_count; class_index++)
+        for (region_index = 0u;
+             region_index < program->classes[class_index].region_count;
+             region_index++)
+            if (program->classes[class_index].regions[region_index]
+                    .reactor_hook_emission_complete)
+                return 1;
+    return 0;
+}
+
+static int program_has_handle_run(const WrtcNativeClassProgram *program) {
+    size_t class_index, region_index;
+    for (class_index = 0u; class_index < program->class_count; class_index++)
+        for (region_index = 0u;
+             region_index < program->classes[class_index].region_count;
+             region_index++)
+            if ((program->classes[class_index].regions[region_index]
+                     .capabilities & WRTC_REGION_HANDLE_RUN) != 0u)
+                return 1;
+    return 0;
+}
+
+static int program_has_reactor_storage(
+    const WrtcNativeClassProgram *program) {
+    size_t class_index, field_index;
+    for (class_index = 0u; class_index < program->class_count; class_index++)
+        for (field_index = 0u;
+             field_index < program->classes[class_index].field_count;
+             field_index++) {
+            const WrtcNativeStorageKind kind =
+                program->classes[class_index].fields[field_index].storage_kind;
+            if (kind == WRTC_NATIVE_FIELD_SELECTOR ||
+                kind == WRTC_NATIVE_FIELD_PACKET_POOL)
+                return 1;
+        }
+    return 0;
+}
+
 static int emit_storage_owner(FILE *file) {
     return fputs(
-        "typedef struct{PyObject_HEAD int k;PyTypeObject*rt;"
+        "typedef struct{PyObject_HEAD int k;int wk;WA*wa;PyTypeObject*rt;"
+        "PyObject*owners;"
         "union{WrtcNativeScalar s;"
         "WrtcNativeFifo f;WrtcNativeMinHeap h;WrtcNativeAtomicUint32 a;"
-        "WrtcNativeMpsc m;WrtcNativeSpsc p;}u;}NSO;"
+        "WrtcNativeMpsc m;WrtcNativeSpsc p;WrtcNativeSelector*r;"
+        "WrtcNativePacketPool*b;WrtcNativeDatagramPacket d;}u;}NSO;"
+        "static void wadt(void*q,WA*a){NSO*o=(NSO*)q;if(!o||o->wa!=a)return;"
+        "o->wa=NULL;o->wk=0;if(a->iq==q)a->iq=NULL;if(a->oq==q)a->oq=NULL;}"
         "static void nd(void*i,void*c){(void)c;Py_DECREF((PyObject*)i);}"
         "static int notr(NSO*o,visitproc v,void*a){"
         "if(o->rt){int z=v((PyObject*)o->rt,a);if(z)return z;}"
+        "if(o->owners){int z=v(o->owners,a);if(z)return z;}"
         "if(o->k==1)return wrtc_native_scalar_traverse(&o->u.s,v,a);"
         "if(o->k==2)return wrtc_native_fifo_traverse(&o->u.f,v,a);"
         "if(o->k==3)return wrtc_native_heap_traverse(&o->u.h,v,a);"
         "if(o->k==5)return wrtc_native_mpsc_traverse(&o->u.m,v,a);"
         "if(o->k==6)return wrtc_native_spsc_traverse(&o->u.p,v,a);return 0;}"
-        "static int nocl(NSO*o){if(o->k==1)wrtc_native_scalar_clear(&o->u.s);"
+        "static int nocl(NSO*o){if(o->wa)wadt(o,o->wa);"
+        "if(o->k==1)wrtc_native_scalar_clear(&o->u.s);"
         "else if(o->k==2)wrtc_native_fifo_clear(&o->u.f);"
         "else if(o->k==3)wrtc_native_heap_clear(&o->u.h);"
         "else if(o->k==4)wrtc_native_atomic_uint32_clear(&o->u.a);"
         "else if(o->k==5)wrtc_native_mpsc_clear(&o->u.m,nd,NULL);"
         "else if(o->k==6)wrtc_native_spsc_clear(&o->u.p,nd,NULL);"
-        "Py_CLEAR(o->rt);o->k=0;return 0;}"
+        "else if(o->k==7)wrtc_native_selector_destroy(o->u.r);"
+        "else if(o->k==8)wrtc_native_packet_pool_destroy(o->u.b);"
+        "else if(o->k==9)(void)wrtc_native_datagram_packet_release(&o->u.d);"
+        "Py_CLEAR(o->rt);Py_CLEAR(o->owners);o->k=0;return 0;}"
         "static void node(NSO*o){PyObject_GC_UnTrack((PyObject*)o);"
         "(void)nocl(o);Py_TYPE(o)->tp_free((PyObject*)o);}"
         "static int n32(PyObject*v,uint_least32_t*out){unsigned long x;"
@@ -1115,6 +1710,7 @@ static int emit_storage_owner(FILE *file) {
         "static PyObject*nqp(NSO*o,PyObject*v){WrtcNativeMpscStatus s;"
         "int notify=0;if(o->k!=5&&o->k!=6){PyErr_SetString(PyExc_TypeError,"
         "\"put_nowait requires bounded queue storage\");return NULL;}"
+        "if(o->wa&&o->wk==1)return wasub(o->wa,v);"
         "if(!o->rt||Py_TYPE(v)!=o->rt){PyErr_SetString(PyExc_TypeError,"
         "\"queue publication requires the exact ABI-declared record type\");"
         "return NULL;}"
@@ -1127,6 +1723,10 @@ static int emit_storage_owner(FILE *file) {
         "WrtcNativeMpscStatus s;(void)unused;if(o->k!=5&&o->k!=6){"
         "PyErr_SetString(PyExc_TypeError,"
         "\"get_nowait requires bounded queue storage\");return NULL;}"
+        "if(o->wa&&o->wk==2){PyObject*r=wag(o->wa);if(!r&&!PyErr_Occurred())"
+        "(void)nqe(\"Empty\");return r;}"
+        "if(o->wa&&o->wk==1){PyObject*r=wapop(o->wa);if(!r&&!PyErr_Occurred())"
+        "(void)nqe(\"Empty\");return r;}"
         "if(o->k==5)s=wrtc_native_mpsc_try_pop(&o->u.m,&i);"
         "else s=(WrtcNativeMpscStatus)wrtc_native_spsc_try_pop(&o->u.p,&i);"
         "if(s==WRTC_MPSC_OK)return(PyObject*)i;"
@@ -1134,16 +1734,163 @@ static int emit_storage_owner(FILE *file) {
         "static PyObject*nqs(NSO*o,PyObject*unused){(void)unused;"
         "if(o->k!=5&&o->k!=6){PyErr_SetString(PyExc_TypeError,"
         "\"qsize requires bounded queue storage\");return NULL;}"
+        "if(o->wa&&o->wk==2)return PyLong_FromSsize_t(waqs(o->wa));"
+        "if(o->wa&&o->wk==1)return PyLong_FromSsize_t(o->wa->pending?"
+        "PyList_GET_SIZE(o->wa->pending):0);"
         "return PyLong_FromSize_t(o->k==5?wrtc_native_mpsc_snapshot(&o->u.m):"
         "wrtc_native_spsc_snapshot(&o->u.p));}"
         "static PyObject*nqz(NSO*o,PyObject*unused){(void)unused;"
         "if(o->k!=5&&o->k!=6){PyErr_SetString(PyExc_TypeError,"
         "\"empty requires bounded queue storage\");return NULL;}"
+        "if(o->wa)return PyBool_FromLong(o->wk==2?waqs(o->wa)==0:"
+        "(!o->wa->pending||PyList_GET_SIZE(o->wa->pending)==0));"
         "return PyBool_FromLong((o->k==5?wrtc_native_mpsc_snapshot(&o->u.m):"
         "wrtc_native_spsc_snapshot(&o->u.p))==0u);}"
+        "static PyObject*nqclosed(NSO*o,void*unused){int open;(void)unused;"
+        "if(o->k!=5&&o->k!=6){PyErr_SetString(PyExc_TypeError,"
+        "\"closed requires bounded queue storage\");return NULL;}"
+        "if(o->wa)open=!o->wa->admission_closed&&!o->wa->closed;"
+        "else open=o->k==5?wrtc_native_mpsc_is_open(&o->u.m):"
+        "wrtc_native_spsc_is_open(&o->u.p);return PyBool_FromLong(!open);}"
+        "static int nrt(PyObject*k,WrtcNativeDescriptorToken*t){"
+        "unsigned long long g;if(!PyArg_ParseTuple(k,\"iK\",&t->descriptor,"
+        "&g))return -1;t->generation=(uint64_t)g;return 0;}"
+        "static PyObject*nrr(NSO*o,PyObject*args){int fd;unsigned int ev;"
+        "PyObject*d=Py_None,*k=NULL;WrtcNativeDescriptorToken t;"
+        "WrtcNativeReactorStatus s;if(o->k!=7||!o->u.r){PyErr_SetString("
+        "PyExc_TypeError,\"register requires live selector storage\");"
+        "return NULL;}if(!PyGILState_Check()){PyErr_SetString("
+        "PyExc_RuntimeError,\"selector mutation requires reactor-thread GIL\");"
+        "return NULL;}if(!PyArg_ParseTuple(args,\"iI|O:register\",&fd,&ev,&d))"
+        "return NULL;s=wrtc_native_selector_register(o->u.r,fd,ev,NULL,&t);"
+        "if(s!=WRTC_REACTOR_OK){PyErr_Format(PyExc_RuntimeError,"
+        "\"selector register failed: %d\",(int)s);return NULL;}"
+        "k=Py_BuildValue(\"(iK)\",t.descriptor,"
+        "(unsigned long long)t.generation);if(!k||PyDict_SetItem(o->owners,k,d)<0){"
+        "(void)wrtc_native_selector_remove(o->u.r,t);Py_XDECREF(k);return NULL;}"
+        "return k;}"
+        "static PyObject*nrm(NSO*o,PyObject*args){PyObject*k,*d=Py_None;"
+        "unsigned int ev;WrtcNativeDescriptorToken t;WrtcNativeReactorStatus s;"
+        "if(o->k!=7||!o->u.r){PyErr_SetString(PyExc_TypeError,"
+        "\"modify requires live selector storage\");return NULL;}"
+        "if(!PyArg_ParseTuple(args,\"OI|O:modify\",&k,&ev,&d)||nrt(k,&t)<0)"
+        "return NULL;s=wrtc_native_selector_modify(o->u.r,t,ev,NULL);"
+        "if(s==WRTC_REACTOR_STALE)return Py_NewRef(Py_False);"
+        "if(s!=WRTC_REACTOR_OK){PyErr_Format(PyExc_RuntimeError,"
+        "\"selector modify failed: %d\",(int)s);return NULL;}"
+        "if(PyDict_SetItem(o->owners,k,d)<0)return NULL;return Py_NewRef(Py_True);}"
+        "static PyObject*nrd(NSO*o,PyObject*k){WrtcNativeDescriptorToken t;"
+        "WrtcNativeReactorStatus s;if(o->k!=7||!o->u.r){PyErr_SetString("
+        "PyExc_TypeError,\"remove requires live selector storage\");return NULL;}"
+        "if(nrt(k,&t)<0)return NULL;s=wrtc_native_selector_remove(o->u.r,t);"
+        "if(s==WRTC_REACTOR_STALE)return Py_NewRef(Py_False);"
+        "if(s!=WRTC_REACTOR_OK){PyErr_Format(PyExc_RuntimeError,"
+        "\"selector remove failed: %d\",(int)s);return NULL;}"
+        "if(PyDict_DelItem(o->owners,k)<0)return NULL;return Py_NewRef(Py_True);}"
+        "static PyObject*nrc(NSO*o,PyObject*k){WrtcNativeDescriptorToken t;"
+        "if(o->k!=7||!o->u.r||nrt(k,&t)<0)return NULL;return PyBool_FromLong("
+        "wrtc_native_selector_token_is_current(o->u.r,t));}"
+        "static PyObject*nro(NSO*o,PyObject*k){PyObject*v;if(o->k!=7||!o->u.r){"
+        "PyErr_SetString(PyExc_TypeError,\"owner requires live selector storage\");"
+        "return NULL;}v=PyDict_GetItemWithError(o->owners,k);if(!v&&!PyErr_Occurred())"
+        "PyErr_SetObject(PyExc_KeyError,k);return v?Py_NewRef(v):NULL;}"
+        "static PyObject*nrp(NSO*o,PyObject*args){int timeout,syserr=0;"
+        "Py_ssize_t limit,i;size_t count=0u;WrtcNativeReadyEvent*events=NULL;"
+        "WrtcNativeReactorStatus s;PyObject*result=NULL;if(o->k!=7||!o->u.r){"
+        "PyErr_SetString(PyExc_TypeError,\"poll requires live selector storage\");"
+        "return NULL;}if(!PyArg_ParseTuple(args,\"in:poll\",&timeout,&limit))"
+        "return NULL;if(limit<=0){PyErr_SetString(PyExc_ValueError,"
+        "\"poll event limit must be positive\");return NULL;}events=PyMem_Calloc("
+        "(size_t)limit,sizeof(*events));if(!events)return PyErr_NoMemory();"
+        "s=wrtc_native_selector_wait(o->u.r,timeout,events,(size_t)limit,&count,"
+        "&syserr);if(s!=WRTC_REACTOR_OK){PyMem_Free(events);if(s=="
+        "WRTC_REACTOR_SYSTEM_ERROR){errno=syserr;return PyErr_SetFromErrno("
+        "PyExc_OSError);}PyErr_Format(PyExc_RuntimeError,"
+        "\"selector poll failed: %d\",(int)s);return NULL;}"
+        "result=PyList_New((Py_ssize_t)count);if(!result){PyMem_Free(events);"
+        "return NULL;}for(i=0;i<(Py_ssize_t)count;i++){PyObject*k=Py_BuildValue("
+        "\"(iK)\",events[i].token.descriptor,(unsigned long long)"
+        "events[i].token.generation),*d,*item;if(!k)goto fail;d=PyDict_GetItemWithError("
+        "o->owners,k);if(!d){Py_DECREF(k);if(!PyErr_Occurred())PyErr_SetString("
+        "PyExc_RuntimeError,\"ready token has no boxed owner\");goto fail;}"
+        "item=Py_BuildValue(\"(OIO)\",k,events[i].events,d);Py_DECREF(k);"
+        "if(!item)goto fail;PyList_SET_ITEM(result,i,item);}PyMem_Free(events);"
+        "return result;fail:PyMem_Free(events);Py_DECREF(result);return NULL;}"
+        "static PyObject*npa(NSO*o,PyObject*unused){(void)unused;if(o->k!=8||"
+        "!o->u.b){PyErr_SetString(PyExc_TypeError,"
+        "\"available requires live packet slab storage\");return NULL;}"
+        "return PyLong_FromSize_t(wrtc_native_packet_pool_available(o->u.b));}"
+        "static WrtcNativePacketDisposition npy(WrtcNativeDatagramPacket*p,"
+        "void*c){PyObject*callback=(PyObject*)c,*payload,*result;"
+        "if(!PyGILState_Check()){PyErr_SetString(PyExc_RuntimeError,"
+        "\"datagram delivery requires reactor-thread GIL\");"
+        "return WRTC_PACKET_DELIVERY_ERROR;}payload=PyBytes_FromStringAndSize("
+        "(const char*)p->data,(Py_ssize_t)p->size);if(!payload)"
+        "return WRTC_PACKET_DELIVERY_ERROR;result=PyObject_CallOneArg("
+        "callback,payload);Py_DECREF(payload);if(!result)"
+        "return WRTC_PACKET_DELIVERY_ERROR;Py_DECREF(result);"
+        "return WRTC_PACKET_CONSUMED;}"
+        "typedef struct{NSO*owner;PyObject*callback;}NPC;"
+        "static WrtcNativePacketDisposition npl(WrtcNativeDatagramPacket*p,"
+        "void*c){NPC*x=(NPC*)c;NSO*lease;PyObject*result;int retained;"
+        "if(!PyGILState_Check()){PyErr_SetString(PyExc_RuntimeError,"
+        "\"retained datagram delivery requires reactor-thread GIL\");"
+        "return WRTC_PACKET_DELIVERY_ERROR;}lease=PyObject_GC_New(NSO,"
+        "Py_TYPE(x->owner));if(!lease){PyErr_NoMemory();return "
+        "WRTC_PACKET_DELIVERY_ERROR;}lease->k=9;lease->rt=NULL;"
+        "lease->owners=NULL;lease->u.d=*p;PyObject_GC_Track((PyObject*)lease);"
+        "result=PyObject_CallOneArg(x->callback,(PyObject*)lease);if(!result){"
+        "if(lease->k==0)p->pool=NULL;else lease->k=0;"
+        "Py_DECREF((PyObject*)lease);return "
+        "WRTC_PACKET_DELIVERY_ERROR;}Py_DECREF(result);if(lease->k!=9){"
+        "p->pool=NULL;Py_DECREF((PyObject*)lease);return WRTC_PACKET_CONSUMED;}"
+        "retained=Py_REFCNT(lease)>1;if(!retained)lease->k=0;"
+        "Py_DECREF((PyObject*)lease);return retained?WRTC_PACKET_RETAINED:"
+        "WRTC_PACKET_CONSUMED;}"
+        "static PyObject*nlt(NSO*o,PyObject*unused){(void)unused;if(o->k!=9){"
+        "PyErr_SetString(PyExc_RuntimeError,\"packet lease is released\");"
+        "return NULL;}return PyBytes_FromStringAndSize((const char*)o->u.d.data,"
+        "(Py_ssize_t)o->u.d.size);}"
+        "static PyObject*nlr(NSO*o,PyObject*unused){WrtcNativeReactorStatus s;"
+        "(void)unused;if(o->k!=9)return Py_NewRef(Py_None);s="
+        "wrtc_native_datagram_packet_release(&o->u.d);o->k=0;if(s!="
+        "WRTC_REACTOR_OK){PyErr_SetString(PyExc_RuntimeError,"
+        "\"packet lease release failed\");return NULL;}return Py_NewRef(Py_None);}"
+        "static PyObject*npd(NSO*o,PyObject*args){int fd;Py_ssize_t budget;"
+        "unsigned long long nanos;PyObject*callback;WrtcNativeDatagramDrainResult r;"
+        "WrtcNativeReactorStatus s;if(o->k!=8||!o->u.b){PyErr_SetString("
+        "PyExc_TypeError,\"drain requires live packet slab storage\");"
+        "return NULL;}if(!PyArg_ParseTuple(args,\"inKO:drain\",&fd,&budget,"
+        "&nanos,&callback))return NULL;if(budget<=0||!PyCallable_Check(callback)){"
+        "PyErr_SetString(PyExc_ValueError,"
+        "\"drain requires positive budget and callable delivery\");return NULL;}"
+        "s=wrtc_native_datagram_drain(fd,o->u.b,(size_t)budget,(uint64_t)nanos,"
+        "npy,callback,&r);if(PyErr_Occurred())return NULL;if(r.packets>"
+        "(size_t)PY_SSIZE_T_MAX||r.receive_syscalls>(size_t)PY_SSIZE_T_MAX)"
+        "return PyErr_NoMemory();return Py_BuildValue(\"(inniii)\",(int)s,"
+        "(Py_ssize_t)r.packets,(Py_ssize_t)r.receive_syscalls,(int)r.reason,"
+        "r.reschedule,r.system_error);}"
+        "static PyObject*npr(NSO*o,PyObject*args){int fd;Py_ssize_t budget;"
+        "unsigned long long nanos;PyObject*callback;WrtcNativeDatagramDrainResult r;"
+        "WrtcNativeReactorStatus s;NPC context;if(o->k!=8||!o->u.b){"
+        "PyErr_SetString(PyExc_TypeError,"
+        "\"drain_retained requires live packet slab storage\");return NULL;}"
+        "if(!PyArg_ParseTuple(args,\"inKO:drain_retained\",&fd,&budget,"
+        "&nanos,&callback))return NULL;if(budget<=0||!PyCallable_Check(callback)){"
+        "PyErr_SetString(PyExc_ValueError,"
+        "\"drain_retained requires positive budget and callable delivery\");"
+        "return NULL;}context.owner=o;context.callback=callback;s="
+        "wrtc_native_datagram_drain(fd,o->u.b,(size_t)budget,(uint64_t)nanos,"
+        "npl,&context,&r);if(PyErr_Occurred())return NULL;if(r.packets>"
+        "(size_t)PY_SSIZE_T_MAX||r.receive_syscalls>(size_t)PY_SSIZE_T_MAX)"
+        "return PyErr_NoMemory();return Py_BuildValue(\"(inniii)\",(int)s,"
+        "(Py_ssize_t)r.packets,(Py_ssize_t)r.receive_syscalls,(int)r.reason,"
+        "r.reschedule,r.system_error);}"
         "static PyObject*nqc(NSO*o,PyObject*unused){(void)unused;"
         "if(o->k!=5&&o->k!=6){PyErr_SetString(PyExc_TypeError,"
         "\"close requires bounded queue storage\");return NULL;}"
+        "if(o->wa&&o->wk==1)return waco(o->wa,NULL);"
+        "if(o->wa&&o->wk==2)return Py_NewRef(Py_None);"
         "if(o->k==5)wrtc_native_mpsc_close(&o->u.m);"
         "else wrtc_native_spsc_close(&o->u.p);return Py_NewRef(Py_None);}"
         "static PyMethodDef nom[]={{\"load\",(PyCFunction)nol,METH_NOARGS,NULL},"
@@ -1152,11 +1899,24 @@ static int emit_storage_owner(FILE *file) {
         "{\"get_nowait\",(PyCFunction)nqg,METH_NOARGS,NULL},"
         "{\"qsize\",(PyCFunction)nqs,METH_NOARGS,NULL},"
         "{\"empty\",(PyCFunction)nqz,METH_NOARGS,NULL},"
+        "{\"register\",(PyCFunction)nrr,METH_VARARGS,NULL},"
+        "{\"modify\",(PyCFunction)nrm,METH_VARARGS,NULL},"
+        "{\"remove\",(PyCFunction)nrd,METH_O,NULL},"
+        "{\"is_current\",(PyCFunction)nrc,METH_O,NULL},"
+        "{\"owner\",(PyCFunction)nro,METH_O,NULL},"
+        "{\"poll\",(PyCFunction)nrp,METH_VARARGS,NULL},"
+        "{\"available\",(PyCFunction)npa,METH_NOARGS,NULL},"
+        "{\"drain\",(PyCFunction)npd,METH_VARARGS,NULL},"
+        "{\"drain_retained\",(PyCFunction)npr,METH_VARARGS,NULL},"
+        "{\"to_bytes\",(PyCFunction)nlt,METH_NOARGS,NULL},"
+        "{\"release\",(PyCFunction)nlr,METH_NOARGS,NULL},"
         "{\"close\",(PyCFunction)nqc,METH_NOARGS,NULL},"
         "{NULL,NULL,0,NULL}};"
+        "static PyGetSetDef nog[]={{\"closed\",(getter)nqclosed,NULL,NULL,NULL},"
+        "{NULL,NULL,NULL,NULL,NULL}};"
         "static PyType_Slot nosl[]={{Py_tp_traverse,(void*)notr},"
         "{Py_tp_clear,(void*)nocl},{Py_tp_dealloc,(void*)node},"
-        "{Py_tp_methods,(void*)nom},{0,NULL}};"
+        "{Py_tp_methods,(void*)nom},{Py_tp_getset,(void*)nog},{0,NULL}};"
         "static PyType_Spec nosp={\"pymeta.NativeStorageOwner\",sizeof(NSO),"
         "0,Py_TPFLAGS_DEFAULT|Py_TPFLAGS_HAVE_GC,nosl};"
         "static const char wrtc_nalias_name[]="
@@ -1170,10 +1930,12 @@ static int emit_storage_owner(FILE *file) {
         "static NSO*nal(PyObject*c){return(NSO*)PyCapsule_GetPointer("
         "c,wrtc_nalias_name);}"
         "static int nai(PyObject*,PyObject*,NSO**);"
+        "static int nri(PyObject*,NSO**,int,const char*,const char*);"
         "static NSO*no(PyObject*self,int k){PyTypeObject*t=nt(self);"
-        "(void)nac;(void)nal;(void)nai;"
+        "(void)nac;(void)nal;(void)nai;(void)nri;"
         "NSO*o;if(!t)return NULL;o=PyObject_GC_New(NSO,t);if(!o)return NULL;"
-        "o->k=k;o->rt=NULL;if(k==1)wrtc_native_scalar_init(&o->u.s);"
+        "o->k=k;o->wk=0;o->wa=NULL;o->rt=NULL;o->owners=NULL;"
+        "if(k==1)wrtc_native_scalar_init(&o->u.s);"
         "else if(k==2){wrtc_native_fifo_init(&o->u.f);"
         "if(wrtc_native_fifo_activate(&o->u.f,8u)<0){PyObject_GC_Del(o);"
         "return NULL;}}else if(k==3){wrtc_native_heap_init(&o->u.h);"
@@ -1209,6 +1971,32 @@ static int emit_storage_owner(FILE *file) {
         "memcpy(n,p,z);n[z]='\\0';x=PyObject_GetAttrString(o,n);"
         "PyMem_Free(n);Py_DECREF(o);if(!x)return NULL;o=x;"
         "if(!d)break;p=d+1;}return o;}\n"
+        "static PyObject*ncv(PyObject*self,const char*s){char*e=NULL;"
+        "unsigned long long x;if(!s)return NULL;if(strncmp(s,\"self.\",5)==0)"
+        "return ncp(self,s);x=strtoull(s,&e,10);if(!e||*e!='\\0'){"
+        "PyErr_SetString(PyExc_TypeError,\"reactor capacity must be an "
+        "integer or self field path\");return NULL;}"
+        "return PyLong_FromUnsignedLongLong(x);}"
+        "static int nri(PyObject*self,NSO**p,int k,const char*cs,const char*bs){"
+        "PyObject*c=NULL,*b=NULL;PyTypeObject*t;NSO*o=NULL;size_t cap,buf=0u;"
+        "if(*p){PyErr_SetString(PyExc_AttributeError,"
+        "\"reactor storage may only be initialized once\");return -1;}"
+        "if(!PyGILState_Check()){PyErr_SetString(PyExc_RuntimeError,"
+        "\"reactor storage initialization requires reactor-thread GIL\");"
+        "return -1;}c=ncv(self,cs);if(!c)return -1;"
+        "cap=PyLong_AsSize_t(c);Py_DECREF(c);if(PyErr_Occurred())return -1;"
+        "if(cap==0u){PyErr_SetString(PyExc_ValueError,"
+        "\"reactor capacity must be positive\");return -1;}"
+        "if(k==8){b=ncv(self,bs);if(!b)return -1;buf=PyLong_AsSize_t(b);"
+        "Py_DECREF(b);if(PyErr_Occurred())return -1;if(buf==0u){"
+        "PyErr_SetString(PyExc_ValueError,"
+        "\"packet buffer size must be positive\");return -1;}}"
+        "t=nt(self);if(!t)return -1;o=PyObject_GC_New(NSO,t);if(!o)return -1;"
+        "o->k=k;o->wk=0;o->wa=NULL;o->rt=NULL;o->owners=PyDict_New();o->u.r=NULL;"
+        "if(!o->owners)goto fail;if((k==7?wrtc_native_selector_create("
+        "&o->u.r,cap):wrtc_native_packet_pool_create(&o->u.b,cap,buf))<0){"
+        "PyErr_NoMemory();goto fail;}PyObject_GC_Track((PyObject*)o);*p=o;"
+        "return 0;fail:Py_XDECREF(o->owners);PyObject_GC_Del(o);return -1;}\n"
         "#if defined(__GNUC__)||defined(__clang__)\n"
         "#define WRTC_UNUSED __attribute__((unused))\n"
         "#else\n#define WRTC_UNUSED\n#endif\n"
@@ -1247,7 +2035,8 @@ static int emit_storage_owner(FILE *file) {
         "if(!PyType_Check(rt)){PyErr_SetString(PyExc_TypeError,"
         "\"queue ABI record guard did not resolve to a type\");goto fail;}"
         "ot=nt(self);if(!ot)goto fail;o=PyObject_GC_New(NSO,ot);"
-        "if(!o)goto fail;o->k=k;o->rt=(PyTypeObject*)rt;rt=NULL;"
+        "if(!o)goto fail;o->k=k;o->wk=0;o->wa=NULL;"
+        "o->rt=(PyTypeObject*)rt;o->owners=NULL;rt=NULL;"
         "if((k==5?wrtc_native_mpsc_init(&o->u.m,capacity):"
         "wrtc_native_spsc_init(&o->u.p,capacity))<0){Py_CLEAR(o->rt);"
         "PyObject_GC_Del(o);"
@@ -1269,6 +2058,12 @@ static int emit_native_class_extension(
     Py_ssize_t position = 0;
     PyObject *key, *value;
     const int has_storage = program_has_storage(program);
+    const int has_reactor_hooks = program_has_reactor_hooks(program);
+    const int has_reactor_storage = program_has_reactor_storage(program);
+    const int has_reactor_runtime = has_reactor_hooks || has_storage;
+    const int has_handle_run = program_has_handle_run(program);
+    const int has_constructors = program_has_constructors(program);
+    const int has_workers = program_has_workers(program);
     const size_t fusion_count = fused_call_count(program);
     if (file == NULL || module == NULL || program == NULL)
         return -1;
@@ -1278,10 +2073,12 @@ static int emit_native_class_extension(
               "#if PY_VERSION_HEX < 0x030C0000\n"
               "#error \"native heap data requires CPython 3.12 or newer\"\n"
               "#endif\n"
-              "typedef struct MS MS;static struct PyModuleDef md;",
+              "typedef struct MS MS;static struct PyModuleDef md;"
+              "static MS*sm(PyObject*);"
+              "static PyTypeObject*dt(PyObject*,size_t);",
               file) < 0 ||
-        ((has_storage || fusion_count != 0u) &&
-         fputs("static PyTypeObject*dt(PyObject*,size_t);", file) < 0) ||
+        (has_handle_run &&
+         fputs("static PyObject*whr(PyObject*,PyObject*);", file) < 0) ||
         (fusion_count != 0u &&
          fputs("static PyObject*fd(PyObject*,size_t);", file) < 0) ||
         (has_storage &&
@@ -1304,13 +2101,80 @@ static int emit_native_class_extension(
               "return b;}\n",
               file) < 0)
         return -1;
-    if (wrtc_boxed_emit_runtime(file) < 0) return -1;
-    if (has_storage &&
-        (wrtc_native_storage_emit_runtime(file) < 0 ||
-         emit_storage_owner(file) < 0))
+    if (fputs(
+            "static int ta(PyObject*t,Py_ssize_t i,const char*n){"
+            "PyObject*v=PyUnicode_FromString(n);if(!v)return -1;"
+            "PyTuple_SET_ITEM(t,i,v);return 0;}"
+            "static int ma(PyObject*m,const char*n,PyObject*v){"
+            "if(!v)return -1;if(PyModule_AddObject(m,n,v)<0){"
+            "Py_DECREF(v);return -1;}return 0;}\n",
+            file) < 0)
         return -1;
+    if (wrtc_boxed_emit_runtime(file) < 0) return -1;
+    if (has_constructors &&
+        fputs(
+            "static PyObject*wwa(PyObject*,size_t,int*);"
+            "typedef struct{PyObject*self;size_t ci;}WCC;"
+            "static PyObject*wce(void*opaque,const WrtcPyExprIR*e,void*f,"
+            "int*h){WCC*c=(WCC*)opaque;const WrtcPyExprIR*a,*q;"
+            "PyTypeObject*t,*b;PyObject*args=NULL,*full=NULL,*kwargs=NULL,"
+            "*callable=NULL,*r=NULL;size_t i;if(!c||!e||"
+            "e->kind!=WRTC_PY_EXPR_CALL||"
+            "e->child_count==0u)return NULL;a=&e->children[0];"
+            "if(a->kind==WRTC_PY_EXPR_ATTRIBUTE&&a->operation&&"
+            "strcmp(a->operation,\"Thread\")==0)return wwa(c->self,c->ci,h);"
+            "if(a->kind!=WRTC_PY_EXPR_ATTRIBUTE||!a->operation||"
+            "strcmp(a->operation,\"__init__\")!=0||a->child_count!=1u)"
+            "return NULL;q=&a->children[0];if(q->kind!=WRTC_PY_EXPR_CALL||"
+            "q->child_count!=1u||q->positional_count!=0u||"
+            "q->keyword_count!=0u||q->children[0].kind!=WRTC_PY_EXPR_NAME||"
+            "!q->children[0].operation||strcmp(q->children[0].operation,"
+            "\"super\")!=0)return NULL;*h=1;t=dt(c->self,c->ci);"
+            "if(!t||!(b=t->tp_base)){PyErr_SetString(PyExc_TypeError,"
+            "\"native constructor base is unavailable\");return NULL;}"
+            "callable=PyObject_GetAttrString((PyObject*)b,\"__init__\");"
+            "if(!callable)return NULL;args=PyTuple_New("
+            "(Py_ssize_t)e->positional_count);"
+            "kwargs=PyDict_New();if(!args||!kwargs)goto done;"
+            "for(i=0u;i<e->positional_count;i++){PyObject*v="
+            "wrtc_boxed_hook_evaluate(&e->children[1u+i],f);"
+            "if(!v)goto done;PyTuple_SET_ITEM(args,(Py_ssize_t)i,v);}"
+            "for(i=0u;i<e->keyword_count;i++){PyObject*v="
+            "wrtc_boxed_hook_evaluate(&e->children[1u+e->positional_count+i],f);"
+            "if(!v||PyDict_SetItemString(kwargs,e->keyword_names[i],v)<0){"
+            "Py_XDECREF(v);goto done;}Py_DECREF(v);}full=PyTuple_New("
+            "(Py_ssize_t)e->positional_count+1);if(!full)goto done;"
+            "PyTuple_SET_ITEM(full,0,Py_NewRef(c->self));for(i=0u;i<"
+            "e->positional_count;i++)PyTuple_SET_ITEM(full,(Py_ssize_t)i+1,"
+            "Py_NewRef(PyTuple_GET_ITEM(args,(Py_ssize_t)i)));r=PyObject_Call("
+            "callable,full,kwargs);done:Py_XDECREF(callable);Py_XDECREF(kwargs);"
+            "Py_XDECREF(full);Py_XDECREF(args);return r;}\n",
+            file) < 0)
+        return -1;
+    if (has_reactor_runtime && wrtc_native_reactor_emit_runtime(file) < 0)
+        return -1;
+    if (has_reactor_hooks &&
+        wrtc_native_reactor_emit_cpython_runtime(file) < 0)
+        return -1;
+    if (has_storage && wrtc_native_storage_emit_runtime(file) < 0)
+        return -1;
+    /* Storage owners carry an optional worker attachment.  Emit the generic
+     * adapter declarations for storage-only artifacts as well; no executor is
+     * created unless a proof-complete owned worker constructor selects it. */
+    if (has_storage &&
+        (wrtc_native_worker_emit_runtime(file) < 0 ||
+         wrtc_native_worker_emit_cpython_adapter(file) < 0))
+        return -1;
+    if (has_workers &&
+        (emit_worker_abis(file, program) < 0 ||
+         wrtc_native_kernel_emit(file, program, "wk") < 0))
+        return -1;
+    if (has_storage && emit_storage_owner(file) < 0) return -1;
     for (index = 0u; index < program->class_count; index++) {
         size_t region_index;
+        if (program->classes[index].custom_constructor &&
+            fprintf(file, "static int cg%zu(PyObject*);", index) < 0)
+            return -1;
         for (region_index = 0u;
              region_index < program->classes[index].region_count;
              region_index++)
@@ -1322,7 +2186,7 @@ static int emit_native_class_extension(
     }
     for (index = 0u; index < program->class_count; index++) {
         size_t region_index;
-        if (program->classes[index].region_count != 0u) {
+        if (class_has_globals(&program->classes[index])) {
             char globals_symbol[32];
             char *module_name =
                 wrtc_boxed_module_name(program->classes[index].filename);
@@ -1335,6 +2199,20 @@ static int emit_native_class_extension(
                 return -1;
             }
             free(module_name);
+        }
+        if (program->classes[index].custom_constructor) {
+            char suite_symbol[64], signature_symbol[64];
+            (void)snprintf(suite_symbol, sizeof suite_symbol,
+                           "c%zu_suite", index);
+            (void)snprintf(signature_symbol, sizeof signature_symbol,
+                           "c%zu_sig", index);
+            if (wrtc_boxed_emit_suite(
+                    file, suite_symbol,
+                    program->classes[index].constructor_body) < 0 ||
+                wrtc_boxed_emit_signature(
+                    file, signature_symbol,
+                    program->classes[index].constructor_signature) < 0)
+                return -1;
         }
         for (region_index = 0u;
              region_index < program->classes[index].region_count;
@@ -1398,40 +2276,193 @@ static int emit_native_class_extension(
         if (emit_class(file, module, program, operations,
                        &program->classes[index], index) < 0)
             return -1;
+        if (emit_python_method_fallback_copy(
+                file, &program->classes[index], index) < 0)
+            return -1;
     }
     if (fprintf(file,
-                "struct MS{PyObject*t[%zu];PyObject*nt;PyObject*fd[%zu];};",
+                "struct MS{PyObject*t[%zu];PyObject*sg[%zu];PyObject*ot[%zu];"
+                "PyObject*nt;PyObject*wt;PyObject*rt[%zu];PyObject*fd[%zu];"
+                "PyObject*hr[7];"
+                "unsigned active;};static size_t mlive=0u;",
                 program->class_count,
+                program->class_count,
+                program->class_count,
+                program->record_count == 0u ? 1u : program->record_count,
                 fusion_count == 0u ? 1u : fusion_count) < 0 ||
-        ((has_storage || fusion_count != 0u) &&
-         fputs("static MS*sm(PyObject*o){PyObject*m="
+        fputs("static MS*sm(PyObject*o){PyObject*m="
                "PyType_GetModuleByDef(Py_TYPE(o),&md);"
                "return m?(MS*)PyModule_GetState(m):NULL;}"
                "static PyTypeObject*dt(PyObject*o,size_t i){"
                "MS*s=sm(o);return s?(PyTypeObject*)s->t[i]:NULL;}",
-               file) < 0) ||
+               file) < 0 ||
         (fusion_count != 0u &&
          fputs("static PyObject*fd(PyObject*o,size_t i){"
                "MS*s=sm(o);return s?s->fd[i]:NULL;}", file) < 0) ||
         (has_storage &&
          fputs("static PyTypeObject*nt(PyObject*o){MS*s=sm(o);"
                "return s?(PyTypeObject*)s->nt:NULL;}", file) < 0) ||
-        fputs("static int mt(PyObject*m,visitproc visit,void*arg){MS*s="
+        0)
+        return -1;
+    if (has_handle_run && fputs(
+            "static PyObject*whr(PyObject*l,PyObject*h){MS*s=sm(l);"
+            "PyObject*d,*v,*hl=NULL,*cb=NULL,*args=NULL,*ctx=NULL,*run=NULL,*full=NULL,*r=NULL;"
+            "PyObject*et=NULL,*ev=NULL,*tb=NULL,*fm=NULL,*fmt=NULL,*dbg=NULL,*msg=NULL,*cd=NULL,*src=NULL,*ceh=NULL;"
+            "int cancelled,i;if(!s||!s->hr[0]||(Py_TYPE(h)!=(PyTypeObject*)s->hr[0]&&"
+            "Py_TYPE(h)!=(PyTypeObject*)s->hr[6]))goto dynamic;"
+            "d=PyType_GetDict((PyTypeObject*)s->hr[0]);for(i=1;i<6;i++){v=PyDict_GetItemString(d,"
+            "i==1?\"_run\":i==2?\"_callback\":i==3?\"_args\":i==4?\"_cancelled\":\"_context\");"
+            "if(v!=s->hr[i])goto dynamic;}args=PyObject_GetAttrString(h,\"_args\");"
+            "if(!args)return NULL;if(!PyTuple_CheckExact(args)){Py_CLEAR(args);goto dynamic;}"
+            "v=PyObject_GetAttrString(h,\"_cancelled\");if(!v)goto done;cancelled=PyObject_IsTrue(v);Py_DECREF(v);"
+            "if(cancelled<0)goto done;if(cancelled){r=Py_NewRef(Py_None);goto done;}"
+            "cb=PyObject_GetAttrString(h,\"_callback\");ctx=PyObject_GetAttrString(h,\"_context\");"
+            "if(!cb||!ctx)goto done;run=PyObject_GetAttrString(ctx,\"run\");if(!run)goto done;"
+            "full=PyTuple_New(PyTuple_GET_SIZE(args)+1);if(!full)goto done;PyTuple_SET_ITEM(full,0,Py_NewRef(cb));"
+            "for(i=0;i<PyTuple_GET_SIZE(args);i++)PyTuple_SET_ITEM(full,i+1,Py_NewRef(PyTuple_GET_ITEM(args,i)));"
+            "r=PyObject_Call(run,full,NULL);if(r)goto done;PyErr_Fetch(&et,&ev,&tb);PyErr_NormalizeException(&et,&ev,&tb);"
+            "if(et&&(PyErr_GivenExceptionMatches(et,PyExc_SystemExit)||PyErr_GivenExceptionMatches(et,PyExc_KeyboardInterrupt))){"
+            "PyErr_Restore(et,ev,tb);et=ev=tb=NULL;goto done;}fm=PyImport_ImportModule(\"asyncio.format_helpers\");"
+            "if(!fm)goto handler_fail;fmt=PyObject_GetAttrString(fm,\"_format_callback_source\");"
+            "hl=PyObject_GetAttrString(h,\"_loop\");if(!hl)goto handler_fail;"
+            "dbg=PyObject_CallMethod(hl,\"get_debug\",NULL);if(!fmt||!dbg)goto handler_fail;"
+            "cd=PyDict_New();if(!cd)goto handler_fail;{PyObject*kw=Py_BuildValue(\"{s:O}\",\"debug\",dbg);"
+            "PyObject*fa=PyTuple_Pack(2,cb,args);if(!kw||!fa){Py_XDECREF(kw);Py_XDECREF(fa);goto handler_fail;}"
+            "v=PyObject_Call(fmt,fa,kw);Py_DECREF(fa);Py_DECREF(kw);}if(!v)goto handler_fail;"
+            "msg=PyUnicode_FromFormat(\"Exception in callback %U\",v);Py_DECREF(v);if(!msg)goto handler_fail;"
+            "if(PyDict_SetItemString(cd,\"message\",msg)<0||PyDict_SetItemString(cd,\"exception\",ev)<0||"
+            "PyDict_SetItemString(cd,\"handle\",h)<0)goto handler_fail;src=PyObject_GetAttrString(h,\"_source_traceback\");"
+            "if(!src)goto handler_fail;if(src!=Py_None&&PyDict_SetItemString(cd,\"source_traceback\",src)<0)goto handler_fail;"
+            "ceh=PyObject_GetAttrString(hl,\"call_exception_handler\");if(!ceh)goto handler_fail;"
+            "v=PyObject_CallOneArg(ceh,cd);if(!v)goto handler_raised;Py_DECREF(v);r=Py_NewRef(Py_None);goto handled;"
+            "handler_fail:PyErr_Clear();PyErr_Restore(et,ev,tb);et=ev=tb=NULL;handled:Py_XDECREF(et);Py_XDECREF(ev);Py_XDECREF(tb);goto done;"
+            "handler_raised:Py_CLEAR(et);Py_CLEAR(ev);Py_CLEAR(tb);goto done;"
+            "dynamic:run=PyObject_GetAttrString(h,\"_run\");if(run)r=PyObject_CallNoArgs(run);"
+            "done:Py_XDECREF(ceh);Py_XDECREF(src);Py_XDECREF(cd);Py_XDECREF(msg);Py_XDECREF(dbg);Py_XDECREF(fmt);Py_XDECREF(fm);"
+            "Py_XDECREF(full);Py_XDECREF(run);Py_XDECREF(ctx);Py_XDECREF(cb);Py_XDECREF(args);Py_XDECREF(hl);return r;}", file) < 0)
+        return -1;
+    if (has_constructors) {
+        if (fputs("static PyObject*wwa(PyObject*o,size_t ci,int*h){MS*s=sm(o);"
+                  "if(!s){PyErr_SetString(PyExc_RuntimeError,"
+                  "\"native module state is unavailable\");return NULL;}"
+                  "(void)ci;*h=0;", file) < 0)
+            return -1;
+        for (index = 0u; index < program->class_count; index++) {
+            const WrtcNativeClassIR *class_ir = &program->classes[index];
+            const WrtcNativeRegionIR *region;
+            const WrtcTypedRecordIR *input_record, *output_record;
+            size_t region_index, input_field, output_field, processor_field;
+            size_t callback_field, loop_field, capacity_field;
+            size_t input_record_index, output_record_index;
+            if (!worker_attachment_shape(program, class_ir)) continue;
+            region = owned_worker_region(class_ir, &region_index);
+            if (region == NULL) continue;
+            input_field = worker_queue_field(class_ir, "worker");
+            output_field = worker_queue_field(class_ir, "reactor");
+            processor_field = worker_processor_field(class_ir);
+            callback_field = worker_callback_field(class_ir, processor_field);
+            loop_field = worker_loop_field(class_ir, region);
+            capacity_field = worker_capacity_field(class_ir, input_field);
+            input_record = worker_input_record_generated(
+                program, region, &input_record_index);
+            output_record = generated_record_type(
+                program, region->result_type, &output_record_index);
+            if (input_record == NULL || output_record == NULL) return -1;
+            if (fprintf(file,
+                        "if(ci==%zu){H%zu*d=(H%zu*)PyObject_GetTypeData(o,"
+                        "dt(o,%zu));PyObject*cur,*orig;WA*a;size_t cap;"
+                        "if(Py_TYPE(o)!=(PyTypeObject*)s->t[%zu]||"
+                        "!d->f%zu||d->f%zu!=Py_None||!d->f%zu||!d->f%zu||"
+                        "!d->f%zu||!d->f%zu)return NULL;cur=PyDict_GetItemString("
+                        "PyType_GetDict((PyTypeObject*)s->t[%zu]),\"_run\");"
+                        "orig=PyDict_GetItemString(s->sg[%zu],\"%s\");"
+                        "orig=orig&&PyType_Check(orig)?PyDict_GetItemString("
+                        "PyType_GetDict((PyTypeObject*)orig),\"_run\"):NULL;"
+                        "if(cur&&cur!=orig)return NULL;cap=PyLong_AsSize_t("
+                        "d->f%zu);if(PyErr_Occurred())return NULL;a=wane("
+                        "(PyTypeObject*)s->wt,cap,&wai%zu,&wai%zu,"
+                        "(PyTypeObject*)s->rt[%zu],(PyTypeObject*)s->rt[%zu],"
+                        "wk_worker_%zu_%zu,d->f%zu,d->f%zu,o,\"%s\",d->f%zu,d->f%zu);"
+                        "if(!a)return NULL;"
+                        "((NSO*)d->f%zu)->wa=a;((NSO*)d->f%zu)->wk=1;"
+                        "((NSO*)d->f%zu)->wa=a;((NSO*)d->f%zu)->wk=2;"
+                        "*h=1;return (PyObject*)a;}",
+                        index, index, index, index, index,
+                        input_field, processor_field, output_field,
+                        loop_field, callback_field, capacity_field,
+                        index, index, class_ir->name, capacity_field,
+                        input_record_index, output_record_index,
+                        input_record_index, output_record_index,
+                        index, region_index, loop_field, callback_field,
+                        class_ir->fields[callback_field].name,
+                        input_field, output_field,
+                        input_field, input_field, output_field, output_field) < 0)
+                return -1;
+        }
+        if (fputs("return NULL;}", file) < 0) return -1;
+    }
+    for (index = 0u; index < program->class_count; index++) {
+        size_t target_index;
+        if (!program->classes[index].custom_constructor) continue;
+        if (fprintf(file, "static int cg%zu(PyObject*o){MS*s=sm(o);"
+                          "PyObject*v;if(!s){PyErr_SetString(PyExc_RuntimeError,"
+                          "\"native module state is unavailable\");return -1;}",
+                    index) < 0)
+            return -1;
+        for (target_index = 0u; target_index < program->class_count;
+             target_index++) {
+            if (fputs("v=PyDict_GetItemString(s->sg[", file) < 0 ||
+                fprintf(file, "%zu],", index) < 0 ||
+                quote(file, program->classes[target_index].name) < 0 ||
+                fprintf(file, ");if(v==s->ot[%zu])v=s->t[%zu];"
+                              "if(v){if(PyDict_SetItemString(g%zu_globals,",
+                        target_index, target_index, index) < 0 ||
+                quote(file, program->classes[target_index].name) < 0 ||
+                fputs(",v)<0)return -1;}else if(PyDict_DelItemString(g",
+                      file) < 0 ||
+                fprintf(file, "%zu_globals,", index) < 0 ||
+                quote(file, program->classes[target_index].name) < 0 ||
+                fputs(")<0){if(PyErr_ExceptionMatches(PyExc_KeyError))"
+                      "PyErr_Clear();else return -1;}", file) < 0)
+                return -1;
+        }
+        if (fputs("return 0;}", file) < 0) return -1;
+    }
+    if (fputs("static int mt(PyObject*m,visitproc visit,void*arg){MS*s="
               "(MS*)PyModule_GetState(m);if(!s)return 0;", file) < 0)
         return -1;
     for (index = 0u; index < program->class_count; index++)
         if (fprintf(file, "Py_VISIT(s->t[%zu]);", index) < 0) return -1;
+    for (index = 0u; index < program->class_count; index++)
+        if (fprintf(file, "Py_VISIT(s->sg[%zu]);Py_VISIT(s->ot[%zu]);",
+                    index, index) < 0)
+            return -1;
     for (index = 0u; index < fusion_count; index++)
         if (fprintf(file, "Py_VISIT(s->fd[%zu]);", index) < 0) return -1;
-    if (fputs("Py_VISIT(s->nt);", file) < 0) return -1;
+    if (fputs("Py_VISIT(s->nt);Py_VISIT(s->wt);", file) < 0) return -1;
+    if (has_handle_run &&
+        fputs("{size_t i;for(i=0u;i<7u;i++)Py_VISIT(s->hr[i]);}", file) < 0)
+        return -1;
+    for (index = 0u; index < program->record_count; index++)
+        if (fprintf(file, "Py_VISIT(s->rt[%zu]);", index) < 0) return -1;
     if (fputs("return 0;}static int mc(PyObject*m){MS*s=(MS*)"
-              "PyModule_GetState(m);if(!s)return 0;", file) < 0)
+              "PyModule_GetState(m);if(!s||!s->active)return 0;"
+              "s->active=0u;if(mlive!=0u)mlive--;", file) < 0)
         return -1;
     for (index = 0u; index < program->class_count; index++)
         if (fprintf(file, "Py_CLEAR(s->t[%zu]);", index) < 0) return -1;
+    for (index = 0u; index < program->class_count; index++)
+        if (fprintf(file, "Py_CLEAR(s->sg[%zu]);Py_CLEAR(s->ot[%zu]);",
+                    index, index) < 0)
+            return -1;
     for (index = 0u; index < fusion_count; index++)
         if (fprintf(file, "Py_CLEAR(s->fd[%zu]);", index) < 0) return -1;
-    if (fputs("Py_CLEAR(s->nt);", file) < 0) return -1;
+    if (fputs("Py_CLEAR(s->nt);Py_CLEAR(s->wt);", file) < 0) return -1;
+    if (has_handle_run &&
+        fputs("{size_t i;for(i=0u;i<7u;i++)Py_CLEAR(s->hr[i]);}", file) < 0)
+        return -1;
+    for (index = 0u; index < program->record_count; index++)
+        if (fprintf(file, "Py_CLEAR(s->rt[%zu]);", index) < 0) return -1;
     for (index = 0u; index < program->class_count; index++) {
         size_t region_index;
         for (region_index = 0u;
@@ -1440,7 +2471,11 @@ static int emit_native_class_extension(
             if (fprintf(file, "wrtc_boxed_signature_clear(&r%zu_%zu_sig);",
                         index, region_index) < 0)
                 return -1;
-        if (program->classes[index].region_count != 0u &&
+        if (program->classes[index].custom_constructor &&
+            fprintf(file, "wrtc_boxed_signature_clear(&c%zu_sig);",
+                    index) < 0)
+            return -1;
+        if (class_has_globals(&program->classes[index]) &&
             fprintf(file, "g%zu_clear_globals();", index) < 0)
             return -1;
     }
@@ -1450,16 +2485,28 @@ static int emit_native_class_extension(
             return -1;
     if (fputs("return 0;}static void mf(void*m){(void)mc((PyObject*)m);}"
               "static int me(PyObject*m){MS*s=(MS*)PyModule_GetState(m);"
-              "PyObject*all=PyTuple_New(", file) < 0 ||
+              "PyObject*constant=NULL,*all=PyTuple_New(", file) < 0 ||
         fprintf(file, "%zu);if(!s||!all)goto error;",
                 program->class_count + program->factory_count) < 0)
+        return -1;
+    if (fputs("if(mlive!=0u){PyErr_SetString(PyExc_RuntimeError,"
+              "\"native artifact permits one live module instance; "
+              "subinterpreters and concurrent re-exec are unsupported\");"
+              "goto error;}mlive++;s->active=1u;", file) < 0)
+        return -1;
+    if (has_storage && !has_workers &&
+        fputs("(void)&wane;(void)&wasp;", file) < 0)
         return -1;
     if (has_storage &&
         fputs("s->nt=PyType_FromModuleAndSpec(m,&nosp,NULL);"
               "if(!s->nt)goto error;", file) < 0)
         return -1;
+    if (has_workers &&
+        fputs("s->wt=PyType_FromModuleAndSpec(m,&wasp,NULL);"
+              "if(!s->wt)goto error;", file) < 0)
+        return -1;
     for (index = 0u; index < program->class_count; index++)
-        if (program->classes[index].region_count != 0u &&
+        if (class_has_globals(&program->classes[index]) &&
             fprintf(file, "if(g%zu_initialize_globals()<0)goto error;",
                     index) < 0)
             return -1;
@@ -1467,8 +2514,49 @@ static int emit_native_class_extension(
         if (fprintf(file, "if(fg%zu_initialize_globals()<0)goto error;",
                     index) < 0)
             return -1;
+    for (index = 0u; index < program->record_count; index++) {
+        char *record_module =
+            wrtc_boxed_module_name(program->records[index].filename);
+        if (record_module == NULL) return -1;
+        if (fputs("{PyObject*x=PyImport_ImportModule(", file) < 0 ||
+            quote(file, record_module) < 0 ||
+            fprintf(file, ");if(!x)goto error;s->rt[%zu]="
+                          "PyObject_GetAttrString(x,",
+                    index) < 0 ||
+            quote(file, program->records[index].name) < 0 ||
+            fputs(");Py_DECREF(x);if(!s->rt[", file) < 0 ||
+            fprintf(file, "%zu]||!PyType_Check(s->rt[%zu]))goto error;}",
+                    index, index) < 0) {
+            free(record_module);
+            return -1;
+        }
+        free(record_module);
+    }
+    if (has_handle_run && fputs(
+            "{static const char*n[]={\"_run\",\"_callback\",\"_args\",\"_cancelled\",\"_context\"};"
+            "PyObject*x=PyImport_ImportModule(\"asyncio.events\");PyObject*d;size_t i;"
+            "if(!x)goto error;s->hr[0]=PyObject_GetAttrString(x,\"Handle\");"
+            "s->hr[6]=PyObject_GetAttrString(x,\"TimerHandle\");Py_DECREF(x);"
+            "if(!s->hr[0]||!PyType_Check(s->hr[0])||!s->hr[6]||!PyType_Check(s->hr[6]))goto error;d=PyType_GetDict((PyTypeObject*)s->hr[0]);"
+            "for(i=0u;i<5u;i++){PyObject*v=PyDict_GetItemString(d,n[i]);if(!v){PyErr_Format(PyExc_ImportError,"
+            "\"asyncio Handle descriptor %s is unavailable\",n[i]);goto error;}s->hr[i+1u]=Py_NewRef(v);}}",
+            file) < 0)
+        return -1;
+    for (index = 0u; index < program->class_count; index++) {
+        if (fprintf(file, "s->sg[%zu]=Py_NewRef(g%zu_globals);"
+                          "{PyObject*v=PyDict_GetItemString(s->sg[%zu],",
+                    index, index, index) < 0 ||
+            quote(file, program->classes[index].name) < 0 ||
+            fprintf(file, ");if(!v||!PyType_Check(v)){PyErr_Format("
+                          "PyExc_ImportError,\"source class %%s is unavailable "
+                          "or was replaced before native module load\",") < 0 ||
+            quote(file, program->classes[index].name) < 0 ||
+            fprintf(file, ");goto error;}s->ot[%zu]=Py_NewRef(v);}",
+                    index) < 0)
+            return -1;
+    }
     for (index = 0u; index < program->class_count; index++)
-        if (program->classes[index].region_count != 0u &&
+        if (class_has_globals(&program->classes[index]) &&
             fprintf(file, "{PyObject*c=PyDict_Copy(g%zu_globals);"
                           "if(!c)goto error;Py_SETREF(g%zu_globals,c);}",
                     index, index) < 0)
@@ -1488,14 +2576,15 @@ static int emit_native_class_extension(
                           "s->t[%zu]=PyType_FromModuleAndSpec(m,&sp%zu,bs);"
                           "Py_DECREF(bs);"
                           "if(!s->t[%zu])goto error;"
+                          "if(pm%zu(s->t[%zu],s->ot[%zu])<0)goto error;"
                           "if(PyModule_AddObjectRef(m,",
-                    index, index, index) < 0 ||
+                    index, index, index, index, index, index) < 0 ||
             quote(file, name) < 0 ||
             fprintf(file, ",s->t[%zu])<0)goto error;"
-                          "PyTuple_SET_ITEM(all,%zu,PyUnicode_FromString(",
+                          "if(ta(all,%zu,",
                     index, index) < 0 ||
             quote(file, name) < 0 ||
-            fputs("));}", file) < 0)
+            fputs(")<0)goto error;}", file) < 0)
             return -1;
     }
     {
@@ -1537,16 +2626,22 @@ static int emit_native_class_extension(
         size_t globals_index, class_for_globals;
         for (globals_index = 0u; globals_index < program->class_count;
              globals_index++)
-            if (program->classes[globals_index].region_count != 0u)
+            if (class_has_globals(&program->classes[globals_index]))
                 for (class_for_globals = 0u;
                      class_for_globals < program->class_count;
                      class_for_globals++)
-                    if (fputs("if(PyDict_SetItemString(g", file) < 0 ||
-                        fprintf(file, "%zu_globals,", globals_index) < 0 ||
+                    if (fputs("{PyObject*v=PyDict_GetItemString(s->sg[",
+                              file) < 0 ||
+                        fprintf(file, "%zu],", globals_index) < 0 ||
                         quote(file,
                               program->classes[class_for_globals].name) < 0 ||
-                        fprintf(file, ",s->t[%zu])<0)goto error;",
-                                class_for_globals) < 0)
+                        fprintf(file, ");if(v==s->ot[%zu])v=s->t[%zu];"
+                                      "if(v&&PyDict_SetItemString(g%zu_globals,",
+                                class_for_globals, class_for_globals,
+                                globals_index) < 0 ||
+                        quote(file,
+                              program->classes[class_for_globals].name) < 0 ||
+                        fputs(",v)<0)goto error;}", file) < 0)
                         return -1;
         for (globals_index = 0u;
              globals_index < program->factory_count; globals_index++)
@@ -1561,10 +2656,10 @@ static int emit_native_class_extension(
                     return -1;
     }
     for (index = 0u; index < program->factory_count; index++) {
-        if (fprintf(file, "PyTuple_SET_ITEM(all,%zu,PyUnicode_FromString(",
+        if (fprintf(file, "if(ta(all,%zu,",
                     program->class_count + index) < 0 ||
             quote(file, program->factories[index].name) < 0 ||
-            fputs("));", file) < 0)
+            fputs(")<0)goto error;", file) < 0)
             return -1;
     }
     for (index = 0u; index < program->class_count; index++) {
@@ -1577,20 +2672,105 @@ static int emit_native_class_extension(
                               "goto error;",
                         index, region_index, index) < 0)
                 return -1;
+        if (program->classes[index].custom_constructor &&
+            fprintf(file, "if(wrtc_boxed_signature_initialize(&c%zu_sig,"
+                          "g%zu_globals)<0)goto error;",
+                    index, index) < 0)
+            return -1;
     }
     for (index = 0u; index < program->factory_count; index++)
         if (fprintf(file, "if(wrtc_boxed_signature_initialize(&f%zu_sig,"
                           "fg%zu_globals)<0)goto error;", index, index) < 0)
             return -1;
     if (fputs("if(PyModule_AddObject(m,\"__all__\",all)<0)goto error;"
-              "all=NULL;", file) < 0 ||
+              "all=NULL;", file) < 0)
+        return -1;
+    if (fprintf(file, "{PyObject*x=PyTuple_New(%zu);if(!x)goto error;",
+                program->class_count) < 0)
+        return -1;
+    for (index = 0u; index < program->class_count; index++)
+        if (fprintf(file, "if(ta(x,%zu,", index) < 0 ||
+            quote(file, program->classes[index].name) < 0 ||
+            fputs(")<0){Py_DECREF(x);goto error;}", file) < 0)
+            return -1;
+    if (fputs("if(ma(m,\"__pymeta_native_classes__\",x)<0)goto error;}",
+              file) < 0 ||
+        fprintf(file, "{PyObject*x=PyTuple_New(%zu);size_t q=0u;(void)q;if(!x)goto error;",
+                emitted_region_count(program)) < 0)
+        return -1;
+    for (index = 0u; index < program->class_count; index++) {
+        size_t region_index;
+        for (region_index = 0u;
+             region_index < program->classes[index].region_count;
+             region_index++) {
+            const char *class_name = program->classes[index].name;
+            const char *region_name =
+                program->classes[index].regions[region_index].name;
+            size_t length = strlen(class_name) + strlen(region_name) + 2u;
+            char *qualified = malloc(length);
+            if (qualified == NULL) return -1;
+            (void)snprintf(qualified, length, "%s.%s", class_name,
+                           region_name);
+            if (fputs("if(ta(x,(Py_ssize_t)q++,", file) < 0 ||
+                quote(file, qualified) < 0 ||
+                fputs(")<0){Py_DECREF(x);goto error;}", file) < 0) {
+                free(qualified);
+                return -1;
+            }
+            free(qualified);
+        }
+    }
+    if (fputs("if(ma(m,\"__pymeta_native_regions__\",x)<0)goto error;}",
+              file) < 0 ||
+        fprintf(file, "{PyObject*x=PyTuple_New(%zu);if(!x)goto error;",
+                program->factory_count) < 0)
+        return -1;
+    for (index = 0u; index < program->factory_count; index++)
+        if (fprintf(file, "if(ta(x,%zu,", index) < 0 ||
+            quote(file, program->factories[index].name) < 0 ||
+            fputs(")<0){Py_DECREF(x);goto error;}", file) < 0)
+            return -1;
+    if (fputs("if(ma(m,\"__pymeta_native_factories__\",x)<0)goto error;}",
+              file) < 0 ||
+        emit_module_string(
+            file, "__pymeta_native_reactor_hook__",
+            has_reactor_hooks
+                ? "guarded_cpython_reactor_thread;ordinary_lookup;"
+                  "generation_checked;bounded_reschedule"
+                : "not_emitted") < 0 ||
+        emit_module_string(
+            file, "__pymeta_native_reactor_state__",
+            has_reactor_storage
+                ? "selector_registry;packet_slab;reactor_owned;generation_tagged"
+                : "not_emitted") < 0 ||
+        emit_module_string(
+            file, "__pymeta_module_instance_policy__",
+            "single_live_module;subinterpreters_unsupported") < 0 ||
         emit_module_string(file, "__pymeta_source_sha256__", source_hash) < 0 ||
         emit_module_string(file, "__pymeta_semantic_sha256__", semantic_hash) < 0 ||
-        emit_module_string(file, "__pymeta_compiler_revision__", revision) < 0 ||
+        emit_module_string(file, "__pymeta_compiler_version__",
+                           "wrtc-pymeta-compiler/0.3") < 0 ||
+        emit_module_string(file, "__pymeta_cpython_revision__", revision) < 0 ||
+        emit_module_string(file, "__pymeta_cpython_source_revision__",
+                           "070700ed4d95c16855603cecab3f41f3b587f973") < 0 ||
         emit_module_string(file, "__pymeta_target__", target) < 0 ||
         emit_module_string(file, "__pymeta_architecture__", architecture) < 0 ||
         emit_module_string(file, "__pymeta_extension_suffix__",
-                           extension_suffix) < 0)
+                           extension_suffix) < 0 ||
+        emit_module_string(file, "__pymeta_optimization__", "release") < 0)
+        return -1;
+    if (fputs(
+            "constant=PySys_GetObject(\"implementation\");"
+            "constant=constant?PyObject_GetAttrString(constant,\"cache_tag\"):NULL;"
+            "if(constant==Py_None){Py_DECREF(constant);"
+            "constant=PyUnicode_FromString(\"\");}"
+            "if(!constant)goto error;"
+            "if(ma(m,\"__pymeta_cache_tag__\",constant)<0){constant=NULL;goto error;}"
+            "constant=NULL;constant=PySys_GetObject(\"abiflags\");"
+            "constant=constant?Py_NewRef(constant):PyUnicode_FromString(\"\");"
+            "if(!constant)goto error;"
+            "if(ma(m,\"__pymeta_abi_flags__\",constant)<0){constant=NULL;goto error;}"
+            "constant=NULL;", file) < 0)
         return -1;
     if (artifact_metadata != NULL) {
         while (PyDict_Next(artifact_metadata, &position, &key, &value)) {
@@ -1610,7 +2790,8 @@ static int emit_native_class_extension(
             free(attribute);
         }
     }
-    if (fputs("return 0;error:Py_XDECREF(all);return -1;}"
+    if (fputs("return 0;error:Py_XDECREF(constant);Py_XDECREF(all);"
+              "(void)mc(m);return -1;}"
               "static PyModuleDef_Slot ms[]={{Py_mod_exec,(void*)me},"
               "{0,NULL}};static struct PyModuleDef md={PyModuleDef_HEAD_INIT,",
               file) < 0 ||

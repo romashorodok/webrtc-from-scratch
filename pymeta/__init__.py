@@ -371,6 +371,10 @@ class _StorageNamespace:
     fifo = Descriptor("storage.fifo", category="storage")
     min_heap = _DescriptorFactory("storage.min_heap", "storage")
     slab = _DescriptorFactory("storage.slab", "storage")
+    selector_registry = _DescriptorFactory(
+        "storage.selector_registry", "storage"
+    )
+    packet_slab = _DescriptorFactory("storage.packet_slab", "storage")
     inline_record = Descriptor("storage.inline_record", category="storage")
 
 

@@ -61,18 +61,34 @@ typedef enum {
     WRTC_NATIVE_FIELD_MIN_HEAP,
     WRTC_NATIVE_FIELD_ATOMIC_UINT32,
     WRTC_NATIVE_FIELD_MPSC,
-    WRTC_NATIVE_FIELD_SPSC
+    WRTC_NATIVE_FIELD_SPSC,
+    WRTC_NATIVE_FIELD_SELECTOR,
+    WRTC_NATIVE_FIELD_PACKET_POOL
 } WrtcNativeStorageKind;
+
+typedef enum {
+    WRTC_REACTOR_HOOK_NONE = 0,
+    WRTC_REACTOR_HOOK_SELECTOR_REMOVE_READER,
+    WRTC_REACTOR_HOOK_SELECTOR_REMOVE_WRITER,
+    WRTC_REACTOR_HOOK_DATAGRAM_GENERATION_CHECK,
+    WRTC_REACTOR_HOOK_DATAGRAM_DELIVERY,
+    WRTC_REACTOR_HOOK_RESCHEDULE
+} WrtcReactorHookKind;
 
 typedef struct {
     char *target;
     WrtcSourceSpan span;
     size_t target_class;
     size_t target_region;
+    size_t positional_count;
+    size_t keyword_count;
     unsigned resolved : 1;
     unsigned required_callee : 1;
     unsigned exact_receiver : 1;
     unsigned fused : 1;
+    WrtcReactorHookKind reactor_hook;
+    unsigned reactor_hook_shape_proven : 1;
+    unsigned attribute_call : 1;
 } WrtcNativeCallEdgeIR;
 
 typedef struct {
@@ -85,6 +101,8 @@ typedef struct {
     char *heap_ordering;
     char *queue_capacity;
     char *queue_item_type;
+    char *reactor_capacity;
+    char *packet_buffer_size;
     char *atomic_memory_order;
     char *atomic_scope;
     char *atomic_linearization;
@@ -131,6 +149,16 @@ typedef struct {
     size_t bounded_loop_count;
     unsigned fusion_requested : 1;
     unsigned selector_shape_validated : 1;
+    unsigned descriptor_generation_validated : 1;
+    unsigned selector_runtime_lowering_available : 1;
+    unsigned datagram_runtime_lowering_available : 1;
+    unsigned reactor_hook_emission_complete : 1;
+    unsigned selector_remove_reader_hook : 1;
+    unsigned selector_remove_writer_hook : 1;
+    unsigned datagram_generation_hook : 1;
+    unsigned datagram_delivery_hook : 1;
+    unsigned bounded_reschedule_hook : 1;
+    unsigned reactor_thread_serialized : 1;
     unsigned packet_order_preserved : 1;
     unsigned pool_lifetime_checked : 1;
     unsigned bounded_interleaving : 1;
@@ -152,8 +180,23 @@ typedef struct {
     unsigned worker_record_abi_proven : 1;
     unsigned worker_reachability_proven : 1;
     unsigned worker_emission_complete : 1;
+    unsigned worker_executor_emission_complete : 1;
+    unsigned worker_bounded_channels_proven : 1;
+    unsigned worker_typed_error_proven : 1;
+    unsigned worker_shutdown_proven : 1;
+    unsigned worker_thread_python_api_free : 1;
+    unsigned kernel_emission_complete : 1;
+    unsigned kernel_python_free : 1;
     unsigned direct_callee_resolved : 1;
     unsigned direct_callee_fused : 1;
+    size_t kernel_statement_count;
+    size_t kernel_emitted_statement_count;
+    size_t kernel_call_count;
+    size_t kernel_emitted_call_count;
+    char *kernel_rejection_reason;
+    WrtcSourceSpan kernel_rejection_span;
+    char *reactor_hook_rejection_reason;
+    WrtcSourceSpan reactor_hook_rejection_span;
 } WrtcNativeRegionIR;
 
 typedef struct {
@@ -185,6 +228,7 @@ typedef struct {
 
 typedef struct {
     char *name;
+    char *abi;
     char *filename;
     WrtcSourceSpan span;
     WrtcWorkerRecordFieldIR *fields;
@@ -202,6 +246,10 @@ typedef struct {
     char *base;
     char *filename;
     WrtcSourceSpan span;
+    WrtcPySuiteIR *constructor_body;
+    WrtcPySignatureIR *constructor_signature;
+    char *constructor_rejection_reason;
+    WrtcSourceSpan constructor_rejection_span;
     WrtcNativeFieldIR *fields;
     size_t field_count;
     WrtcNativeRegionIR *regions;
@@ -210,6 +258,7 @@ typedef struct {
     unsigned gc_tracked : 1;
     unsigned weakrefs : 1;
     unsigned custom_constructor : 1;
+    unsigned custom_new : 1;
 } WrtcNativeClassIR;
 
 typedef struct {

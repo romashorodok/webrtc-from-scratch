@@ -9,7 +9,7 @@ from queue import Empty, Full
 from typing import TYPE_CHECKING, Annotated, Callable
 
 import pymeta
-from pymeta.concurrent import BoundedQueue, bounded_queue, spsc
+from pymeta.concurrent import BoundedQueue, bounded_queue, owned_shard, spsc
 
 from .datagrams import OwnedPacket
 
@@ -20,12 +20,19 @@ if TYPE_CHECKING:
 @pymeta.record(abi="webrtc.event_loop.packet_result.v1")
 @dataclass(frozen=True, slots=True)
 class PacketResult:
-    peer_id: object
-    value: object
+    peer_id: Annotated[int, pymeta.uint[64]]
+    value: Annotated[int, pymeta.uint[32]]
 
 
 @pymeta.native_class(pymeta.compact_object, gc=pymeta.tracked, weakrefs=False)
 class PacketWorker:
+    """One native-or-Python worker with bounded handoff channels.
+
+    ``capacity`` bounds each channel's queued slots.  A running worker may
+    additionally own one item it has already claimed, matching Go channel
+    semantics: buffer capacity does not include the receiver's active value.
+    """
+
     _input: Annotated[
         BoundedQueue[OwnedPacket],
         spsc
@@ -56,7 +63,7 @@ class PacketWorker:
         self,
         index: int,
         capacity: int,
-        processor: Callable[[OwnedPacket], PacketResult],
+        processor: Callable[[OwnedPacket], PacketResult] | None,
         loop: "WebRTCSelectorEventLoop",
         on_result: Callable[[PacketResult], object],
     ) -> None:
@@ -98,6 +105,13 @@ class PacketWorker:
 
     @pymeta.region(
         pymeta.required,
+        execute=owned_shard(
+            key="packet.peer_id",
+            workers="self._loop._config.packet_workers",
+            input=spsc,
+            output=spsc,
+            ordered=True,
+        ),
         effects=pymeta.effects(
             reads={"packet"},
             writes={"self.peer_state"},
@@ -108,7 +122,7 @@ class PacketWorker:
         ),
     )
     def process_packet(self, packet: OwnedPacket) -> PacketResult:
-        return self._processor(packet)
+        return PacketResult(packet.peer_id, 1)
 
     @pymeta.region(
         pymeta.required,
@@ -150,7 +164,11 @@ class PacketWorker:
                 packet = self.receive_packet()
                 if packet is None:
                     break
-                result = self.process_packet(packet)
+                result = (
+                    self.process_packet(packet)
+                    if self._processor is None
+                    else self._processor(packet)
+                )
                 if not self.publish_result(result):
                     continue
                 try:
@@ -179,6 +197,9 @@ class PacketWorker:
 
     def stop(self) -> None:
         self._input.close()
+        close = getattr(self._thread, "close", None)
+        if close is not None:
+            close()
         self._input_ready.set()
 
     def join(self) -> None:
@@ -220,19 +241,20 @@ class PacketWorkerPool:
         processor: Callable[[OwnedPacket], PacketResult] | None = None,
         on_result: Callable[[PacketResult], object] | None = None,
     ) -> None:
-        processor = processor or (lambda packet: PacketResult(packet.peer_id, packet))
         on_result = on_result or (lambda result: None)
         self._accepting = True
-        self._workers = tuple(
-            PacketWorker(
-                index,
-                config.packet_queue_capacity,
-                processor,
-                loop,
-                on_result,
+        workers = []
+        for index in range(config.packet_workers):
+            workers.append(
+                PacketWorker(
+                    index,
+                    config.packet_queue_capacity,
+                    processor,
+                    loop,
+                    on_result,
+                )
             )
-            for index in range(config.packet_workers)
-        )
+        self._workers = tuple(workers)
         for worker in self._workers:
             worker.start()
 
@@ -248,6 +270,14 @@ class PacketWorkerPool:
 
     def stop_admission(self) -> None:
         self._accepting = False
+
+    @pymeta.region(
+        pymeta.required,
+        effects=pymeta.effects(owner="reactor", suspend=pymeta.never),
+    )
+    def drain_results(self) -> None:
+        for worker in self._workers:
+            worker.drain_results()
 
     def close(self) -> None:
         if not self._accepting and not any(

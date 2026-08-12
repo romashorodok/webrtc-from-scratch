@@ -390,6 +390,26 @@ static int analyze_call(Analyzer *analyzer,
                      expression->positional_count == 0u &&
                      expression->keyword_count == 0u)
                 kind = WRTC_NATIVE_OP_SPSC_CLOSE;
+            else if (field->storage_kind == WRTC_NATIVE_FIELD_SELECTOR &&
+                     strcmp(function->operation, "register") == 0 &&
+                     expression->positional_count == 3u &&
+                     expression->keyword_count == 0u)
+                kind = WRTC_NATIVE_OP_SELECTOR_REGISTER;
+            else if (field->storage_kind == WRTC_NATIVE_FIELD_SELECTOR &&
+                     strcmp(function->operation, "is_current") == 0 &&
+                     expression->positional_count == 1u &&
+                     expression->keyword_count == 0u)
+                kind = WRTC_NATIVE_OP_SELECTOR_IS_CURRENT;
+            else if (field->storage_kind == WRTC_NATIVE_FIELD_SELECTOR &&
+                     strcmp(function->operation, "owner") == 0 &&
+                     expression->positional_count == 1u &&
+                     expression->keyword_count == 0u)
+                kind = WRTC_NATIVE_OP_SELECTOR_OWNER;
+            else if (field->storage_kind == WRTC_NATIVE_FIELD_SELECTOR &&
+                     strcmp(function->operation, "remove") == 0 &&
+                     expression->positional_count == 1u &&
+                     expression->keyword_count == 0u)
+                kind = WRTC_NATIVE_OP_SELECTOR_REMOVE;
             if (kind == WRTC_NATIVE_OP_UNSUPPORTED_ESCAPE)
                 return add_operation(
                     analyzer, proof_index, kind, expression->span, NULL,
@@ -688,6 +708,11 @@ int wrtc_native_operation_prove(const WrtcNativeClassProgram *program,
                 table->fields[proof_index].class_index = class_index;
                 table->fields[proof_index].field_index = field_index;
                 table->fields[proof_index].complete = 1u;
+                if (program->classes[class_index].fields[field_index]
+                            .storage_kind == WRTC_NATIVE_FIELD_SELECTOR ||
+                    program->classes[class_index].fields[field_index]
+                            .storage_kind == WRTC_NATIVE_FIELD_PACKET_POOL)
+                    table->fields[proof_index].touched = 1u;
                 proof_index++;
             }
     for (class_index = 0u; class_index < program->class_count; class_index++)
@@ -741,6 +766,8 @@ const char *wrtc_native_operation_kind_name(WrtcNativeOperationKind kind) {
         "mpsc_put_nowait", "mpsc_get_nowait", "mpsc_qsize",
         "mpsc_empty", "mpsc_close", "spsc_put_nowait",
         "spsc_get_nowait", "spsc_qsize", "spsc_empty", "spsc_close",
+        "selector_register", "selector_is_current", "selector_owner",
+        "selector_remove",
         "boxed_write",
         "unsupported_escape"
     };

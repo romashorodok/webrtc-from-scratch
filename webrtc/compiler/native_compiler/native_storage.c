@@ -117,6 +117,26 @@ int wrtc_native_storage_field_eligible(const WrtcNativeFieldIR *field,
         }
         return 1;
     }
+    if (field->storage_kind == WRTC_NATIVE_FIELD_SELECTOR ||
+        field->storage_kind == WRTC_NATIVE_FIELD_PACKET_POOL) {
+        if (field->owner == NULL || strcmp(field->owner, "reactor") != 0) {
+            if (reason != NULL)
+                *reason = "native reactor storage requires owned_by('reactor')";
+            return 0;
+        }
+        if (field->reactor_capacity == NULL) {
+            if (reason != NULL)
+                *reason = "native reactor storage requires explicit capacity";
+            return 0;
+        }
+        if (field->storage_kind == WRTC_NATIVE_FIELD_PACKET_POOL &&
+            field->packet_buffer_size == NULL) {
+            if (reason != NULL)
+                *reason = "native packet slab requires explicit buffer_size";
+            return 0;
+        }
+        return 1;
+    }
     if (reason != NULL) *reason = "field does not request native storage";
     return 0;
 }

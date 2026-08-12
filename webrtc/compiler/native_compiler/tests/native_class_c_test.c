@@ -104,7 +104,7 @@ int main(void) {
         "        for key, mask in events:\n"
         "            reader, writer = key.data\n"
         "            if mask & selectors.EVENT_READ:\n"
-        "                loop._ready.append(reader)\n"
+        "                loop._remove_reader(key.fileobj)\n"
         "            if mask & selectors.EVENT_WRITE:\n"
         "                loop._remove_writer(key.fileobj)\n"
         "        return polled\n"
@@ -112,7 +112,9 @@ int main(void) {
         "effects=pymeta.effects(writes={'packet_pool'}, owner='reactor', "
         "noescape={'packet.payload'}, allocate=pymeta.never, "
         "suspend=pymeta.never))\n"
-        "    def drain(self, loop, transport):\n"
+        "    def drain(self, loop, transport, generation):\n"
+        "        if not self._is_current(transport, generation):\n"
+        "            return\n"
         "        started = loop.time()\n"
         "        budget = self.config.receive_packet_budget\n"
         "        time_budget = self.config.receive_time_budget_us / 1000000\n"
@@ -263,6 +265,7 @@ int main(void) {
     CHECK(wrtc_native_class_analyze(
               reactor_profile, sizeof reactor_profile - 1u,
               "arbitrary_component.py", &program) == 0);
+    wrtc_native_class_resolve_calls(program);
     CHECK(program != NULL && program->class_count == 1u);
     CHECK(program->classes[0].region_count == 3u);
     CHECK((program->classes[0].regions[0].capabilities &
@@ -270,6 +273,14 @@ int main(void) {
     CHECK((program->classes[0].regions[0].capabilities &
            WRTC_REGION_SELECTOR_DISPATCH) != 0u);
     CHECK(program->classes[0].regions[0].selector_shape_validated);
+    CHECK(program->classes[0].regions[0]
+              .selector_runtime_lowering_available);
+    CHECK(program->classes[0].regions[0]
+              .selector_remove_reader_hook);
+    CHECK(program->classes[0].regions[0]
+              .selector_remove_writer_hook);
+    CHECK(program->classes[0].regions[0]
+              .reactor_hook_emission_complete);
     turn = &program->classes[0].regions[1];
     CHECK(turn->loop_count == 1u);
     CHECK(turn->bounded_loop_count == 1u);
@@ -285,6 +296,13 @@ int main(void) {
     CHECK(turn->packet_order_preserved);
     CHECK(turn->pool_lifetime_checked);
     CHECK(turn->bounded_interleaving);
+    CHECK(turn->descriptor_generation_validated);
+    CHECK(turn->datagram_runtime_lowering_available);
+    CHECK(turn->datagram_generation_hook);
+    CHECK(turn->datagram_delivery_hook);
+    CHECK(turn->bounded_reschedule_hook);
+    CHECK(turn->reactor_thread_serialized);
+    CHECK(turn->reactor_hook_emission_complete);
     CHECK((program->classes[0].regions[2].capabilities &
            WRTC_REGION_SOCKET_RECEIVE) != 0u);
     CHECK((program->classes[0].regions[2].capabilities &
@@ -310,6 +328,18 @@ int main(void) {
               "rejected") == 0);
     CHECK(PyObject_IsTrue(
               PyDict_GetItemString(proofs, "bounded_interleaving")) == 1);
+    CHECK(PyObject_IsTrue(PyDict_GetItemString(
+              proofs, "descriptor_generation_validated")) == 1);
+    CHECK(PyObject_IsTrue(PyDict_GetItemString(
+              proofs, "datagram_runtime_lowering_available")) == 1);
+    CHECK(PyObject_IsTrue(PyDict_GetItemString(
+              proofs, "reactor_hook_emission_complete")) == 1);
+    CHECK(PyObject_IsTrue(PyDict_GetItemString(
+              proofs, "datagram_generation_hook")) == 1);
+    CHECK(PyObject_IsTrue(PyDict_GetItemString(
+              proofs, "datagram_delivery_hook")) == 1);
+    CHECK(PyObject_IsTrue(PyDict_GetItemString(
+              proofs, "bounded_reschedule_hook")) == 1);
     needle = PyUnicode_FromString("packet_budget");
     CHECK(needle != NULL);
     CHECK(PySequence_Contains(

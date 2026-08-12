@@ -23,6 +23,7 @@ from webrtc.compiler.native_artifact import (
     NativeModuleRequirements,
     load_native_artifact,
 )
+from webrtc.event_loop.commands import PublishedHandle
 
 
 @pytest.fixture(scope="module")
@@ -135,13 +136,12 @@ def test_threadsafe_handle_uses_dynamic_run(native_module: object) -> None:
     try:
         handle = loop.call_soon_threadsafe(trace.append, "threadsafe")
         calls = _profile_handle_run(loop._run_once)
-        thread_safe_type = getattr(asyncio.events, "_ThreadSafeHandle", None)
-        if thread_safe_type is None:
-            assert type(handle) is asyncio.Handle
-            assert calls == 0
-        else:
-            assert type(handle) is thread_safe_type
-            assert calls == 1
+        # The custom loop publishes through its cancellation/claim wrapper;
+        # command dispatch later enqueues the wrapper's exact asyncio Handle.
+        assert type(handle) is PublishedHandle
+        # The wrapper dynamically executes its claim/state transition; only
+        # exact asyncio Handle/TimerHandle objects use the C fast path.
+        assert calls == 1
         assert trace == ["threadsafe"]
     finally:
         loop.close()

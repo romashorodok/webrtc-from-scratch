@@ -7,7 +7,7 @@ import asyncio
 from collections.abc import Callable
 from pathlib import Path
 from threading import RLock
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from webrtc.compiler.native_artifact import (
     NativeArtifactCompatibilityError,
@@ -21,12 +21,14 @@ from .compile_policy import (
     artifact_candidates,
     require_compatible_host,
 )
+from .config import LoopConfig
 
 __all__ = [
     "LoopConfig",
     "WebRTCSelectorEventLoop",
     "automatic_loop_factory",
     "event_loop_mode",
+    "event_loop_selection_reason",
     "new_event_loop",
     "reference_loop_factory",
 ]
@@ -34,6 +36,7 @@ __all__ = [
 _selection_lock = RLock()
 _selected_factory: Callable[..., asyncio.AbstractEventLoop] | None = None
 _selected_mode: Literal["native", "asyncio"] | None = None
+_selection_reason: str | None = None
 
 
 def _artifact_candidates() -> tuple[Path, ...]:
@@ -62,42 +65,77 @@ def _validated_native_factory(artifact: Path) -> Callable[..., asyncio.AbstractE
 
 
 def _select_factory() -> Callable[..., asyncio.AbstractEventLoop]:
-    global _selected_factory, _selected_mode
+    global _selected_factory, _selected_mode, _selection_reason
     with _selection_lock:
         if _selected_factory is not None:
             return _selected_factory
-        for artifact in _artifact_candidates():
+        candidates = _artifact_candidates()
+        last_rejection: str | None = None
+        for artifact in candidates:
             try:
                 factory = _validated_native_factory(artifact)
-            except Exception:
+            except Exception as exc:
+                last_rejection = f"{artifact}: {exc}"
                 continue
             _selected_factory = factory
             _selected_mode = "native"
+            _selection_reason = f"compatible native artifact: {artifact}"
             return factory
         _selected_factory = asyncio.new_event_loop
         _selected_mode = "asyncio"
+        _selection_reason = (
+            last_rejection
+            if last_rejection is not None
+            else "no native event-loop artifact candidate was found"
+        )
         return _selected_factory
 
 
-def automatic_loop_factory(config: "LoopConfig") -> asyncio.AbstractEventLoop:
-    global _selected_factory, _selected_mode
+def automatic_loop_factory(
+    config: LoopConfig,
+    *,
+    require_native: bool = False,
+    force_asyncio: bool = False,
+) -> asyncio.AbstractEventLoop:
+    global _selected_factory, _selected_mode, _selection_reason
+    if require_native and force_asyncio:
+        raise ValueError("require_native and force_asyncio are mutually exclusive")
+    if force_asyncio:
+        with _selection_lock:
+            _selected_factory = asyncio.new_event_loop
+            _selected_mode = "asyncio"
+            _selection_reason = "stock asyncio explicitly requested"
+        return asyncio.new_event_loop()
     factory = _select_factory()
+    if _selected_mode != "native" and require_native:
+        raise NativeArtifactCompatibilityError(
+            "compatible native event loop is required: "
+            f"{_selection_reason or 'selection failed'}"
+        )
     if _selected_mode == "native":
         try:
             if config == LoopConfig():
                 loop = factory()
             else:
                 loop = factory(**config.factory_arguments())
-        except Exception:
+        except Exception as exc:
             with _selection_lock:
                 _selected_factory = asyncio.new_event_loop
                 _selected_mode = "asyncio"
+                _selection_reason = f"native event-loop factory failed: {exc}"
+            if require_native:
+                raise NativeArtifactCompatibilityError(
+                    f"compatible native event-loop factory failed: {exc}"
+                ) from exc
             return asyncio.new_event_loop()
         if isinstance(loop, asyncio.AbstractEventLoop):
             return loop
         with _selection_lock:
             _selected_factory = asyncio.new_event_loop
             _selected_mode = "asyncio"
+            _selection_reason = "native factory returned a non-event-loop object"
+        if require_native:
+            raise NativeArtifactCompatibilityError(_selection_reason)
         return asyncio.new_event_loop()
     return asyncio.new_event_loop()
 
@@ -108,6 +146,8 @@ def new_event_loop(
     packet_queue_capacity: int = 2048,
     receive_packet_budget: int = 32,
     receive_time_budget_us: int = 100,
+    require_native: bool = False,
+    force_asyncio: bool = False,
 ) -> asyncio.AbstractEventLoop:
     return automatic_loop_factory(
         LoopConfig(
@@ -115,7 +155,9 @@ def new_event_loop(
             packet_queue_capacity=packet_queue_capacity,
             receive_packet_budget=receive_packet_budget,
             receive_time_budget_us=receive_time_budget_us,
-        )
+        ),
+        require_native=require_native,
+        force_asyncio=force_asyncio,
     )
 
 
@@ -130,11 +172,22 @@ def event_loop_mode() -> Literal["native", "asyncio"]:
     return cast(Literal["native", "asyncio"], _selected_mode)
 
 
+def event_loop_selection_reason() -> str:
+    _select_factory()
+    return _selection_reason or "event-loop selection has no detail"
+
+
 def _reset_native_selection_for_tests() -> None:
-    global _selected_factory, _selected_mode
+    global _selected_factory, _selected_mode, _selection_reason
     with _selection_lock:
         _selected_factory = None
         _selected_mode = None
+        _selection_reason = None
 
 
-from .loop import LoopConfig, WebRTCSelectorEventLoop
+def __getattr__(name: str) -> Any:
+    if name == "WebRTCSelectorEventLoop":
+        from .loop import WebRTCSelectorEventLoop
+
+        return WebRTCSelectorEventLoop
+    raise AttributeError(name)

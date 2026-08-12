@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextvars
 
-from dataclasses import dataclass
 from enum import IntEnum
 from typing import Annotated, Callable
 
@@ -15,6 +14,7 @@ from pymeta.concurrent import atomic
 from pymeta.cpython import pinned_semantics
 
 from .atomic import LockedAtomic
+from .config import LoopConfig
 from .commands import (
     Command,
     CommandInbox,
@@ -25,35 +25,6 @@ from .commands import (
 from .datagrams import DatagramReactor
 from .scheduler import ReactorScheduler
 from .workers import PacketWorkerPool
-
-
-@dataclass(frozen=True, slots=True)
-class LoopConfig:
-    packet_workers: int = 0
-    packet_queue_capacity: int = 2048
-    receive_packet_budget: int = 32
-    receive_time_budget_us: int = 100
-    command_capacity: int = 4096
-
-    def __post_init__(self) -> None:
-        if self.packet_workers < 0:
-            raise ValueError("packet_workers must not be negative")
-        for name in (
-            "packet_queue_capacity",
-            "receive_packet_budget",
-            "receive_time_budget_us",
-            "command_capacity",
-        ):
-            if getattr(self, name) <= 0:
-                raise ValueError(f"{name} must be positive")
-
-    def factory_arguments(self) -> dict[str, int]:
-        return {
-            "packet_workers": self.packet_workers,
-            "packet_queue_capacity": self.packet_queue_capacity,
-            "receive_packet_budget": self.receive_packet_budget,
-            "receive_time_budget_us": self.receive_time_budget_us,
-        }
 
 
 class LoopState(IntEnum):
@@ -97,7 +68,10 @@ class LoopLifecycle:
         return changed
 
     def is_open(self) -> bool:
-        return self._state.load() is LoopState.OPEN
+        # Native atomic storage materializes the enum's integer value.  Value
+        # comparison preserves the IntEnum contract in both the Python and
+        # compiled representations; identity is not part of IntEnum semantics.
+        return self._state.load() == LoopState.OPEN
 
     @property
     def state(self) -> LoopState:
@@ -153,6 +127,31 @@ class WebRTCSelectorEventLoop(asyncio.SelectorEventLoop):
     _clock_resolution: Annotated[
         float,
         float_[64] | storage.native_field | owned_by("reactor"),
+    ]
+    # ``SelectorEventLoop.__init__`` creates these attributes on the base
+    # instance.  Declare them here as boxed native fields so a generated
+    # subtype can install its own data descriptors before delegating to that
+    # initializer.  Boxed storage is intentional: CPython permits callers to
+    # replace each value with an arbitrary object.
+    _selector: Annotated[
+        object,
+        owned_by("reactor"),
+    ]
+    _debug: Annotated[
+        object,
+        owned_by("reactor"),
+    ]
+    _stopping: Annotated[
+        object,
+        owned_by("reactor"),
+    ]
+    _current_handle: Annotated[
+        object,
+        owned_by("reactor"),
+    ]
+    slow_callback_duration: Annotated[
+        object,
+        owned_by("reactor"),
     ]
     _scheduler: Annotated[
         ReactorScheduler, exact_type(ReactorScheduler) | owned_by("reactor")
@@ -226,7 +225,7 @@ class WebRTCSelectorEventLoop(asyncio.SelectorEventLoop):
             dispatch_command(self, command)
         self._packet_workers.close()
         self._datagrams.close()
-        super().close()
+        asyncio.SelectorEventLoop.close(self)
         self._lifecycle.finish_close()
 
 

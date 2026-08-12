@@ -245,8 +245,16 @@ def start_write_loop(pc: PeerConnection, loop: asyncio.AbstractEventLoop):
                 send_time_cache.add(pkt.extensions.transport_sequence_number)
                 await asyncio.to_thread(pc._transport.sendto, encoded)
 
-    # asyncio.run_coroutine_threadsafe(rtcp_handler(), loop)
-    rw_loop.run_until_complete(encode())
+    # The SRTP session routes every decrypted feedback packet into the sender's
+    # bounded RTCP stream.  Consume that stream on the server event loop; if no
+    # consumer is registered the queue eventually fills and all later feedback
+    # is dropped.
+    rtcp_future = asyncio.run_coroutine_threadsafe(rtcp_handler(), loop)
+    try:
+        rw_loop.run_until_complete(encode())
+    finally:
+        rtcp_future.cancel()
+        rw_loop.close()
 
 
 @app.websocket("/ws")

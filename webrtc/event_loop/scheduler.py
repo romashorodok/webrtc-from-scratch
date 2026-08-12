@@ -128,5 +128,6 @@ class ReactorScheduler:
         timeout = self.compute_timeout(loop)
         events = loop._selector.select(timeout)
         self.process_selector_events(loop, events)
+        loop._packet_workers.drain_results()
         self.promote_due_timers(loop)
         self.run_ready_snapshot(loop)

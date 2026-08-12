@@ -12,20 +12,30 @@ import pytest
 from webrtc import event_loop
 from webrtc.compiler import event_loop as reference_event_loop
 from webrtc.compiler.module_compiler import ModuleCompileError, compile_module
+from webrtc.event_loop import compile_policy
 
 
 @pytest.fixture(scope="module")
 def native_event_loop_artifact(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Path:
+    if (reason := compile_policy.host_compatibility_error()) is not None:
+        pytest.skip(reason)
     output = tmp_path_factory.mktemp("native-event-loop")
-    return compile_module(Path(reference_event_loop.__file__), output).artifact_path
+    return compile_module(
+        compile_policy.SOURCE_PATH,
+        output,
+        source_paths=compile_policy.SOURCE_PATHS,
+        artifact_metadata=compile_policy.ARTIFACT_POLICY_METADATA,
+    ).artifact_path
 
 
 def test_compiler_emits_native_selector_heap_type(
     native_event_loop_artifact: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if (reason := compile_policy.host_compatibility_error()) is not None:
+        pytest.skip(reason)
     monkeypatch.setenv("WEBRTC_EVENT_LOOP_NATIVE", str(native_event_loop_artifact))
     event_loop._reset_native_selection_for_tests()
     loop = event_loop.new_event_loop()
@@ -44,6 +54,8 @@ def test_compiled_loop_preserves_ready_snapshot_and_timer_cancellation(
     native_event_loop_artifact: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if (reason := compile_policy.host_compatibility_error()) is not None:
+        pytest.skip(reason)
     monkeypatch.setenv("WEBRTC_EVENT_LOOP_NATIVE", str(native_event_loop_artifact))
     event_loop._reset_native_selection_for_tests()
     loop = event_loop.new_event_loop()

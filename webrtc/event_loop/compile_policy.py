@@ -21,13 +21,15 @@ from webrtc.compiler.module_contract import policy_sha256, source_manifest_sha25
 
 CPYTHON_REVISION = "070700ed4d95c16855603cecab3f41f3b587f973"
 ARTIFACT_ENVIRONMENT_VARIABLE = "WEBRTC_EVENT_LOOP_NATIVE"
-SOURCE_PATH = Path(__file__).with_name("loop.py")
+SOURCE_PATH = Path(__file__).with_name("event_loop.py")
 SOURCE_PATHS = tuple(
     Path(__file__).with_name(name)
     for name in (
         "atomic.py",
         "commands.py",
+        "config.py",
         "datagrams.py",
+        "event_loop.py",
         "loop.py",
         "scheduler.py",
         "workers.py",
@@ -41,8 +43,8 @@ NATIVE_FACTORY = "new_event_loop"
 class EventLoopTarget:
     revision: str = CPYTHON_REVISION
     abi: str = "exact"
-    free_threaded: bool = True
-    gil: str = "not_used"
+    free_threaded: str = "optional"
+    gil: str = "reactor_thread_confined"
     subinterpreters: str = "unsupported"
 
 
@@ -82,7 +84,7 @@ ARTIFACT_POLICY_METADATA: Mapping[str, str] = MappingProxyType(
         "source_manifest_sha256": SOURCE_MANIFEST_SHA256,
         "event_loop_cpython_revision": event_loop_target.revision,
         "event_loop_abi": event_loop_target.abi,
-        "event_loop_free_threaded": "required",
+        "event_loop_free_threaded": event_loop_target.free_threaded,
         "event_loop_gil": event_loop_target.gil,
         "event_loop_subinterpreters": event_loop_target.subinterpreters,
     }
@@ -131,8 +133,6 @@ def host_compatibility_error() -> str | None:
 
     if platform.python_implementation() != "CPython":
         return "event-loop native artifact requires CPython"
-    if sysconfig.get_config_var("Py_GIL_DISABLED") != 1:
-        return "event-loop native artifact requires a free-threaded CPython build"
     if (sys.implementation.cache_tag or "") == "":
         return "event-loop native artifact requires an exact CPython cache tag"
     suffix = sysconfig.get_config_var("EXT_SUFFIX")

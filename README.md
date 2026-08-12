@@ -28,8 +28,15 @@ poetry install && cd examples && poetry install && cd ..
 
 In other term session (Also in watch mode for rust and python proj)
 ```bash
-cd examples &&  make serve
+cd examples && make serve
 ```
+
+The default server target builds and requires a compatible compiled native
+event loop for the system-based project environment. Both regular GIL-enabled
+and free-threaded CPython builds are supported; the artifact is compiled for
+the running interpreter's exact ABI. The example Makefile consistently uses
+`examples/.venv`, which contains the server and watcher dependencies.
+For an explicit stock-asyncio run, use `cd examples && make serve-asyncio`.
 
 ### Install
 ```bash

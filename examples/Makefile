@@ -1,12 +1,39 @@
 
-run:
-	uv run serve.py examples.ws:app
+.PHONY: help native-event-loop serve serve-native serve-asyncio asyncio run opus client
 
-opus:
-	uv run serve.py examples.opus_ws:app --port 9001
+SERVER_APP ?= examples.ws:app
+SERVER_PORT ?= 9000
+SERVER_ARGS ?=
+SYSTEM_PYTHON ?= .venv/bin/python
 
-client:
-	uv run serve.py examples.client:app
+help:
+	@printf '%s\n' \
+		'serve          Build and require the native loop for the system environment' \
+		'serve-asyncio  Start the WebRTC server with stock asyncio forced' \
+		'native-event-loop  Build the native loop for the system project environment' \
+		'opus           Build and require the native event loop' \
+		'client         Build and require the native event loop'
+
+serve: serve-native
+
+native-event-loop:
+	$(SYSTEM_PYTHON) -m webrtc.event_loop.build_native
+
+serve-native: native-event-loop
+	$(SYSTEM_PYTHON) serve.py $(SERVER_APP) --port $(SERVER_PORT) --require-native-event-loop $(SERVER_ARGS)
+
+serve-asyncio:
+	$(SYSTEM_PYTHON) serve.py $(SERVER_APP) --port $(SERVER_PORT) --force-asyncio-event-loop $(SERVER_ARGS)
+
+asyncio: serve-asyncio
+
+run: serve-native
+
+opus: native-event-loop
+	$(SYSTEM_PYTHON) serve.py examples.opus_ws:app --port 9001 --require-native-event-loop $(SERVER_ARGS)
+
+client: native-event-loop
+	$(SYSTEM_PYTHON) serve.py examples.client:app --require-native-event-loop $(SERVER_ARGS)
 
 y4m:
 	ffmpeg -f lavfi -i testsrc=duration=5:size=640x480:rate=30 -pix_fmt yuv420p -f yuv4mpegpipe output.y4m

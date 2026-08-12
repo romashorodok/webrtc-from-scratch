@@ -57,9 +57,11 @@ def test_policy_hash_covers_normalized_target_and_required_surface() -> None:
         "native_class": "WebRTCSelectorEventLoop",
         "required_methods": ["_run_once"],
         "sources": [
-            "atomic.py",
-            "commands.py",
-            "datagrams.py",
+                "atomic.py",
+                "commands.py",
+                "config.py",
+                "datagrams.py",
+            "event_loop.py",
             "loop.py",
             "scheduler.py",
             "workers.py",
@@ -76,8 +78,8 @@ def test_policy_hash_covers_normalized_target_and_required_surface() -> None:
             "070700ed4d95c16855603cecab3f41f3b587f973"
         ),
         "event_loop_abi": "exact",
-        "event_loop_free_threaded": "required",
-        "event_loop_gil": "not_used",
+        "event_loop_free_threaded": "optional",
+        "event_loop_gil": "reactor_thread_confined",
         "event_loop_subinterpreters": "unsupported",
     }
 
@@ -143,7 +145,7 @@ def test_incompatible_host_fails_to_stock_without_importing_artifact(
         loop.close()
 
 
-def test_host_policy_requires_free_threaded_cpython(
+def test_host_policy_allows_gil_enabled_cpython(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original = compile_policy.sysconfig.get_config_var
@@ -154,4 +156,4 @@ def test_host_policy_requires_free_threaded_cpython(
         return original(name)
 
     monkeypatch.setattr(compile_policy.sysconfig, "get_config_var", config_var)
-    assert "free-threaded" in (compile_policy.host_compatibility_error() or "")
+    assert compile_policy.host_compatibility_error() is None

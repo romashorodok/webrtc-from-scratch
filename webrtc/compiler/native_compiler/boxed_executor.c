@@ -259,6 +259,200 @@ static PyObject *evaluate_collection(const WrtcPyExprIR *expression,
     return result;
 }
 
+static PyObject *evaluate_dict(const WrtcPyExprIR *expression,
+                               WrtcBoxedFrame *frame) {
+    PyObject *result = PyDict_New();
+    size_t index;
+    if (result == NULL) return NULL;
+    if (expression->child_count % 2u != 0u) {
+        Py_DECREF(result);
+        PyErr_SetString(PyExc_SystemError, "invalid boxed dictionary IR");
+        return NULL;
+    }
+    for (index = 0u; index < expression->child_count; index += 2u) {
+        PyObject *key = evaluate(&expression->children[index], frame);
+        PyObject *value = key == NULL
+                              ? NULL
+                              : evaluate(&expression->children[index + 1u],
+                                         frame);
+        if (key == NULL || value == NULL ||
+            PyDict_SetItem(result, key, value) < 0) {
+            Py_XDECREF(value);
+            Py_XDECREF(key);
+            Py_DECREF(result);
+            return NULL;
+        }
+        Py_DECREF(value);
+        Py_DECREF(key);
+    }
+    return result;
+}
+
+static PyObject *evaluate_joined_string(const WrtcPyExprIR *expression,
+                                        WrtcBoxedFrame *frame) {
+    PyObject *parts = PyTuple_New((Py_ssize_t)expression->child_count);
+    PyObject *separator = NULL, *result = NULL;
+    size_t index;
+    if (parts == NULL) return NULL;
+    for (index = 0u; index < expression->child_count; index++) {
+        PyObject *part = evaluate(&expression->children[index], frame);
+        if (part == NULL) goto done;
+        PyTuple_SET_ITEM(parts, (Py_ssize_t)index, part);
+    }
+    separator = PyUnicode_FromString("");
+    if (separator != NULL) result = PyUnicode_Join(separator, parts);
+done:
+    Py_XDECREF(separator);
+    Py_DECREF(parts);
+    return result;
+}
+
+static PyObject *evaluate_formatted_value(const WrtcPyExprIR *expression,
+                                          WrtcBoxedFrame *frame) {
+    PyObject *value, *converted = NULL, *format = NULL, *result = NULL;
+    if (expression->child_count != 2u || expression->operation == NULL) {
+        PyErr_SetString(PyExc_SystemError, "invalid formatted-value IR");
+        return NULL;
+    }
+    value = evaluate(&expression->children[0], frame);
+    if (value == NULL) return NULL;
+    if (strcmp(expression->operation, "115") == 0)
+        converted = PyObject_Str(value);
+    else if (strcmp(expression->operation, "114") == 0)
+        converted = PyObject_Repr(value);
+    else if (strcmp(expression->operation, "97") == 0)
+        converted = PyObject_ASCII(value);
+    else if (strcmp(expression->operation, "-1") == 0)
+        converted = Py_NewRef(value);
+    else
+        PyErr_SetString(PyExc_SystemError,
+                        "invalid formatted-value conversion");
+    Py_DECREF(value);
+    if (converted == NULL) return NULL;
+    format = evaluate(&expression->children[1], frame);
+    if (format != NULL) result = PyObject_Format(converted, format);
+    Py_XDECREF(format);
+    Py_DECREF(converted);
+    return result;
+}
+
+typedef struct {
+    const WrtcPyExprIR *lambda;
+    PyObject *globals;
+} WrtcBoxedLambda;
+
+static void boxed_lambda_capsule_clear(PyObject *capsule) {
+    WrtcBoxedLambda *lambda = PyCapsule_GetPointer(
+        capsule, "wrtc.boxed_lambda");
+    if (lambda == NULL) {
+        PyErr_Clear();
+        return;
+    }
+    Py_CLEAR(lambda->globals);
+    PyMem_Free(lambda);
+}
+
+static PyObject *invoke_boxed_lambda(PyObject *capsule, PyObject *args,
+                                     PyObject *kwargs) {
+    WrtcBoxedLambda *lambda = PyCapsule_GetPointer(
+        capsule, "wrtc.boxed_lambda");
+    PyObject *locals = NULL, *result = NULL;
+    WrtcBoxedFrame frame;
+    Py_ssize_t positional, keyword_count = 0;
+    size_t index;
+    if (lambda == NULL || lambda->lambda == NULL ||
+        lambda->lambda->child_count != 1u)
+        return NULL;
+    positional = PyTuple_GET_SIZE(args);
+    if (kwargs != NULL) keyword_count = PyDict_Size(kwargs);
+    if (positional < 0 || keyword_count < 0) return NULL;
+    if ((size_t)positional > lambda->lambda->keyword_count) {
+        PyErr_Format(PyExc_TypeError,
+                     "<lambda>() takes %zu positional arguments but %zd "
+                     "were given", lambda->lambda->keyword_count,
+                     positional);
+        return NULL;
+    }
+    locals = PyDict_New();
+    if (locals == NULL) return NULL;
+    for (index = 0u; index < (size_t)positional; index++)
+        if (PyDict_SetItemString(
+                locals, lambda->lambda->keyword_names[index],
+                PyTuple_GET_ITEM(args, (Py_ssize_t)index)) < 0)
+            goto done;
+    if (kwargs != NULL) {
+        PyObject *key, *value;
+        Py_ssize_t position = 0;
+        while (PyDict_Next(kwargs, &position, &key, &value)) {
+            const char *name = PyUnicode_AsUTF8(key);
+            size_t parameter;
+            if (name == NULL) goto done;
+            for (parameter = 0u;
+                 parameter < lambda->lambda->keyword_count; parameter++)
+                if (strcmp(lambda->lambda->keyword_names[parameter], name) == 0)
+                    break;
+            if (parameter == lambda->lambda->keyword_count) {
+                PyErr_Format(PyExc_TypeError,
+                             "<lambda>() got an unexpected keyword argument "
+                             "'%s'", name);
+                goto done;
+            }
+            if (parameter < (size_t)positional ||
+                PyDict_Contains(locals, key) == 1) {
+                PyErr_Format(PyExc_TypeError,
+                             "<lambda>() got multiple values for argument "
+                             "'%s'", name);
+                goto done;
+            }
+            if (PyDict_SetItem(locals, key, value) < 0) goto done;
+        }
+    }
+    for (index = 0u; index < lambda->lambda->keyword_count; index++)
+        if (PyDict_GetItemString(
+                locals, lambda->lambda->keyword_names[index]) == NULL) {
+            PyErr_Format(PyExc_TypeError,
+                         "<lambda>() missing required argument: '%s'",
+                         lambda->lambda->keyword_names[index]);
+            goto done;
+        }
+    frame.globals = lambda->globals;
+    frame.locals = locals;
+    frame.return_value = NULL;
+    frame.local_names = lambda->lambda->keyword_names;
+    frame.local_count = lambda->lambda->keyword_count;
+    frame.hooks = NULL;
+    result = evaluate(&lambda->lambda->children[0], &frame);
+done:
+    Py_DECREF(locals);
+    return result;
+}
+
+static PyMethodDef boxed_lambda_method = {
+    "<lambda>",
+    (PyCFunction)(void (*)(void))invoke_boxed_lambda,
+    METH_VARARGS | METH_KEYWORDS,
+    NULL
+};
+
+static PyObject *evaluate_lambda(const WrtcPyExprIR *expression,
+                                 WrtcBoxedFrame *frame) {
+    WrtcBoxedLambda *lambda = PyMem_Calloc(1u, sizeof(*lambda));
+    PyObject *capsule, *callable;
+    if (lambda == NULL) return PyErr_NoMemory();
+    lambda->lambda = expression;
+    lambda->globals = Py_NewRef(frame->globals);
+    capsule = PyCapsule_New(
+        lambda, "wrtc.boxed_lambda", boxed_lambda_capsule_clear);
+    if (capsule == NULL) {
+        Py_DECREF(lambda->globals);
+        PyMem_Free(lambda);
+        return NULL;
+    }
+    callable = PyCFunction_New(&boxed_lambda_method, capsule);
+    Py_DECREF(capsule);
+    return callable;
+}
+
 static PyObject *evaluate(const WrtcPyExprIR *expression,
                           WrtcBoxedFrame *frame) {
     PyObject *first, *second, *result;
@@ -323,6 +517,14 @@ static PyObject *evaluate(const WrtcPyExprIR *expression,
             return evaluate_collection(expression, frame, 1);
         case WRTC_PY_EXPR_LIST:
             return evaluate_collection(expression, frame, 0);
+        case WRTC_PY_EXPR_DICT:
+            return evaluate_dict(expression, frame);
+        case WRTC_PY_EXPR_JOINED_STRING:
+            return evaluate_joined_string(expression, frame);
+        case WRTC_PY_EXPR_FORMATTED_VALUE:
+            return evaluate_formatted_value(expression, frame);
+        case WRTC_PY_EXPR_LAMBDA:
+            return evaluate_lambda(expression, frame);
         case WRTC_PY_EXPR_SUBSCRIPT:
             first = evaluate(&expression->children[0], frame);
             if (first == NULL) return NULL;

@@ -385,6 +385,158 @@ static int lower_expression(PyObject *node, const char *filename,
             goto error;
         out->kind = is_kind(node, "Tuple")
                         ? WRTC_PY_EXPR_TUPLE : WRTC_PY_EXPR_LIST;
+    } else if (is_kind(node, "Dict")) {
+        PyObject *values = attribute(node, "values");
+        items = attribute(node, "keys");
+        item_count = items == NULL ? -1 : PySequence_Size(items);
+        if (item_count < 0 ||
+            (size_t)item_count > SIZE_MAX / 2u || values == NULL ||
+            PySequence_Size(values) != item_count ||
+            allocate_expression_children(
+                out, (size_t)item_count * 2u) < 0)
+            goto error;
+        for (index = 0; index < item_count; index++) {
+            PyObject *key = PySequence_GetItem(items, index);
+            PyObject *value = PySequence_GetItem(values, index);
+            if (key == NULL || key == Py_None || value == NULL) {
+                Py_XDECREF(key);
+                Py_XDECREF(value);
+                Py_DECREF(values);
+                diagnostic(filename, node,
+                           "dictionary unpacking is unsupported");
+                goto error;
+            }
+            if (lower_expression(key, filename,
+                                 &out->children[(size_t)index * 2u]) < 0 ||
+                lower_expression(value, filename,
+                                 &out->children[(size_t)index * 2u + 1u]) < 0) {
+                Py_DECREF(key);
+                Py_DECREF(value);
+                Py_DECREF(values);
+                goto error;
+            }
+            Py_DECREF(key);
+            Py_DECREF(value);
+        }
+        Py_DECREF(values);
+        out->kind = WRTC_PY_EXPR_DICT;
+    } else if (is_kind(node, "JoinedStr")) {
+        items = attribute(node, "values");
+        item_count = items == NULL ? -1 : PySequence_Size(items);
+        if (item_count < 0 ||
+            allocate_expression_children(out, (size_t)item_count) < 0 ||
+            lower_expression_sequence(items, filename, out, 0u) < 0)
+            goto error;
+        out->kind = WRTC_PY_EXPR_JOINED_STRING;
+    } else if (is_kind(node, "FormattedValue")) {
+        char conversion_text[32];
+        long conversion;
+        first = attribute(node, "value");
+        second = attribute(node, "format_spec");
+        third = attribute(node, "conversion");
+        conversion = third == NULL ? -1 : PyLong_AsLong(third);
+        if (conversion == -1 && PyErr_Occurred()) goto error;
+        if (allocate_expression_children(out, 2u) < 0 ||
+            lower_expression(first, filename, &out->children[0]) < 0)
+            goto error;
+        if (second == Py_None) {
+            out->children[1].kind = WRTC_PY_EXPR_CONSTANT;
+            out->children[1].span = out->span;
+            /* Constant IR stores the expression spelling consumed by
+             * Py_eval_input, not the already-decoded string value. */
+            out->children[1].text = copy_text("''");
+            out->children[1].operation = copy_text("str");
+        } else if (lower_expression(second, filename, &out->children[1]) < 0) {
+            goto error;
+        }
+        (void)snprintf(conversion_text, sizeof conversion_text, "%ld",
+                       conversion);
+        out->operation = copy_text(conversion_text);
+        out->kind = WRTC_PY_EXPR_FORMATTED_VALUE;
+    } else if (is_kind(node, "Lambda")) {
+        PyObject *arguments = attribute(node, "args");
+        PyObject *posonly = arguments == NULL
+                                ? NULL : attribute(arguments, "posonlyargs");
+        PyObject *positional = arguments == NULL
+                                   ? NULL : attribute(arguments, "args");
+        PyObject *vararg = arguments == NULL
+                               ? NULL : attribute(arguments, "vararg");
+        PyObject *keyword_only = arguments == NULL
+                                     ? NULL : attribute(arguments, "kwonlyargs");
+        PyObject *kwarg = arguments == NULL
+                              ? NULL : attribute(arguments, "kwarg");
+        PyObject *defaults = arguments == NULL
+                                 ? NULL : attribute(arguments, "defaults");
+        PyObject *keyword_defaults = arguments == NULL
+                                         ? NULL : attribute(arguments,
+                                                            "kw_defaults");
+        Py_ssize_t parameter_count = positional == NULL
+                                         ? -1 : PySequence_Size(positional);
+        int simple = arguments != NULL && posonly != NULL &&
+                     positional != NULL && vararg == Py_None &&
+                     keyword_only != NULL && kwarg == Py_None &&
+                     defaults != NULL && keyword_defaults != NULL &&
+                     PySequence_Size(posonly) == 0 &&
+                     PySequence_Size(keyword_only) == 0 &&
+                     PySequence_Size(defaults) == 0 &&
+                     PySequence_Size(keyword_defaults) == 0 &&
+                     parameter_count >= 0;
+        first = attribute(node, "body");
+        if (!simple || first == NULL) {
+            diagnostic(filename, node,
+                       "boxed lambda requires positional parameters without "
+                       "defaults or captures");
+            Py_XDECREF(keyword_defaults);
+            Py_XDECREF(defaults);
+            Py_XDECREF(kwarg);
+            Py_XDECREF(keyword_only);
+            Py_XDECREF(vararg);
+            Py_XDECREF(positional);
+            Py_XDECREF(posonly);
+            Py_XDECREF(arguments);
+            goto error;
+        }
+        out->keyword_count = (size_t)parameter_count;
+        out->keyword_names = calloc(
+            out->keyword_count, sizeof(*out->keyword_names));
+        if (out->keyword_count != 0u && out->keyword_names == NULL) {
+            PyErr_NoMemory();
+            goto lambda_error;
+        }
+        for (index = 0; index < parameter_count; index++) {
+            PyObject *argument = PySequence_GetItem(positional, index);
+            PyObject *name = argument == NULL
+                                 ? NULL : attribute(argument, "arg");
+            out->keyword_names[(size_t)index] = object_text(name);
+            Py_XDECREF(name);
+            Py_XDECREF(argument);
+            if (out->keyword_names[(size_t)index] == NULL)
+                goto lambda_error;
+        }
+        if (allocate_expression_children(out, 1u) < 0 ||
+            lower_expression(first, filename, &out->children[0]) < 0)
+            goto lambda_error;
+        out->kind = WRTC_PY_EXPR_LAMBDA;
+        Py_DECREF(keyword_defaults);
+        Py_DECREF(defaults);
+        Py_DECREF(kwarg);
+        Py_DECREF(keyword_only);
+        Py_DECREF(vararg);
+        Py_DECREF(positional);
+        Py_DECREF(posonly);
+        Py_DECREF(arguments);
+        Py_CLEAR(first);
+        goto expression_complete;
+lambda_error:
+        Py_XDECREF(keyword_defaults);
+        Py_XDECREF(defaults);
+        Py_XDECREF(kwarg);
+        Py_XDECREF(keyword_only);
+        Py_XDECREF(vararg);
+        Py_XDECREF(positional);
+        Py_XDECREF(posonly);
+        Py_XDECREF(arguments);
+        goto error;
     } else if (is_kind(node, "Subscript")) {
         first = attribute(node, "value");
         second = attribute(node, "slice");
@@ -422,6 +574,7 @@ static int lower_expression(PyObject *node, const char *filename,
         diagnostic(filename, node, detail);
         goto error;
     }
+expression_complete:
     if (out->operation == NULL &&
         (out->kind == WRTC_PY_EXPR_NAME ||
          out->kind == WRTC_PY_EXPR_ATTRIBUTE ||
@@ -679,6 +832,106 @@ int wrtc_py_ir_lower_suite(PyObject *statements, const char *filename,
     }
     *out = result;
     return 0;
+}
+
+static int name_in_lambda_parameters(const WrtcPyExprIR *lambda,
+                                     const char *name) {
+    size_t index;
+    for (index = 0u; index < lambda->keyword_count; index++)
+        if (strcmp(lambda->keyword_names[index], name) == 0) return 1;
+    return 0;
+}
+
+static int name_is_outer_local(const char *name,
+                               const WrtcPySuiteIR *suite,
+                               const WrtcPySignatureIR *signature) {
+    size_t index;
+    for (index = 0u; index < suite->local_count; index++)
+        if (strcmp(suite->local_names[index], name) == 0) return 1;
+    for (index = 0u; index < signature->parameter_count; index++)
+        if (strcmp(signature->parameters[index].name, name) == 0) return 1;
+    return 0;
+}
+
+static const WrtcPyExprIR *lambda_capture_in_expression(
+    const WrtcPyExprIR *expression, const WrtcPyExprIR *lambda,
+    const WrtcPySuiteIR *suite, const WrtcPySignatureIR *signature) {
+    size_t index;
+    if (expression->kind == WRTC_PY_EXPR_NAME && expression->operation != NULL &&
+        name_is_outer_local(expression->operation, suite, signature) &&
+        !name_in_lambda_parameters(lambda, expression->operation))
+        return expression;
+    for (index = 0u; index < expression->child_count; index++) {
+        const WrtcPyExprIR *captured = lambda_capture_in_expression(
+            &expression->children[index], lambda, suite, signature);
+        if (captured != NULL) return captured;
+    }
+    return NULL;
+}
+
+static const WrtcPyExprIR *validate_lambdas_in_expression(
+    const WrtcPyExprIR *expression, const WrtcPySuiteIR *suite,
+    const WrtcPySignatureIR *signature) {
+    size_t index;
+    if (expression->kind == WRTC_PY_EXPR_LAMBDA) {
+        const WrtcPyExprIR *captured = lambda_capture_in_expression(
+            &expression->children[0], expression, suite, signature);
+        if (captured != NULL) return captured;
+    }
+    for (index = 0u; index < expression->child_count; index++) {
+        const WrtcPyExprIR *captured = validate_lambdas_in_expression(
+            &expression->children[index], suite, signature);
+        if (captured != NULL) return captured;
+    }
+    return NULL;
+}
+
+static const WrtcPyExprIR *validate_lambdas_in_statements(
+    const WrtcPyStmtIR *statements, size_t count,
+    const WrtcPySuiteIR *suite, const WrtcPySignatureIR *signature) {
+    size_t statement_index, expression_index;
+    for (statement_index = 0u; statement_index < count; statement_index++) {
+        const WrtcPyStmtIR *statement = &statements[statement_index];
+        const WrtcPyExprIR *captured;
+        for (expression_index = 0u;
+             expression_index < statement->expression_count;
+             expression_index++) {
+            captured = validate_lambdas_in_expression(
+                &statement->expressions[expression_index], suite, signature);
+            if (captured != NULL) return captured;
+        }
+        captured = validate_lambdas_in_statements(
+            statement->body, statement->body_count, suite, signature);
+        if (captured != NULL) return captured;
+        captured = validate_lambdas_in_statements(
+            statement->orelse, statement->orelse_count, suite, signature);
+        if (captured != NULL) return captured;
+        captured = validate_lambdas_in_statements(
+            statement->finalbody, statement->finalbody_count,
+            suite, signature);
+        if (captured != NULL) return captured;
+        captured = validate_lambdas_in_statements(
+            statement->handlers, statement->handler_count, suite, signature);
+        if (captured != NULL) return captured;
+    }
+    return NULL;
+}
+
+int wrtc_py_suite_validate_lambdas(const WrtcPySuiteIR *suite,
+                                   const WrtcPySignatureIR *signature,
+                                   const char *filename) {
+    const WrtcPyExprIR *captured;
+    if (suite == NULL || signature == NULL) return -1;
+    captured = validate_lambdas_in_statements(
+        suite->statements, suite->statement_count, suite, signature);
+    if (captured == NULL) return 0;
+    PyErr_Format(PyExc_SyntaxError,
+                 "%s:%d:%d: error: boxed lambda capture of local '%s' is "
+                 "unsupported",
+                 filename == NULL ? "<unknown>" : filename,
+                 captured->span.line, captured->span.column,
+                 captured->operation);
+    return -1;
 }
 
 void wrtc_py_signature_ir_free(WrtcPySignatureIR *signature) {

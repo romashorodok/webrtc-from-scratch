@@ -69,6 +69,7 @@ class Stream:
         self.is_rtp = is_rtp
         self._on_close = on_close
         self._closed = False
+        self._dropped_packets = 0
 
         # Async queue for buffered packets
         # Use packet count limit rather than byte limit for simplicity
@@ -108,9 +109,30 @@ class Stream:
             return True
         except asyncio.QueueFull:
             # Drop packet when buffer full
-            seq = int.from_bytes(data[2:4], 'big') if len(data) >= 4 else -1
-            logger.warn(Component.SRTP, f"DROPPED packet - stream queue full",
-                       ssrc=self.ssrc, seq=seq, maxsize=self._queue.maxsize)
+            self._dropped_packets += 1
+            # A stalled consumer can otherwise emit two warnings for every
+            # packet indefinitely. Keep the first failures visible, then
+            # report periodic progress while preserving non-blocking ingress.
+            if self._dropped_packets <= 5 or self._dropped_packets % 100 == 0:
+                header_value = (
+                    int.from_bytes(data[2:4], "big") if len(data) >= 4 else -1
+                )
+                fields = {
+                    "ssrc": self.ssrc,
+                    "maxsize": self._queue.maxsize,
+                    "dropped": self._dropped_packets,
+                }
+                if self.is_rtp:
+                    fields["seq"] = header_value
+                else:
+                    # RTCP bytes 2-3 are the length in 32-bit words minus one,
+                    # not an RTP sequence number.
+                    fields["length_words_minus_one"] = header_value
+                logger.warn(
+                    Component.SRTP,
+                    "DROPPED packet - stream queue full",
+                    **fields,
+                )
             return False
 
     async def read(self) -> bytes:
@@ -346,11 +368,8 @@ class Session:
             await self._new_stream_queue.put((stream, ssrc))
             logger.info(Component.SRTP, f"New stream created", ssrc=ssrc)
 
-        # Check if write succeeded (could fail if stream queue is full)
-        write_success = await stream.write(decrypted)
-        if not write_success:
-            seq = int.from_bytes(decrypted[2:4], 'big') if len(decrypted) >= 4 else -1
-            logger.warn(Component.SRTP, f"Stream write FAILED - queue full", ssrc=ssrc, seq=seq)
+        # Stream.write owns the bounded-queue drop accounting and logging.
+        await stream.write(decrypted)
 
     async def accept_stream(self) -> tuple[Stream, int]:
         """

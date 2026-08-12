@@ -1,6 +1,7 @@
 #include "native_class.h"
 #include "native_class_generator.h"
 #include "native_operation.h"
+#include "native_kernel.h"
 #include "native_storage.h"
 
 #include <stdint.h>
@@ -15,6 +16,23 @@ static char *copy_text(const char *value) {
     copy = malloc(length + 1u);
     if (copy != NULL) memcpy(copy, value, length + 1u);
     return copy;
+}
+
+static char *consume_error_text(void) {
+    PyObject *type = NULL, *value = NULL, *traceback = NULL, *text = NULL;
+    const char *utf8;
+    char *result = NULL;
+    PyErr_Fetch(&type, &value, &traceback);
+    PyErr_NormalizeException(&type, &value, &traceback);
+    text = PyObject_Str(value != NULL ? value : type);
+    utf8 = text == NULL ? NULL : PyUnicode_AsUTF8(text);
+    if (utf8 != NULL) result = copy_text(utf8);
+    Py_XDECREF(text);
+    Py_XDECREF(traceback);
+    Py_XDECREF(value);
+    Py_XDECREF(type);
+    PyErr_Clear();
+    return result;
 }
 
 static const char *kind(PyObject *node) {
@@ -112,6 +130,17 @@ static char *dotted_name(PyObject *node) {
         return result;
     }
     return copy_text("");
+}
+
+static char *source_expression(PyObject *node) {
+    PyObject *ast = PyImport_ImportModule("ast");
+    PyObject *value = ast == NULL ? NULL :
+        PyObject_CallMethod(ast, "unparse", "O", node);
+    const char *text = value == NULL ? NULL : PyUnicode_AsUTF8(value);
+    char *result = text == NULL ? NULL : copy_text(text);
+    Py_XDECREF(value);
+    Py_XDECREF(ast);
+    return result;
 }
 
 static int final_name_is(PyObject *node, const char *wanted) {
@@ -828,6 +857,18 @@ static int analyze_region_body(PyObject *node, WrtcNativeRegionIR *region) {
         region->calls[region->call_count].span = span_of(node);
         region->calls[region->call_count].target_class = (size_t)-1;
         region->calls[region->call_count].target_region = (size_t)-1;
+        {
+            PyObject *arguments = attr(node, "args");
+            PyObject *keywords = attr(node, "keywords");
+            region->calls[region->call_count].positional_count =
+                arguments == NULL ? 0u : (size_t)PySequence_Size(arguments);
+            region->calls[region->call_count].keyword_count =
+                keywords == NULL ? 0u : (size_t)PySequence_Size(keywords);
+            region->calls[region->call_count].attribute_call =
+                function != NULL && is_kind(function, "Attribute");
+            Py_XDECREF(keywords);
+            Py_XDECREF(arguments);
+        }
         if (region->call_count == 0u)
             region->direct_call_target = copy_text(name);
         region->call_count++;
@@ -844,6 +885,9 @@ static int analyze_region_body(PyObject *node, WrtcNativeRegionIR *region) {
             region->capabilities |= WRTC_REGION_MIN_HEAP;
         if (final != NULL && strcmp(final, "select") == 0)
             region->capabilities |= WRTC_REGION_SELECTOR_POLL;
+        if (final != NULL && strcmp(final, "_is_current") == 0 &&
+            expression_contains(node, "generation"))
+            region->descriptor_generation_validated = 1u;
         if (final != NULL &&
             (strcmp(final, "recv") == 0 ||
              strcmp(final, "recvfrom") == 0 ||
@@ -964,6 +1008,9 @@ static int analyze_region_body(PyObject *node, WrtcNativeRegionIR *region) {
         (region->capabilities & WRTC_REGION_SELECTOR_KEY_DATA) != 0u;
     if (region->selector_shape_validated)
         region->capabilities |= WRTC_REGION_SELECTOR_DISPATCH;
+    region->selector_runtime_lowering_available =
+        region->selector_shape_validated ||
+        (region->capabilities & WRTC_REGION_SELECTOR_POLL) != 0u;
     region->packet_order_preserved =
         (region->capabilities & WRTC_REGION_BOUNDED_LOOP) != 0u &&
         (region->capabilities & WRTC_REGION_DELIVERY) != 0u;
@@ -974,6 +1021,12 @@ static int analyze_region_body(PyObject *node, WrtcNativeRegionIR *region) {
         (region->capabilities & WRTC_REGION_PACKET_BUDGET) != 0u &&
         (region->capabilities & WRTC_REGION_TIME_BUDGET) != 0u &&
         (region->capabilities & WRTC_REGION_RESCHEDULE) != 0u;
+    region->datagram_runtime_lowering_available =
+        region->packet_order_preserved && region->pool_lifetime_checked &&
+        region->bounded_interleaving &&
+        region->descriptor_generation_validated;
+    /* Set only by artifact code generation, never by semantic recognition. */
+    region->reactor_hook_emission_complete = 0u;
     if ((region->capabilities & WRTC_REGION_BOUNDED_QUEUE) != 0u &&
         expression_contains(node, "Full"))
         region->full_queue_behavior_proven = 1u;
@@ -988,6 +1041,81 @@ static int analyze_region_body(PyObject *node, WrtcNativeRegionIR *region) {
     if ((region->capabilities & WRTC_REGION_SHUTDOWN) != 0u)
         region->shutdown_interaction_proven = 1u;
     return 0;
+}
+
+static PyObject *slot_assignment_value(PyObject *member) {
+    PyObject *targets, *target, *value;
+    char *name;
+    if (member == NULL || !is_kind(member, "Assign")) return NULL;
+    targets = attr(member, "targets");
+    if (targets == NULL || PySequence_Size(targets) != 1) {
+        Py_XDECREF(targets);
+        return NULL;
+    }
+    target = PySequence_GetItem(targets, 0);
+    Py_DECREF(targets);
+    name = target != NULL && is_kind(target, "Name")
+               ? node_name(target) : NULL;
+    Py_XDECREF(target);
+    if (name == NULL || strcmp(name, "__slots__") != 0) {
+        free(name);
+        return NULL;
+    }
+    free(name);
+    value = attr(member, "value");
+    return value;
+}
+
+static int body_has_annotated_field(PyObject *body, const char *name) {
+    Py_ssize_t index, count = PySequence_Size(body);
+    for (index = 0; index < count; index++) {
+        PyObject *member = PySequence_GetItem(body, index);
+        PyObject *target = member != NULL && is_kind(member, "AnnAssign")
+                               ? attr(member, "target") : NULL;
+        char *candidate = target != NULL && is_kind(target, "Name")
+                              ? node_name(target) : NULL;
+        int found = candidate != NULL && strcmp(candidate, name) == 0;
+        free(candidate);
+        Py_XDECREF(target);
+        Py_XDECREF(member);
+        if (found) return 1;
+    }
+    return 0;
+}
+
+static size_t unannotated_slot_count(PyObject *body) {
+    Py_ssize_t index, count = PySequence_Size(body);
+    size_t result = 0u;
+    for (index = 0; index < count; index++) {
+        PyObject *member = PySequence_GetItem(body, index);
+        PyObject *value = slot_assignment_value(member);
+        PyObject *slots = value != NULL &&
+                                  (is_kind(value, "Tuple") ||
+                                   is_kind(value, "List"))
+                              ? attr(value, "elts") : NULL;
+        Py_ssize_t slot_index, slot_count = slots == NULL
+                                                 ? (value != NULL &&
+                                                    is_kind(value, "Constant")
+                                                        ? 1 : 0)
+                                                 : PySequence_Size(slots);
+        for (slot_index = 0; slot_index < slot_count; slot_index++) {
+            PyObject *slot_node = slots == NULL
+                                      ? Py_NewRef(value)
+                                      : PySequence_GetItem(slots, slot_index);
+            PyObject *slot = slot_node == NULL
+                                 ? NULL : attr(slot_node, "value");
+            const char *name = slot != NULL && PyUnicode_Check(slot)
+                                   ? PyUnicode_AsUTF8(slot) : NULL;
+            if (name != NULL && !body_has_annotated_field(body, name))
+                result++;
+            Py_XDECREF(slot);
+            Py_XDECREF(slot_node);
+        }
+        Py_XDECREF(slots);
+        Py_XDECREF(value);
+        Py_XDECREF(member);
+    }
+    return result;
 }
 
 static int analyze_class(const WrtcCompilerCore *core, PyObject *node,
@@ -1038,10 +1166,10 @@ static int analyze_class(const WrtcCompilerCore *core, PyObject *node,
             class_ir->field_count++;
         if (member != NULL && is_kind(member, "FunctionDef")) {
             char *member_name = definition_name(member);
-            if (member_name != NULL &&
-                (strcmp(member_name, "__init__") == 0 ||
-                 strcmp(member_name, "__new__") == 0))
+            if (member_name != NULL && strcmp(member_name, "__init__") == 0)
                 class_ir->custom_constructor = 1u;
+            if (member_name != NULL && strcmp(member_name, "__new__") == 0)
+                class_ir->custom_new = 1u;
             free(member_name);
         }
         for (deco_index = 0; deco_index < deco_count; deco_index++) {
@@ -1055,6 +1183,7 @@ static int analyze_class(const WrtcCompilerCore *core, PyObject *node,
         Py_XDECREF(member_decorators);
         Py_XDECREF(member);
     }
+    class_ir->field_count += unannotated_slot_count(body);
     class_ir->fields = calloc(class_ir->field_count, sizeof(*class_ir->fields));
     class_ir->regions =
         calloc(class_ir->region_count, sizeof(*class_ir->regions));
@@ -1081,6 +1210,10 @@ static int analyze_class(const WrtcCompilerCore *core, PyObject *node,
                 field->storage_kind = WRTC_NATIVE_FIELD_SPSC;
             else if (expression_contains(annotation, "mpsc"))
                 field->storage_kind = WRTC_NATIVE_FIELD_MPSC;
+            else if (expression_contains(annotation, "selector_registry"))
+                field->storage_kind = WRTC_NATIVE_FIELD_SELECTOR;
+            else if (expression_contains(annotation, "packet_slab"))
+                field->storage_kind = WRTC_NATIVE_FIELD_PACKET_POOL;
             else if (expression_contains(annotation, "fifo"))
                 field->storage_kind = WRTC_NATIVE_FIELD_FIFO;
             else if (expression_contains(annotation, "min_heap"))
@@ -1115,12 +1248,54 @@ static int analyze_class(const WrtcCompilerCore *core, PyObject *node,
             field->queue_capacity = find_call_keyword_text(
                 annotation, "bounded_queue", "capacity");
             field->queue_item_type = find_queue_item_type(annotation);
+            field->reactor_capacity = find_call_keyword_text(
+                annotation,
+                field->storage_kind == WRTC_NATIVE_FIELD_SELECTOR
+                    ? "selector_registry" : "packet_slab",
+                "capacity");
+            if (field->storage_kind == WRTC_NATIVE_FIELD_PACKET_POOL)
+                field->packet_buffer_size = find_call_keyword_text(
+                    annotation, "packet_slab", "buffer_size");
             Py_XDECREF(annotation);
             Py_XDECREF(target);
         } else if (member != NULL && is_kind(member, "FunctionDef")) {
+            char *member_name = definition_name(member);
             PyObject *member_decorators = attr(member, "decorator_list");
             Py_ssize_t deco_index, deco_count =
                 member_decorators == NULL ? 0 : PySequence_Size(member_decorators);
+            if (member_name != NULL && strcmp(member_name, "__init__") == 0) {
+                PyObject *statements = attr(member, "body");
+                if (statements == NULL ||
+                    wrtc_py_ir_lower_signature(
+                        member,
+                        class_ir->filename == NULL
+                            ? core->filename : class_ir->filename,
+                        &class_ir->constructor_signature) < 0) {
+                    Py_XDECREF(statements);
+                    free(member_name);
+                    Py_XDECREF(member_decorators);
+                    Py_DECREF(member);
+                    goto error;
+                }
+                if (wrtc_py_ir_lower_suite(
+                        statements,
+                        class_ir->filename == NULL
+                            ? core->filename : class_ir->filename,
+                        &class_ir->constructor_body) < 0) {
+                    class_ir->constructor_rejection_reason =
+                        consume_error_text();
+                    class_ir->constructor_rejection_span = span_of(member);
+                } else if (wrtc_py_suite_validate_lambdas(
+                               class_ir->constructor_body,
+                               class_ir->constructor_signature,
+                               class_ir->filename == NULL
+                                   ? core->filename : class_ir->filename) < 0) {
+                    class_ir->constructor_rejection_reason =
+                        consume_error_text();
+                    class_ir->constructor_rejection_span = span_of(member);
+                }
+                Py_DECREF(statements);
+            }
             for (deco_index = 0; deco_index < deco_count; deco_index++) {
                 PyObject *decorator =
                     PySequence_GetItem(member_decorators, deco_index);
@@ -1134,7 +1309,7 @@ static int analyze_class(const WrtcCompilerCore *core, PyObject *node,
                         PyObject *returns = attr(member, "returns");
                         region->result_type =
                             returns == NULL || returns == Py_None
-                                ? NULL : dotted_name(returns);
+                                ? NULL : source_expression(returns);
                         Py_XDECREF(returns);
                     }
                     if (parse_region_decorator(core, decorator, region) < 0) {
@@ -1190,8 +1365,52 @@ static int analyze_class(const WrtcCompilerCore *core, PyObject *node,
                 }
                 Py_XDECREF(decorator);
             }
+            free(member_name);
             Py_XDECREF(member_decorators);
         }
+        Py_XDECREF(member);
+    }
+    for (index = 0; index < count; index++) {
+        PyObject *member = PySequence_GetItem(body, index);
+        PyObject *value = slot_assignment_value(member);
+        PyObject *slots = value != NULL &&
+                                  (is_kind(value, "Tuple") ||
+                                   is_kind(value, "List"))
+                              ? attr(value, "elts") : NULL;
+        Py_ssize_t slot_index, slot_count = slots == NULL
+                                                 ? (value != NULL &&
+                                                    is_kind(value, "Constant")
+                                                        ? 1 : 0)
+                                                 : PySequence_Size(slots);
+        for (slot_index = 0; slot_index < slot_count; slot_index++) {
+            PyObject *slot_node = slots == NULL
+                                      ? Py_NewRef(value)
+                                      : PySequence_GetItem(slots, slot_index);
+            PyObject *slot = slot_node == NULL
+                                 ? NULL : attr(slot_node, "value");
+            const char *name = slot != NULL && PyUnicode_Check(slot)
+                                   ? PyUnicode_AsUTF8(slot) : NULL;
+            if (name != NULL && !body_has_annotated_field(body, name)) {
+                WrtcNativeFieldIR *field = &class_ir->fields[field_index++];
+                field->name = copy_text(name);
+                field->declared_type = copy_text("object");
+                field->type = WRTC_TYPE_OBJECT;
+                field->storage_kind = WRTC_NATIVE_FIELD_PYOBJECT;
+                field->span = span_of(slot_node);
+                if (field->name == NULL || field->declared_type == NULL) {
+                    Py_XDECREF(slot);
+                    Py_XDECREF(slot_node);
+                    Py_XDECREF(slots);
+                    Py_XDECREF(value);
+                    Py_XDECREF(member);
+                    goto error;
+                }
+            }
+            Py_XDECREF(slot);
+            Py_XDECREF(slot_node);
+        }
+        Py_XDECREF(slots);
+        Py_XDECREF(value);
         Py_XDECREF(member);
     }
     /*
@@ -1295,6 +1514,8 @@ int wrtc_native_class_analyze(const char *source, size_t source_length,
             char *record_abi =
                 called_decorator_keyword_string(node, "record", "abi");
             record->name = definition_name(node);
+            record->abi = record_abi;
+            record_abi = NULL;
             record->filename = copy_text(filename);
             record->span = span_of(node);
             record->representation_proven = 1u;
@@ -1349,7 +1570,7 @@ int wrtc_native_class_analyze(const char *source, size_t source_length,
                 Py_XDECREF(member);
             }
             record->abi_declared =
-                record_abi != NULL && record_abi[0] != '\0';
+                record->abi != NULL && record->abi[0] != '\0';
             record->boxed_ownership_proven =
                 record->abi_declared &&
                 has_called_decorator(node, "dataclass") &&
@@ -1508,10 +1729,11 @@ parse_error:
 
 int wrtc_native_class_merge(WrtcNativeClassProgram *destination,
                             WrtcNativeClassProgram *source) {
-    WrtcNativeClassIR *classes;
-    WrtcTypedRecordIR *records;
-    WrtcNativeFactoryIR *factories;
+    WrtcNativeClassIR *classes = NULL;
+    WrtcTypedRecordIR *records = NULL;
+    WrtcNativeFactoryIR *factories = NULL;
     size_t class_count, record_count, factory_count;
+    size_t left, right;
     if (destination == NULL || source == NULL) {
         PyErr_SetString(PyExc_ValueError, "native class merge input is absent");
         return -1;
@@ -1520,62 +1742,124 @@ int wrtc_native_class_merge(WrtcNativeClassProgram *destination,
     record_count = destination->record_count + source->record_count;
     factory_count = destination->factory_count + source->factory_count;
     if (class_count < destination->class_count ||
-        record_count < destination->record_count) {
+        record_count < destination->record_count ||
+        factory_count < destination->factory_count ||
+        (class_count != 0u &&
+         class_count > SIZE_MAX / sizeof(*classes)) ||
+        (record_count != 0u &&
+         record_count > SIZE_MAX / sizeof(*records)) ||
+        (factory_count != 0u &&
+         factory_count > SIZE_MAX / sizeof(*factories))) {
         PyErr_NoMemory();
         return -1;
     }
-    if (destination->factory_name == NULL &&
-        source->factory_name != NULL) {
+    /*
+     * Final-name resolution is deliberately used by exact-type annotations.
+     * Ambiguous names must therefore reject before either ownership graph is
+     * mutated; silently choosing the first class/record/factory would make a
+     * guarded call or exported module surface depend on discovery order.
+     */
+    for (left = 0u; left < destination->class_count; left++)
+        for (right = 0u; right < source->class_count; right++)
+            if (strcmp(destination->classes[left].name,
+                       source->classes[right].name) == 0) {
+                PyErr_Format(
+                    PyExc_ValueError,
+                    "%s:%d:%d: error: native class %s conflicts with %s:%d:%d",
+                    source->classes[right].filename,
+                    source->classes[right].span.line,
+                    source->classes[right].span.column,
+                    source->classes[right].name,
+                    destination->classes[left].filename,
+                    destination->classes[left].span.line,
+                    destination->classes[left].span.column);
+                return -1;
+            }
+    for (left = 0u; left < destination->record_count; left++)
+        for (right = 0u; right < source->record_count; right++)
+            if (strcmp(destination->records[left].name,
+                       source->records[right].name) == 0) {
+                PyErr_Format(
+                    PyExc_ValueError,
+                    "%s:%d:%d: error: native record %s conflicts with %s:%d:%d",
+                    source->records[right].filename,
+                    source->records[right].span.line,
+                    source->records[right].span.column,
+                    source->records[right].name,
+                    destination->records[left].filename,
+                    destination->records[left].span.line,
+                    destination->records[left].span.column);
+                return -1;
+            }
+    for (left = 0u; left < destination->factory_count; left++)
+        for (right = 0u; right < source->factory_count; right++)
+            if (strcmp(destination->factories[left].name,
+                       source->factories[right].name) == 0) {
+                PyErr_Format(
+                    PyExc_ValueError,
+                    "%s:%d:%d: error: native factory %s conflicts with %s:%d:%d",
+                    source->factories[right].filename,
+                    source->factories[right].span.line,
+                    source->factories[right].span.column,
+                    source->factories[right].name,
+                    destination->factories[left].filename,
+                    destination->factories[left].span.line,
+                    destination->factories[left].span.column);
+                return -1;
+            }
+    if (class_count != 0u) {
+        classes = malloc(class_count * sizeof(*classes));
+        if (classes == NULL) goto no_memory;
+        memcpy(classes, destination->classes,
+               destination->class_count * sizeof(*classes));
+        memcpy(classes + destination->class_count, source->classes,
+               source->class_count * sizeof(*classes));
+    }
+    if (record_count != 0u) {
+        records = malloc(record_count * sizeof(*records));
+        if (records == NULL) goto no_memory;
+        memcpy(records, destination->records,
+               destination->record_count * sizeof(*records));
+        memcpy(records + destination->record_count, source->records,
+               source->record_count * sizeof(*records));
+    }
+    if (factory_count != 0u) {
+        factories = malloc(factory_count * sizeof(*factories));
+        if (factories == NULL) goto no_memory;
+        memcpy(factories, destination->factories,
+               destination->factory_count * sizeof(*factories));
+        memcpy(factories + destination->factory_count, source->factories,
+               source->factory_count * sizeof(*factories));
+    }
+    free(destination->classes);
+    free(destination->records);
+    free(destination->factories);
+    free(source->classes);
+    free(source->records);
+    free(source->factories);
+    destination->classes = classes;
+    destination->class_count = class_count;
+    destination->records = records;
+    destination->record_count = record_count;
+    destination->factories = factories;
+    destination->factory_count = factory_count;
+    source->classes = NULL;
+    source->class_count = 0u;
+    source->records = NULL;
+    source->record_count = 0u;
+    source->factories = NULL;
+    source->factory_count = 0u;
+    if (destination->factory_name == NULL && source->factory_name != NULL) {
         destination->factory_name = source->factory_name;
         source->factory_name = NULL;
     }
-    factories = destination->factories;
-    if (source->factory_count != 0u) {
-        factories =
-            realloc(factories, factory_count * sizeof(*factories));
-        if (factories == NULL) {
-            PyErr_NoMemory();
-            return -1;
-        }
-        memcpy(factories + destination->factory_count, source->factories,
-               source->factory_count * sizeof(*factories));
-        destination->factories = factories;
-        destination->factory_count = factory_count;
-        free(source->factories);
-        source->factories = NULL;
-        source->factory_count = 0u;
-    }
-    classes = destination->classes;
-    if (source->class_count != 0u) {
-        classes = realloc(classes, class_count * sizeof(*classes));
-        if (classes == NULL) {
-            PyErr_NoMemory();
-            return -1;
-        }
-        memcpy(classes + destination->class_count, source->classes,
-               source->class_count * sizeof(*classes));
-        destination->classes = classes;
-        destination->class_count = class_count;
-        free(source->classes);
-        source->classes = NULL;
-        source->class_count = 0u;
-    }
-    records = destination->records;
-    if (source->record_count != 0u) {
-        records = realloc(records, record_count * sizeof(*records));
-        if (records == NULL) {
-            PyErr_NoMemory();
-            return -1;
-        }
-        memcpy(records + destination->record_count, source->records,
-               source->record_count * sizeof(*records));
-        destination->records = records;
-        destination->record_count = record_count;
-        free(source->records);
-        source->records = NULL;
-        source->record_count = 0u;
-    }
     return 0;
+no_memory:
+    free(factories);
+    free(records);
+    free(classes);
+    PyErr_NoMemory();
+    return -1;
 }
 
 static const char *final_type_name(const char *type_name,
@@ -1733,10 +2017,18 @@ static int worker_region_reachable(
     const WrtcNativeClassProgram *program, size_t class_index,
     size_t region_index, size_t region_stride, unsigned char *visiting,
     const char **reason) {
-    const WrtcNativeRegionIR *region =
-        &program->classes[class_index].regions[region_index];
+    const WrtcNativeRegionIR *region;
     size_t call_index;
-    const size_t flat_index = class_index * region_stride + region_index;
+    size_t flat_index;
+    if (program == NULL || visiting == NULL ||
+        class_index >= program->class_count ||
+        region_index >= program->classes[class_index].region_count ||
+        region_index >= region_stride) {
+        *reason = "worker call graph contains an invalid region edge";
+        return 0;
+    }
+    region = &program->classes[class_index].regions[region_index];
+    flat_index = class_index * region_stride + region_index;
     if (region->policy != WRTC_REGION_REQUIRED) {
         *reason = "reachable worker callee is not a required region";
         return 0;
@@ -1766,6 +2058,78 @@ static int worker_region_reachable(
     return 1;
 }
 
+static void reject_all_worker_reachability(
+    WrtcNativeClassProgram *program, const char *reason) {
+    size_t class_index, region_index;
+    if (program == NULL) return;
+    for (class_index = 0u; class_index < program->class_count;
+         class_index++) {
+        WrtcNativeClassIR *class_ir = &program->classes[class_index];
+        for (region_index = 0u; region_index < class_ir->region_count;
+             region_index++) {
+            WrtcNativeRegionIR *region = &class_ir->regions[region_index];
+            if ((region->capabilities & WRTC_REGION_OWNED_SHARD) == 0u)
+                continue;
+            region->worker_reachability_proven = 0u;
+            region->worker_emission_complete = 0u;
+            region->worker_python_free = 0u;
+            free(region->worker_rejection_reason);
+            region->worker_rejection_reason = copy_text(reason);
+        }
+    }
+}
+
+static int worker_kernel_emitted(
+    const WrtcNativeClassProgram *program, size_t class_index,
+    size_t region_index, size_t region_stride, unsigned char *visiting) {
+    const WrtcNativeRegionIR *region;
+    size_t flat_index, call_index;
+    if (program == NULL || visiting == NULL ||
+        class_index >= program->class_count ||
+        region_index >= program->classes[class_index].region_count ||
+        region_index >= region_stride)
+        return 0;
+    region = &program->classes[class_index].regions[region_index];
+    if (!region->kernel_emission_complete || !region->kernel_python_free)
+        return 0;
+    flat_index = class_index * region_stride + region_index;
+    if (visiting[flat_index] != 0u) return 1;
+    visiting[flat_index] = 1u;
+    for (call_index = 0u; call_index < region->call_count; call_index++) {
+        const WrtcNativeCallEdgeIR *edge = &region->calls[call_index];
+        if (worker_call_is_record_constructor(program, edge->target))
+            continue;
+        if (!edge->resolved ||
+            !worker_kernel_emitted(program, edge->target_class,
+                                   edge->target_region, region_stride,
+                                   visiting))
+            return 0;
+    }
+    return 1;
+}
+
+static unsigned worker_channels_proven(
+    const WrtcNativeClassProgram *program,
+    const WrtcNativeClassIR *class_ir,
+    const WrtcTypedRecordIR *input,
+    const WrtcTypedRecordIR *output) {
+    int input_seen = 0, output_seen = 0;
+    size_t field_index;
+    if (program == NULL || class_ir == NULL || input == NULL || output == NULL)
+        return 0u;
+    for (field_index = 0u; field_index < class_ir->field_count; field_index++) {
+        const WrtcNativeFieldIR *field = &class_ir->fields[field_index];
+        const WrtcTypedRecordIR *payload;
+        if (field->queue_topology != WRTC_QUEUE_SPSC ||
+            field->queue_capacity == NULL || !field->typed_queue_payload)
+            continue;
+        payload = worker_record_for_type(program, field->queue_item_type);
+        if (payload == input) input_seen = 1;
+        if (payload == output) output_seen = 1;
+    }
+    return input_seen && output_seen ? 1u : 0u;
+}
+
 static void finalize_worker_proofs(WrtcNativeClassProgram *program) {
     size_t class_index, region_index;
     size_t region_stride = 1u, visiting_size;
@@ -1776,15 +2140,17 @@ static void finalize_worker_proofs(WrtcNativeClassProgram *program) {
             if (program->classes[class_index].region_count > region_stride)
                 region_stride =
                     program->classes[class_index].region_count;
-    if (program == NULL ||
-        program->class_count > SIZE_MAX / region_stride) {
-        PyErr_NoMemory();
+    if (program == NULL) return;
+    if (program->class_count > SIZE_MAX / region_stride) {
+        reject_all_worker_reachability(
+            program, "worker reachability workspace size overflow");
         return;
     }
     visiting_size = program->class_count * region_stride;
     visiting = visiting_size == 0u ? NULL : calloc(visiting_size, 1u);
     if (visiting_size != 0u && visiting == NULL) {
-        PyErr_Clear();
+        reject_all_worker_reachability(
+            program, "worker reachability workspace allocation failed");
         return;
     }
     for (class_index = 0u; class_index < program->class_count;
@@ -1796,6 +2162,7 @@ static void finalize_worker_proofs(WrtcNativeClassProgram *program) {
             const WrtcTypedRecordIR *input = NULL, *output;
             const char *reason = NULL;
             size_t parameter_index;
+            int kernel_graph_emitted;
             if ((region->capabilities & WRTC_REGION_OWNED_SHARD) == 0u)
                 continue;
             for (parameter_index = 0u;
@@ -1815,6 +2182,8 @@ static void finalize_worker_proofs(WrtcNativeClassProgram *program) {
                 input != NULL && output != NULL &&
                 input->worker_abi_eligible &&
                 output->worker_abi_eligible;
+            region->worker_bounded_channels_proven =
+                worker_channels_proven(program, class_ir, input, output);
             memset(visiting, 0, visiting_size);
             region->worker_reachability_proven =
                 worker_region_reachable(
@@ -1826,12 +2195,31 @@ static void finalize_worker_proofs(WrtcNativeClassProgram *program) {
              * proof and intentionally remains false until a portable worker
              * kernel emitter exists for every reachable statement.
              */
-            region->worker_emission_complete = 0u;
+            memset(visiting, 0, visiting_size);
+            region->worker_executor_emission_complete =
+                region->worker_record_abi_proven &&
+                region->worker_bounded_channels_proven &&
+                region->shard_ordered;
+            region->worker_typed_error_proven =
+                region->worker_executor_emission_complete;
+            region->worker_shutdown_proven =
+                region->worker_executor_emission_complete;
+            kernel_graph_emitted = worker_kernel_emitted(
+                program, class_index, region_index, region_stride, visiting);
+            region->worker_thread_python_api_free =
+                region->worker_executor_emission_complete &&
+                region->worker_reachability_proven &&
+                kernel_graph_emitted;
+            region->worker_emission_complete =
+                region->worker_reachability_proven &&
+                region->worker_executor_emission_complete &&
+                kernel_graph_emitted;
             region->worker_python_free =
                 region->worker_record_abi_proven &&
                 region->worker_reachability_proven &&
                 region->worker_emission_complete;
             free(region->worker_rejection_reason);
+            region->worker_rejection_reason = NULL;
             if (!region->worker_reachability_proven)
                 region->worker_rejection_reason = copy_text(
                     reason == NULL
@@ -1840,6 +2228,9 @@ static void finalize_worker_proofs(WrtcNativeClassProgram *program) {
                 region->worker_rejection_reason = copy_text(
                     "worker input/result records are not fully native ABI "
                     "records");
+            else if (!region->worker_bounded_channels_proven)
+                region->worker_rejection_reason = copy_text(
+                    "worker input/result bounded SPSC fields are not proven");
             else if (!region->worker_emission_complete)
                 region->worker_rejection_reason = copy_text(
                     "python-independent worker body emitter is unavailable");
@@ -2155,6 +2546,199 @@ static void finalize_spsc_proofs(WrtcNativeClassProgram *program) {
     wrtc_native_operation_table_free(table);
 }
 
+static const char *call_final_name(const WrtcNativeCallEdgeIR *edge) {
+    const char *dot;
+    if (edge == NULL || edge->target == NULL) return NULL;
+    dot = strrchr(edge->target, '.');
+    return dot == NULL ? edge->target : dot + 1;
+}
+
+static int reactor_call_shape(const WrtcNativeCallEdgeIR *edge,
+                              size_t positional_count) {
+    return edge != NULL && edge->attribute_call &&
+           edge->positional_count == positional_count &&
+           edge->keyword_count == 0u;
+}
+
+static void reject_reactor_hook(WrtcNativeRegionIR *region,
+                                const WrtcNativeCallEdgeIR *edge,
+                                const char *reason) {
+    if (region->reactor_hook_rejection_reason != NULL) return;
+    region->reactor_hook_rejection_reason = copy_text(reason);
+    region->reactor_hook_rejection_span =
+        edge == NULL ? region->span : edge->span;
+}
+
+/*
+ * Prove the complete CPython-extension reactor boundary set from normalized
+ * call semantics.  Source spans identify the already-proven call site for the
+ * generated boxed hook; they never choose which behavior is lowered.
+ */
+static void finalize_reactor_hook_proofs(WrtcNativeClassProgram *program) {
+    size_t class_index, region_index;
+    if (program == NULL) return;
+    for (class_index = 0u; class_index < program->class_count; class_index++) {
+        WrtcNativeClassIR *class_ir = &program->classes[class_index];
+        for (region_index = 0u; region_index < class_ir->region_count;
+             region_index++) {
+            WrtcNativeRegionIR *region = &class_ir->regions[region_index];
+            size_t call_index;
+            const int selector = region->selector_runtime_lowering_available;
+            const int datagram = region->datagram_runtime_lowering_available;
+            free(region->reactor_hook_rejection_reason);
+            region->reactor_hook_rejection_reason = NULL;
+            memset(&region->reactor_hook_rejection_span, 0,
+                   sizeof(region->reactor_hook_rejection_span));
+            region->reactor_hook_emission_complete = 0u;
+            region->selector_remove_reader_hook = 0u;
+            region->selector_remove_writer_hook = 0u;
+            region->datagram_generation_hook = 0u;
+            region->datagram_delivery_hook = 0u;
+            region->bounded_reschedule_hook = 0u;
+            region->reactor_thread_serialized =
+                region->owner != NULL &&
+                strcmp(region->owner, "reactor") == 0;
+            for (call_index = 0u; call_index < region->call_count;
+                 call_index++) {
+                WrtcNativeCallEdgeIR *edge = &region->calls[call_index];
+                const char *name = call_final_name(edge);
+                edge->reactor_hook = WRTC_REACTOR_HOOK_NONE;
+                edge->reactor_hook_shape_proven = 0u;
+                if (name == NULL) continue;
+                if (selector && strcmp(name, "_remove_reader") == 0) {
+                    if (!reactor_call_shape(edge, 1u)) {
+                        reject_reactor_hook(
+                            region, edge,
+                            "selector removal requires one positional "
+                            "file object and no keyword arguments");
+                        continue;
+                    }
+                    edge->reactor_hook =
+                        WRTC_REACTOR_HOOK_SELECTOR_REMOVE_READER;
+                    edge->reactor_hook_shape_proven = 1u;
+                    region->selector_remove_reader_hook = 1u;
+                } else if (selector &&
+                           strcmp(name, "_remove_writer") == 0) {
+                    if (!reactor_call_shape(edge, 1u)) {
+                        reject_reactor_hook(
+                            region, edge,
+                            "selector removal requires one positional "
+                            "file object and no keyword arguments");
+                        continue;
+                    }
+                    edge->reactor_hook =
+                        WRTC_REACTOR_HOOK_SELECTOR_REMOVE_WRITER;
+                    edge->reactor_hook_shape_proven = 1u;
+                    region->selector_remove_writer_hook = 1u;
+                } else if (datagram && strcmp(name, "_is_current") == 0) {
+                    if (!reactor_call_shape(edge, 2u)) {
+                        reject_reactor_hook(
+                            region, edge,
+                            "datagram generation guard requires transport "
+                            "and generation positional arguments");
+                        continue;
+                    }
+                    edge->reactor_hook =
+                        WRTC_REACTOR_HOOK_DATAGRAM_GENERATION_CHECK;
+                    edge->reactor_hook_shape_proven = 1u;
+                    region->datagram_generation_hook = 1u;
+                } else if (datagram && strcmp(name, "deliver") == 0) {
+                    if (!reactor_call_shape(edge, 1u)) {
+                        reject_reactor_hook(
+                            region, edge,
+                            "datagram delivery requires one owned packet "
+                            "positional argument");
+                        continue;
+                    }
+                    edge->reactor_hook =
+                        WRTC_REACTOR_HOOK_DATAGRAM_DELIVERY;
+                    edge->reactor_hook_shape_proven = 1u;
+                    region->datagram_delivery_hook = 1u;
+                } else if (datagram &&
+                           strcmp(name, "request_reschedule") == 0) {
+                    if (!reactor_call_shape(edge, 0u)) {
+                        reject_reactor_hook(
+                            region, edge,
+                            "bounded reschedule requires no arguments");
+                        continue;
+                    }
+                    edge->reactor_hook = WRTC_REACTOR_HOOK_RESCHEDULE;
+                    edge->reactor_hook_shape_proven = 1u;
+                    region->bounded_reschedule_hook = 1u;
+                }
+            }
+            if (!region->reactor_thread_serialized && (selector || datagram))
+                reject_reactor_hook(
+                    region, NULL,
+                    "reactor boundary hooks require effects(owner='reactor')");
+            if (selector &&
+                (!region->selector_remove_reader_hook ||
+                 !region->selector_remove_writer_hook))
+                reject_reactor_hook(
+                    region, NULL,
+                    "selector dispatch requires guarded reader and writer "
+                    "cancellation removal hooks");
+            if (datagram &&
+                (!region->datagram_generation_hook ||
+                 !region->datagram_delivery_hook ||
+                 !region->bounded_reschedule_hook))
+                reject_reactor_hook(
+                    region, NULL,
+                    "datagram drain requires generation, delivery, and "
+                    "bounded reschedule hooks");
+            if ((selector || datagram) &&
+                region->reactor_hook_rejection_reason == NULL)
+                region->reactor_hook_emission_complete = 1u;
+        }
+    }
+    /* A selector polling facade may delegate dispatch to an exact fused
+     * required region.  The guarded cancellation calls execute in that
+     * callee's generated wrapper, so propagate only already-proven hook
+     * facts across the resolved fusion edge. */
+    for (class_index = 0u; class_index < program->class_count; class_index++) {
+        WrtcNativeClassIR *class_ir = &program->classes[class_index];
+        for (region_index = 0u; region_index < class_ir->region_count;
+             region_index++) {
+            WrtcNativeRegionIR *region = &class_ir->regions[region_index];
+            size_t call_index;
+            static const char missing_selector_hooks[] =
+                "selector dispatch requires guarded reader and writer "
+                "cancellation removal hooks";
+            if (!region->selector_runtime_lowering_available) continue;
+            for (call_index = 0u; call_index < region->call_count;
+                 call_index++) {
+                const WrtcNativeCallEdgeIR *edge =
+                    &region->calls[call_index];
+                const WrtcNativeRegionIR *target;
+                if (!edge->resolved || !edge->required_callee ||
+                    !edge->exact_receiver || !edge->fused ||
+                    edge->target_class >= program->class_count ||
+                    edge->target_region >=
+                        program->classes[edge->target_class].region_count)
+                    continue;
+                target = &program->classes[edge->target_class]
+                              .regions[edge->target_region];
+                if (target->selector_remove_reader_hook)
+                    region->selector_remove_reader_hook = 1u;
+                if (target->selector_remove_writer_hook)
+                    region->selector_remove_writer_hook = 1u;
+            }
+            if (region->selector_remove_reader_hook &&
+                region->selector_remove_writer_hook &&
+                region->reactor_thread_serialized &&
+                region->reactor_hook_rejection_reason != NULL &&
+                strcmp(region->reactor_hook_rejection_reason,
+                       missing_selector_hooks) == 0) {
+                free(region->reactor_hook_rejection_reason);
+                region->reactor_hook_rejection_reason = NULL;
+                memset(&region->reactor_hook_rejection_span, 0,
+                       sizeof(region->reactor_hook_rejection_span));
+                region->reactor_hook_emission_complete = 1u;
+            }
+        }
+    }
+}
+
 void wrtc_native_class_resolve_calls(WrtcNativeClassProgram *program) {
     size_t class_index, region_index;
     if (program == NULL) return;
@@ -2204,7 +2788,9 @@ void wrtc_native_class_resolve_calls(WrtcNativeClassProgram *program) {
     }
     finalize_mpsc_proofs(program);
     finalize_spsc_proofs(program);
+    wrtc_native_kernel_prove(program);
     finalize_worker_proofs(program);
+    finalize_reactor_hook_proofs(program);
 }
 
 static int dict_set_owned(PyObject *mapping, const char *name, PyObject *value) {
@@ -2336,6 +2922,10 @@ static int operation_kind_lowerable(WrtcNativeOperationKind kind) {
            kind == WRTC_NATIVE_OP_SPSC_QSIZE ||
            kind == WRTC_NATIVE_OP_SPSC_EMPTY ||
            kind == WRTC_NATIVE_OP_SPSC_CLOSE ||
+           kind == WRTC_NATIVE_OP_SELECTOR_REGISTER ||
+           kind == WRTC_NATIVE_OP_SELECTOR_IS_CURRENT ||
+           kind == WRTC_NATIVE_OP_SELECTOR_OWNER ||
+           kind == WRTC_NATIVE_OP_SELECTOR_REMOVE ||
            kind == WRTC_NATIVE_OP_ATOMIC_COMPARE_EXCHANGE;
 }
 
@@ -2481,7 +3071,10 @@ static PyObject *remaining_calls_report(
                 break;
             }
         }
-        if (lowered || edge->fused) continue;
+        if (lowered || edge->fused ||
+            (edge->reactor_hook != WRTC_REACTOR_HOOK_NONE &&
+             edge->reactor_hook_shape_proven))
+            continue;
         call = PyDict_New();
         if (edge->resolved &&
             edge->target_class < program->class_count &&
@@ -2521,6 +3114,70 @@ static PyObject *remaining_calls_report(
         Py_DECREF(call);
     }
     return calls;
+}
+
+static const char *reactor_hook_kind_name(WrtcReactorHookKind kind) {
+    switch (kind) {
+        case WRTC_REACTOR_HOOK_SELECTOR_REMOVE_READER:
+            return "selector_remove_reader";
+        case WRTC_REACTOR_HOOK_SELECTOR_REMOVE_WRITER:
+            return "selector_remove_writer";
+        case WRTC_REACTOR_HOOK_DATAGRAM_GENERATION_CHECK:
+            return "datagram_generation_check";
+        case WRTC_REACTOR_HOOK_DATAGRAM_DELIVERY:
+            return "datagram_delivery";
+        case WRTC_REACTOR_HOOK_RESCHEDULE:
+            return "bounded_reschedule";
+        default:
+            return "none";
+    }
+}
+
+static PyObject *reactor_hook_sites_report(
+    const WrtcNativeClassIR *class_ir,
+    const WrtcNativeRegionIR *region, const char *fallback_filename) {
+    PyObject *sites = PyList_New(0);
+    size_t index;
+    if (sites == NULL) return NULL;
+    for (index = 0u; index < region->call_count; index++) {
+        const WrtcNativeCallEdgeIR *edge = &region->calls[index];
+        PyObject *site;
+        if (edge->reactor_hook == WRTC_REACTOR_HOOK_NONE) continue;
+        site = PyDict_New();
+        if (site == NULL ||
+            dict_set_owned(
+                site, "hook",
+                PyUnicode_FromString(
+                    reactor_hook_kind_name(edge->reactor_hook))) < 0 ||
+            dict_set_owned(
+                site, "target",
+                edge->target == NULL ? Py_NewRef(Py_None)
+                                     : PyUnicode_FromString(edge->target)) < 0 ||
+            dict_set_owned(site, "positional_count",
+                           PyLong_FromSize_t(edge->positional_count)) < 0 ||
+            dict_set_owned(site, "keyword_count",
+                           PyLong_FromSize_t(edge->keyword_count)) < 0 ||
+            dict_set_owned(site, "shape_proven",
+                           PyBool_FromLong(
+                               edge->reactor_hook_shape_proven)) < 0 ||
+            dict_set_owned(
+                site, "execution",
+                PyUnicode_FromString(
+                    "guarded_reactor_thread_python_call")) < 0 ||
+            dict_set_owned(
+                site, "source",
+                span_report(edge->span,
+                            class_ir->filename == NULL
+                                ? fallback_filename
+                                : class_ir->filename)) < 0 ||
+            PyList_Append(sites, site) < 0) {
+            Py_XDECREF(site);
+            Py_DECREF(sites);
+            return NULL;
+        }
+        Py_DECREF(site);
+    }
+    return sites;
 }
 
 static PyObject *fusion_decisions_report(
@@ -2859,6 +3516,19 @@ PyObject *wrtc_native_class_capability_report(
                                        class_ir->filename == NULL
                                            ? filename
                                            : class_ir->filename)) < 0 ||
+            dict_set_owned(class_report, "custom_constructor",
+                           PyBool_FromLong(
+                               class_ir->custom_constructor)) < 0 ||
+            dict_set_owned(class_report, "constructor_emission_complete",
+                           PyBool_FromLong(
+                               !class_ir->custom_constructor ||
+                               class_ir->constructor_body != NULL)) < 0 ||
+            dict_set_owned(
+                class_report, "constructor_rejection_reason",
+                class_ir->constructor_rejection_reason == NULL
+                    ? Py_NewRef(Py_None)
+                    : PyUnicode_FromString(
+                          class_ir->constructor_rejection_reason)) < 0 ||
             PyDict_SetItemString(class_report, "fields", fields) < 0 ||
             PyDict_SetItemString(class_report, "regions", regions) < 0)
             goto class_error;
@@ -2892,6 +3562,12 @@ PyObject *wrtc_native_class_capability_report(
                                 : field->storage_kind ==
                                           WRTC_NATIVE_FIELD_SPSC
                                       ? "bounded_spsc"
+                                : field->storage_kind ==
+                                          WRTC_NATIVE_FIELD_SELECTOR
+                                      ? "native_selector_registry"
+                                : field->storage_kind ==
+                                          WRTC_NATIVE_FIELD_PACKET_POOL
+                                      ? "native_packet_slab"
                                 : "pyobject";
             operation_proof = field_operation_proof(
                 operation_table, class_index, field_index,
@@ -2989,10 +3665,18 @@ PyObject *wrtc_native_class_capability_report(
                 dict_set_owned(field_report, "queue_algorithm",
                                PyUnicode_FromString(algorithm)) < 0 ||
                 dict_set_owned(field_report, "capacity",
-                               field->queue_capacity == NULL
-                                   ? Py_NewRef(Py_None)
-                                   : PyUnicode_FromString(
-                                         field->queue_capacity)) < 0 ||
+                               field->queue_capacity != NULL
+                                   ? PyUnicode_FromString(field->queue_capacity)
+                                   : field->reactor_capacity != NULL
+                                         ? PyUnicode_FromString(
+                                               field->reactor_capacity)
+                                         : Py_NewRef(Py_None)) < 0 ||
+                dict_set_owned(
+                    field_report, "packet_buffer_size",
+                    field->packet_buffer_size == NULL
+                        ? Py_NewRef(Py_None)
+                        : PyUnicode_FromString(
+                              field->packet_buffer_size)) < 0 ||
                 dict_set_owned(
                     field_report, "bounded",
                     PyBool_FromLong(field->queue_capacity != NULL)) < 0 ||
@@ -3122,6 +3806,8 @@ PyObject *wrtc_native_class_capability_report(
             PyObject *remaining_calls = remaining_calls_report(
                 program, class_ir, region, operation_table, class_index,
                 region_index, filename);
+            PyObject *reactor_hook_sites = reactor_hook_sites_report(
+                class_ir, region, filename);
             PyObject *fusion_decisions = fusion_decisions_report(
                 program, class_ir, region, filename);
             PyObject *rejection_reasons = PyList_New(0);
@@ -3159,10 +3845,16 @@ PyObject *wrtc_native_class_capability_report(
             const char *region_filename =
                 class_ir->filename == NULL ? filename : class_ir->filename;
             const char *rejection_code =
-                !operation_complete
+                class_ir->constructor_rejection_reason != NULL
+                    ? "native_constructor_emission"
+                : !operation_complete
                     ? "native_operation_proof"
                     : !operation_lowerable
                           ? "native_operation_emission"
+                          : (region->selector_runtime_lowering_available ||
+                             region->datagram_runtime_lowering_available) &&
+                                !region->reactor_hook_emission_complete
+                                ? "reactor_hook_emission"
                           : unproven_concurrency
                                 ? ((region->capabilities &
                                     WRTC_REGION_MPSC) != 0u
@@ -3175,20 +3867,52 @@ PyObject *wrtc_native_class_capability_report(
                                              ? "spsc_contract_unproven"
                                        : "native_concurrency_unproven")
                                 : "native_class_emission";
+            if ((region->selector_runtime_lowering_available ||
+                 region->datagram_runtime_lowering_available) &&
+                !region->reactor_hook_emission_complete &&
+                region->reactor_hook_rejection_reason != NULL)
+                rejection_span = region->reactor_hook_rejection_span;
+            if (class_ir->constructor_rejection_reason != NULL)
+                rejection_span = class_ir->constructor_rejection_span;
             const char *status =
                 generator_accepted
-                    ? "compiled"
+                    ? (region->reactor_hook_emission_complete
+                           ? "guarded" : "compiled")
                     : region->policy == WRTC_REGION_REQUIRED
                           ? "rejected" : "interpreted";
             const char *reason =
                 generator_accepted
-                    ? "accepted by native-class generator integration"
+                    ? (region->reactor_hook_emission_complete
+                           ? "accepted with serialized guarded CPython "
+                             "reactor boundary hooks"
+                           : "accepted by native-class generator integration")
+                    : class_ir->constructor_rejection_reason != NULL
+                          ? class_ir->constructor_rejection_reason
                     : !operation_complete
                           ? "native-field operation proof rejected one or "
                             "more source sites"
                     : !operation_lowerable
                           ? "native-field operation proof succeeded, but one "
                             "or more source sites have no generic emitted hook"
+                    : region->datagram_runtime_lowering_available &&
+                          !region->reactor_hook_emission_complete
+                          ? (region->reactor_hook_rejection_reason != NULL
+                                 ? region->reactor_hook_rejection_reason
+                                 : "bounded datagram runtime, descriptor "
+                                   "generation, packet ownership, and budgets "
+                                   "are proven; transport delivery and "
+                                   "reschedule remain guarded reactor-thread "
+                                   "Python boundaries without generated hook "
+                                   "wiring")
+                    : region->selector_runtime_lowering_available &&
+                          !region->reactor_hook_emission_complete
+                          ? (region->reactor_hook_rejection_reason != NULL
+                                 ? region->reactor_hook_rejection_reason
+                                 : "selector polling or dispatch shape is "
+                                   "proven; cancelled-handle descriptor "
+                                   "removal and callback publication remain "
+                                   "guarded reactor-thread Python boundaries "
+                                   "without generated hook wiring")
                     : unproven_concurrency
                     ? ((region->capabilities &
                         WRTC_REGION_OWNED_SHARD) != 0u &&
@@ -3259,7 +3983,7 @@ PyObject *wrtc_native_class_capability_report(
             }
             if (region_report == NULL || proofs == NULL ||
                 operation_sites == NULL || remaining_calls == NULL ||
-                fusion_decisions == NULL ||
+                reactor_hook_sites == NULL || fusion_decisions == NULL ||
                 rejection_reasons == NULL || execution == NULL ||
                 dict_set_owned(region_report, "name",
                                PyUnicode_FromString(region->name)) < 0 ||
@@ -3302,6 +4026,9 @@ PyObject *wrtc_native_class_capability_report(
                 PyDict_SetItemString(region_report,
                                      "remaining_python_calls",
                                      remaining_calls) < 0 ||
+                PyDict_SetItemString(region_report,
+                                     "guarded_reactor_calls",
+                                     reactor_hook_sites) < 0 ||
                 PyDict_SetItemString(region_report, "rejection_reasons",
                                      rejection_reasons) < 0 ||
                 dict_set_owned(
@@ -3309,6 +4036,18 @@ PyObject *wrtc_native_class_capability_report(
                     PyUnicode_FromString(
                         generator_accepted
                             ? "boxed_semantic_codegen"
+                            : "not_emitted")) < 0 ||
+                dict_set_owned(
+                    execution, "portable_kernel",
+                    PyUnicode_FromString(
+                        region->kernel_emission_complete
+                            ? "emitted_c17_translation_unit"
+                            : "not_emitted")) < 0 ||
+                dict_set_owned(
+                    execution, "native_reactor_hook",
+                    PyUnicode_FromString(
+                        region->reactor_hook_emission_complete
+                            ? "guarded_cpython_reactor_thread_hook"
                             : "not_emitted")) < 0 ||
                 dict_set_owned(
                     execution, "exceptions",
@@ -3351,6 +4090,42 @@ PyObject *wrtc_native_class_capability_report(
                                PyLong_FromSize_t(region->bounded_loop_count)) < 0 ||
                 dict_set_owned(proofs, "selector_shape_validated",
                                PyBool_FromLong(region->selector_shape_validated)) < 0 ||
+                dict_set_owned(proofs, "descriptor_generation_validated",
+                               PyBool_FromLong(
+                                   region->descriptor_generation_validated)) < 0 ||
+                dict_set_owned(proofs, "selector_runtime_lowering_available",
+                               PyBool_FromLong(
+                                   region->selector_runtime_lowering_available)) < 0 ||
+                dict_set_owned(proofs, "datagram_runtime_lowering_available",
+                               PyBool_FromLong(
+                                   region->datagram_runtime_lowering_available)) < 0 ||
+                dict_set_owned(proofs, "reactor_hook_emission_complete",
+                               PyBool_FromLong(
+                                   region->reactor_hook_emission_complete)) < 0 ||
+                dict_set_owned(proofs, "selector_remove_reader_hook",
+                               PyBool_FromLong(
+                                   region->selector_remove_reader_hook)) < 0 ||
+                dict_set_owned(proofs, "selector_remove_writer_hook",
+                               PyBool_FromLong(
+                                   region->selector_remove_writer_hook)) < 0 ||
+                dict_set_owned(proofs, "datagram_generation_hook",
+                               PyBool_FromLong(
+                                   region->datagram_generation_hook)) < 0 ||
+                dict_set_owned(proofs, "datagram_delivery_hook",
+                               PyBool_FromLong(
+                                   region->datagram_delivery_hook)) < 0 ||
+                dict_set_owned(proofs, "bounded_reschedule_hook",
+                               PyBool_FromLong(
+                                   region->bounded_reschedule_hook)) < 0 ||
+                dict_set_owned(proofs, "reactor_thread_serialized",
+                               PyBool_FromLong(
+                                   region->reactor_thread_serialized)) < 0 ||
+                dict_set_owned(
+                    proofs, "reactor_hook_rejection_reason",
+                    region->reactor_hook_rejection_reason == NULL
+                        ? Py_NewRef(Py_None)
+                        : PyUnicode_FromString(
+                              region->reactor_hook_rejection_reason)) < 0 ||
                 dict_set_owned(proofs, "packet_order_preserved",
                                PyBool_FromLong(region->packet_order_preserved)) < 0 ||
                 dict_set_owned(proofs, "pool_lifetime_checked",
@@ -3419,6 +4194,50 @@ PyObject *wrtc_native_class_capability_report(
                 dict_set_owned(proofs, "worker_emission_complete",
                                PyBool_FromLong(
                                    region->worker_emission_complete)) < 0 ||
+                dict_set_owned(proofs, "worker_executor_emission_complete",
+                               PyBool_FromLong(
+                                   region->worker_executor_emission_complete)) < 0 ||
+                dict_set_owned(proofs, "worker_bounded_channels",
+                               PyBool_FromLong(
+                                   region->worker_bounded_channels_proven)) < 0 ||
+                dict_set_owned(proofs, "worker_typed_error",
+                               PyBool_FromLong(
+                                   region->worker_typed_error_proven)) < 0 ||
+                dict_set_owned(proofs, "worker_shutdown",
+                               PyBool_FromLong(
+                                   region->worker_shutdown_proven)) < 0 ||
+                dict_set_owned(proofs, "worker_thread_python_api_free",
+                               PyBool_FromLong(
+                                   region->worker_thread_python_api_free)) < 0 ||
+                dict_set_owned(proofs, "kernel_python_free",
+                               PyBool_FromLong(
+                                   region->kernel_python_free)) < 0 ||
+                dict_set_owned(proofs, "kernel_emission_complete",
+                               PyBool_FromLong(
+                                   region->kernel_emission_complete)) < 0 ||
+                dict_set_owned(proofs, "kernel_statement_count",
+                               PyLong_FromSize_t(
+                                   region->kernel_statement_count)) < 0 ||
+                dict_set_owned(proofs, "kernel_emitted_statement_count",
+                               PyLong_FromSize_t(
+                                   region->kernel_emitted_statement_count)) < 0 ||
+                dict_set_owned(proofs, "kernel_call_count",
+                               PyLong_FromSize_t(
+                                   region->kernel_call_count)) < 0 ||
+                dict_set_owned(proofs, "kernel_emitted_call_count",
+                               PyLong_FromSize_t(
+                                   region->kernel_emitted_call_count)) < 0 ||
+                dict_set_owned(
+                    proofs, "kernel_rejection_reason",
+                    region->kernel_rejection_reason == NULL
+                        ? Py_NewRef(Py_None)
+                        : PyUnicode_FromString(
+                              region->kernel_rejection_reason)) < 0 ||
+                dict_set_owned(
+                    proofs, "kernel_rejection_source",
+                    span_report(region->kernel_rejection_span,
+                                class_ir->filename == NULL
+                                    ? filename : class_ir->filename)) < 0 ||
                 dict_set_owned(
                     proofs, "worker_rejection_reason",
                     region->worker_rejection_reason == NULL
@@ -3433,6 +4252,7 @@ PyObject *wrtc_native_class_capability_report(
                 Py_XDECREF(execution);
                 Py_XDECREF(rejection_reasons);
                 Py_XDECREF(remaining_calls);
+                Py_XDECREF(reactor_hook_sites);
                 Py_XDECREF(fusion_decisions);
                 Py_XDECREF(operation_sites);
                 Py_XDECREF(proofs);
@@ -3442,6 +4262,7 @@ PyObject *wrtc_native_class_capability_report(
             Py_DECREF(execution);
             Py_DECREF(rejection_reasons);
             Py_DECREF(remaining_calls);
+            Py_DECREF(reactor_hook_sites);
             Py_DECREF(fusion_decisions);
             Py_DECREF(operation_sites);
             Py_DECREF(proofs);
@@ -3480,6 +4301,9 @@ void wrtc_native_class_free(WrtcNativeClassProgram *program) {
         free(class_ir->name);
         free(class_ir->base);
         free(class_ir->filename);
+        free(class_ir->constructor_rejection_reason);
+        wrtc_py_suite_ir_free(class_ir->constructor_body);
+        wrtc_py_signature_ir_free(class_ir->constructor_signature);
         for (index = 0u; index < class_ir->field_count; index++) {
             free(class_ir->fields[index].name);
             free(class_ir->fields[index].declared_type);
@@ -3487,6 +4311,8 @@ void wrtc_native_class_free(WrtcNativeClassProgram *program) {
             free(class_ir->fields[index].heap_key);
             free(class_ir->fields[index].heap_ordering);
             free(class_ir->fields[index].queue_capacity);
+            free(class_ir->fields[index].reactor_capacity);
+            free(class_ir->fields[index].packet_buffer_size);
             free(class_ir->fields[index].queue_item_type);
             free(class_ir->fields[index].atomic_memory_order);
             free(class_ir->fields[index].atomic_scope);
@@ -3501,6 +4327,8 @@ void wrtc_native_class_free(WrtcNativeClassProgram *program) {
             free(class_ir->regions[index].result_type);
             free(class_ir->regions[index].direct_call_target);
             free(class_ir->regions[index].worker_rejection_reason);
+            free(class_ir->regions[index].kernel_rejection_reason);
+            free(class_ir->regions[index].reactor_hook_rejection_reason);
             for (call_index = 0u;
                  call_index < class_ir->regions[index].call_count;
                  call_index++)
@@ -3523,6 +4351,7 @@ void wrtc_native_class_free(WrtcNativeClassProgram *program) {
         }
         free(program->records[class_index].fields);
         free(program->records[class_index].name);
+        free(program->records[class_index].abi);
         free(program->records[class_index].filename);
     }
     free(program->classes);

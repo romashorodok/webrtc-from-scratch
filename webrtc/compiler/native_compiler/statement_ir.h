@@ -23,6 +23,10 @@ typedef enum {
     WRTC_PY_EXPR_COMPARE,
     WRTC_PY_EXPR_TUPLE,
     WRTC_PY_EXPR_LIST,
+    WRTC_PY_EXPR_DICT,
+    WRTC_PY_EXPR_JOINED_STRING,
+    WRTC_PY_EXPR_FORMATTED_VALUE,
+    WRTC_PY_EXPR_LAMBDA,
     WRTC_PY_EXPR_SUBSCRIPT,
     WRTC_PY_EXPR_SLICE
 } WrtcPyExprKind;
@@ -109,6 +113,9 @@ int wrtc_py_ir_lower_suite(PyObject *statements, const char *filename,
                            WrtcPySuiteIR **out);
 int wrtc_py_ir_lower_signature(PyObject *function, const char *filename,
                                WrtcPySignatureIR **out);
+int wrtc_py_suite_validate_lambdas(const WrtcPySuiteIR *suite,
+                                   const WrtcPySignatureIR *signature,
+                                   const char *filename);
 void wrtc_py_expr_ir_clear(WrtcPyExprIR *expression);
 void wrtc_py_stmt_ir_clear(WrtcPyStmtIR *statement);
 void wrtc_py_suite_ir_free(WrtcPySuiteIR *suite);
