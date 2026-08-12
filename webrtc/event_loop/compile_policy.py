@@ -87,6 +87,10 @@ ARTIFACT_POLICY_METADATA: Mapping[str, str] = MappingProxyType(
         "event_loop_free_threaded": event_loop_target.free_threaded,
         "event_loop_gil": event_loop_target.gil,
         "event_loop_subinterpreters": event_loop_target.subinterpreters,
+        # Promotion is deliberately fail-closed.  A release process may set
+        # this to true only after attaching a passing 15-triple report for the
+        # exact artifact; compiler output is diagnostic by default.
+        "performance_adopted": "false",
     }
 )
 
@@ -110,6 +114,7 @@ DEVELOPMENT_ARTIFACT_METADATA: Mapping[str, str] = MappingProxyType(
         "source_manifest_sha256": SOURCE_MANIFEST_SHA256,
         "artifact_profile": "compiled-development",
         "production_compatible": "false",
+        "performance_adopted": "false",
     }
 )
 

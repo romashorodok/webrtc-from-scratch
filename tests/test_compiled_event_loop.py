@@ -38,10 +38,11 @@ def test_compiler_emits_native_selector_heap_type(
         pytest.skip(reason)
     monkeypatch.setenv("WEBRTC_EVENT_LOOP_NATIVE", str(native_event_loop_artifact))
     event_loop._reset_native_selection_for_tests()
-    loop = event_loop.new_event_loop()
+    assert event_loop.event_loop_mode() == "asyncio"
+    assert "diagnostic-only" in event_loop.event_loop_selection_reason()
+    loop = event_loop.new_event_loop(require_native=True)
     try:
         loop_type = type(loop)
-        assert event_loop.event_loop_mode() == "native"
         assert issubclass(loop_type, asyncio.SelectorEventLoop)
         assert loop_type.__module__ == "event_loop_native"
         assert inspect.ismethoddescriptor(vars(loop_type)["_run_once"])
@@ -58,7 +59,7 @@ def test_compiled_loop_preserves_ready_snapshot_and_timer_cancellation(
         pytest.skip(reason)
     monkeypatch.setenv("WEBRTC_EVENT_LOOP_NATIVE", str(native_event_loop_artifact))
     event_loop._reset_native_selection_for_tests()
-    loop = event_loop.new_event_loop()
+    loop = event_loop.new_event_loop(require_native=True)
     trace: list[str] = []
     captured: list[str] = []
     failures: list[tuple[str, str]] = []
@@ -104,6 +105,18 @@ def test_compiled_loop_preserves_ready_snapshot_and_timer_cancellation(
         loop._run_once()  # type: ignore[attr-defined]
         assert failures == [("LookupError", "native callback failure")]
         assert getattr(loop, "_current_handle") is None
+
+        bulk_deadline = loop.time() + 60.0
+        handles = [
+            loop.call_at(bulk_deadline + index, lambda: None)
+            for index in range(120)
+        ]
+        for handle in handles[:80]:
+            handle.cancel()
+        loop.call_soon(lambda: None)
+        loop._run_once()  # type: ignore[attr-defined]
+        assert len(loop._scheduled) == 40  # type: ignore[attr-defined]
+        assert loop._timer_cancelled_count == 0  # type: ignore[attr-defined]
     finally:
         loop.close()
         event_loop._reset_native_selection_for_tests()

@@ -301,14 +301,13 @@ def test_server_uses_compatible_mocked_native_selection(
     monkeypatch.setattr(
         event_loop,
         "_validated_native_factory",
-        lambda _artifact: lambda: native_loop,
+        lambda _artifact, **_kwargs: lambda: native_loop,
     )
 
     selected = serve.server_loop_factory(require_native=True)
     try:
         assert selected is native_loop
         assert event_loop.event_loop_mode() == "native"
-        assert str(candidate) in event_loop.event_loop_selection_reason()
     finally:
         selected.close()
 

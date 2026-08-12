@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(wrtc_pymeta_compiler_c VERSION 0.3 LANGUAGES C)
+project(wrtc_pymeta_compiler_c VERSION 0.4 LANGUAGES C)
 
 include(CTest)
 

@@ -13,7 +13,7 @@ import sysconfig
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
-COMPILER_VERSION = "wrtc-pymeta-compiler/0.3"
+COMPILER_VERSION = "wrtc-pymeta-compiler/0.4"
 OPTIMIZATION_MODE = "release"
 CPYTHON_SOURCE_REVISION = "070700ed4d95c16855603cecab3f41f3b587f973"
 

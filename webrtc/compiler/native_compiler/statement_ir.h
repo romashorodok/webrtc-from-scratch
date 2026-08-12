@@ -31,6 +31,26 @@ typedef enum {
     WRTC_PY_EXPR_SLICE
 } WrtcPyExprKind;
 
+/* Canonical binary vocabulary shared by AST lowering and every PyObject
+ * execution path.  CPython calls true division ``Div`` in the AST; the IR
+ * deliberately normalizes that spelling instead of making backends guess. */
+typedef enum {
+    WRTC_PY_BINARY_INVALID = 0,
+    WRTC_PY_BINARY_ADD,
+    WRTC_PY_BINARY_SUBTRACT,
+    WRTC_PY_BINARY_MULTIPLY,
+    WRTC_PY_BINARY_MATRIX_MULTIPLY,
+    WRTC_PY_BINARY_TRUE_DIVIDE,
+    WRTC_PY_BINARY_FLOOR_DIVIDE,
+    WRTC_PY_BINARY_REMAINDER,
+    WRTC_PY_BINARY_POWER,
+    WRTC_PY_BINARY_LEFT_SHIFT,
+    WRTC_PY_BINARY_RIGHT_SHIFT,
+    WRTC_PY_BINARY_AND,
+    WRTC_PY_BINARY_XOR,
+    WRTC_PY_BINARY_OR
+} WrtcPyBinaryOp;
+
 typedef struct WrtcPyExprIR {
     WrtcPyExprKind kind;
     WrtcSourceSpan span;
@@ -43,6 +63,9 @@ typedef struct WrtcPyExprIR {
     size_t child_count;
     size_t positional_count;
     size_t keyword_count;
+    WrtcPyBinaryOp binary_operation;
+    PyObject *cached_constant;
+    PyObject *cached_keyword_names;
 } WrtcPyExprIR;
 
 typedef enum {
@@ -77,6 +100,7 @@ typedef struct WrtcPyStmtIR {
     struct WrtcPyStmtIR *handlers;
     size_t handler_count;
     unsigned iterator_is_range : 1;
+    WrtcPyBinaryOp binary_operation;
 } WrtcPyStmtIR;
 
 typedef struct {
@@ -120,5 +144,7 @@ void wrtc_py_expr_ir_clear(WrtcPyExprIR *expression);
 void wrtc_py_stmt_ir_clear(WrtcPyStmtIR *statement);
 void wrtc_py_suite_ir_free(WrtcPySuiteIR *suite);
 void wrtc_py_signature_ir_free(WrtcPySignatureIR *signature);
+WrtcPyBinaryOp wrtc_py_binary_from_name(const char *name);
+const char *wrtc_py_binary_name(WrtcPyBinaryOp operation);
 
 #endif

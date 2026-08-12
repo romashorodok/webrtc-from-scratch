@@ -72,34 +72,164 @@ static PyObject *evaluate_constant(const WrtcPyExprIR *expression,
      * CPython's own literal parser preserves exact integer, float, bytes,
      * string, complex, and ellipsis construction semantics.
      */
+    if (expression->cached_constant != NULL)
+        return Py_NewRef(expression->cached_constant);
     return PyRun_StringFlags(expression->text, Py_eval_input,
                              frame->globals, frame->locals, NULL);
 }
 
-static PyObject *binary_operation(const char *operation, PyObject *left,
+static int initialize_expression(WrtcPyExprIR *expression,
+                                 PyObject *globals) {
+    size_t index;
+    if (expression->kind == WRTC_PY_EXPR_CONSTANT &&
+        expression->cached_constant == NULL) {
+        expression->cached_constant = PyRun_StringFlags(
+            expression->text, Py_eval_input, globals, globals, NULL);
+        if (expression->cached_constant == NULL) return -1;
+    }
+    if (expression->kind == WRTC_PY_EXPR_CALL &&
+        expression->keyword_count != 0u &&
+        expression->cached_keyword_names == NULL) {
+        expression->cached_keyword_names =
+            PyTuple_New((Py_ssize_t)expression->keyword_count);
+        if (expression->cached_keyword_names == NULL) return -1;
+        for (index = 0u; index < expression->keyword_count; index++) {
+            PyObject *name = PyUnicode_InternFromString(
+                expression->keyword_names[index]);
+            if (name == NULL) return -1;
+            PyTuple_SET_ITEM(expression->cached_keyword_names,
+                             (Py_ssize_t)index, name);
+        }
+    }
+    for (index = 0u; index < expression->child_count; index++)
+        if (initialize_expression(&expression->children[index], globals) < 0)
+            return -1;
+    return 0;
+}
+
+static int initialize_statements(WrtcPyStmtIR *statements, size_t count,
+                                 PyObject *globals) {
+    size_t statement_index, expression_index;
+    for (statement_index = 0u; statement_index < count; statement_index++) {
+        WrtcPyStmtIR *statement = &statements[statement_index];
+        for (expression_index = 0u;
+             expression_index < statement->expression_count;
+             expression_index++)
+            if (initialize_expression(
+                    &statement->expressions[expression_index], globals) < 0)
+                return -1;
+        if (initialize_statements(statement->body, statement->body_count,
+                                  globals) < 0 ||
+            initialize_statements(statement->orelse, statement->orelse_count,
+                                  globals) < 0 ||
+            initialize_statements(statement->finalbody,
+                                  statement->finalbody_count, globals) < 0 ||
+            initialize_statements(statement->handlers,
+                                  statement->handler_count, globals) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+static void clear_expression(WrtcPyExprIR *expression) {
+    size_t index;
+    Py_CLEAR(expression->cached_constant);
+    Py_CLEAR(expression->cached_keyword_names);
+    for (index = 0u; index < expression->child_count; index++)
+        clear_expression(&expression->children[index]);
+}
+
+static void clear_statements(WrtcPyStmtIR *statements, size_t count) {
+    size_t statement_index, expression_index;
+    for (statement_index = 0u; statement_index < count; statement_index++) {
+        WrtcPyStmtIR *statement = &statements[statement_index];
+        for (expression_index = 0u;
+             expression_index < statement->expression_count;
+             expression_index++)
+            clear_expression(&statement->expressions[expression_index]);
+        clear_statements(statement->body, statement->body_count);
+        clear_statements(statement->orelse, statement->orelse_count);
+        clear_statements(statement->finalbody, statement->finalbody_count);
+        clear_statements(statement->handlers, statement->handler_count);
+    }
+}
+
+void wrtc_boxed_suite_clear(WrtcPySuiteIR *suite);
+
+int wrtc_boxed_suite_initialize(WrtcPySuiteIR *suite, PyObject *globals) {
+    if (suite == NULL || globals == NULL) {
+        PyErr_SetString(PyExc_SystemError, "boxed suite initialization is invalid");
+        return -1;
+    }
+    if (initialize_statements(
+            suite->statements, suite->statement_count, globals) < 0) {
+        wrtc_boxed_suite_clear(suite);
+        return -1;
+    }
+    return 0;
+}
+
+void wrtc_boxed_suite_clear(WrtcPySuiteIR *suite) {
+    if (suite != NULL)
+        clear_statements(suite->statements, suite->statement_count);
+}
+
+WrtcPyBinaryOp wrtc_py_binary_from_name(const char *name) {
+    if (name == NULL) return WRTC_PY_BINARY_INVALID;
+#define WRTC_BINARY_NAME(ast_name, value) \
+    if (strcmp(name, ast_name) == 0) return value
+    WRTC_BINARY_NAME("Add", WRTC_PY_BINARY_ADD);
+    WRTC_BINARY_NAME("Sub", WRTC_PY_BINARY_SUBTRACT);
+    WRTC_BINARY_NAME("Mult", WRTC_PY_BINARY_MULTIPLY);
+    WRTC_BINARY_NAME("MatMult", WRTC_PY_BINARY_MATRIX_MULTIPLY);
+    WRTC_BINARY_NAME("Div", WRTC_PY_BINARY_TRUE_DIVIDE);
+    WRTC_BINARY_NAME("TrueDiv", WRTC_PY_BINARY_TRUE_DIVIDE);
+    WRTC_BINARY_NAME("FloorDiv", WRTC_PY_BINARY_FLOOR_DIVIDE);
+    WRTC_BINARY_NAME("Mod", WRTC_PY_BINARY_REMAINDER);
+    WRTC_BINARY_NAME("Pow", WRTC_PY_BINARY_POWER);
+    WRTC_BINARY_NAME("LShift", WRTC_PY_BINARY_LEFT_SHIFT);
+    WRTC_BINARY_NAME("RShift", WRTC_PY_BINARY_RIGHT_SHIFT);
+    WRTC_BINARY_NAME("BitAnd", WRTC_PY_BINARY_AND);
+    WRTC_BINARY_NAME("BitXor", WRTC_PY_BINARY_XOR);
+    WRTC_BINARY_NAME("BitOr", WRTC_PY_BINARY_OR);
+#undef WRTC_BINARY_NAME
+    return WRTC_PY_BINARY_INVALID;
+}
+
+const char *wrtc_py_binary_name(WrtcPyBinaryOp operation) {
+    static const char *const names[] = {
+        NULL, "Add", "Sub", "Mult", "MatMult", "TrueDiv", "FloorDiv",
+        "Mod", "Pow", "LShift", "RShift", "BitAnd", "BitXor", "BitOr"
+    };
+    return operation > WRTC_PY_BINARY_INVALID &&
+                   operation <= WRTC_PY_BINARY_OR
+               ? names[(size_t)operation] : NULL;
+}
+
+static PyObject *binary_operation(WrtcPyBinaryOp operation, PyObject *left,
                                   PyObject *right, int inplace) {
-#define BINARY(name, regular, in_place) \
-    if (strcmp(operation, name) == 0) \
-        return inplace ? in_place(left, right) : regular(left, right)
-    BINARY("Add", PyNumber_Add, PyNumber_InPlaceAdd);
-    BINARY("Sub", PyNumber_Subtract, PyNumber_InPlaceSubtract);
-    BINARY("Mult", PyNumber_Multiply, PyNumber_InPlaceMultiply);
-    BINARY("MatMult", PyNumber_MatrixMultiply, PyNumber_InPlaceMatrixMultiply);
-    BINARY("TrueDiv", PyNumber_TrueDivide, PyNumber_InPlaceTrueDivide);
-    BINARY("FloorDiv", PyNumber_FloorDivide, PyNumber_InPlaceFloorDivide);
-    BINARY("Mod", PyNumber_Remainder, PyNumber_InPlaceRemainder);
-    BINARY("LShift", PyNumber_Lshift, PyNumber_InPlaceLshift);
-    BINARY("RShift", PyNumber_Rshift, PyNumber_InPlaceRshift);
-    BINARY("BitAnd", PyNumber_And, PyNumber_InPlaceAnd);
-    BINARY("BitXor", PyNumber_Xor, PyNumber_InPlaceXor);
-    BINARY("BitOr", PyNumber_Or, PyNumber_InPlaceOr);
+#define BINARY(value, regular, in_place) \
+    case value: return inplace ? in_place(left, right) : regular(left, right)
+    switch (operation) {
+        BINARY(WRTC_PY_BINARY_ADD, PyNumber_Add, PyNumber_InPlaceAdd);
+        BINARY(WRTC_PY_BINARY_SUBTRACT, PyNumber_Subtract, PyNumber_InPlaceSubtract);
+        BINARY(WRTC_PY_BINARY_MULTIPLY, PyNumber_Multiply, PyNumber_InPlaceMultiply);
+        BINARY(WRTC_PY_BINARY_MATRIX_MULTIPLY, PyNumber_MatrixMultiply, PyNumber_InPlaceMatrixMultiply);
+        BINARY(WRTC_PY_BINARY_TRUE_DIVIDE, PyNumber_TrueDivide, PyNumber_InPlaceTrueDivide);
+        BINARY(WRTC_PY_BINARY_FLOOR_DIVIDE, PyNumber_FloorDivide, PyNumber_InPlaceFloorDivide);
+        BINARY(WRTC_PY_BINARY_REMAINDER, PyNumber_Remainder, PyNumber_InPlaceRemainder);
+        BINARY(WRTC_PY_BINARY_LEFT_SHIFT, PyNumber_Lshift, PyNumber_InPlaceLshift);
+        BINARY(WRTC_PY_BINARY_RIGHT_SHIFT, PyNumber_Rshift, PyNumber_InPlaceRshift);
+        BINARY(WRTC_PY_BINARY_AND, PyNumber_And, PyNumber_InPlaceAnd);
+        BINARY(WRTC_PY_BINARY_XOR, PyNumber_Xor, PyNumber_InPlaceXor);
+        BINARY(WRTC_PY_BINARY_OR, PyNumber_Or, PyNumber_InPlaceOr);
+        case WRTC_PY_BINARY_POWER:
+            return inplace ? PyNumber_InPlacePower(left, right, Py_None)
+                           : PyNumber_Power(left, right, Py_None);
+        default: break;
+    }
 #undef BINARY
-    if (strcmp(operation, "Pow") == 0)
-        return inplace
-                   ? PyNumber_InPlacePower(left, right, Py_None)
-                   : PyNumber_Power(left, right, Py_None);
-    PyErr_Format(PyExc_SystemError, "unknown boxed binary operation %s",
-                 operation);
+    PyErr_SetString(PyExc_SystemError, "unknown boxed binary operation");
     return NULL;
 }
 
@@ -134,33 +264,37 @@ static PyObject *compare_operation(const char *operation, PyObject *left,
 static PyObject *evaluate_call(const WrtcPyExprIR *expression,
                                WrtcBoxedFrame *frame) {
     PyObject *callable = evaluate(&expression->children[0], frame);
-    PyObject *arguments = NULL, *keywords = NULL, *result = NULL;
+    PyObject *small_stack[8], **stack = small_stack, *result = NULL;
+    const size_t argument_count =
+        expression->positional_count + expression->keyword_count;
     size_t index;
     if (callable == NULL) return NULL;
-    arguments = PyTuple_New((Py_ssize_t)expression->positional_count);
-    keywords = PyDict_New();
-    if (arguments == NULL || keywords == NULL) goto done;
-    for (index = 0u; index < expression->positional_count; index++) {
-        PyObject *value = evaluate(&expression->children[1u + index], frame);
-        if (value == NULL) goto done;
-        PyTuple_SET_ITEM(arguments, (Py_ssize_t)index, value);
+    memset(small_stack, 0, sizeof small_stack);
+    if (expression->keyword_count != 0u &&
+        expression->cached_keyword_names == NULL) {
+        PyErr_SetString(PyExc_SystemError,
+                        "boxed call keyword cache is uninitialized");
+        goto done;
     }
-    for (index = 0u; index < expression->keyword_count; index++) {
-        PyObject *value = evaluate(
-            &expression->children[1u + expression->positional_count + index],
-            frame);
-        if (value == NULL ||
-            PyDict_SetItemString(
-                keywords, expression->keyword_names[index], value) < 0) {
-            Py_XDECREF(value);
+    if (argument_count > sizeof small_stack / sizeof small_stack[0]) {
+        stack = PyMem_Malloc(argument_count * sizeof(*stack));
+        if (stack == NULL) {
+            PyErr_NoMemory();
             goto done;
         }
-        Py_DECREF(value);
+        memset(stack, 0, argument_count * sizeof(*stack));
     }
-    result = PyObject_Call(callable, arguments, keywords);
+    for (index = 0u; index < argument_count; index++) {
+        PyObject *value = evaluate(&expression->children[1u + index], frame);
+        if (value == NULL) goto done;
+        stack[index] = value;
+    }
+    result = PyObject_Vectorcall(
+        callable, stack, expression->positional_count,
+        expression->cached_keyword_names);
 done:
-    Py_XDECREF(keywords);
-    Py_XDECREF(arguments);
+    for (index = 0u; index < argument_count; index++) Py_XDECREF(stack[index]);
+    if (stack != small_stack) PyMem_Free(stack);
     Py_DECREF(callable);
     return result;
 }
@@ -484,7 +618,7 @@ static PyObject *evaluate(const WrtcPyExprIR *expression,
                 return NULL;
             }
             result =
-                binary_operation(expression->operation, first, second, 0);
+                binary_operation(expression->binary_operation, first, second, 0);
             Py_DECREF(second);
             Py_DECREF(first);
             return result;
@@ -921,7 +1055,7 @@ static int execute_statement(const WrtcPyStmtIR *statement,
                 return -1;
             }
             updated = binary_operation(
-                statement->operation, lvalue.value, right, 1);
+                statement->binary_operation, lvalue.value, right, 1);
             Py_DECREF(right);
             if (updated == NULL) {
                 lvalue_clear(&lvalue);
@@ -1173,6 +1307,152 @@ static int bind_missing(const WrtcBoxedSignature *signature,
     PyErr_Format(PyExc_TypeError,
                  "%s() missing 1 required %s argument: '%s'",
                  signature->name, kind, name);
+    return -1;
+}
+
+static Py_ssize_t vector_keyword_index(PyObject *names, const char *wanted) {
+    Py_ssize_t index, count = names == NULL ? 0 : PyTuple_GET_SIZE(names);
+    for (index = 0; index < count; index++) {
+        PyObject *name = PyTuple_GET_ITEM(names, index);
+        int equal = PyUnicode_Check(name)
+                        ? PyUnicode_CompareWithASCIIString(name, wanted) == 0
+                        : 0;
+        if (equal || PyErr_Occurred()) return equal ? index : -2;
+    }
+    return -1;
+}
+
+int wrtc_boxed_bind_method(const WrtcBoxedSignature *signature, PyObject *self,
+                           PyObject *const *args, Py_ssize_t nargs,
+                           PyObject *keyword_names, PyObject **locals) {
+    unsigned char small_consumed[16] = {0}, *consumed = small_consumed;
+    PyObject *bound = NULL;
+    Py_ssize_t keyword_count =
+        keyword_names == NULL ? 0 : PyTuple_GET_SIZE(keyword_names);
+    Py_ssize_t position = 0, index;
+    size_t parameter;
+    int has_var_keyword = 0;
+    if (signature == NULL || self == NULL || nargs < 0 || locals == NULL ||
+        signature->defaults == NULL ||
+        (keyword_names != NULL && !PyTuple_Check(keyword_names))) {
+        PyErr_SetString(PyExc_TypeError, "invalid vector signature binding");
+        return -1;
+    }
+    if (keyword_count > (Py_ssize_t)sizeof small_consumed) {
+        consumed = PyMem_Calloc((size_t)keyword_count, sizeof(*consumed));
+        if (consumed == NULL) {
+            PyErr_NoMemory();
+            return -1;
+        }
+    }
+    *locals = NULL;
+    bound = PyDict_New();
+    if (bound == NULL) goto error;
+    for (parameter = 0u; parameter < signature->parameter_count; parameter++)
+        if (signature->parameters[parameter].kind == WRTC_PY_PARAM_VAR_KEYWORD)
+            has_var_keyword = 1;
+    for (parameter = 0u; parameter < signature->parameter_count; parameter++) {
+        const WrtcBoxedParameterSpec *spec = &signature->parameters[parameter];
+        PyObject *value = NULL;
+        Py_ssize_t keyword = -1;
+        const Py_ssize_t available = nargs + 1;
+        if (spec->kind == WRTC_PY_PARAM_POSITIONAL_ONLY ||
+            spec->kind == WRTC_PY_PARAM_POSITIONAL_OR_KEYWORD) {
+            if (position < available) {
+                value = position++ == 0 ? self : args[position - 2];
+                if (spec->kind == WRTC_PY_PARAM_POSITIONAL_OR_KEYWORD) {
+                    keyword = vector_keyword_index(keyword_names, spec->name);
+                    if (keyword == -2) goto error;
+                    if (keyword >= 0) {
+                        PyErr_Format(PyExc_TypeError,
+                                     "%s() got multiple values for argument '%s'",
+                                     signature->name, spec->name);
+                        goto error;
+                    }
+                }
+            } else if (spec->kind == WRTC_PY_PARAM_POSITIONAL_OR_KEYWORD &&
+                       (keyword = vector_keyword_index(keyword_names,
+                                                       spec->name)) >= 0) {
+                value = args[nargs + keyword];
+                consumed[keyword] = 1u;
+            } else if (keyword == -2) {
+                goto error;
+            } else if (signature->defaults[parameter] != NULL) {
+                value = signature->defaults[parameter];
+            } else if (bind_missing(signature, spec->name, "positional") < 0) {
+                goto error;
+            }
+            if (value != NULL && PyDict_SetItemString(bound, spec->name, value) < 0)
+                goto error;
+        } else if (spec->kind == WRTC_PY_PARAM_VAR_POSITIONAL) {
+            Py_ssize_t tail_count = available - position;
+            PyObject *tail = PyTuple_New(tail_count);
+            Py_ssize_t tail_index;
+            if (tail == NULL) goto error;
+            for (tail_index = 0; tail_index < tail_count; tail_index++) {
+                Py_ssize_t source = position + tail_index;
+                PyObject *value_at = source == 0 ? self : args[source - 1];
+                PyTuple_SET_ITEM(tail, tail_index, Py_NewRef(value_at));
+            }
+            if (PyDict_SetItemString(bound, spec->name, tail) < 0) {
+                Py_DECREF(tail);
+                goto error;
+            }
+            Py_DECREF(tail);
+            position = available;
+        } else if (spec->kind == WRTC_PY_PARAM_KEYWORD_ONLY) {
+            keyword = vector_keyword_index(keyword_names, spec->name);
+            if (keyword == -2) goto error;
+            if (keyword >= 0) {
+                value = args[nargs + keyword];
+                consumed[keyword] = 1u;
+            } else if (signature->defaults[parameter] != NULL) {
+                value = signature->defaults[parameter];
+            } else if (bind_missing(signature, spec->name, "keyword-only") < 0) {
+                goto error;
+            }
+            if (value != NULL && PyDict_SetItemString(bound, spec->name, value) < 0)
+                goto error;
+        } else if (spec->kind == WRTC_PY_PARAM_VAR_KEYWORD) {
+            PyObject *remaining = PyDict_New();
+            if (remaining == NULL) goto error;
+            for (index = 0; index < keyword_count; index++) {
+                if (consumed[index]) continue;
+                if (PyDict_SetItem(remaining, PyTuple_GET_ITEM(keyword_names, index),
+                                   args[nargs + index]) < 0) {
+                    Py_DECREF(remaining);
+                    goto error;
+                }
+                consumed[index] = 1u;
+            }
+            if (PyDict_SetItemString(bound, spec->name, remaining) < 0) {
+                Py_DECREF(remaining);
+                goto error;
+            }
+            Py_DECREF(remaining);
+        }
+    }
+    if (position < nargs + 1) {
+        PyErr_Format(PyExc_TypeError,
+                     "%s() takes %zd positional arguments but %zd were given",
+                     signature->name, position, nargs + 1);
+        goto error;
+    }
+    for (index = 0; index < keyword_count; index++) {
+        if (!consumed[index] && !has_var_keyword) {
+            PyObject *name = PyTuple_GET_ITEM(keyword_names, index);
+            PyErr_Format(PyExc_TypeError,
+                         "%s() got an unexpected keyword argument '%U'",
+                         signature->name, name);
+            goto error;
+        }
+    }
+    if (consumed != small_consumed) PyMem_Free(consumed);
+    *locals = bound;
+    return 0;
+error:
+    if (consumed != small_consumed) PyMem_Free(consumed);
+    Py_XDECREF(bound);
     return -1;
 }
 

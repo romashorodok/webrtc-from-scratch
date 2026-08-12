@@ -796,8 +796,9 @@ static int emit_fused_call_case(
     method = method == NULL ? edge->target : method + 1;
     if (fputs("if(", file) < 0 ||
         emit_span_test(file, edge->span) < 0 ||
-        fputs("){PyObject*recv=NULL,*args=NULL,*kwargs=NULL,*callable=NULL,"
-              "*result=NULL,*current,*original;PyTypeObject*expected;size_t i;"
+        fputs("){PyObject*recv=NULL,*callable=NULL,*result=NULL,*current,"
+              "*original,*small[8]={0},**av=small;PyTypeObject*expected;"
+              "size_t i,ac=e->positional_count+e->keyword_count;"
               "int direct=0;*h=1;"
               "if(e->kind!=WRTC_PY_EXPR_CALL||e->child_count==0u||"
               "e->children[0].kind!=WRTC_PY_EXPR_ATTRIBUTE||"
@@ -825,37 +826,25 @@ static int emit_fused_call_case(
               "(PyCFunction)(void(*)(void))w",
               file) < 0 ||
         fprintf(file, "%zu_%zu;"
-                      "args=PyTuple_New((Py_ssize_t)",
-                edge->target_class, edge->target_region) < 0 ||
+                      "if(ac>8u){av=PyMem_Calloc(ac,sizeof(*av));"
+                      "if(!av){PyErr_NoMemory();goto done%zu;}}",
+                edge->target_class, edge->target_region, fusion_index) < 0 ||
         fputs(
-              "e->positional_count);kwargs=PyDict_New();"
-              "if(!args||!kwargs)goto done",
-              file) < 0 ||
-        fprintf(file, "%zu;", fusion_index) < 0 ||
-        fputs(
-              "for(i=0u;i<e->positional_count;i++){PyObject*v="
+              "for(i=0u;i<ac;i++){PyObject*v="
               "wrtc_boxed_hook_evaluate(&e->children[1u+i],f);"
               "if(!v)goto done",
               file) < 0 ||
         fprintf(file, "%zu;", fusion_index) < 0 ||
-        fputs("PyTuple_SET_ITEM(args,(Py_ssize_t)i,v);}"
-              "for(i=0u;i<e->keyword_count;i++){PyObject*v="
-              "wrtc_boxed_hook_evaluate(&e->children[1u+"
-              "e->positional_count+i],f);if(!v)goto done",
-              file) < 0 ||
-        fprintf(file, "%zu;", fusion_index) < 0 ||
-        fputs(
-              "if(PyDict_SetItemString(kwargs,e->keyword_names[i],v)<0){"
-              "Py_DECREF(v);goto done",
-              file) < 0 ||
-        fprintf(file, "%zu;", fusion_index) < 0 ||
-        fputs("}Py_DECREF(v);}"
-              "if(!direct)result=PyObject_Call(callable,args,kwargs);else "
+        fputs("av[i]=v;}"
+              "if(!direct)result=PyObject_Vectorcall(callable,av,"
+              "e->positional_count,e->cached_keyword_names);else "
               "result=w",
               file) < 0 ||
-        fprintf(file, "%zu_%zu(recv,args,kwargs);"
-                      "done%zu:Py_XDECREF(callable);Py_XDECREF(kwargs);"
-                      "Py_XDECREF(args);Py_XDECREF(recv);return result;}",
+        fprintf(file, "%zu_%zu(recv,av,(Py_ssize_t)e->positional_count,"
+                      "e->cached_keyword_names);done%zu:"
+                      "for(i=0u;i<ac;i++)Py_XDECREF(av[i]);"
+                      "if(av!=small)PyMem_Free(av);Py_XDECREF(callable);"
+                      "Py_XDECREF(recv);return result;}",
                 edge->target_class, edge->target_region,
                 fusion_index) < 0)
         return -1;
@@ -1455,9 +1444,9 @@ static int emit_class(FILE *file, const char *module,
             (void)snprintf(hook_argument, sizeof hook_argument,
                            "&hooks,");
         if (fprintf(file,
-                    "static PyObject*w%zu_%zu(PyObject*self,PyObject*args,"
-                    "PyObject*kwargs){PyObject*full=NULL,*locals=NULL,*result="
-                    "NULL,*globals=g%zu_globals;Py_ssize_t i,n;",
+                    "static PyObject*w%zu_%zu(PyObject*self,"
+                    "PyObject*const*args,Py_ssize_t nargs,PyObject*kwnames){"
+                    "PyObject*locals=NULL,*result=NULL,*globals=g%zu_globals;",
                     class_index, region_index, class_index) < 0)
             return -1;
         if (has_hooks &&
@@ -1467,14 +1456,11 @@ static int emit_class(FILE *file, const char *module,
                     class_index, region_index) < 0)
             return -1;
         if (fprintf(file,
-                    "if(!globals)return "
-                    "NULL;n=PyTuple_GET_SIZE(args);full=PyTuple_New(n+1);"
-                    "if(!full)return NULL;PyTuple_SET_ITEM(full,0,Py_NewRef(self));"
-                    "for(i=0;i<n;i++)PyTuple_SET_ITEM(full,i+1,Py_NewRef("
-                    "PyTuple_GET_ITEM(args,i)));if(wrtc_boxed_bind(&r%zu_%zu_sig,"
-                    "full,kwargs,&locals)<0)goto done;if(%s("
+                    "if(!globals)return NULL;if(wrtc_boxed_bind_method("
+                    "&r%zu_%zu_sig,self,args,nargs,kwnames,&locals)<0)goto done;"
+                    "if(%s("
                     "&r%zu_%zu_suite,globals,locals,%s&result)<0)goto done;"
-                    "done:Py_XDECREF(locals);Py_DECREF(full);return result;}\n",
+                    "done:Py_XDECREF(locals);return result;}\n",
                     class_index, region_index,
                     has_hooks ? "wrtc_boxed_execute_with_hooks" :
                                 "wrtc_boxed_execute",
@@ -1509,7 +1495,7 @@ static int emit_class(FILE *file, const char *module,
         if (fputc('{', file) == EOF ||
             quote(file, class_ir->regions[region_index].name) < 0 ||
             fprintf(file, ",(PyCFunction)(void(*)(void))w%zu_%zu,"
-                          "METH_VARARGS|METH_KEYWORDS,NULL},",
+                          "METH_FASTCALL|METH_KEYWORDS,NULL},",
                     class_index, region_index) < 0)
             return -1;
     }
@@ -2179,8 +2165,8 @@ static int emit_native_class_extension(
              region_index < program->classes[index].region_count;
              region_index++)
             if (fprintf(file,
-                        "static PyObject*w%zu_%zu(PyObject*,PyObject*,"
-                        "PyObject*);",
+                        "static PyObject*w%zu_%zu(PyObject*,PyObject*const*,"
+                        "Py_ssize_t,PyObject*);",
                         index, region_index) < 0)
                 return -1;
     }
@@ -2468,20 +2454,24 @@ static int emit_native_class_extension(
         for (region_index = 0u;
              region_index < program->classes[index].region_count;
              region_index++)
-            if (fprintf(file, "wrtc_boxed_signature_clear(&r%zu_%zu_sig);",
+            if (fprintf(file, "wrtc_boxed_suite_clear(&r%zu_%zu_suite);"
+                              "wrtc_boxed_signature_clear(&r%zu_%zu_sig);",
+                        index, region_index,
                         index, region_index) < 0)
                 return -1;
         if (program->classes[index].custom_constructor &&
-            fprintf(file, "wrtc_boxed_signature_clear(&c%zu_sig);",
-                    index) < 0)
+            fprintf(file, "wrtc_boxed_suite_clear(&c%zu_suite);"
+                          "wrtc_boxed_signature_clear(&c%zu_sig);",
+                    index, index) < 0)
             return -1;
         if (class_has_globals(&program->classes[index]) &&
             fprintf(file, "g%zu_clear_globals();", index) < 0)
             return -1;
     }
     for (index = 0u; index < program->factory_count; index++)
-        if (fprintf(file, "wrtc_boxed_signature_clear(&f%zu_sig);"
-                          "fg%zu_clear_globals();", index, index) < 0)
+        if (fprintf(file, "wrtc_boxed_suite_clear(&f%zu_suite);"
+                          "wrtc_boxed_signature_clear(&f%zu_sig);"
+                          "fg%zu_clear_globals();", index, index, index) < 0)
             return -1;
     if (fputs("return 0;}static void mf(void*m){(void)mc((PyObject*)m);}"
               "static int me(PyObject*m){MS*s=(MS*)PyModule_GetState(m);"
@@ -2667,20 +2657,28 @@ static int emit_native_class_extension(
         for (region_index = 0u;
              region_index < program->classes[index].region_count;
              region_index++)
-            if (fprintf(file, "if(wrtc_boxed_signature_initialize("
+            if (fprintf(file, "if(wrtc_boxed_suite_initialize("
+                              "&r%zu_%zu_suite,g%zu_globals)<0)goto error;"
+                              "if(wrtc_boxed_signature_initialize("
                               "&r%zu_%zu_sig,g%zu_globals)<0)"
                               "goto error;",
+                        index, region_index, index,
                         index, region_index, index) < 0)
                 return -1;
         if (program->classes[index].custom_constructor &&
-            fprintf(file, "if(wrtc_boxed_signature_initialize(&c%zu_sig,"
+            fprintf(file, "if(wrtc_boxed_suite_initialize(&c%zu_suite,"
+                          "g%zu_globals)<0)goto error;"
+                          "if(wrtc_boxed_signature_initialize(&c%zu_sig,"
                           "g%zu_globals)<0)goto error;",
-                    index, index) < 0)
+                    index, index, index, index) < 0)
             return -1;
     }
     for (index = 0u; index < program->factory_count; index++)
-        if (fprintf(file, "if(wrtc_boxed_signature_initialize(&f%zu_sig,"
-                          "fg%zu_globals)<0)goto error;", index, index) < 0)
+        if (fprintf(file, "if(wrtc_boxed_suite_initialize(&f%zu_suite,"
+                          "fg%zu_globals)<0)goto error;"
+                          "if(wrtc_boxed_signature_initialize(&f%zu_sig,"
+                          "fg%zu_globals)<0)goto error;",
+                    index, index, index, index) < 0)
             return -1;
     if (fputs("if(PyModule_AddObject(m,\"__all__\",all)<0)goto error;"
               "all=NULL;", file) < 0)
@@ -2746,10 +2744,13 @@ static int emit_native_class_extension(
         emit_module_string(
             file, "__pymeta_module_instance_policy__",
             "single_live_module;subinterpreters_unsupported") < 0 ||
+        emit_module_string(
+            file, "__pymeta_pyobject_region_backend__",
+            "boxed_ir_fastcall;cached_constants;vectorcall;direct_fusion") < 0 ||
         emit_module_string(file, "__pymeta_source_sha256__", source_hash) < 0 ||
         emit_module_string(file, "__pymeta_semantic_sha256__", semantic_hash) < 0 ||
         emit_module_string(file, "__pymeta_compiler_version__",
-                           "wrtc-pymeta-compiler/0.3") < 0 ||
+                           "wrtc-pymeta-compiler/0.4") < 0 ||
         emit_module_string(file, "__pymeta_cpython_revision__", revision) < 0 ||
         emit_module_string(file, "__pymeta_cpython_source_revision__",
                            "070700ed4d95c16855603cecab3f41f3b587f973") < 0 ||

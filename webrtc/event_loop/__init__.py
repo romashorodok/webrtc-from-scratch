@@ -37,15 +37,27 @@ _selection_lock = RLock()
 _selected_factory: Callable[..., asyncio.AbstractEventLoop] | None = None
 _selected_mode: Literal["native", "asyncio"] | None = None
 _selection_reason: str | None = None
+_diagnostic_factories: dict[Path, Callable[..., asyncio.AbstractEventLoop]] = {}
 
 
 def _artifact_candidates() -> tuple[Path, ...]:
     return artifact_candidates()
 
 
-def _validated_native_factory(artifact: Path) -> Callable[..., asyncio.AbstractEventLoop]:
+def _validated_native_factory(
+    artifact: Path, *, allow_diagnostic: bool = False
+) -> Callable[..., asyncio.AbstractEventLoop]:
     require_compatible_host()
+    cached = _diagnostic_factories.get(artifact)
+    if cached is not None:
+        if allow_diagnostic:
+            return cached
+        raise NativeArtifactCompatibilityError(
+            "native event-loop artifact is diagnostic-only: performance gates "
+            "have not been adopted"
+        )
     native = load_native_artifact(artifact, NATIVE_REQUIREMENTS)
+    adopted = getattr(native, "__pymeta_performance_adopted__", None) == "true"
     loop_type = getattr(native, NATIVE_CLASS, None)
     factory = getattr(native, NATIVE_FACTORY)
     try:
@@ -61,7 +73,15 @@ def _validated_native_factory(artifact: Path) -> Callable[..., asyncio.AbstractE
             "native event-loop factory did not return its exported loop class"
         )
     probe.close()
-    return cast(Callable[..., asyncio.AbstractEventLoop], factory)
+    validated = cast(Callable[..., asyncio.AbstractEventLoop], factory)
+    if not adopted:
+        _diagnostic_factories[artifact] = validated
+        if not allow_diagnostic:
+            raise NativeArtifactCompatibilityError(
+                "native event-loop artifact is diagnostic-only: performance "
+                "gates have not been adopted"
+            )
+    return validated
 
 
 def _select_factory() -> Callable[..., asyncio.AbstractEventLoop]:
@@ -106,12 +126,23 @@ def automatic_loop_factory(
             _selected_mode = "asyncio"
             _selection_reason = "stock asyncio explicitly requested"
         return asyncio.new_event_loop()
-    factory = _select_factory()
-    if _selected_mode != "native" and require_native:
+    if require_native:
+        last_rejection: str | None = None
+        for artifact in _artifact_candidates():
+            try:
+                factory = _validated_native_factory(
+                    artifact, allow_diagnostic=True
+                )
+                return factory() if config == LoopConfig() else factory(
+                    **config.factory_arguments()
+                )
+            except Exception as exc:
+                last_rejection = f"{artifact}: {exc}"
         raise NativeArtifactCompatibilityError(
             "compatible native event loop is required: "
-            f"{_selection_reason or 'selection failed'}"
+            f"{last_rejection or 'no artifact candidate was found'}"
         )
+    factory = _select_factory()
     if _selected_mode == "native":
         try:
             if config == LoopConfig():

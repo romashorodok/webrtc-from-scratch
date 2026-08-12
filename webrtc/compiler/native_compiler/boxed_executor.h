@@ -50,5 +50,10 @@ int wrtc_boxed_signature_initialize(WrtcBoxedSignature *signature,
 void wrtc_boxed_signature_clear(WrtcBoxedSignature *signature);
 int wrtc_boxed_bind(const WrtcBoxedSignature *signature, PyObject *args,
                     PyObject *kwargs, PyObject **locals);
+int wrtc_boxed_bind_method(const WrtcBoxedSignature *signature, PyObject *self,
+                           PyObject *const *args, Py_ssize_t nargs,
+                           PyObject *keyword_names, PyObject **locals);
+int wrtc_boxed_suite_initialize(WrtcPySuiteIR *suite, PyObject *globals);
+void wrtc_boxed_suite_clear(WrtcPySuiteIR *suite);
 
 #endif

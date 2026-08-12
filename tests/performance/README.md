@@ -63,3 +63,22 @@ For comparable runs, keep the Python executable, power source, thermal state,
 background load, frame rate, bitrate, peer count, MTU, and loss profile fixed.
 Compare the raw paired samples, not only the aggregate medians. A result is
 invalid if the controller reports workload parity failure.
+
+## Event-loop benchmark
+
+`benchmark_event_loop.py` runs stock asyncio, the interpreted reference loop,
+and a compatible native artifact as isolated, balanced-order triples. Native
+fallback is an error. The default report uses 15 triples and is written to
+`benchmark-results/event-loop.json`:
+
+```sh
+.venv/bin/python tests/performance/benchmark_event_loop.py
+```
+
+Timing is untraced. Latency is a separate bounded probe, retained allocations
+use a warmed fixed-operation probe, and selector calls are counted without
+replacing the selector object. The report keeps every raw sample and includes
+a deterministic one-sided 95% paired bootstrap bound for each throughput
+comparison. Native allocation counters are reported when the artifact was
+built with instrumentation; their absence is explicit and cannot satisfy the
+native-allocation acceptance gate.

@@ -21,14 +21,14 @@ def test_percentiles_are_deterministic_and_include_tail() -> None:
     assert BENCHMARK._percentile(values, 0.99) == 100.0
 
 
-def test_controller_requires_isolated_pairs() -> None:
+def test_controller_requires_isolated_triples() -> None:
     with pytest.raises(ValueError, match="at least three"):
         BENCHMARK.run_controller(BENCHMARK.BenchmarkConfig(), ("ready",), 2)
 
 
-def test_parser_defaults_to_seven_pairs_and_all_core_scenarios() -> None:
+def test_parser_defaults_to_fifteen_triples_and_all_core_scenarios() -> None:
     arguments = BENCHMARK._parser().parse_args([])
-    assert arguments.pairs == 7
+    assert arguments.triples == 15
     assert set(arguments.scenarios) == {
         "idle",
         "timers",
@@ -51,16 +51,24 @@ def test_short_stock_worker_reports_observed_metrics(scenario: str) -> None:
 
     assert result["requested_mode"] == result["resolved_mode"] == "asyncio"
     assert result["scenario"] == scenario
-    assert result["process_cpu_seconds"] >= 0
-    assert result["wall_seconds"] > 0
-    assert result["selector_polls"] > 0
-    assert result["allocations"]["positive_blocks"] >= 0
-    assert result["allocations"]["positive_bytes"] >= 0
-    assert result["latency_ms"]["p99"] >= result["latency_ms"]["p50"]
+    assert result["throughput"]["process_cpu_seconds"] >= 0
+    assert result["throughput"]["wall_seconds"] > 0
+    assert result["allocations"]["operations"] == config.allocation_operations
+    assert result["allocations"]["completed"] == config.allocation_operations
+    assert result["selector"]["polls"] == result["selector"]["iterations"]
+    assert result["latency"]["p99_ms"] >= result["latency"]["p50_ms"]
 
 
-def test_benchmark_reports_measurements_without_claiming_speedup() -> None:
+def test_benchmark_has_strict_modes_and_deterministic_confidence_gate() -> None:
     source = SCRIPT.read_text(encoding="utf-8")
-    assert '"note"' in source
-    assert "20%" not in source
-    assert "5%" not in source
+    assert BENCHMARK.MODES == ("asyncio", "reference", "native-required")
+    assert BENCHMARK._bootstrap_lower_bound([1.25] * 15) == 1.25
+    assert '"meets_1_20_gate"' in source
+
+
+def test_latency_sampling_is_bounded() -> None:
+    samples = BENCHMARK._BoundedLatency(3)
+    for value in range(10):
+        samples.add(float(value))
+    assert samples.observations == 10
+    assert samples.milliseconds() == [7000.0, 8000.0, 9000.0]

@@ -272,7 +272,7 @@ sys.path.insert(0, sys.argv[2])
 spec = importlib.util.spec_from_file_location("renamed_component_native", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-assert module.__pymeta_compiler_version__ == "wrtc-pymeta-compiler/0.3"
+assert module.__pymeta_compiler_version__ == "wrtc-pymeta-compiler/0.4"
 assert module.__pymeta_cpython_revision__ == sys.version
 assert len(module.__pymeta_cpython_source_revision__) == 40
 assert module.__pymeta_cache_tag__ == (sys.implementation.cache_tag or "")

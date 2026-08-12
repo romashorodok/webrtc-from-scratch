@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
-"""Isolated, machine-readable microbenchmarks for the WebRTC event loop.
-
-The benchmark deliberately reports measurements rather than deciding whether a
-result meets the project's adoption thresholds.  Run stock and automatic modes
-in separate processes so selector state, allocator state, and ready queues are
-not shared between samples.
-"""
+"""Strict, isolated performance probes for the WebRTC event loop."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 import gc
+import hashlib
+import itertools
 import json
 import os
+import random
 import socket
+import statistics
 import struct
 import subprocess
 import sys
 import threading
 import time
 import tracemalloc
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -30,11 +29,12 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-
-Mode = Literal["asyncio", "auto"]
-Scenario = Literal[
+Mode = Literal["asyncio", "reference", "native-required"]
+Scenario = Literal["idle", "timers", "ready", "cancelled", "cross-thread", "udp"]
+MODES: tuple[Mode, ...] = ("asyncio", "reference", "native-required")
+SCENARIOS: tuple[Scenario, ...] = (
     "idle", "timers", "ready", "cancelled", "cross-thread", "udp"
-]
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,28 +44,37 @@ class BenchmarkConfig:
     ready_batch_size: int = 256
     cancelled_timer_count: int = 2_000
     cross_thread_batch_size: int = 64
+    latency_sample_limit: int = 4_096
+    allocation_operations: int = 2_048
 
     def validate(self) -> None:
-        if self.duration_seconds <= 0:
-            raise ValueError("duration must be positive")
-        if self.timer_interval_seconds <= 0:
-            raise ValueError("timer interval must be positive")
-        if self.ready_batch_size <= 0:
-            raise ValueError("ready batch size must be positive")
-        if self.cancelled_timer_count <= 0:
-            raise ValueError("cancelled timer count must be positive")
-        if self.cross_thread_batch_size <= 0:
-            raise ValueError("cross-thread batch size must be positive")
+        positive = {
+            "duration": self.duration_seconds,
+            "timer interval": self.timer_interval_seconds,
+            "ready batch": self.ready_batch_size,
+            "cancelled timers": self.cancelled_timer_count,
+            "cross-thread batch": self.cross_thread_batch_size,
+            "latency sample limit": self.latency_sample_limit,
+            "allocation operations": self.allocation_operations,
+        }
+        for name, value in positive.items():
+            if value <= 0:
+                raise ValueError(f"{name} must be positive")
 
 
 def _loop_factory(mode: Mode) -> tuple[Callable[[], asyncio.AbstractEventLoop], str]:
     if mode == "asyncio":
         return asyncio.new_event_loop, "asyncio"
-    # Import only in auto workers.  This keeps the stock baseline independent
-    # from native-module discovery and import costs.
     from webrtc import event_loop
+    if mode == "reference":
+        return event_loop.reference_loop_factory, "reference"
 
-    return event_loop.new_event_loop, event_loop.event_loop_mode()
+    def native() -> asyncio.AbstractEventLoop:
+        return event_loop.new_event_loop(require_native=True)
+
+    loop = native()
+    loop.close()
+    return native, "native-required"
 
 
 def _percentile(values: list[float], fraction: float) -> float:
@@ -76,31 +85,38 @@ def _percentile(values: list[float], fraction: float) -> float:
     return ordered[index]
 
 
-class _SelectorProbe:
-    def __init__(self, selector: Any) -> None:
-        self._selector = selector
-        self.polls = 0
+class _BoundedLatency:
+    """Deterministic bounded sampling; callback volume cannot grow memory."""
 
-    def select(self, timeout: float | None = None) -> Any:
-        self.polls += 1
-        return self._selector.select(timeout)
+    def __init__(self, limit: int) -> None:
+        self._samples: deque[float] = deque(maxlen=limit)
+        self.observations = 0
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._selector, name)
+    def add(self, seconds: float) -> None:
+        self.observations += 1
+        self._samples.append(max(0.0, seconds))
+
+    def milliseconds(self) -> list[float]:
+        return [sample * 1_000.0 for sample in self._samples]
 
 
 def _run_scenario(
-    loop: asyncio.AbstractEventLoop, scenario: Scenario, config: BenchmarkConfig
-) -> tuple[int, int, list[float]]:
+    loop: asyncio.AbstractEventLoop,
+    scenario: Scenario,
+    config: BenchmarkConfig,
+    *,
+    sample_latency: bool,
+) -> tuple[int, int, _BoundedLatency]:
     callbacks = 0
     wakeups = 0
-    latencies: list[float] = []
+    latency = _BoundedLatency(config.latency_sample_limit)
     deadline = loop.time() + config.duration_seconds
 
     def record(scheduled: float) -> None:
         nonlocal callbacks
         callbacks += 1
-        latencies.append(max(0.0, loop.time() - scheduled))
+        if sample_latency:
+            latency.add(loop.time() - scheduled)
 
     if scenario == "idle":
         loop.call_at(deadline, loop.stop)
@@ -112,7 +128,6 @@ def _run_scenario(
                 loop.call_at(following, timer_tick, following)
             else:
                 loop.stop()
-
         first = loop.time() + config.timer_interval_seconds
         loop.call_at(first, timer_tick, first)
     elif scenario == "ready":
@@ -134,7 +149,6 @@ def _run_scenario(
                     schedule_batch()
                 else:
                     loop.stop()
-
         schedule_batch()
     elif scenario == "cancelled":
         far_future = deadline + 60.0
@@ -150,30 +164,30 @@ def _run_scenario(
     elif scenario == "cross-thread":
         finished = threading.Event()
         batch_finished = threading.Event()
-        batch_lock = threading.Lock()
-        batch_remaining = 0
+        lock = threading.Lock()
+        remaining = 0
 
-        def thread_callback(scheduled: float) -> None:
-            nonlocal batch_remaining, wakeups
+        def delivered(scheduled: float) -> None:
+            nonlocal remaining, wakeups
             wakeups += 1
             record(scheduled)
-            with batch_lock:
-                batch_remaining -= 1
-                if batch_remaining == 0:
+            with lock:
+                remaining -= 1
+                if remaining == 0:
                     batch_finished.set()
             if loop.time() >= deadline:
                 finished.set()
                 loop.stop()
 
         def producer() -> None:
-            nonlocal batch_remaining
+            nonlocal remaining
             while not finished.is_set():
                 batch_finished.clear()
-                with batch_lock:
-                    batch_remaining = config.cross_thread_batch_size
-                now = time.monotonic()
+                with lock:
+                    remaining = config.cross_thread_batch_size
+                scheduled = time.monotonic()
                 for _ in range(config.cross_thread_batch_size):
-                    loop.call_soon_threadsafe(thread_callback, now)
+                    loop.call_soon_threadsafe(delivered, scheduled)
                 batch_finished.wait(timeout=config.duration_seconds)
 
         thread = threading.Thread(target=producer, name="event-loop-benchmark")
@@ -183,7 +197,7 @@ def _run_scenario(
         finally:
             finished.set()
             thread.join()
-        return callbacks, wakeups, latencies
+        return callbacks, wakeups, latency
     elif scenario == "udp":
         receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -200,8 +214,8 @@ def _run_scenario(
                 except BlockingIOError:
                     break
                 callbacks += 1
-                if len(payload) == 8:
-                    latencies.append(max(0.0, loop.time() - struct.unpack("!d", payload)[0]))
+                if sample_latency and len(payload) == 8:
+                    latency.add(loop.time() - struct.unpack("!d", payload)[0])
             if loop.time() >= deadline:
                 finished.set()
                 loop.stop()
@@ -223,155 +237,346 @@ def _run_scenario(
             loop.remove_reader(receiver.fileno())
             sender.close()
             receiver.close()
-        return callbacks, wakeups, latencies
+        return callbacks, wakeups, latency
     else:
         raise ValueError(f"unknown scenario: {scenario}")
 
     loop.run_forever()
-    return callbacks, wakeups, latencies
+    return callbacks, wakeups, latency
+
+
+def _timed_probe(factory: Callable[[], asyncio.AbstractEventLoop], scenario: Scenario,
+                 config: BenchmarkConfig, *, latency: bool) -> dict[str, Any]:
+    loop = factory()
+    gc_enabled = gc.isenabled()
+    gc.disable()
+    wall_start = time.perf_counter()
+    cpu_start = time.process_time()
+    try:
+        callbacks, wakeups, samples = _run_scenario(
+            loop, scenario, config, sample_latency=latency
+        )
+    finally:
+        cpu_seconds = time.process_time() - cpu_start
+        wall_seconds = time.perf_counter() - wall_start
+        loop.close()
+        if gc_enabled:
+            gc.enable()
+    latency_ms = samples.milliseconds()
+    return {
+        "callbacks": callbacks,
+        "wakeups": wakeups,
+        "wall_seconds": wall_seconds,
+        "process_cpu_seconds": cpu_seconds,
+        "callbacks_per_cpu_second": callbacks / cpu_seconds if cpu_seconds else 0.0,
+        "latency_observations": samples.observations,
+        "latency_sample_count": len(latency_ms),
+        "p50_ms": _percentile(latency_ms, 0.50),
+        "p95_ms": _percentile(latency_ms, 0.95),
+        "p99_ms": _percentile(latency_ms, 0.99),
+        "maximum_ms": max(latency_ms, default=0.0),
+    }
+
+
+def _allocation_probe(factory: Callable[[], asyncio.AbstractEventLoop],
+                      operations: int) -> dict[str, int]:
+    loop = factory()
+    completed = 0
+
+    def callback() -> None:
+        nonlocal completed
+        completed += 1
+
+    # Warm every cache and allocator size class used by the fixed workload.
+    for _ in range(operations):
+        loop.call_soon(callback)
+    loop.call_soon(loop.stop)
+    loop.run_forever()
+    gc.collect()
+    tracemalloc.start()
+    before = tracemalloc.take_snapshot()
+    for _ in range(operations):
+        loop.call_soon(callback)
+    loop.call_soon(loop.stop)
+    loop.run_forever()
+    after = tracemalloc.take_snapshot()
+    differences = after.compare_to(before, "traceback")
+    current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    loop.close()
+    return {
+        "operations": operations,
+        "completed": completed - operations,
+        "retained_blocks": sum(item.count_diff for item in differences),
+        "retained_bytes": sum(item.size_diff for item in differences),
+        "peak_traced_bytes": peak,
+        "current_traced_bytes": current,
+    }
+
+
+def _selector_probe(factory: Callable[[], asyncio.AbstractEventLoop],
+                    iterations: int = 32) -> dict[str, int]:
+    """Count selector calls without replacing the guarded selector object."""
+    loop = factory()
+    selector = getattr(loop, "_selector", None)
+    polls = 0
+
+    def profile(frame: Any, event: str, _argument: Any) -> None:
+        nonlocal polls
+        if (
+            event == "call"
+            and frame.f_code.co_name == "select"
+            and frame.f_locals.get("self") is selector
+        ):
+            polls += 1
+
+    previous = sys.getprofile()
+    sys.setprofile(profile)
+    try:
+        for _ in range(iterations):
+            loop.call_soon(loop.stop)
+            loop.run_forever()
+    finally:
+        sys.setprofile(previous)
+        loop.close()
+    return {"iterations": iterations, "polls": polls}
+
+
+def _native_allocation_counters(factory: Callable[[], asyncio.AbstractEventLoop]) -> dict[str, Any]:
+    loop = factory()
+    try:
+        module = sys.modules.get(type(loop).__module__)
+        reader = getattr(module, "__pymeta_native_allocation_counters__", None)
+        if not callable(reader):
+            return {"available": False, "reason": "artifact is not instrumented"}
+        before = dict(reader())
+        loop.call_soon(loop.stop)
+        loop.run_forever()
+        after = dict(reader())
+        keys = set(before) | set(after)
+        return {
+            "available": True,
+            "before": before,
+            "after": after,
+            "delta": {key: int(after.get(key, 0)) - int(before.get(key, 0))
+                      for key in sorted(keys)},
+        }
+    finally:
+        loop.close()
+
+
+def _native_artifact_metadata(factory: Callable[[], asyncio.AbstractEventLoop]) -> dict[str, Any]:
+    loop = factory()
+    try:
+        from webrtc.compiler.module_contract import COMPILER_VERSION, semantic_sha256
+        from webrtc.event_loop import compile_policy
+
+        candidates = compile_policy.artifact_candidates()
+        if len(candidates) != 1:
+            raise RuntimeError("native artifact path is ambiguous")
+        artifact = candidates[0].expanduser().resolve()
+        source = compile_policy.SOURCE_PATH.read_bytes()
+        return {
+            "path": str(artifact),
+            "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            "validated_compiler_version": COMPILER_VERSION,
+            "validated_source_sha256": hashlib.sha256(source).hexdigest(),
+            "validated_semantic_sha256": semantic_sha256(
+                source, filename=str(compile_policy.SOURCE_PATH)
+            ),
+            "validated_policy": dict(compile_policy.ARTIFACT_POLICY_METADATA),
+            "loop_type_module": type(loop).__module__,
+        }
+    finally:
+        loop.close()
 
 
 def run_worker(mode: Mode, scenario: Scenario, config: BenchmarkConfig) -> dict[str, Any]:
     config.validate()
-    factory, resolved_mode = _loop_factory(mode)
-    loop = factory()
-    selector = getattr(loop, "_selector", None)
-    probe = _SelectorProbe(selector) if selector is not None else None
-    if probe is not None:
-        loop._selector = probe  # type: ignore[attr-defined]
-
-    gc.collect()
-    tracemalloc.start()
-    allocation_before = tracemalloc.take_snapshot()
-    wall_start = time.perf_counter()
-    cpu_start = time.process_time()
-    try:
-        callbacks, wakeups, latencies = _run_scenario(loop, scenario, config)
-    finally:
-        cpu_seconds = time.process_time() - cpu_start
-        wall_seconds = time.perf_counter() - wall_start
-        allocation_after = tracemalloc.take_snapshot()
-        loop.close()
-        tracemalloc.stop()
-
-    allocation_differences = allocation_after.compare_to(
-        allocation_before, "traceback"
-    )
-    allocated_blocks = sum(max(0, item.count_diff) for item in allocation_differences)
-    allocated_bytes = sum(max(0, item.size_diff) for item in allocation_differences)
-    latency_ms = [sample * 1_000 for sample in latencies]
+    factory, resolved = _loop_factory(mode)
+    throughput = _timed_probe(factory, scenario, config, latency=False)
+    latency = _timed_probe(factory, scenario, config, latency=True)
+    allocations = _allocation_probe(factory, config.allocation_operations)
+    selector = _selector_probe(factory)
+    native_allocations = (_native_allocation_counters(factory)
+                          if mode == "native-required" else {"available": False})
+    artifact = (_native_artifact_metadata(factory)
+                if mode == "native-required" else None)
     return {
         "requested_mode": mode,
-        "resolved_mode": resolved_mode,
+        "resolved_mode": resolved,
         "scenario": scenario,
         "config": asdict(config),
-        "callbacks": callbacks,
-        "wakeups": wakeups,
-        "selector_polls": 0 if probe is None else probe.polls,
-        "wall_seconds": wall_seconds,
-        "process_cpu_seconds": cpu_seconds,
-        "callbacks_per_cpu_second": callbacks / cpu_seconds if cpu_seconds else 0.0,
-        "allocations": {
-            "positive_blocks": allocated_blocks,
-            "positive_bytes": allocated_bytes,
-        },
-        "latency_ms": {
-            "sample_count": len(latency_ms),
-            "p50": _percentile(latency_ms, 0.50),
-            "p95": _percentile(latency_ms, 0.95),
-            "p99": _percentile(latency_ms, 0.99),
-            "maximum": max(latency_ms, default=0.0),
-        },
+        "throughput": throughput,
+        "latency": latency,
+        "allocations": allocations,
+        "selector": selector,
+        "native_allocations": native_allocations,
+        "native_artifact": artifact,
         "python": sys.version,
         "platform": sys.platform,
     }
 
 
-def run_controller(
-    config: BenchmarkConfig, scenarios: tuple[Scenario, ...], pairs: int
-) -> dict[str, Any]:
-    if pairs < 3:
-        raise ValueError("paired benchmarks require at least three isolated pairs")
+def _bootstrap_lower_bound(ratios: list[float], *, seed: int = 0,
+                           iterations: int = 10_000) -> float:
+    if not ratios:
+        raise ValueError("bootstrap requires paired ratios")
+    generator = random.Random(seed)
+    estimates = []
+    for _ in range(iterations):
+        estimates.append(statistics.median(
+            ratios[generator.randrange(len(ratios))] for _ in ratios
+        ))
+    return _percentile(estimates, 0.05)
+
+
+def _summaries(samples: list[dict[str, Any]], scenarios: tuple[Scenario, ...]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for scenario in scenarios:
+        scenario_samples = [sample for sample in samples if sample["scenario"] == scenario]
+        by_mode = {mode: [sample for sample in scenario_samples if sample["requested_mode"] == mode]
+                   for mode in MODES}
+        native_by_triple = {sample["triple"]: sample for sample in by_mode["native-required"]}
+        comparisons: dict[str, Any] = {}
+        for baseline in ("asyncio", "reference"):
+            ratios = []
+            for sample in by_mode[baseline]:
+                native = native_by_triple[sample["triple"]]
+                denominator = sample["throughput"]["callbacks_per_cpu_second"]
+                ratios.append(native["throughput"]["callbacks_per_cpu_second"] / denominator
+                              if denominator else 0.0)
+            lower_bound = _bootstrap_lower_bound(ratios)
+            comparisons[baseline] = {
+                "paired_ratios": ratios,
+                "median_ratio": statistics.median(ratios),
+                "one_sided_95_percent_lower_bound": lower_bound,
+                "meets_1_20_gate": scenario == "idle" or lower_bound >= 1.20,
+            }
+        p99 = {
+            mode: statistics.median(
+                float(sample["latency"]["p99_ms"]) for sample in by_mode[mode]
+            ) for mode in MODES
+        }
+        better_p99 = min(p99["asyncio"], p99["reference"])
+        latency_limit = better_p99 + max(better_p99 * 0.05, 0.1)
+        allocation_medians = {
+            mode: {
+                field: statistics.median(
+                    max(0, int(sample["allocations"][field]))
+                    for sample in by_mode[mode]
+                )
+                for field in ("retained_blocks", "retained_bytes")
+            }
+            for mode in MODES
+        }
+        allocation_pass = all(
+            allocation_medians["native-required"][field]
+            <= min(allocation_medians["asyncio"][field],
+                   allocation_medians["reference"][field])
+            for field in ("retained_blocks", "retained_bytes")
+        )
+        counter_samples = [sample["native_allocations"]
+                           for sample in by_mode["native-required"]]
+        counter_pass = bool(counter_samples) and all(
+            sample.get("available") and
+            all(value == 0 for value in sample.get("delta", {}).values())
+            for sample in counter_samples
+        )
+        idle_cpu_pass = True
+        if scenario == "idle":
+            cpu = {
+                mode: statistics.median(
+                    float(sample["throughput"]["process_cpu_seconds"])
+                    for sample in by_mode[mode]
+                ) for mode in MODES
+            }
+            idle_cpu_pass = cpu["native-required"] <= min(
+                cpu["asyncio"], cpu["reference"]
+            )
+        gates = {
+            "throughput": all(item["meets_1_20_gate"]
+                              for item in comparisons.values()),
+            "latency": p99["native-required"] <= latency_limit,
+            "python_allocations": allocation_pass,
+            "native_internal_allocations": counter_pass,
+            "idle_cpu": idle_cpu_pass,
+        }
+        result[scenario] = {
+            "comparisons": comparisons,
+            "p99_ms_median": p99,
+            "native_p99_limit_ms": latency_limit,
+            "allocation_medians": allocation_medians,
+            "gates": gates,
+            "passes_all_gates": all(gates.values()),
+        }
+    return result
+
+
+def run_controller(config: BenchmarkConfig, scenarios: tuple[Scenario, ...],
+                   triples: int) -> dict[str, Any]:
+    if triples < 3:
+        raise ValueError("paired benchmarks require at least three isolated triples")
     samples: list[dict[str, Any]] = []
     script = Path(__file__).resolve()
-    for pair in range(pairs):
-        # Alternate order to reduce a monotonic thermal/order bias.
-        modes: tuple[Mode, Mode] = (
-            ("asyncio", "auto") if pair % 2 == 0 else ("auto", "asyncio")
-        )
+    orders = tuple(itertools.permutations(MODES))
+    for triple in range(triples):
         for scenario in scenarios:
-            for mode in modes:
-                command = [
-                    sys.executable,
-                    str(script),
-                    "--worker",
-                    "--mode",
-                    mode,
-                    "--scenario",
-                    scenario,
-                    "--config-json",
-                    json.dumps(asdict(config), sort_keys=True),
-                ]
+            for mode in orders[triple % len(orders)]:
                 completed = subprocess.run(
-                    command,
-                    check=True,
-                    capture_output=True,
-                    text=True,
+                    [sys.executable, str(script), "--worker", "--mode", mode,
+                     "--scenario", scenario, "--config-json",
+                     json.dumps(asdict(config), sort_keys=True)],
+                    check=True, capture_output=True, text=True,
                     cwd=REPOSITORY_ROOT,
                     env={**os.environ, "PYTHONHASHSEED": "0"},
                 )
                 sample = json.loads(completed.stdout)
-                sample["pair"] = pair
+                sample["triple"] = triple
+                sample["order"] = orders[triple % len(orders)]
                 samples.append(sample)
+    summaries = _summaries(samples, scenarios)
     return {
         "config": asdict(config),
-        "pairs": pairs,
+        "triples": triples,
         "scenarios": scenarios,
         "samples": samples,
-        "note": (
-            "Raw paired measurements only; apply the repository's adoption "
-            "thresholds and confidence analysis before selecting native mode."
-        ),
+        "summaries": summaries,
+        "adoption_eligible": all(
+            summary["passes_all_gates"] for summary in summaries.values()
+        ) and set(("ready", "timers", "cancelled", "cross-thread", "udp"))
+        .issubset(scenarios),
+        "note": "Native adoption requires every correctness, latency, allocation, and throughput gate to pass.",
     }
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker", action="store_true")
-    parser.add_argument("--mode", choices=("asyncio", "auto"), default="asyncio")
-    parser.add_argument(
-        "--scenario",
-        choices=("idle", "timers", "ready", "cancelled", "cross-thread", "udp"),
-        default="ready",
-    )
-    parser.add_argument(
-        "--scenarios",
-        nargs="+",
-        choices=("idle", "timers", "ready", "cancelled", "cross-thread", "udp"),
-        default=("idle", "timers", "ready", "cancelled", "cross-thread", "udp"),
-    )
-    parser.add_argument("--pairs", type=int, default=7)
+    parser.add_argument("--mode", choices=MODES, default="asyncio")
+    parser.add_argument("--scenario", choices=SCENARIOS, default="ready")
+    parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=SCENARIOS)
+    parser.add_argument("--triples", "--pairs", dest="triples", type=int, default=15)
     parser.add_argument("--duration", type=float, default=0.25)
+    parser.add_argument("--allocation-operations", type=int, default=2_048)
     parser.add_argument("--config-json")
+    parser.add_argument("--output", type=Path,
+                        default=REPOSITORY_ROOT / "benchmark-results" / "event-loop.json")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.config_json:
-        config = BenchmarkConfig(**json.loads(args.config_json))
-    else:
-        config = BenchmarkConfig(duration_seconds=args.duration)
+    config = (BenchmarkConfig(**json.loads(args.config_json)) if args.config_json
+              else BenchmarkConfig(duration_seconds=args.duration,
+                                   allocation_operations=args.allocation_operations))
     if args.worker:
         print(json.dumps(run_worker(args.mode, args.scenario, config), sort_keys=True))
-    else:
-        print(
-            json.dumps(
-                run_controller(config, tuple(args.scenarios), args.pairs),
-                sort_keys=True,
-                indent=2,
-            )
-        )
+        return 0
+    report = run_controller(config, tuple(args.scenarios), args.triples)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(report, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    print(args.output)
     return 0
 
 

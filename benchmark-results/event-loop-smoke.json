@@ -1,0 +1,703 @@
+{
+  "adoption_eligible": false,
+  "config": {
+    "allocation_operations": 16,
+    "cancelled_timer_count": 2000,
+    "cross_thread_batch_size": 64,
+    "duration_seconds": 0.02,
+    "latency_sample_limit": 4096,
+    "ready_batch_size": 256,
+    "timer_interval_seconds": 0.001
+  },
+  "note": "Native adoption requires every correctness, latency, allocation, and throughput gate to pass.",
+  "samples": [
+    {
+      "allocations": {
+        "completed": 16,
+        "current_traced_bytes": 7040,
+        "operations": 16,
+        "peak_traced_bytes": 8440,
+        "retained_blocks": 29,
+        "retained_bytes": 2816
+      },
+      "config": {
+        "allocation_operations": 16,
+        "cancelled_timer_count": 2000,
+        "cross_thread_batch_size": 64,
+        "duration_seconds": 0.02,
+        "latency_sample_limit": 4096,
+        "ready_batch_size": 256,
+        "timer_interval_seconds": 0.001
+      },
+      "latency": {
+        "callbacks": 8704,
+        "callbacks_per_cpu_second": 435831.95633668784,
+        "latency_observations": 8704,
+        "latency_sample_count": 4096,
+        "maximum_ms": 0.8641540189273655,
+        "p50_ms": 0.4375120042823255,
+        "p95_ms": 0.6675319746136665,
+        "p99_ms": 0.7974319742061198,
+        "process_cpu_seconds": 0.019971000000000017,
+        "wakeups": 0,
+        "wall_seconds": 0.0205844709998928
+      },
+      "native_allocations": {
+        "available": false
+      },
+      "native_artifact": null,
+      "order": [
+        "asyncio",
+        "reference",
+        "native-required"
+      ],
+      "platform": "darwin",
+      "python": "3.13.13 (main, Apr 21 2026, 21:18:19) [Clang 14.0.3 (clang-1403.0.22.14.1)]",
+      "requested_mode": "asyncio",
+      "resolved_mode": "asyncio",
+      "scenario": "ready",
+      "selector": {
+        "iterations": 32,
+        "polls": 32
+      },
+      "throughput": {
+        "callbacks": 11520,
+        "callbacks_per_cpu_second": 616306.4412582928,
+        "latency_observations": 0,
+        "latency_sample_count": 0,
+        "maximum_ms": 0.0,
+        "p50_ms": 0.0,
+        "p95_ms": 0.0,
+        "p99_ms": 0.0,
+        "process_cpu_seconds": 0.018691999999999986,
+        "wakeups": 0,
+        "wall_seconds": 0.0200643059797585
+      },
+      "triple": 0
+    },
+    {
+      "allocations": {
+        "completed": 16,
+        "current_traced_bytes": 7312,
+        "operations": 16,
+        "peak_traced_bytes": 8768,
+        "retained_blocks": 31,
+        "retained_bytes": 2904
+      },
+      "config": {
+        "allocation_operations": 16,
+        "cancelled_timer_count": 2000,
+        "cross_thread_batch_size": 64,
+        "duration_seconds": 0.02,
+        "latency_sample_limit": 4096,
+        "ready_batch_size": 256,
+        "timer_interval_seconds": 0.001
+      },
+      "latency": {
+        "callbacks": 9728,
+        "callbacks_per_cpu_second": 519658.1196581193,
+        "latency_observations": 9728,
+        "latency_sample_count": 4096,
+        "maximum_ms": 2.076725009828806,
+        "p50_ms": 0.3752129850909114,
+        "p95_ms": 1.6958010382950306,
+        "p99_ms": 1.992770005017519,
+        "process_cpu_seconds": 0.018720000000000014,
+        "wakeups": 0,
+        "wall_seconds": 0.02022609196137637
+      },
+      "native_allocations": {
+        "available": false
+      },
+      "native_artifact": null,
+      "order": [
+        "asyncio",
+        "reference",
+        "native-required"
+      ],
+      "platform": "darwin",
+      "python": "3.13.13 (main, Apr 21 2026, 21:18:19) [Clang 14.0.3 (clang-1403.0.22.14.1)]",
+      "requested_mode": "reference",
+      "resolved_mode": "reference",
+      "scenario": "ready",
+      "selector": {
+        "iterations": 32,
+        "polls": 32
+      },
+      "throughput": {
+        "callbacks": 11520,
+        "callbacks_per_cpu_second": 608879.492600423,
+        "latency_observations": 0,
+        "latency_sample_count": 0,
+        "maximum_ms": 0.0,
+        "p50_ms": 0.0,
+        "p95_ms": 0.0,
+        "p99_ms": 0.0,
+        "process_cpu_seconds": 0.018919999999999992,
+        "wakeups": 0,
+        "wall_seconds": 0.020207552006468177
+      },
+      "triple": 0
+    },
+    {
+      "allocations": {
+        "completed": 16,
+        "current_traced_bytes": 9430,
+        "operations": 16,
+        "peak_traced_bytes": 10774,
+        "retained_blocks": 91,
+        "retained_bytes": 5550
+      },
+      "config": {
+        "allocation_operations": 16,
+        "cancelled_timer_count": 2000,
+        "cross_thread_batch_size": 64,
+        "duration_seconds": 0.02,
+        "latency_sample_limit": 4096,
+        "ready_batch_size": 256,
+        "timer_interval_seconds": 0.001
+      },
+      "latency": {
+        "callbacks": 4864,
+        "callbacks_per_cpu_second": 246290.95144057905,
+        "latency_observations": 4864,
+        "latency_sample_count": 4096,
+        "maximum_ms": 1.9548310083337128,
+        "p50_ms": 0.6762570119462907,
+        "p95_ms": 1.409837044775486,
+        "p99_ms": 1.8516910495236516,
+        "process_cpu_seconds": 0.019749000000000017,
+        "wakeups": 0,
+        "wall_seconds": 0.02068155800225213
+      },
+      "native_allocations": {
+        "available": false,
+        "reason": "artifact is not instrumented"
+      },
+      "native_artifact": {
+        "loop_type_module": "event_loop_native",
+        "path": "/private/tmp/wrtc-event-loop-perf-final/event_loop_native.cpython-313-darwin.so",
+        "sha256": "55781f6f2c570e8500d8e5beac3c6f50b737c74f7b0e4d17588a7e8f65d52b49",
+        "validated_compiler_version": "wrtc-pymeta-compiler/0.4",
+        "validated_policy": {
+          "event_loop_abi": "exact",
+          "event_loop_cpython_revision": "070700ed4d95c16855603cecab3f41f3b587f973",
+          "event_loop_free_threaded": "optional",
+          "event_loop_gil": "reactor_thread_confined",
+          "event_loop_subinterpreters": "unsupported",
+          "performance_adopted": "false",
+          "policy_sha256": "73a8702c7b8c3eb45c755302825d1f9abd4cd507cd9df2bf8a95b7239dbdf584",
+          "source_manifest_sha256": "6e16402eb9ae854794cb472b7c8b08c1cae8b6f17d7976f86e973241d5c6701c"
+        },
+        "validated_semantic_sha256": "d9852720eb7758bad7f90f65c353e0bddc7ee7b14aef8bdf538c9b4b19973856",
+        "validated_source_sha256": "9bbe38665826b54a79bb9b4cf4cc769df23fb923ecd88d53e747f7e9d7a590cf"
+      },
+      "order": [
+        "asyncio",
+        "reference",
+        "native-required"
+      ],
+      "platform": "darwin",
+      "python": "3.13.13 (main, Apr 21 2026, 21:18:19) [Clang 14.0.3 (clang-1403.0.22.14.1)]",
+      "requested_mode": "native-required",
+      "resolved_mode": "native-required",
+      "scenario": "ready",
+      "selector": {
+        "iterations": 32,
+        "polls": 32
+      },
+      "throughput": {
+        "callbacks": 5376,
+        "callbacks_per_cpu_second": 274495.78759254585,
+        "latency_observations": 0,
+        "latency_sample_count": 0,
+        "maximum_ms": 0.0,
+        "p50_ms": 0.0,
+        "p95_ms": 0.0,
+        "p99_ms": 0.0,
+        "process_cpu_seconds": 0.019584999999999964,
+        "wakeups": 0,
+        "wall_seconds": 0.020711461023893207
+      },
+      "triple": 0
+    },
+    {
+      "allocations": {
+        "completed": 16,
+        "current_traced_bytes": 7040,
+        "operations": 16,
+        "peak_traced_bytes": 8440,
+        "retained_blocks": 29,
+        "retained_bytes": 2816
+      },
+      "config": {
+        "allocation_operations": 16,
+        "cancelled_timer_count": 2000,
+        "cross_thread_batch_size": 64,
+        "duration_seconds": 0.02,
+        "latency_sample_limit": 4096,
+        "ready_batch_size": 256,
+        "timer_interval_seconds": 0.001
+      },
+      "latency": {
+        "callbacks": 10752,
+        "callbacks_per_cpu_second": 549496.6014207595,
+        "latency_observations": 10752,
+        "latency_sample_count": 4096,
+        "maximum_ms": 0.7890529814176261,
+        "p50_ms": 0.30078901909291744,
+        "p95_ms": 0.5819880170747638,
+        "p99_ms": 0.7322200108319521,
+        "process_cpu_seconds": 0.019567,
+        "wakeups": 0,
+        "wall_seconds": 0.020604954042937607
+      },
+      "native_allocations": {
+        "available": false
+      },
+      "native_artifact": null,
+      "order": [
+        "asyncio",
+        "native-required",
+        "reference"
+      ],
+      "platform": "darwin",
+      "python": "3.13.13 (main, Apr 21 2026, 21:18:19) [Clang 14.0.3 (clang-1403.0.22.14.1)]",
+      "requested_mode": "asyncio",
+      "resolved_mode": "asyncio",
+      "scenario": "ready",
+      "selector": {
+        "iterations": 32,
+        "polls": 32
+      },
+      "throughput": {
+        "callbacks": 13568,
+        "callbacks_per_cpu_second": 720208.0789850843,
+        "latency_observations": 0,
+        "latency_sample_count": 0,
+        "maximum_ms": 0.0,
+        "p50_ms": 0.0,
+        "p95_ms": 0.0,
+        "p99_ms": 0.0,
+        "process_cpu_seconds": 0.018838999999999995,
+        "wakeups": 0,
+        "wall_seconds": 0.020211250986903906
+      },
+      "triple": 1
+    },
+    {
+      "allocations": {
+        "completed": 16,
+        "current_traced_bytes": 9687,
+        "operations": 16,
+        "peak_traced_bytes": 11031,
+        "retained_blocks": 97,
+        "retained_bytes": 5853
+      },
+      "config": {
+        "allocation_operations": 16,
+        "cancelled_timer_count": 2000,
+        "cross_thread_batch_size": 64,
+        "duration_seconds": 0.02,
+        "latency_sample_limit": 4096,
+        "ready_batch_size": 256,
+        "timer_interval_seconds": 0.001
+      },
+      "latency": {
+        "callbacks": 4352,
+        "callbacks_per_cpu_second": 231403.20093582154,
+        "latency_observations": 4352,
+        "latency_sample_count": 4096,
+        "maximum_ms": 2.3721110192127526,
+        "p50_ms": 0.7241109851747751,
+        "p95_ms": 1.5870810020714998,
+        "p99_ms": 2.2594889742322266,
+        "process_cpu_seconds": 0.018807000000000018,
+        "wakeups": 0,
+        "wall_seconds": 0.020321905030868948
+      },
+      "native_allocations": {
+        "available": false,
+        "reason": "artifact is not instrumented"
+      },
+      "native_artifact": {
+        "loop_type_module": "event_loop_native",
+        "path": "/private/tmp/wrtc-event-loop-perf-final/event_loop_native.cpython-313-darwin.so",
+        "sha256": "55781f6f2c570e8500d8e5beac3c6f50b737c74f7b0e4d17588a7e8f65d52b49",
+        "validated_compiler_version": "wrtc-pymeta-compiler/0.4",
+        "validated_policy": {
+          "event_loop_abi": "exact",
+          "event_loop_cpython_revision": "070700ed4d95c16855603cecab3f41f3b587f973",
+          "event_loop_free_threaded": "optional",
+          "event_loop_gil": "reactor_thread_confined",
+          "event_loop_subinterpreters": "unsupported",
+          "performance_adopted": "false",
+          "policy_sha256": "73a8702c7b8c3eb45c755302825d1f9abd4cd507cd9df2bf8a95b7239dbdf584",
+          "source_manifest_sha256": "6e16402eb9ae854794cb472b7c8b08c1cae8b6f17d7976f86e973241d5c6701c"
+        },
+        "validated_semantic_sha256": "d9852720eb7758bad7f90f65c353e0bddc7ee7b14aef8bdf538c9b4b19973856",
+        "validated_source_sha256": "9bbe38665826b54a79bb9b4cf4cc769df23fb923ecd88d53e747f7e9d7a590cf"
+      },
+      "order": [
+        "asyncio",
+        "native-required",
+        "reference"
+      ],
+      "platform": "darwin",
+      "python": "3.13.13 (main, Apr 21 2026, 21:18:19) [Clang 14.0.3 (clang-1403.0.22.14.1)]",
+      "requested_mode": "native-required",
+      "resolved_mode": "native-required",
+      "scenario": "ready",
+      "selector": {
+        "iterations": 32,
+        "polls": 32
+      },
+      "throughput": {
+        "callbacks": 5632,
+        "callbacks_per_cpu_second": 274383.7084673092,
+        "latency_observations": 0,
+        "latency_sample_count": 0,
+        "maximum_ms": 0.0,
+        "p50_ms": 0.0,
+        "p95_ms": 0.0,
+        "p99_ms": 0.0,
+        "process_cpu_seconds": 0.020526000000000044,
+        "wakeups": 0,
+        "wall_seconds": 0.02121367701329291
+      },
+      "triple": 1
+    },
+    {
+      "allocations": {
+        "completed": 16,
+        "current_traced_bytes": 7312,
+        "operations": 16,
+        "peak_traced_bytes": 8768,
+        "retained_blocks": 31,
+        "retained_bytes": 2904
+      },
+      "config": {
+        "allocation_operations": 16,
+        "cancelled_timer_count": 2000,
+        "cross_thread_batch_size": 64,
+        "duration_seconds": 0.02,
+        "latency_sample_limit": 4096,
+        "ready_batch_size": 256,
+        "timer_interval_seconds": 0.001
+      },
+      "latency": {
+        "callbacks": 11776,
+        "callbacks_per_cpu_second": 605761.3168724276,
+        "latency_observations": 11776,
+        "latency_sample_count": 4096,
+        "maximum_ms": 0.4170730244368315,
+        "p50_ms": 0.30494900420308113,
+        "p95_ms": 0.40360697312280536,
+        "p99_ms": 0.41248800698667765,
+        "process_cpu_seconds": 0.019440000000000013,
+        "wakeups": 0,
+        "wall_seconds": 0.020254696952179074
+      },
+      "native_allocations": {
+        "available": false
+      },
+      "native_artifact": null,
+      "order": [
+        "asyncio",
+        "native-required",
+        "reference"
+      ],
+      "platform": "darwin",
+      "python": "3.13.13 (main, Apr 21 2026, 21:18:19) [Clang 14.0.3 (clang-1403.0.22.14.1)]",
+      "requested_mode": "reference",
+      "resolved_mode": "reference",
+      "scenario": "ready",
+      "selector": {
+        "iterations": 32,
+        "polls": 32
+      },
+      "throughput": {
+        "callbacks": 14592,
+        "callbacks_per_cpu_second": 758419.9584199592,
+        "latency_observations": 0,
+        "latency_sample_count": 0,
+        "maximum_ms": 0.0,
+        "p50_ms": 0.0,
+        "p95_ms": 0.0,
+        "p99_ms": 0.0,
+        "process_cpu_seconds": 0.01923999999999998,
+        "wakeups": 0,
+        "wall_seconds": 0.020193517033476382
+      },
+      "triple": 1
+    },
+    {
+      "allocations": {
+        "completed": 16,
+        "current_traced_bytes": 7312,
+        "operations": 16,
+        "peak_traced_bytes": 8768,
+        "retained_blocks": 31,
+        "retained_bytes": 2904
+      },
+      "config": {
+        "allocation_operations": 16,
+        "cancelled_timer_count": 2000,
+        "cross_thread_batch_size": 64,
+        "duration_seconds": 0.02,
+        "latency_sample_limit": 4096,
+        "ready_batch_size": 256,
+        "timer_interval_seconds": 0.001
+      },
+      "latency": {
+        "callbacks": 7936,
+        "callbacks_per_cpu_second": 434611.17196056957,
+        "latency_observations": 7936,
+        "latency_sample_count": 4096,
+        "maximum_ms": 1.746794965583831,
+        "p50_ms": 0.40740001713857055,
+        "p95_ms": 1.5028989873826504,
+        "p99_ms": 1.7096569645218551,
+        "process_cpu_seconds": 0.01826,
+        "wakeups": 0,
+        "wall_seconds": 0.020178185950499028
+      },
+      "native_allocations": {
+        "available": false
+      },
+      "native_artifact": null,
+      "order": [
+        "reference",
+        "asyncio",
+        "native-required"
+      ],
+      "platform": "darwin",
+      "python": "3.13.13 (main, Apr 21 2026, 21:18:19) [Clang 14.0.3 (clang-1403.0.22.14.1)]",
+      "requested_mode": "reference",
+      "resolved_mode": "reference",
+      "scenario": "ready",
+      "selector": {
+        "iterations": 32,
+        "polls": 32
+      },
+      "throughput": {
+        "callbacks": 9216,
+        "callbacks_per_cpu_second": 508525.078629366,
+        "latency_observations": 0,
+        "latency_sample_count": 0,
+        "maximum_ms": 0.0,
+        "p50_ms": 0.0,
+        "p95_ms": 0.0,
+        "p99_ms": 0.0,
+        "process_cpu_seconds": 0.018123,
+        "wakeups": 0,
+        "wall_seconds": 0.020344258984550834
+      },
+      "triple": 2
+    },
+    {
+      "allocations": {
+        "completed": 16,
+        "current_traced_bytes": 7040,
+        "operations": 16,
+        "peak_traced_bytes": 8440,
+        "retained_blocks": 29,
+        "retained_bytes": 2816
+      },
+      "config": {
+        "allocation_operations": 16,
+        "cancelled_timer_count": 2000,
+        "cross_thread_batch_size": 64,
+        "duration_seconds": 0.02,
+        "latency_sample_limit": 4096,
+        "ready_batch_size": 256,
+        "timer_interval_seconds": 0.001
+      },
+      "latency": {
+        "callbacks": 10496,
+        "callbacks_per_cpu_second": 563906.9467576428,
+        "latency_observations": 10496,
+        "latency_sample_count": 4096,
+        "maximum_ms": 1.0620429529808462,
+        "p50_ms": 0.32313697738572955,
+        "p95_ms": 0.6719199591316283,
+        "p99_ms": 1.0089909774251282,
+        "process_cpu_seconds": 0.01861299999999999,
+        "wakeups": 0,
+        "wall_seconds": 0.020138689957093447
+      },
+      "native_allocations": {
+        "available": false
+      },
+      "native_artifact": null,
+      "order": [
+        "reference",
+        "asyncio",
+        "native-required"
+      ],
+      "platform": "darwin",
+      "python": "3.13.13 (main, Apr 21 2026, 21:18:19) [Clang 14.0.3 (clang-1403.0.22.14.1)]",
+      "requested_mode": "asyncio",
+      "resolved_mode": "asyncio",
+      "scenario": "ready",
+      "selector": {
+        "iterations": 32,
+        "polls": 32
+      },
+      "throughput": {
+        "callbacks": 15104,
+        "callbacks_per_cpu_second": 800890.8213585031,
+        "latency_observations": 0,
+        "latency_sample_count": 0,
+        "maximum_ms": 0.0,
+        "p50_ms": 0.0,
+        "p95_ms": 0.0,
+        "p99_ms": 0.0,
+        "process_cpu_seconds": 0.018858999999999987,
+        "wakeups": 0,
+        "wall_seconds": 0.02022492396645248
+      },
+      "triple": 2
+    },
+    {
+      "allocations": {
+        "completed": 16,
+        "current_traced_bytes": 10426,
+        "operations": 16,
+        "peak_traced_bytes": 11770,
+        "retained_blocks": 112,
+        "retained_bytes": 6592
+      },
+      "config": {
+        "allocation_operations": 16,
+        "cancelled_timer_count": 2000,
+        "cross_thread_batch_size": 64,
+        "duration_seconds": 0.02,
+        "latency_sample_limit": 4096,
+        "ready_batch_size": 256,
+        "timer_interval_seconds": 0.001
+      },
+      "latency": {
+        "callbacks": 3072,
+        "callbacks_per_cpu_second": 172216.61621258076,
+        "latency_observations": 3072,
+        "latency_sample_count": 3072,
+        "maximum_ms": 2.868250012397766,
+        "p50_ms": 1.0262670111842453,
+        "p95_ms": 2.4102130555547774,
+        "p99_ms": 2.7465190505608916,
+        "process_cpu_seconds": 0.01783799999999991,
+        "wakeups": 0,
+        "wall_seconds": 0.021152443019673228
+      },
+      "native_allocations": {
+        "available": false,
+        "reason": "artifact is not instrumented"
+      },
+      "native_artifact": {
+        "loop_type_module": "event_loop_native",
+        "path": "/private/tmp/wrtc-event-loop-perf-final/event_loop_native.cpython-313-darwin.so",
+        "sha256": "55781f6f2c570e8500d8e5beac3c6f50b737c74f7b0e4d17588a7e8f65d52b49",
+        "validated_compiler_version": "wrtc-pymeta-compiler/0.4",
+        "validated_policy": {
+          "event_loop_abi": "exact",
+          "event_loop_cpython_revision": "070700ed4d95c16855603cecab3f41f3b587f973",
+          "event_loop_free_threaded": "optional",
+          "event_loop_gil": "reactor_thread_confined",
+          "event_loop_subinterpreters": "unsupported",
+          "performance_adopted": "false",
+          "policy_sha256": "73a8702c7b8c3eb45c755302825d1f9abd4cd507cd9df2bf8a95b7239dbdf584",
+          "source_manifest_sha256": "6e16402eb9ae854794cb472b7c8b08c1cae8b6f17d7976f86e973241d5c6701c"
+        },
+        "validated_semantic_sha256": "d9852720eb7758bad7f90f65c353e0bddc7ee7b14aef8bdf538c9b4b19973856",
+        "validated_source_sha256": "9bbe38665826b54a79bb9b4cf4cc769df23fb923ecd88d53e747f7e9d7a590cf"
+      },
+      "order": [
+        "reference",
+        "asyncio",
+        "native-required"
+      ],
+      "platform": "darwin",
+      "python": "3.13.13 (main, Apr 21 2026, 21:18:19) [Clang 14.0.3 (clang-1403.0.22.14.1)]",
+      "requested_mode": "native-required",
+      "resolved_mode": "native-required",
+      "scenario": "ready",
+      "selector": {
+        "iterations": 32,
+        "polls": 32
+      },
+      "throughput": {
+        "callbacks": 2304,
+        "callbacks_per_cpu_second": 143301.40564746826,
+        "latency_observations": 0,
+        "latency_sample_count": 0,
+        "maximum_ms": 0.0,
+        "p50_ms": 0.0,
+        "p95_ms": 0.0,
+        "p99_ms": 0.0,
+        "process_cpu_seconds": 0.016078000000000037,
+        "wakeups": 0,
+        "wall_seconds": 0.024473018012940884
+      },
+      "triple": 2
+    }
+  ],
+  "scenarios": [
+    "ready"
+  ],
+  "summaries": {
+    "ready": {
+      "allocation_medians": {
+        "asyncio": {
+          "retained_blocks": 29,
+          "retained_bytes": 2816
+        },
+        "native-required": {
+          "retained_blocks": 97,
+          "retained_bytes": 5853
+        },
+        "reference": {
+          "retained_blocks": 31,
+          "retained_bytes": 2904
+        }
+      },
+      "comparisons": {
+        "asyncio": {
+          "median_ratio": 0.38097838176707227,
+          "meets_1_20_gate": false,
+          "one_sided_95_percent_lower_bound": 0.1789275164926908,
+          "paired_ratios": [
+            0.445388477576377,
+            0.38097838176707227,
+            0.1789275164926908
+          ]
+        },
+        "reference": {
+          "median_ratio": 0.3617833436753717,
+          "meets_1_20_gate": false,
+          "one_sided_95_percent_lower_bound": 0.2817981092175637,
+          "paired_ratios": [
+            0.450821206705813,
+            0.3617833436753717,
+            0.2817981092175637
+          ]
+        }
+      },
+      "gates": {
+        "idle_cpu": true,
+        "latency": false,
+        "native_internal_allocations": false,
+        "python_allocations": false,
+        "throughput": false
+      },
+      "native_p99_limit_ms": 0.8974319742061198,
+      "p99_ms_median": {
+        "asyncio": 0.7974319742061198,
+        "native-required": 2.2594889742322266,
+        "reference": 1.7096569645218551
+      },
+      "passes_all_gates": false
+    }
+  },
+  "triples": 3
+}

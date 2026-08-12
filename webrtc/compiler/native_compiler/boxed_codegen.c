@@ -102,9 +102,9 @@ static int emit_expression_initializer(
         fputc(',', output) == EOF ||
         emit_pointer(output, context->prefix, "expr_children", identifier,
                      expression->child_count) < 0 ||
-        fprintf(output, ",%zu,%zu,%zu}", expression->child_count,
+        fprintf(output, ",%zu,%zu,%zu,%d,NULL,NULL}", expression->child_count,
                 expression->positional_count,
-                expression->keyword_count) < 0)
+                expression->keyword_count, (int)expression->binary_operation) < 0)
         return -1;
     return 0;
 }
@@ -182,8 +182,9 @@ static int emit_statement_initializer(
         fprintf(output, ",%zu,", statement->finalbody_count) < 0 ||
         emit_pointer(output, context->prefix, "stmt_handlers", identifier,
                      statement->handler_count) < 0 ||
-        fprintf(output, ",%zu,%u}", statement->handler_count,
-                statement->iterator_is_range ? 1u : 0u) < 0)
+        fprintf(output, ",%zu,%u,%d}", statement->handler_count,
+                statement->iterator_is_range ? 1u : 0u,
+                (int)statement->binary_operation) < 0)
         return -1;
     return 0;
 }
@@ -394,10 +395,19 @@ int wrtc_boxed_emit_runtime(FILE *output) {
         "WRTC_PY_EXPR_JOINED_STRING,WRTC_PY_EXPR_FORMATTED_VALUE,"
         "WRTC_PY_EXPR_LAMBDA,WRTC_PY_EXPR_SUBSCRIPT,"
         "WRTC_PY_EXPR_SLICE}WrtcPyExprKind;\n"
+        "typedef enum{WRTC_PY_BINARY_INVALID=0,WRTC_PY_BINARY_ADD,"
+        "WRTC_PY_BINARY_SUBTRACT,WRTC_PY_BINARY_MULTIPLY,"
+        "WRTC_PY_BINARY_MATRIX_MULTIPLY,WRTC_PY_BINARY_TRUE_DIVIDE,"
+        "WRTC_PY_BINARY_FLOOR_DIVIDE,WRTC_PY_BINARY_REMAINDER,"
+        "WRTC_PY_BINARY_POWER,WRTC_PY_BINARY_LEFT_SHIFT,"
+        "WRTC_PY_BINARY_RIGHT_SHIFT,WRTC_PY_BINARY_AND,"
+        "WRTC_PY_BINARY_XOR,WRTC_PY_BINARY_OR}WrtcPyBinaryOp;\n"
         "typedef struct WrtcPyExprIR{WrtcPyExprKind kind;WrtcSourceSpan span;"
         "char*text,*operation,**operations;size_t operation_count;"
         "char**keyword_names;struct WrtcPyExprIR*children;"
-        "size_t child_count,positional_count,keyword_count;}WrtcPyExprIR;\n"
+        "size_t child_count,positional_count,keyword_count;"
+        "WrtcPyBinaryOp binary_operation;PyObject*cached_constant;"
+        "PyObject*cached_keyword_names;}WrtcPyExprIR;\n"
         "typedef enum{WRTC_PY_STMT_EXPR=0,WRTC_PY_STMT_ASSIGN,"
         "WRTC_PY_STMT_AUGMENTED_ASSIGN,WRTC_PY_STMT_IF,WRTC_PY_STMT_WHILE,"
         "WRTC_PY_STMT_FOR,WRTC_PY_STMT_TRY,WRTC_PY_STMT_TRY_FINALLY,"
@@ -410,7 +420,8 @@ int wrtc_boxed_emit_runtime(FILE *output) {
         "struct WrtcPyStmtIR*orelse;size_t orelse_count;"
         "struct WrtcPyStmtIR*finalbody;size_t finalbody_count;"
         "struct WrtcPyStmtIR*handlers;size_t handler_count;"
-        "unsigned iterator_is_range:1;}WrtcPyStmtIR;\n"
+        "unsigned iterator_is_range:1;WrtcPyBinaryOp binary_operation;}"
+        "WrtcPyStmtIR;\n"
         "typedef struct{WrtcPyStmtIR*statements;size_t statement_count;"
         "char**local_names;size_t local_count;}WrtcPySuiteIR;\n";
     static const char signatures[] =
@@ -433,6 +444,10 @@ int wrtc_boxed_emit_runtime(FILE *output) {
         "PyObject*,const WrtcBoxedNativeHooks*,PyObject**);"
         "PyObject*wrtc_boxed_hook_evaluate(const WrtcPyExprIR*,void*);"
         "PyObject*wrtc_boxed_hook_local(const char*,void*);"
+        "int wrtc_boxed_suite_initialize(WrtcPySuiteIR*,PyObject*);"
+        "void wrtc_boxed_suite_clear(WrtcPySuiteIR*);"
+        "int wrtc_boxed_bind_method(const WrtcBoxedSignature*,PyObject*,"
+        "PyObject*const*,Py_ssize_t,PyObject*,PyObject**);"
         "void wrtc_boxed_signature_clear(WrtcBoxedSignature*signature);\n";
     if (output == NULL || implementation == NULL ||
         fputs(declarations, output) < 0 ||

@@ -81,6 +81,7 @@ def test_policy_hash_covers_normalized_target_and_required_surface() -> None:
         "event_loop_free_threaded": "optional",
         "event_loop_gil": "reactor_thread_confined",
         "event_loop_subinterpreters": "unsupported",
+        "performance_adopted": "false",
     }
 
 

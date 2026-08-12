@@ -40,7 +40,7 @@ int main(void) {
     CHECK(fread(text, 1u, (size_t)length, file) == (size_t)length);
     text[length] = '\0';
     CHECK(strstr(text, "PyInit_fixture_native") != NULL);
-    CHECK(strstr(text, "wrtc-pymeta-compiler/0.3") != NULL);
+    CHECK(strstr(text, "wrtc-pymeta-compiler/0.4") != NULL);
     CHECK(strstr(text, "__pymeta_cache_tag__") != NULL);
     CHECK(strstr(text, "__pymeta_abi_flags__") != NULL);
     CHECK(strstr(text, "__pymeta_extension_suffix__") != NULL);

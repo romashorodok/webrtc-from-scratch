@@ -117,6 +117,27 @@ int main(void) {
     WrtcBoxedSignature signature = {
         "bound", parameters, 5u, NULL
     };
+    static const char *const binary_names[] = {
+        "add", "subtract", "multiply", "matrix_multiply", "true_divide",
+        "floor_divide", "remainder", "power", "left_shift", "right_shift",
+        "and_", "xor", "or_"
+    };
+    static const char binary_source[] =
+        "class Operand:\n"
+        " def __matmul__(self, other): return ('matmul', other)\n"
+        "def add(x,y): return x+y\n"
+        "def subtract(x,y): return x-y\n"
+        "def multiply(x,y): return x*y\n"
+        "def matrix_multiply(x,y): return x@y\n"
+        "def true_divide(x,y): return x/y\n"
+        "def floor_divide(x,y): return x//y\n"
+        "def remainder(x,y): return x%y\n"
+        "def power(x,y): return x**y\n"
+        "def left_shift(x,y): return x<<y\n"
+        "def right_shift(x,y): return x>>y\n"
+        "def and_(x,y): return x&y\n"
+        "def xor(x,y): return x^y\n"
+        "def or_(x,y): return x|y\n";
 
     Py_Initialize();
     globals = PyDict_New();
@@ -125,6 +146,55 @@ int main(void) {
     CHECK(PyDict_SetItemString(
               globals, "__builtins__", PyEval_GetBuiltins()) == 0);
     CHECK(function_body(globals, source, "region") != NULL);
+    {
+        PyObject *loaded = PyRun_String(
+            binary_source, Py_file_input, globals, globals);
+        size_t binary_index;
+        CHECK(loaded != NULL);
+        Py_DECREF(loaded);
+        CHECK(wrtc_py_binary_from_name("Div") == WRTC_PY_BINARY_TRUE_DIVIDE);
+        CHECK(strcmp(wrtc_py_binary_name(WRTC_PY_BINARY_TRUE_DIVIDE),
+                     "TrueDiv") == 0);
+        for (binary_index = 0u;
+             binary_index < sizeof binary_names / sizeof binary_names[0];
+             binary_index++) {
+            const char *binary_name = binary_names[binary_index];
+            PyObject *left = NULL, *right = PyLong_FromLong(3);
+            PyObject *python_function = Py_XNewRef(
+                PyDict_GetItemString(globals, binary_name));
+            if (strcmp(binary_name, "matrix_multiply") == 0) {
+                PyObject *operand = PyDict_GetItemString(globals, "Operand");
+                left = operand == NULL ? NULL : PyObject_CallNoArgs(operand);
+            } else {
+                left = PyLong_FromLong(12);
+            }
+            CHECK(left != NULL && right != NULL && python_function != NULL);
+            PyDict_Clear(locals);
+            CHECK(PyDict_SetItemString(locals, "x", left) == 0);
+            CHECK(PyDict_SetItemString(locals, "y", right) == 0);
+            CHECK(run_region(globals, binary_source, binary_name,
+                             locals, &result) == 0);
+            expected = PyObject_CallFunctionObjArgs(
+                python_function, left, right, NULL);
+            CHECK(expected != NULL);
+            {
+                int parity = PyObject_RichCompareBool(result, expected, Py_EQ);
+                if (parity != 1) {
+                    (void)fprintf(stderr, "binary parity failed: %s\n", binary_name);
+                    PyObject_Print(result, stderr, 0);
+                    (void)fputc('\n', stderr);
+                    PyObject_Print(expected, stderr, 0);
+                    (void)fputc('\n', stderr);
+                }
+                CHECK(parity == 1);
+            }
+            Py_CLEAR(expected);
+            Py_CLEAR(result);
+            Py_DECREF(right);
+            Py_DECREF(left);
+            Py_DECREF(python_function);
+        }
+    }
     box_type = PyDict_GetItemString(globals, "Box");
     values = Py_BuildValue("[iiii]", -1, 2, 3, -4);
     events = Py_BuildValue("[(ii)(ii)(Oi)]", 7, 1, 5, 0, Py_None, 1);

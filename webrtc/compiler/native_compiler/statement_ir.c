@@ -366,7 +366,12 @@ static int lower_expression(PyObject *node, const char *filename,
                 lower_expression(second, filename, &out->children[1]) < 0)
                 goto error;
             out->kind = WRTC_PY_EXPR_BINARY;
-            out->operation = copy_text(node_kind(third));
+            out->binary_operation = wrtc_py_binary_from_name(node_kind(third));
+            out->operation = copy_text(wrtc_py_binary_name(out->binary_operation));
+            if (out->binary_operation == WRTC_PY_BINARY_INVALID) {
+                diagnostic(filename, node, "unsupported binary operator");
+                goto error;
+            }
         }
     } else if (is_kind(node, "UnaryOp")) {
         first = attribute(node, "operand");
@@ -661,7 +666,12 @@ static int lower_statement(PyObject *node, const char *filename,
         second = attribute(node, "value");
         third = attribute(node, "op");
         out->kind = WRTC_PY_STMT_AUGMENTED_ASSIGN;
-        out->operation = copy_text(node_kind(third));
+        out->binary_operation = wrtc_py_binary_from_name(node_kind(third));
+        out->operation = copy_text(wrtc_py_binary_name(out->binary_operation));
+        if (out->binary_operation == WRTC_PY_BINARY_INVALID) {
+            diagnostic(filename, node, "unsupported augmented binary operator");
+            goto error;
+        }
         out->expression_count = 2u;
     } else if (is_kind(node, "If") || is_kind(node, "While")) {
         first = attribute(node, "test");
