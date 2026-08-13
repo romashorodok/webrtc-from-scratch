@@ -1,5 +1,7 @@
 #include "aot_codegen.h"
 
+#include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -20,11 +22,269 @@ typedef struct {
     int has_hooks;
     int direct;
     const char *slot_names[WRTC_AOT_SLOT_LIMIT];
+    WrtcNativeRepresentation slot_representations[WRTC_AOT_SLOT_LIMIT];
+    unsigned char slot_scalar_seen[WRTC_AOT_SLOT_LIMIT];
+    unsigned char slot_scalar_conflict[WRTC_AOT_SLOT_LIMIT];
     size_t slot_count;
     const WrtcPyExprIR *expressions[WRTC_AOT_EXPRESSION_LIMIT];
     size_t expression_ids[WRTC_AOT_EXPRESSION_LIMIT];
     size_t expression_count;
 } AotEmitter;
+
+static const WrtcNativeOperationIR *direct_operation(
+    const AotEmitter *emitter, const WrtcPyExprIR *expression);
+static const WrtcNativeCallEdgeIR *call_edge(
+    const AotEmitter *emitter, const WrtcPyExprIR *expression);
+static size_t slot_index(const AotEmitter *emitter, const char *name);
+
+static const char *aot_final_type_name(const char *annotation,
+                                       char *buffer, size_t capacity) {
+    const char *start, *end, *dot;
+    size_t length;
+    if (annotation == NULL || capacity == 0u) return NULL;
+    start = annotation;
+    while (*start == ' ' || *start == '\'' || *start == '"') start++;
+    end = start;
+    while (*end != '\0' && *end != '\'' && *end != '"' &&
+           *end != '[' && *end != '|' && *end != ' ')
+        end++;
+    dot = end;
+    while (dot > start && dot[-1] != '.') dot--;
+    length = (size_t)(end - dot);
+    if (length == 0u || length >= capacity) return NULL;
+    memcpy(buffer, dot, length);
+    buffer[length] = '\0';
+    return buffer;
+}
+
+static size_t expression_owner_class(const AotEmitter *emitter,
+                                     const WrtcPyExprIR *owner) {
+    size_t parameter, class_index;
+    if (owner == NULL || owner->kind != WRTC_PY_EXPR_NAME ||
+        owner->operation == NULL)
+        return (size_t)-1;
+    if (strcmp(owner->operation, "self") == 0) return emitter->class_index;
+    for (parameter = 0u;
+         parameter < emitter->region->signature->parameter_count; parameter++) {
+        const WrtcPyParameterIR *item =
+            &emitter->region->signature->parameters[parameter];
+        char type_name[256];
+        const char *resolved;
+        if (item->name == NULL || strcmp(item->name, owner->operation) != 0)
+            continue;
+        resolved = aot_final_type_name(item->annotation, type_name,
+                                       sizeof type_name);
+        if (resolved == NULL) return (size_t)-1;
+        for (class_index = 0u;
+             class_index < emitter->program->class_count; class_index++)
+            if (strcmp(emitter->program->classes[class_index].name,
+                       resolved) == 0)
+                return class_index;
+    }
+    return (size_t)-1;
+}
+
+static const WrtcNativeFieldIR *direct_object_field(
+    const AotEmitter *emitter, const WrtcPyExprIR *expression,
+    size_t *class_index_out, size_t *field_index_out) {
+    size_t class_index, field_index;
+    const WrtcNativeClassIR *class_ir;
+    if (expression == NULL || expression->kind != WRTC_PY_EXPR_ATTRIBUTE ||
+        expression->child_count != 1u || expression->operation == NULL)
+        return NULL;
+    class_index = expression_owner_class(emitter, &expression->children[0]);
+    if (class_index == (size_t)-1) return NULL;
+    class_ir = &emitter->program->classes[class_index];
+    for (field_index = 0u; field_index < class_ir->field_count; field_index++) {
+        const WrtcNativeFieldIR *field = &class_ir->fields[field_index];
+        if (field->storage_kind == WRTC_NATIVE_FIELD_PYOBJECT &&
+            strcmp(field->name, expression->operation) == 0) {
+            *class_index_out = class_index;
+            *field_index_out = field_index;
+            return field;
+        }
+    }
+    return NULL;
+}
+
+static size_t first_region_manifest(const WrtcNativeClassProgram *program,
+                                    size_t class_index) {
+    size_t index, manifest = 0u;
+    for (index = 0u; index < class_index; index++)
+        manifest += program->classes[index].region_count;
+    return manifest;
+}
+
+static const WrtcNativeFieldIR *typed_heap_key_expression(
+    const AotEmitter *emitter, const WrtcPyExprIR *expression) {
+    const WrtcNativeOperationIR *operation;
+    const WrtcNativeFieldOperationProof *proof;
+    const WrtcNativeFieldIR *field;
+    if (expression == NULL || expression->kind != WRTC_PY_EXPR_ATTRIBUTE ||
+        expression->child_count != 1u || expression->operation == NULL ||
+        expression->children[0].kind != WRTC_PY_EXPR_SUBSCRIPT)
+        return NULL;
+    operation = direct_operation(emitter, &expression->children[0]);
+    if (operation == NULL || operation->kind != WRTC_NATIVE_OP_ROOT_READ)
+        return NULL;
+    proof = &emitter->operations->fields[operation->field_proof_index];
+    field = &emitter->program->classes[proof->class_index]
+                 .fields[proof->field_index];
+    if (field->storage_kind != WRTC_NATIVE_FIELD_MIN_HEAP ||
+        field->heap_key == NULL || field->heap_key_type == NULL ||
+        strcmp(field->heap_key, expression->operation) != 0)
+        return NULL;
+    return field;
+}
+
+static WrtcNativeRepresentation constant_scalar_representation(
+    const WrtcPyExprIR *expression) {
+    char *end = NULL;
+    if (expression->operation == NULL || expression->text == NULL)
+        return WRTC_NATIVE_REPR_VOID;
+    if (strcmp(expression->operation, "bool") == 0 &&
+        (strcmp(expression->text, "True") == 0 ||
+         strcmp(expression->text, "False") == 0))
+        return WRTC_NATIVE_REPR_BOOL;
+    if (strcmp(expression->operation, "float") == 0) {
+        errno = 0;
+        (void)strtod(expression->text, &end);
+        return errno == 0 && end != expression->text && *end == '\0'
+                   ? WRTC_NATIVE_REPR_DOUBLE : WRTC_NATIVE_REPR_VOID;
+    }
+    if (strcmp(expression->operation, "int") == 0) {
+        errno = 0;
+        (void)strtoll(expression->text, &end, 0);
+        return errno == 0 && end != expression->text && *end == '\0'
+                   ? WRTC_NATIVE_REPR_INT64 : WRTC_NATIVE_REPR_VOID;
+    }
+    return WRTC_NATIVE_REPR_VOID;
+}
+
+static int scalar_representation(WrtcNativeRepresentation representation) {
+    return representation == WRTC_NATIVE_REPR_PY_SSIZE_T ||
+           representation == WRTC_NATIVE_REPR_INT64 ||
+           representation == WRTC_NATIVE_REPR_DOUBLE ||
+           representation == WRTC_NATIVE_REPR_BOOL;
+}
+
+static WrtcNativeRepresentation expression_scalar_representation(
+    const AotEmitter *emitter, const WrtcPyExprIR *expression) {
+    const WrtcNativeOperationIR *operation;
+    WrtcNativeRepresentation left, right;
+    size_t slot, index;
+    if (expression == NULL) return WRTC_NATIVE_REPR_VOID;
+    operation = direct_operation(emitter, expression);
+    if (operation != NULL && scalar_representation(
+            operation->result_representation)) {
+        if ((operation->kind == WRTC_NATIVE_OP_TRUTH ||
+             operation->kind == WRTC_NATIVE_OP_SCALAR_READ) &&
+            expression->kind == WRTC_PY_EXPR_ATTRIBUTE &&
+            expression->child_count == 1u)
+            return operation->result_representation;
+        if (operation->kind == WRTC_NATIVE_OP_LENGTH &&
+            expression->child_count >= 2u &&
+            expression->children[1].kind == WRTC_PY_EXPR_ATTRIBUTE &&
+            expression->children[1].child_count == 1u)
+            return operation->result_representation;
+        return WRTC_NATIVE_REPR_VOID;
+    }
+    if (typed_heap_key_expression(emitter, expression) != NULL) {
+        const WrtcNativeFieldIR *field =
+            typed_heap_key_expression(emitter, expression);
+        if (strcmp(field->heap_key_type, "float") == 0)
+            return WRTC_NATIVE_REPR_DOUBLE;
+        if (strcmp(field->heap_key_type, "bool") == 0)
+            return WRTC_NATIVE_REPR_BOOL;
+        if (strcmp(field->heap_key_type, "int") == 0)
+            return WRTC_NATIVE_REPR_INT64;
+    }
+    switch (expression->kind) {
+        case WRTC_PY_EXPR_NAME:
+            slot = slot_index(emitter, expression->operation);
+            return slot == (size_t)-1 ? WRTC_NATIVE_REPR_VOID
+                                      : emitter->slot_representations[slot];
+        case WRTC_PY_EXPR_CONSTANT:
+            return constant_scalar_representation(expression);
+        case WRTC_PY_EXPR_CALL: {
+            const WrtcNativeCallEdgeIR *edge = call_edge(emitter, expression);
+            if (edge == NULL || !edge->result_contract_proven)
+                return WRTC_NATIVE_REPR_VOID;
+            if (edge->result_representation == WRTC_CALL_RESULT_DOUBLE)
+                return WRTC_NATIVE_REPR_DOUBLE;
+            if (edge->result_representation == WRTC_CALL_RESULT_BOOL)
+                return WRTC_NATIVE_REPR_BOOL;
+            if (edge->result_representation == WRTC_CALL_RESULT_INT64)
+                return WRTC_NATIVE_REPR_INT64;
+            return WRTC_NATIVE_REPR_VOID;
+        }
+        case WRTC_PY_EXPR_UNARY:
+            left = expression_scalar_representation(
+                emitter, &expression->children[0]);
+            if (expression->operation != NULL &&
+                strcmp(expression->operation, "Not") == 0 &&
+                scalar_representation(left))
+                return WRTC_NATIVE_REPR_BOOL;
+            if (expression->operation != NULL &&
+                (strcmp(expression->operation, "USub") == 0 ||
+                 strcmp(expression->operation, "UAdd") == 0) &&
+                left == WRTC_NATIVE_REPR_DOUBLE)
+                return left;
+            return WRTC_NATIVE_REPR_VOID;
+        case WRTC_PY_EXPR_BINARY:
+            if (expression->child_count != 2u)
+                return WRTC_NATIVE_REPR_VOID;
+            left = expression_scalar_representation(
+                emitter, &expression->children[0]);
+            right = expression_scalar_representation(
+                emitter, &expression->children[1]);
+            if (!scalar_representation(left) ||
+                !scalar_representation(right))
+                return WRTC_NATIVE_REPR_VOID;
+            if (expression->binary_operation == WRTC_PY_BINARY_TRUE_DIVIDE)
+                return WRTC_NATIVE_REPR_DOUBLE;
+            if ((left == WRTC_NATIVE_REPR_DOUBLE ||
+                 right == WRTC_NATIVE_REPR_DOUBLE) &&
+                (expression->binary_operation == WRTC_PY_BINARY_ADD ||
+                 expression->binary_operation == WRTC_PY_BINARY_SUBTRACT ||
+                 expression->binary_operation == WRTC_PY_BINARY_MULTIPLY))
+                return WRTC_NATIVE_REPR_DOUBLE;
+            /* Arbitrary precision integer arithmetic cannot be represented by
+             * int64_t without a separately proven range. */
+            return WRTC_NATIVE_REPR_VOID;
+        case WRTC_PY_EXPR_COMPARE:
+            if (expression->operation_count == 0u ||
+                expression->child_count != expression->operation_count + 1u)
+                return WRTC_NATIVE_REPR_VOID;
+            for (index = 0u; index < expression->child_count; index++)
+                if (!scalar_representation(expression_scalar_representation(
+                        emitter, &expression->children[index])))
+                    return WRTC_NATIVE_REPR_VOID;
+            for (index = 0u; index < expression->operation_count; index++) {
+                left = expression_scalar_representation(
+                    emitter, &expression->children[index]);
+                right = expression_scalar_representation(
+                    emitter, &expression->children[index + 1u]);
+                /* CPython compares large ints with floats without first
+                 * rounding the integer to double.  Keep mixed comparisons
+                 * boxed until a numeric-range proof is available. */
+                if ((left == WRTC_NATIVE_REPR_DOUBLE) !=
+                    (right == WRTC_NATIVE_REPR_DOUBLE))
+                    return WRTC_NATIVE_REPR_VOID;
+            }
+            for (index = 0u; index < expression->operation_count; index++)
+                if (strcmp(expression->operations[index], "Eq") != 0 &&
+                    strcmp(expression->operations[index], "NotEq") != 0 &&
+                    strcmp(expression->operations[index], "Lt") != 0 &&
+                    strcmp(expression->operations[index], "LtE") != 0 &&
+                    strcmp(expression->operations[index], "Gt") != 0 &&
+                    strcmp(expression->operations[index], "GtE") != 0)
+                    return WRTC_NATIVE_REPR_VOID;
+            return WRTC_NATIVE_REPR_BOOL;
+        default:
+            return WRTC_NATIVE_REPR_VOID;
+    }
+}
 
 static int same_span(WrtcSourceSpan left, WrtcSourceSpan right) {
     return left.line == right.line && left.column == right.column &&
@@ -60,6 +320,17 @@ static const WrtcNativeCallEdgeIR *direct_call(
             same_span(edge->span, expression->span))
             return edge;
     }
+    return NULL;
+}
+
+static const WrtcNativeCallEdgeIR *call_edge(
+    const AotEmitter *emitter, const WrtcPyExprIR *expression) {
+    size_t index;
+    if (expression == NULL || expression->kind != WRTC_PY_EXPR_CALL)
+        return NULL;
+    for (index = 0u; index < emitter->region->call_count; index++)
+        if (same_span(emitter->region->calls[index].span, expression->span))
+            return &emitter->region->calls[index];
     return NULL;
 }
 
@@ -343,6 +614,8 @@ int wrtc_aot_emit_runtime(FILE *file) {
         "#else\n#define WRTC_AOT_UNUSED\n#endif\n"
         "#define WRTC_REGION_SLOT_COUNT 64u\n"
         "typedef struct{PyObject*values[WRTC_REGION_SLOT_COUNT];"
+        "int64_t scalar_i[WRTC_REGION_SLOT_COUNT];"
+        "double scalar_d[WRTC_REGION_SLOT_COUNT];uint64_t scalar_mask;"
         "uint64_t initialized_mask;uint64_t owned_mask;PyObject*globals;"
         "PyObject*return_value;const WrtcBoxedNativeHooks*hooks;}"
         "WrtcRegionFrame;"
@@ -390,6 +663,66 @@ static size_t slot_index(const AotEmitter *emitter, const char *name) {
     return (size_t)-1;
 }
 
+static void discover_scalar_locals(AotEmitter *emitter,
+                                   const WrtcPyStmtIR *statements,
+                                   size_t count) {
+    size_t index;
+    for (index = 0u; index < count; index++) {
+        const WrtcPyStmtIR *statement = &statements[index];
+        if (statement->kind == WRTC_PY_STMT_ASSIGN) {
+            WrtcNativeRepresentation representation =
+                statement->expression_count != 0u
+                    ? expression_scalar_representation(
+                          emitter, &statement->expressions[0])
+                    : WRTC_NATIVE_REPR_VOID;
+            size_t target;
+            for (target = 1u; target < statement->expression_count; target++) {
+                size_t slot;
+                if (statement->expressions[target].kind != WRTC_PY_EXPR_NAME)
+                    continue;
+                slot = slot_index(emitter,
+                                  statement->expressions[target].operation);
+                if (slot != (size_t)-1) {
+                    if (statement->expression_count == 2u &&
+                        scalar_representation(representation)) {
+                        if (emitter->slot_scalar_seen[slot] &&
+                            emitter->slot_representations[slot] !=
+                                representation)
+                            emitter->slot_scalar_conflict[slot] = 1u;
+                        emitter->slot_scalar_seen[slot] = 1u;
+                        emitter->slot_representations[slot] = representation;
+                    } else {
+                        emitter->slot_scalar_conflict[slot] = 1u;
+                    }
+                }
+            }
+        }
+        if ((statement->kind == WRTC_PY_STMT_AUGMENTED_ASSIGN ||
+             statement->kind == WRTC_PY_STMT_FOR) &&
+            statement->expression_count != 0u &&
+            statement->expressions[0].kind == WRTC_PY_EXPR_NAME) {
+            size_t slot = slot_index(
+                emitter, statement->expressions[0].operation);
+            if (slot != (size_t)-1)
+                emitter->slot_scalar_conflict[slot] = 1u;
+        }
+        discover_scalar_locals(emitter, statement->body,
+                               statement->body_count);
+        discover_scalar_locals(emitter, statement->orelse,
+                               statement->orelse_count);
+        discover_scalar_locals(emitter, statement->finalbody,
+                               statement->finalbody_count);
+    }
+}
+
+static void finalize_scalar_locals(AotEmitter *emitter) {
+    size_t index;
+    for (index = 0u; index < emitter->slot_count; index++)
+        if (!emitter->slot_scalar_seen[index] ||
+            emitter->slot_scalar_conflict[index])
+            emitter->slot_representations[index] = WRTC_NATIVE_REPR_VOID;
+}
+
 static int function_prefix(FILE *file, const AotEmitter *emitter,
                            const char *kind, size_t id) {
     return fprintf(file, "%s%zu_%zu_%zu", kind, emitter->class_index,
@@ -433,6 +766,524 @@ static int emit_eval_statement(FILE *file, const AotEmitter *emitter,
     return 0;
 }
 
+/* Emit a proven scalar storage operation directly into a C scalar.  The
+ * source expression is used only to locate its already-emitted owner; runtime
+ * dispatch is selected exclusively from the native operation table. */
+static int emit_direct_scalar_statement(FILE *file, AotEmitter *emitter,
+                                        const WrtcPyExprIR *expression,
+                                        const char *runtime_root,
+                                        const char *target) {
+    const WrtcNativeOperationIR *operation =
+        direct_operation(emitter, expression);
+    const WrtcNativeFieldOperationProof *proof;
+    const WrtcNativeFieldIR *field;
+    const WrtcPyExprIR *owner = NULL;
+    const char *owner_suffix = NULL;
+    size_t owner_id;
+    const char *kernel;
+    char member;
+    if (operation == NULL) return 0;
+    if ((operation->kind == WRTC_NATIVE_OP_TRUTH ||
+         operation->kind == WRTC_NATIVE_OP_SCALAR_READ) &&
+        operation->result_representation == WRTC_NATIVE_REPR_BOOL &&
+        expression->kind == WRTC_PY_EXPR_ATTRIBUTE &&
+        expression->child_count == 1u) {
+        owner = &expression->children[0];
+        owner_suffix = ".children[0]";
+    } else if (operation->kind == WRTC_NATIVE_OP_SCALAR_READ &&
+               scalar_representation(operation->result_representation) &&
+               expression->kind == WRTC_PY_EXPR_ATTRIBUTE &&
+               expression->child_count == 1u) {
+        owner = &expression->children[0];
+        owner_suffix = ".children[0]";
+    } else if (operation->kind == WRTC_NATIVE_OP_LENGTH &&
+               operation->result_representation == WRTC_NATIVE_REPR_PY_SSIZE_T &&
+               expression->child_count >= 2u &&
+               expression->children[1].kind == WRTC_PY_EXPR_ATTRIBUTE) {
+        owner = &expression->children[1].children[0];
+        owner_suffix = ".children[1].children[0]";
+    } else {
+        return 0;
+    }
+    proof = &emitter->operations->fields[operation->field_proof_index];
+    field = &emitter->program->classes[proof->class_index]
+                 .fields[proof->field_index];
+    if (field->storage_kind == WRTC_NATIVE_FIELD_SCALAR) {
+        kernel = NULL;
+        member = 's';
+    } else if (field->storage_kind == WRTC_NATIVE_FIELD_FIFO) {
+        kernel = operation->kind == WRTC_NATIVE_OP_TRUTH
+                     ? "wrtc_native_fifo_truth"
+                     : "wrtc_native_fifo_snapshot";
+        member = 'f';
+    } else if (field->storage_kind == WRTC_NATIVE_FIELD_MIN_HEAP) {
+        kernel = operation->kind == WRTC_NATIVE_OP_TRUTH
+                     ? "wrtc_native_heap_truth"
+                     : "wrtc_native_heap_snapshot";
+        member = 'h';
+    } else {
+        return 0;
+    }
+    owner_id = expression_id(emitter, owner);
+    if (owner_id == (size_t)-1 || fputs("{PyObject*wo=", file) < 0 ||
+        function_prefix(file, emitter, "wae", owner_id) < 0 ||
+        fprintf(file, "(f,&%s%s);NSO*wn;if(!wo)return -1;wn=*np%zu_%zu(wo);"
+                      "Py_DECREF(wo);if(!wn){PyErr_SetString(PyExc_AttributeError,",
+                runtime_root, owner_suffix, proof->class_index,
+                proof->field_index) < 0 ||
+        quote(file, field->name) < 0 ||
+        fputs(");return -1;}", file) < 0)
+        return -1;
+    if (field->storage_kind == WRTC_NATIVE_FIELD_SCALAR) {
+        const char *tag = operation->result_representation ==
+                                  WRTC_NATIVE_REPR_DOUBLE
+                              ? "WRTC_SCALAR_DOUBLE"
+                              : operation->result_representation ==
+                                        WRTC_NATIVE_REPR_BOOL
+                                    ? "WRTC_SCALAR_BOOL"
+                                    : "WRTC_SCALAR_INT64";
+        const char *value = operation->result_representation ==
+                                    WRTC_NATIVE_REPR_DOUBLE
+                                ? "floating"
+                                : operation->result_representation ==
+                                          WRTC_NATIVE_REPR_BOOL
+                                      ? "boolean"
+                                      : "integer";
+        if (fprintf(file, "if(wn->u.s.tag==%s)%s=wn->u.s.value.%s;"
+                          "else if(wn->u.s.tag==WRTC_SCALAR_BOXED){",
+                    tag, target, value) < 0)
+            return -1;
+        if (operation->result_representation == WRTC_NATIVE_REPR_DOUBLE) {
+            if (fprintf(file,
+                        "if(!PyFloat_CheckExact(wn->u.s.value.boxed)){"
+                        "PyErr_SetString(PyExc_TypeError,\"boxed native "
+                        "scalar violated float contract\");return -1;}"
+                        "%s=PyFloat_AS_DOUBLE(wn->u.s.value.boxed);",
+                        target) < 0)
+                return -1;
+        } else if (operation->result_representation == WRTC_NATIVE_REPR_BOOL) {
+            if (fprintf(file,
+                        "if(!PyBool_Check(wn->u.s.value.boxed)){"
+                        "PyErr_SetString(PyExc_TypeError,\"boxed native "
+                        "scalar violated bool contract\");return -1;}"
+                        "%s=(wn->u.s.value.boxed==Py_True);",
+                        target) < 0)
+                return -1;
+        } else if (fprintf(file,
+                           "if(!PyLong_CheckExact(wn->u.s.value.boxed)){"
+                           "PyErr_SetString(PyExc_TypeError,\"boxed native "
+                           "scalar violated sint contract\");return -1;}"
+                           "{long long ws_boxed=PyLong_AsLongLong("
+                           "wn->u.s.value.boxed);if(ws_boxed==-1&&"
+                           "PyErr_Occurred())return -1;%s=(int64_t)ws_boxed;}",
+                           target) < 0) {
+            return -1;
+        }
+        if (fprintf(file,
+                    "}else{PyErr_Format(PyExc_TypeError,\"native scalar "
+                    "representation changed for %%s: expected %%d, got %%d\",") < 0 ||
+            quote(file, field->name) < 0 ||
+            fprintf(file, ",(int)%s,(int)wn->u.s.tag);return -1;}}",
+                    tag) < 0)
+            return -1;
+    } else if (fprintf(file, "%s=%s(&wn->u.%c);if(%s<0)return -1;}",
+                       target, kernel, member, target) < 0) {
+        return -1;
+    }
+    return 1;
+}
+
+static int emit_scalar_expression(FILE *file, AotEmitter *emitter,
+                                  const WrtcPyExprIR *expression,
+                                  const char *runtime_root,
+                                  const char *target) {
+    WrtcNativeRepresentation representation =
+        expression_scalar_representation(emitter, expression);
+    size_t id = expression_id(emitter, expression), slot, index;
+    int direct;
+    char left[48], right[48];
+    char left_root[256], right_root[256];
+    if (!scalar_representation(representation)) return 0;
+    direct = emit_direct_scalar_statement(file, emitter, expression,
+                                          runtime_root, target);
+    if (direct != 0) return direct;
+    if (typed_heap_key_expression(emitter, expression) != NULL) {
+        const WrtcNativeFieldIR *field =
+            typed_heap_key_expression(emitter, expression);
+        size_t root_id = expression_id(emitter, &expression->children[0]);
+        if (root_id == (size_t)-1 ||
+            fputs("{PyObject*wr=", file) < 0 ||
+            function_prefix(file, emitter, "wae", root_id) < 0 ||
+            fprintf(file,
+                    "(f,&%s.children[0]),*wk;if(!wr)return -1;"
+                    "if(!%s.cached_attribute_name){Py_DECREF(wr);"
+                    "PyErr_SetString(PyExc_SystemError,"
+                    "\"heap-key attribute cache is uninitialized\");"
+                    "return -1;}wk=PyObject_GetAttr(wr,"
+                    "%s.cached_attribute_name);Py_DECREF(wr);if(!wk)"
+                    "return -1;",
+                    runtime_root, runtime_root, runtime_root) < 0)
+            return -1;
+        if (strcmp(field->heap_key_type, "float") == 0) {
+            if (fprintf(file,
+                        "if(!PyFloat_CheckExact(wk)){Py_DECREF(wk);"
+                        "PyErr_SetString(PyExc_TypeError,"
+                        "\"native heap key violated float contract\");"
+                        "return -1;}%s=PyFloat_AS_DOUBLE(wk);",
+                        target) < 0)
+                return -1;
+        } else if (strcmp(field->heap_key_type, "bool") == 0) {
+            if (fprintf(file,
+                        "if(!PyBool_Check(wk)){Py_DECREF(wk);PyErr_SetString("
+                        "PyExc_TypeError,\"native heap key violated bool "
+                        "contract\");return -1;}%s=(wk==Py_True);",
+                        target) < 0)
+                return -1;
+        } else if (fprintf(file,
+                           "if(!PyLong_CheckExact(wk)){Py_DECREF(wk);"
+                           "PyErr_SetString(PyExc_TypeError,"
+                           "\"native heap key violated int contract\");"
+                           "return -1;}{long long wv=PyLong_AsLongLong(wk);"
+                           "if(wv==-1&&PyErr_Occurred()){Py_DECREF(wk);"
+                           "return -1;}%s=(int64_t)wv;}",
+                           target) < 0) {
+            return -1;
+        }
+        return fputs("Py_DECREF(wk);}", file) < 0 ? -1 : 1;
+    }
+    switch (expression->kind) {
+        case WRTC_PY_EXPR_NAME:
+            slot = slot_index(emitter, expression->operation);
+            if (slot == (size_t)-1 ||
+                !scalar_representation(emitter->slot_representations[slot]))
+                return 0;
+            return fprintf(
+                       file,
+                       "if((f->scalar_mask&(UINT64_C(1)<<%zu))==0u){"
+                       "PyErr_SetString(PyExc_UnboundLocalError,"
+                       "\"uninitialized scalar local\");return -1;}%s=%s[%zu];",
+                       slot, target,
+                       representation == WRTC_NATIVE_REPR_DOUBLE
+                           ? "f->scalar_d" : "f->scalar_i",
+                       slot) < 0 ? -1 : 1;
+        case WRTC_PY_EXPR_CONSTANT:
+            if (representation == WRTC_NATIVE_REPR_DOUBLE) {
+                char *end = NULL;
+                double value = strtod(expression->text, &end);
+                return fprintf(file, "%s=%a;", target, value) < 0 ? -1 : 1;
+            }
+            if (representation == WRTC_NATIVE_REPR_BOOL)
+                return fprintf(file, "%s=%d;", target,
+                               strcmp(expression->text, "True") == 0) < 0
+                           ? -1 : 1;
+            {
+                char *end = NULL;
+                long long value = strtoll(expression->text, &end, 0);
+                return fprintf(file, "%s=INT64_C(%lld);", target,
+                               value) < 0 ? -1 : 1;
+            }
+        case WRTC_PY_EXPR_CALL: {
+            const WrtcNativeCallEdgeIR *edge = call_edge(emitter, expression);
+            if (edge == NULL || !edge->result_contract_proven ||
+                id == (size_t)-1)
+                return 0;
+            if (edge->call_abi == WRTC_CALL_ABI_MONOTONIC_CLOCK &&
+                expression->child_count == 1u &&
+                expression->children[0].kind == WRTC_PY_EXPR_ATTRIBUTE &&
+                expression->children[0].child_count == 1u) {
+                const WrtcPyExprIR *receiver =
+                    &expression->children[0].children[0];
+                const size_t receiver_id = expression_id(emitter, receiver);
+                const size_t receiver_slot =
+                    receiver->kind == WRTC_PY_EXPR_NAME
+                        ? slot_index(emitter, receiver->operation)
+                        : (size_t)-1;
+                if (receiver_id == (size_t)-1 ||
+                    fputs("{PyObject*ws_receiver=NULL,*ws_call=NULL,**ws_dict;"
+                          "int ws_receiver_owned=0,ws_override=0;",
+                          file) < 0)
+                    return -1;
+                if (receiver_slot != (size_t)-1 &&
+                    !scalar_representation(
+                        emitter->slot_representations[receiver_slot])) {
+                    if (fprintf(file,
+                                "if((f->initialized_mask&(UINT64_C(1)<<%zu))"
+                                "==0u){PyErr_SetString(PyExc_UnboundLocalError,"
+                                "\"uninitialized pinned-call receiver\");"
+                                "return -1;}ws_receiver=f->values[%zu];",
+                                receiver_slot, receiver_slot) < 0)
+                        return -1;
+                } else if (fputs("ws_receiver=", file) < 0 ||
+                           function_prefix(file, emitter, "wae",
+                                           receiver_id) < 0 ||
+                           fputs("(f,&", file) < 0 ||
+                           fprintf(file, "%s.children[0].children[0]);"
+                                         "if(!ws_receiver)return -1;"
+                                         "ws_receiver_owned=1;",
+                                   runtime_root) < 0) {
+                    return -1;
+                }
+                if (fprintf(
+                        file,
+                        "if(!%s.children[0].cached_attribute_name){"
+                        "if(ws_receiver_owned)Py_DECREF(ws_receiver);"
+                        "PyErr_SetString(PyExc_SystemError,\"pinned-call "
+                        "attribute cache is uninitialized\");return -1;}"
+                        "ws_dict=_PyObject_GetDictPtr(ws_receiver);"
+                        "if(ws_dict&&*ws_dict){PyObject*ws_entry="
+                        "PyDict_GetItemWithError(*ws_dict,%s.children[0]."
+                        "cached_attribute_name);ws_override=ws_entry!=NULL;"
+                        "if(!ws_entry&&PyErr_Occurred()){"
+                        "if(ws_receiver_owned)Py_DECREF(ws_receiver);"
+                        "return -1;}}if(ws_receiver_owned)"
+                        "Py_DECREF(ws_receiver);if(ws_override){ws_call=",
+                        runtime_root, runtime_root) < 0 ||
+                    function_prefix(file, emitter, "wae", id) < 0 ||
+                    fprintf(file,
+                            "(f,&%s);if(!ws_call)return -1;"
+                            "if(!PyFloat_CheckExact(ws_call)){Py_DECREF("
+                            "ws_call);PyErr_SetString(PyExc_TypeError,"
+                            "\"external call violated float return "
+                            "contract\");return -1;}%s="
+                            "PyFloat_AS_DOUBLE(ws_call);Py_DECREF(ws_call);"
+                            "}else{PyTime_t ws_time;if(PyTime_Monotonic("
+                            "&ws_time)<0)return -1;%s="
+                            "PyTime_AsSecondsDouble(ws_time);}}",
+                            runtime_root, target, target) < 0)
+                    return -1;
+                return 1;
+            }
+            if (edge->call_abi == WRTC_CALL_ABI_FLOAT_ULP) {
+                char argument[48], argument_root[256];
+                int emitted;
+                if (expression->positional_count != 1u ||
+                    expression->keyword_count != 0u ||
+                    expression->child_count != 2u ||
+                    expression_scalar_representation(
+                        emitter, &expression->children[1]) !=
+                        WRTC_NATIVE_REPR_DOUBLE)
+                    return 0;
+                (void)snprintf(argument, sizeof argument, "ws_ulp_%zu", id);
+                (void)snprintf(argument_root, sizeof argument_root,
+                               "%s.children[1]", runtime_root);
+                if (fprintf(file, "{double %s;", argument) < 0)
+                    return -1;
+                emitted = emit_scalar_expression(
+                    file, emitter, &expression->children[1], argument_root,
+                    argument);
+                if (emitted <= 0) return emitted;
+                return fprintf(
+                           file,
+                           "if(isnan(%s))%s=%s;else{double ws_abs=fabs(%s);"
+                           "if(isinf(ws_abs))%s=ws_abs;else if(ws_abs==0.0)"
+                           "%s=nextafter(0.0,1.0);else{double ws_next="
+                           "nextafter(ws_abs,INFINITY);%s=isinf(ws_next)?"
+                           "ws_abs-nextafter(ws_abs,-INFINITY):"
+                           "ws_next-ws_abs;}}}",
+                           argument, target, argument, argument, target,
+                           target, target) < 0
+                           ? -1
+                           : 1;
+            }
+            if (edge->call_abi == WRTC_CALL_ABI_FLOAT_MIN ||
+                edge->call_abi == WRTC_CALL_ABI_FLOAT_MAX) {
+                char first[48], second[48];
+                char first_root[256], second_root[256];
+                int emitted;
+                if (expression->positional_count != 2u ||
+                    expression->keyword_count != 0u ||
+                    expression->child_count != 3u ||
+                    expression_scalar_representation(
+                        emitter, &expression->children[1]) !=
+                        WRTC_NATIVE_REPR_DOUBLE ||
+                    expression_scalar_representation(
+                        emitter, &expression->children[2]) !=
+                        WRTC_NATIVE_REPR_DOUBLE)
+                    return 0;
+                (void)snprintf(first, sizeof first, "ws_first_%zu", id);
+                (void)snprintf(second, sizeof second, "ws_second_%zu", id);
+                (void)snprintf(first_root, sizeof first_root,
+                               "%s.children[1]", runtime_root);
+                (void)snprintf(second_root, sizeof second_root,
+                               "%s.children[2]", runtime_root);
+                if (fprintf(file, "{double %s,%s;", first, second) < 0)
+                    return -1;
+                emitted = emit_scalar_expression(
+                    file, emitter, &expression->children[1], first_root,
+                    first);
+                if (emitted <= 0) return emitted;
+                emitted = emit_scalar_expression(
+                    file, emitter, &expression->children[2], second_root,
+                    second);
+                if (emitted <= 0) return emitted;
+                return fprintf(
+                           file, "%s=%s%s%s?%s:%s;}", target, second,
+                           edge->call_abi == WRTC_CALL_ABI_FLOAT_MAX ? ">" : "<",
+                           first, second, first) < 0
+                           ? -1
+                           : 1;
+            }
+            if (fputs("{PyObject*ws_call=", file) < 0 ||
+                function_prefix(file, emitter, "wae", id) < 0 ||
+                fprintf(file, "(f,&%s);if(!ws_call)return -1;", runtime_root) < 0)
+                return -1;
+            if (edge->result_representation == WRTC_CALL_RESULT_DOUBLE) {
+                if (fprintf(file,
+                            "if(!PyFloat_CheckExact(ws_call)){Py_DECREF("
+                            "ws_call);PyErr_SetString(PyExc_TypeError,"
+                            "\"external call violated float return contract\");"
+                            "return -1;}%s=PyFloat_AS_DOUBLE(ws_call);",
+                            target) < 0)
+                    return -1;
+            } else if (edge->result_representation == WRTC_CALL_RESULT_BOOL) {
+                if (fprintf(file,
+                            "if(!PyBool_Check(ws_call)){Py_DECREF(ws_call);"
+                            "PyErr_SetString(PyExc_TypeError,\"external call "
+                            "violated bool return contract\");return -1;}"
+                            "%s=(ws_call==Py_True);",
+                            target) < 0)
+                    return -1;
+            } else if (edge->result_representation ==
+                       WRTC_CALL_RESULT_INT64) {
+                if (fprintf(file,
+                            "if(!PyLong_CheckExact(ws_call)){Py_DECREF("
+                            "ws_call);PyErr_SetString(PyExc_TypeError,"
+                            "\"external call violated sint return contract\");"
+                            "return -1;}{long long ws_value="
+                            "PyLong_AsLongLong(ws_call);if(ws_value==-1&&"
+                            "PyErr_Occurred()){Py_DECREF(ws_call);return -1;}"
+                            "%s=(int64_t)ws_value;}",
+                            target) < 0)
+                    return -1;
+            } else {
+                return 0;
+            }
+            return fputs("Py_DECREF(ws_call);}", file) < 0 ? -1 : 1;
+        }
+        case WRTC_PY_EXPR_UNARY:
+            if (id == (size_t)-1) return 0;
+            (void)snprintf(left, sizeof left, "ws_l_%zu", id);
+            if (fprintf(file, "{%s %s;",
+                        expression_scalar_representation(
+                            emitter, &expression->children[0]) ==
+                                WRTC_NATIVE_REPR_DOUBLE ? "double" : "int64_t",
+                        left) < 0)
+                return -1;
+            (void)snprintf(left_root, sizeof left_root, "%s.children[0]",
+                           runtime_root);
+            direct = emit_scalar_expression(file, emitter,
+                                             &expression->children[0],
+                                             left_root, left);
+            if (direct <= 0) return direct;
+            if (strcmp(expression->operation, "Not") == 0) {
+                if (fprintf(file, "%s=!%s;}", target, left) < 0) return -1;
+            } else if (strcmp(expression->operation, "USub") == 0) {
+                if (fprintf(file, "%s=-%s;}", target, left) < 0) return -1;
+            } else if (fprintf(file, "%s=%s;}", target, left) < 0) {
+                return -1;
+            }
+            return 1;
+        case WRTC_PY_EXPR_BINARY: {
+            WrtcNativeRepresentation left_rep =
+                expression_scalar_representation(
+                    emitter, &expression->children[0]);
+            WrtcNativeRepresentation right_rep =
+                expression_scalar_representation(
+                    emitter, &expression->children[1]);
+            const char *operator_text = NULL;
+            if (id == (size_t)-1) return 0;
+            (void)snprintf(left, sizeof left, "ws_l_%zu", id);
+            (void)snprintf(right, sizeof right, "ws_r_%zu", id);
+            (void)snprintf(left_root, sizeof left_root, "%s.children[0]",
+                           runtime_root);
+            (void)snprintf(right_root, sizeof right_root, "%s.children[1]",
+                           runtime_root);
+            if (fprintf(file, "{%s %s;%s %s;",
+                        left_rep == WRTC_NATIVE_REPR_DOUBLE
+                            ? "double" : "int64_t", left,
+                        right_rep == WRTC_NATIVE_REPR_DOUBLE
+                            ? "double" : "int64_t", right) < 0)
+                return -1;
+            direct = emit_scalar_expression(file, emitter,
+                                             &expression->children[0],
+                                             left_root, left);
+            if (direct <= 0) return direct;
+            direct = emit_scalar_expression(file, emitter,
+                                             &expression->children[1],
+                                             right_root, right);
+            if (direct <= 0) return direct;
+            switch (expression->binary_operation) {
+                case WRTC_PY_BINARY_ADD: operator_text = "+"; break;
+                case WRTC_PY_BINARY_SUBTRACT: operator_text = "-"; break;
+                case WRTC_PY_BINARY_MULTIPLY: operator_text = "*"; break;
+                case WRTC_PY_BINARY_TRUE_DIVIDE: operator_text = "/"; break;
+                default: return 0;
+            }
+            if (expression->binary_operation == WRTC_PY_BINARY_TRUE_DIVIDE &&
+                fprintf(file,
+                        "if(%s==0){PyErr_SetString(PyExc_ZeroDivisionError,"
+                        "\"%s\");return -1;}", right,
+                        left_rep == WRTC_NATIVE_REPR_DOUBLE ||
+                                right_rep == WRTC_NATIVE_REPR_DOUBLE
+                            ? "float division by zero" : "division by zero") < 0)
+                return -1;
+            if (fprintf(file, "%s=(double)%s%s(double)%s;}", target, left,
+                        operator_text, right) < 0)
+                return -1;
+            return 1;
+        }
+        case WRTC_PY_EXPR_COMPARE:
+            if (id == (size_t)-1) return 0;
+            if (fprintf(file, "{%s=1;", target) < 0) return -1;
+            for (index = 0u; index < expression->operation_count; index++) {
+                WrtcNativeRepresentation left_rep =
+                    expression_scalar_representation(
+                        emitter, &expression->children[index]);
+                WrtcNativeRepresentation right_rep =
+                    expression_scalar_representation(
+                        emitter, &expression->children[index + 1u]);
+                const char *operator_text = NULL;
+                (void)snprintf(left, sizeof left, "ws_l_%zu_%zu", id, index);
+                (void)snprintf(right, sizeof right, "ws_r_%zu_%zu", id, index);
+                (void)snprintf(left_root, sizeof left_root,
+                               "%s.children[%zu]", runtime_root, index);
+                (void)snprintf(right_root, sizeof right_root,
+                               "%s.children[%zu]", runtime_root, index + 1u);
+                if (fprintf(file, "%s %s;%s %s;",
+                            left_rep == WRTC_NATIVE_REPR_DOUBLE
+                                ? "double" : "int64_t", left,
+                            right_rep == WRTC_NATIVE_REPR_DOUBLE
+                                ? "double" : "int64_t", right) < 0)
+                    return -1;
+                direct = emit_scalar_expression(
+                    file, emitter, &expression->children[index],
+                    left_root, left);
+                if (direct <= 0) return direct;
+                direct = emit_scalar_expression(
+                    file, emitter, &expression->children[index + 1u],
+                    right_root, right);
+                if (direct <= 0) return direct;
+                if (strcmp(expression->operations[index], "Eq") == 0)
+                    operator_text = "==";
+                else if (strcmp(expression->operations[index], "NotEq") == 0)
+                    operator_text = "!=";
+                else if (strcmp(expression->operations[index], "Lt") == 0)
+                    operator_text = "<";
+                else if (strcmp(expression->operations[index], "LtE") == 0)
+                    operator_text = "<=";
+                else if (strcmp(expression->operations[index], "Gt") == 0)
+                    operator_text = ">";
+                else operator_text = ">=";
+                if (fprintf(file, "if(!(%s%s%s))%s=0;", left,
+                            operator_text, right, target) < 0)
+                    return -1;
+            }
+            return fputs("}", file) < 0 ? -1 : 1;
+        default:
+            return 0;
+    }
+}
+
 static int emit_expression(AotEmitter *emitter,
                            const WrtcPyExprIR *expression, size_t *result_id) {
     FILE *file = emitter->file;
@@ -448,7 +1299,9 @@ static int emit_expression(AotEmitter *emitter,
     }
     emitter->expressions[emitter->expression_count] = expression;
     emitter->expression_ids[emitter->expression_count++] = id;
-    if (fputs("static PyObject*WRTC_AOT_UNUSED ", file) < 0 ||
+    if (fputs(expression->kind == WRTC_PY_EXPR_NAME
+                  ? "static inline PyObject*WRTC_AOT_UNUSED "
+                  : "static PyObject*WRTC_AOT_UNUSED ", file) < 0 ||
         function_prefix(file, emitter, "wae", id) < 0 ||
         fputs("(WrtcRegionFrame*f,const WrtcPyExprIR*e){(void)f;(void)e;",
               file) < 0) {
@@ -678,26 +1531,83 @@ native_fail:
         expression->children[0].child_count == 1u) {
         const size_t argc = expression->positional_count +
                             expression->keyword_count;
+        const int unchecked_self =
+            native_call->target_class == emitter->class_index &&
+            native_call->target != NULL &&
+            strncmp(native_call->target, "self.", 5u) == 0;
         size_t receiver_id = expression_id(
             emitter, &expression->children[0].children[0]);
-        if (receiver_id == (size_t)-1 || fputs("PyObject*r=NULL,*recv=", file) < 0 ||
-            function_prefix(file, emitter, "wae", receiver_id) < 0 ||
-            fprintf(file, "(f,&e->children[0].children[0]),*a[%zu]={0};"
-                          "size_t i;if(!recv)return NULL;",
+        const WrtcPyExprIR *receiver_expression =
+            &expression->children[0].children[0];
+        size_t receiver_slot = receiver_expression->kind == WRTC_PY_EXPR_NAME
+                                   ? slot_index(emitter,
+                                                receiver_expression->operation)
+                                   : (size_t)-1;
+        if (receiver_id == (size_t)-1 ||
+            fprintf(file,
+                    "PyObject*r=NULL,*recv=NULL,*a[%zu]={0};"
+                    "unsigned char own_a[%zu]={0};int recv_owned=0;size_t i;",
+                    argc == 0u ? 1u : argc,
                     argc == 0u ? 1u : argc) < 0)
             goto fail;
-        for (index = 0u; index < argc; index++)
-            if (fprintf(file, "a[%zu]=", index) < 0 ||
-                function_prefix(file, emitter, "wae", children[index + 1u]) < 0 ||
-                fprintf(file, "(f,&e->children[%zu]);if(!a[%zu])goto done;",
-                        index + 1u, index) < 0)
+        if (receiver_slot != (size_t)-1 &&
+            !scalar_representation(
+                emitter->slot_representations[receiver_slot])) {
+            if (fprintf(file,
+                        "if((f->initialized_mask&(UINT64_C(1)<<%zu))==0u){"
+                        "PyErr_SetString(PyExc_UnboundLocalError,"
+                        "\"uninitialized call receiver\");return NULL;}"
+                        "recv=f->values[%zu];",
+                        receiver_slot, receiver_slot) < 0)
                 goto fail;
-        if (fprintf(file, "r=wi%zu_%zu(recv,a,%zu,e->cached_keyword_names);",
-                    native_call->target_class, native_call->target_region,
-                    expression->positional_count) < 0 ||
+        } else if (fputs("recv=", file) < 0 ||
+                   function_prefix(file, emitter, "wae", receiver_id) < 0 ||
+                   fputs("(f,&e->children[0].children[0]);if(!recv)return NULL;"
+                         "recv_owned=1;", file) < 0) {
+            goto fail;
+        }
+        for (index = 0u; index < argc; index++) {
+            const WrtcPyExprIR *argument = &expression->children[index + 1u];
+            size_t argument_slot = argument->kind == WRTC_PY_EXPR_NAME
+                                       ? slot_index(emitter,
+                                                    argument->operation)
+                                       : (size_t)-1;
+            if (argument_slot != (size_t)-1 &&
+                !scalar_representation(
+                    emitter->slot_representations[argument_slot])) {
+                if (fprintf(file,
+                            "if((f->initialized_mask&(UINT64_C(1)<<%zu))==0u){"
+                            "PyErr_SetString(PyExc_UnboundLocalError,"
+                            "\"uninitialized call argument\");goto done;}"
+                            "a[%zu]=f->values[%zu];",
+                            argument_slot, index, argument_slot) < 0)
+                    goto fail;
+            } else if (fprintf(file, "a[%zu]=", index) < 0 ||
+                       function_prefix(file, emitter, "wae",
+                                       children[index + 1u]) < 0 ||
+                       fprintf(file,
+                               "(f,&e->children[%zu]);if(!a[%zu])goto done;"
+                               "own_a[%zu]=1u;",
+                               index + 1u, index, index) < 0) {
+                goto fail;
+            }
+        }
+        if ((unchecked_self
+                 ? fprintf(file,
+                           "if(wu%zu_%zu(recv,a,%zu,e->cached_keyword_names,"
+                           "&r)<0)r=NULL;",
+                           native_call->target_class,
+                           native_call->target_region,
+                           expression->positional_count)
+                 : fprintf(file,
+                           "r=wi%zu_%zu(recv,a,%zu,e->cached_keyword_names);",
+                           native_call->target_class,
+                           native_call->target_region,
+                           expression->positional_count)) < 0 ||
             (argc != 0u && fputs("done:", file) < 0) ||
-            fprintf(file, "for(i=0u;i<%zu;i++)Py_XDECREF(a[i]);"
-                          "Py_DECREF(recv);return r;}", argc) < 0)
+            fprintf(file, "for(i=0u;i<%zu;i++)if(own_a[i])Py_DECREF(a[i]);"
+                          "if(recv_owned)Py_DECREF(recv);"
+                          "return r;}", argc) < 0)
             goto fail;
         free(children);
         *result_id = id;
@@ -742,20 +1652,100 @@ native_fail:
         case WRTC_PY_EXPR_NAME:
             slot = slot_index(emitter, expression->operation);
             if (slot != (size_t)-1) {
-                if (fprintf(file, "return wafl(f,%zu,", slot) < 0 ||
-                    quote(file, expression->operation) < 0 ||
-                    fputs(");}", file) < 0) goto fail;
+                const WrtcNativeRepresentation representation =
+                    emitter->slot_representations[slot];
+                if (scalar_representation(representation)) {
+                    if (fprintf(file, "if((f->scalar_mask&(UINT64_C(1)<<%zu))"
+                                      "==0u){PyErr_Format(PyExc_UnboundLocalError,"
+                                      "\"cannot access uninitialized scalar local\");"
+                                      "return NULL;}", slot) < 0)
+                        goto fail;
+                    if (representation == WRTC_NATIVE_REPR_DOUBLE) {
+                        if (fprintf(file, "return PyFloat_FromDouble(f->scalar_d[%zu]);}",
+                                    slot) < 0) goto fail;
+                    } else if (representation == WRTC_NATIVE_REPR_BOOL) {
+                        if (fprintf(file, "return PyBool_FromLong((int)f->scalar_i[%zu]);}",
+                                    slot) < 0) goto fail;
+                    } else if (fprintf(file, "return PyLong_FromLongLong((long long)"
+                                             "f->scalar_i[%zu]);}", slot) < 0) {
+                        goto fail;
+                    }
+                } else if (fprintf(file, "return wafl(f,%zu,", slot) < 0 ||
+                           quote(file, expression->operation) < 0 ||
+                           fputs(");}", file) < 0) goto fail;
             } else if (fputs("return wafg(f,e->operation);}", file) < 0) {
                 goto fail;
             }
             break;
         case WRTC_PY_EXPR_ATTRIBUTE:
-            if (fputs("PyObject*o=", file) < 0 ||
-                emit_eval_child(file, emitter, children[0], 0u) < 0 ||
-                fputs(",*r;if(!o)return NULL;r=PyObject_GetAttrString(o,"
-                      "e->operation);Py_DECREF(o);return r;}", file) < 0)
+        {
+            const WrtcPyExprIR *owner_expression = &expression->children[0];
+            size_t field_class = (size_t)-1, field_index = (size_t)-1;
+            const WrtcNativeFieldIR *object_field =
+                emitter->direct
+                    ? direct_object_field(emitter, expression, &field_class,
+                                          &field_index)
+                    : NULL;
+            size_t owner_slot = owner_expression->kind == WRTC_PY_EXPR_NAME
+                                    ? slot_index(emitter,
+                                                 owner_expression->operation)
+                                    : (size_t)-1;
+            if (object_field != NULL && owner_slot != (size_t)-1 &&
+                !scalar_representation(
+                    emitter->slot_representations[owner_slot])) {
+                const size_t manifest = first_region_manifest(
+                    emitter->program, field_class);
+                if (fprintf(file,
+                            "PyObject*o,*r;WrtcSchedulerContext wc;"
+                            "if((f->initialized_mask&(UINT64_C(1)<<%zu))==0u){"
+                            "PyErr_SetString(PyExc_UnboundLocalError,"
+                            "\"uninitialized native field owner\");"
+                            "return NULL;}o=f->values[%zu];if(wg(o,%zu,%zu,"
+                            "&wc)){H%zu*d=(H%zu*)PyObject_GetTypeData(o,"
+                            "dt(o,%zu));if(!d->f%zu){PyErr_SetString("
+                            "PyExc_AttributeError,",
+                            owner_slot, owner_slot, field_class, manifest,
+                            field_class, field_class, field_class,
+                            field_index) < 0 ||
+                    quote(file, object_field->name) < 0 ||
+                    fputs(");return NULL;}return Py_NewRef(d->f", file) < 0 ||
+                    fprintf(file,
+                            "%zu);}if(!e->cached_attribute_name){"
+                            "PyErr_SetString(PyExc_SystemError,"
+                            "\"AOT attribute-name cache is uninitialized\");"
+                            "return NULL;}r=PyObject_GetAttr(o,"
+                            "e->cached_attribute_name);return r;}",
+                            field_index) < 0)
+                    goto fail;
+                break;
+            }
+            if (owner_slot != (size_t)-1 &&
+                !scalar_representation(
+                    emitter->slot_representations[owner_slot])) {
+                if (fprintf(file,
+                            "PyObject*o,*r;if((f->initialized_mask&"
+                            "(UINT64_C(1)<<%zu))==0u){PyErr_SetString("
+                            "PyExc_UnboundLocalError,"
+                            "\"uninitialized attribute owner\");return NULL;}"
+                            "if(!e->cached_attribute_name){PyErr_SetString("
+                            "PyExc_SystemError,\"AOT attribute-name cache is "
+                            "uninitialized\");return NULL;}o=f->values[%zu];"
+                            "r=PyObject_GetAttr(o,e->cached_attribute_name);"
+                            "return r;}",
+                            owner_slot, owner_slot) < 0)
+                    goto fail;
+            } else if (fputs("PyObject*o=", file) < 0 ||
+                       emit_eval_child(file, emitter, children[0], 0u) < 0 ||
+                       fputs(",*r;if(!o)return NULL;if(!e->cached_attribute_name){"
+                             "Py_DECREF(o);PyErr_SetString(PyExc_SystemError,"
+                             "\"AOT attribute-name cache is uninitialized\");"
+                             "return NULL;}r=PyObject_GetAttr(o,"
+                             "e->cached_attribute_name);Py_DECREF(o);return r;}",
+                             file) < 0) {
                 goto fail;
+            }
             break;
+        }
         case WRTC_PY_EXPR_CONSTANT:
             if (fputs("(void)f;if(!e->cached_constant){PyErr_SetString("
                       "PyExc_SystemError,\"AOT constant cache is "
@@ -766,6 +1756,133 @@ native_fail:
         case WRTC_PY_EXPR_CALL: {
             const size_t count = expression->positional_count +
                                  expression->keyword_count;
+            if (expression->child_count != 0u &&
+                expression->children[0].kind == WRTC_PY_EXPR_ATTRIBUTE &&
+                expression->children[0].child_count == 1u) {
+                const WrtcPyExprIR *owner_expression =
+                    &expression->children[0].children[0];
+                size_t owner_field_class = (size_t)-1;
+                size_t owner_field_index = (size_t)-1;
+                const WrtcNativeFieldIR *owner_field =
+                    emitter->direct
+                        ? direct_object_field(
+                              emitter, owner_expression,
+                              &owner_field_class, &owner_field_index)
+                        : NULL;
+                size_t owner_id = expression_id(emitter, owner_expression);
+                size_t owner_slot = owner_expression->kind == WRTC_PY_EXPR_NAME
+                                        ? slot_index(
+                                              emitter,
+                                              owner_expression->operation)
+                                        : (size_t)-1;
+                if (owner_id == (size_t)-1 ||
+                    fprintf(file,
+                            "PyObject*owner=NULL,*a[%zu]={0},*r=NULL;"
+                            "unsigned char own_a[%zu]={0};int owner_owned=0;"
+                            "size_t i;if(!e->children[0].cached_attribute_name){"
+                            "PyErr_SetString(PyExc_SystemError,"
+                            "\"AOT attribute-name cache is uninitialized\");"
+                            "return NULL;}",
+                            count + 1u, count == 0u ? 1u : count) < 0)
+                    goto fail;
+                if (owner_field != NULL &&
+                    owner_expression->children[0].kind == WRTC_PY_EXPR_NAME) {
+                    size_t root_slot = slot_index(
+                        emitter,
+                        owner_expression->children[0].operation);
+                    size_t manifest = first_region_manifest(
+                        emitter->program, owner_field_class);
+                    if (root_slot == (size_t)-1 ||
+                        scalar_representation(
+                            emitter->slot_representations[root_slot]) ||
+                        fprintf(file,
+                                "if((f->initialized_mask&(UINT64_C(1)<<%zu))"
+                                "==0u){PyErr_SetString("
+                                "PyExc_UnboundLocalError,"
+                                "\"uninitialized component owner\");"
+                                "return NULL;}{PyObject*root=f->values[%zu];"
+                                "WrtcSchedulerContext wc;if(wg(root,%zu,%zu,"
+                                "&wc)){H%zu*d=(H%zu*)PyObject_GetTypeData("
+                                "root,dt(root,%zu));if(!d->f%zu){"
+                                "PyErr_SetString(PyExc_AttributeError,",
+                                root_slot, root_slot, owner_field_class,
+                                manifest, owner_field_class,
+                                owner_field_class, owner_field_class,
+                                owner_field_index) < 0 ||
+                        quote(file, owner_field->name) < 0 ||
+                        fprintf(file,
+                                ");return NULL;}owner=d->f%zu;}else{owner=",
+                                owner_field_index) < 0 ||
+                        function_prefix(file, emitter, "wae", owner_id) < 0 ||
+                        fputs("(f,&e->children[0].children[0]);if(!owner)"
+                              "return NULL;owner_owned=1;}}a[0]=owner;",
+                              file) < 0)
+                        goto fail;
+                } else if (owner_slot != (size_t)-1 &&
+                    !scalar_representation(
+                        emitter->slot_representations[owner_slot])) {
+                    if (fprintf(file,
+                                "if((f->initialized_mask&(UINT64_C(1)<<%zu))"
+                                "==0u){PyErr_SetString("
+                                "PyExc_UnboundLocalError,"
+                                "\"uninitialized method receiver\");"
+                                "return NULL;}owner=f->values[%zu];a[0]=owner;",
+                                owner_slot, owner_slot) < 0)
+                        goto fail;
+                } else if (fputs("owner=", file) < 0 ||
+                           function_prefix(file, emitter, "wae", owner_id) < 0 ||
+                           fputs("(f,&e->children[0].children[0]);"
+                                 "if(!owner)return NULL;owner_owned=1;a[0]=owner;",
+                                 file) < 0) {
+                    goto fail;
+                }
+                for (index = 0u; index < count; index++) {
+                    const WrtcPyExprIR *argument =
+                        &expression->children[index + 1u];
+                    size_t argument_slot =
+                        argument->kind == WRTC_PY_EXPR_NAME
+                            ? slot_index(emitter, argument->operation)
+                            : (size_t)-1;
+                    if (argument_slot != (size_t)-1 &&
+                        !scalar_representation(
+                            emitter->slot_representations[argument_slot])) {
+                        if (fprintf(file,
+                                    "if((f->initialized_mask&(UINT64_C(1)<<%zu))"
+                                    "==0u){PyErr_SetString("
+                                    "PyExc_UnboundLocalError,"
+                                    "\"uninitialized method argument\");"
+                                    "goto done;}a[%zu]=f->values[%zu];",
+                                    argument_slot, index + 1u,
+                                    argument_slot) < 0)
+                            goto fail;
+                    } else if (fprintf(file, "a[%zu]=", index + 1u) < 0 ||
+                               emit_eval_child(file, emitter,
+                                               children[index + 1u],
+                                               index + 1u) < 0 ||
+                               fprintf(file,
+                                       ";if(!a[%zu])goto done;own_a[%zu]=1u;",
+                                       index + 1u, index) < 0) {
+                        goto fail;
+                    }
+                }
+                if ((emitter->direct &&
+                     fputs("wrtc_native_allocation_pause();", file) < 0) ||
+                    fprintf(file,
+                            "r=PyObject_VectorcallMethod("
+                            "e->children[0].cached_attribute_name,a,%zu,"
+                            "e->cached_keyword_names);",
+                            expression->positional_count + 1u) < 0 ||
+                    (emitter->direct &&
+                     fputs("wrtc_native_allocation_resume();", file) < 0) ||
+                    (count != 0u && fputs("done:", file) < 0) ||
+                    fprintf(file,
+                            "for(i=0u;i<%zu;i++)if(own_a[i])"
+                            "Py_DECREF(a[i+1u]);if(owner_owned)"
+                            "Py_DECREF(owner);return r;}",
+                            count) < 0)
+                    goto fail;
+                break;
+            }
             if (fputs("PyObject*c=", file) < 0 ||
                 emit_eval_child(file, emitter, children[0], 0u) < 0 ||
                 fprintf(file, ",*a[%zu]={0},*r=NULL;size_t i;", count == 0u ? 1u : count) < 0 ||
@@ -977,8 +2094,12 @@ static int emit_target(AotEmitter *emitter, const WrtcPyExprIR *target,
         case WRTC_PY_EXPR_ATTRIBUTE:
             if (fputs("PyObject*o=", file) < 0 ||
                 emit_eval_child(file, emitter, owner, 0u) < 0 ||
-                fputs(";int z;if(!o)return -1;z=PyObject_SetAttrString(o,"
-                      "t->operation,v);Py_DECREF(o);return z;}", file) < 0)
+                fputs(";int z;if(!o)return -1;if(!t->cached_attribute_name){"
+                      "Py_DECREF(o);PyErr_SetString(PyExc_SystemError,"
+                      "\"AOT attribute-name cache is uninitialized\");"
+                      "return -1;}z=PyObject_SetAttr(o,"
+                      "t->cached_attribute_name,v);Py_DECREF(o);return z;}",
+                      file) < 0)
                 goto fail;
             break;
         case WRTC_PY_EXPR_SUBSCRIPT:
@@ -992,8 +2113,23 @@ static int emit_target(AotEmitter *emitter, const WrtcPyExprIR *target,
             break;
         case WRTC_PY_EXPR_TUPLE:
         case WRTC_PY_EXPR_LIST:
-            if (fputs("PyObject*i=PyObject_GetIter(v),*x,*extra;size_t n;"
-                      "if(!i)return -1;", file) < 0)
+            if (fprintf(file,
+                        "PyObject*i=NULL,*x,*extra;size_t n;if((PyTuple_CheckExact(v)"
+                        "&&PyTuple_GET_SIZE(v)==%zu)||(PyList_CheckExact(v)&&"
+                        "PyList_GET_SIZE(v)==%zu)){",
+                        target->child_count, target->child_count) < 0)
+                goto fail;
+            for (index = 0u; index < target->child_count; index++) {
+                if (fputs("x=PyTuple_CheckExact(v)?PyTuple_GET_ITEM(v,", file) < 0 ||
+                    fprintf(file, "%zu):PyList_GET_ITEM(v,%zu);if(", index,
+                            index) < 0 ||
+                    function_prefix(file, emitter, "wat", children[index]) < 0 ||
+                    fprintf(file, "(f,&t->children[%zu],x)<0)return -1;",
+                            index) < 0)
+                    goto fail;
+            }
+            if (fputs("return 0;}i=PyObject_GetIter(v);if(!i)return -1;",
+                      file) < 0)
                 goto fail;
             for (index = 0u; index < target->child_count; index++) {
                 if (fprintf(file, "x=PyIter_Next(i);if(!x){Py_DECREF(i);"
@@ -1098,7 +2234,7 @@ static int emit_statement(AotEmitter *emitter,
             goto fail;
     }
     id = emitter->statement_id++;
-    if (fputs("static int ", file) < 0 ||
+    if (fputs("static inline int ", file) < 0 ||
         function_prefix(file, emitter, "wax", id) < 0 ||
         fputs("(WrtcRegionFrame*f,const WrtcPyStmtIR*s,WrtcFlow*flow){"
               "PyObject*v=NULL;(void)f;(void)s;(void)v;"
@@ -1106,12 +2242,128 @@ static int emit_statement(AotEmitter *emitter,
         goto fail;
     switch (statement->kind) {
         case WRTC_PY_STMT_EXPR:
+        {
+            const WrtcNativeCallEdgeIR *call =
+                direct_call(emitter, &statement->expressions[0]);
+            const WrtcPyExprIR *expression = &statement->expressions[0];
+            if (call != NULL && expression->child_count != 0u &&
+                expression->children[0].kind == WRTC_PY_EXPR_ATTRIBUTE &&
+                expression->children[0].child_count == 1u) {
+                const size_t argc = expression->positional_count +
+                                    expression->keyword_count;
+                const char *entry =
+                    call->target_class == emitter->class_index &&
+                            call->target != NULL &&
+                            strncmp(call->target, "self.", 5u) == 0
+                        ? "wu" : "wv";
+                size_t receiver_id = expression_id(
+                    emitter, &expression->children[0].children[0]);
+                const WrtcPyExprIR *receiver_expression =
+                    &expression->children[0].children[0];
+                size_t receiver_slot =
+                    receiver_expression->kind == WRTC_PY_EXPR_NAME
+                        ? slot_index(emitter, receiver_expression->operation)
+                        : (size_t)-1;
+                if (receiver_id == (size_t)-1 ||
+                    fprintf(file,
+                            "{int z=-1;PyObject*recv=NULL,*a[%zu]={0};"
+                            "unsigned char own_a[%zu]={0};int recv_owned=0;"
+                            "size_t i;",
+                            argc == 0u ? 1u : argc,
+                            argc == 0u ? 1u : argc) < 0)
+                    goto fail;
+                if (receiver_slot != (size_t)-1 &&
+                    !scalar_representation(
+                        emitter->slot_representations[receiver_slot])) {
+                    if (fprintf(file,
+                                "if((f->initialized_mask&(UINT64_C(1)<<%zu))"
+                                "==0u){PyErr_SetString(PyExc_UnboundLocalError,"
+                                "\"uninitialized call receiver\");return -1;}"
+                                "recv=f->values[%zu];",
+                                receiver_slot, receiver_slot) < 0)
+                        goto fail;
+                } else if (fputs("recv=", file) < 0 ||
+                           function_prefix(file, emitter, "wae", receiver_id) < 0 ||
+                           fputs("(f,&s->expressions[0].children[0].children[0]);"
+                                 "if(!recv)return -1;recv_owned=1;",
+                                 file) < 0) {
+                    goto fail;
+                }
+                for (index = 0u; index < argc; index++) {
+                    const WrtcPyExprIR *argument =
+                        &expression->children[index + 1u];
+                    size_t argument_id = expression_id(emitter, argument);
+                    size_t argument_slot =
+                        argument->kind == WRTC_PY_EXPR_NAME
+                            ? slot_index(emitter, argument->operation)
+                            : (size_t)-1;
+                    if (argument_id == (size_t)-1) goto fail;
+                    if (argument_slot != (size_t)-1 &&
+                        !scalar_representation(
+                            emitter->slot_representations[argument_slot])) {
+                        if (fprintf(file,
+                                    "if((f->initialized_mask&(UINT64_C(1)<<%zu))"
+                                    "==0u){PyErr_SetString("
+                                    "PyExc_UnboundLocalError,"
+                                    "\"uninitialized call argument\");"
+                                    "goto done;}a[%zu]=f->values[%zu];",
+                                    argument_slot, index, argument_slot) < 0)
+                            goto fail;
+                    } else if (fprintf(file, "a[%zu]=", index) < 0 ||
+                               function_prefix(file, emitter, "wae",
+                                               argument_id) < 0 ||
+                               fprintf(file,
+                                       "(f,&s->expressions[0].children[%zu]);"
+                                       "if(!a[%zu])goto done;own_a[%zu]=1u;",
+                                       index + 1u, index, index) < 0) {
+                        goto fail;
+                    }
+                }
+                if (fprintf(file,
+                            "if(%s%zu_%zu(recv,a,%zu,"
+                            "s->expressions[0].cached_keyword_names,NULL)<0)"
+                            "goto done;z=0;done:for(i=0u;i<%zu;i++)"
+                            "if(own_a[i])Py_DECREF(a[i]);"
+                            "if(recv_owned)Py_DECREF(recv);"
+                            "return z;}}",
+                            entry, call->target_class, call->target_region,
+                            expression->positional_count, argc) < 0)
+                    goto fail;
+                break;
+            }
             if (fputs("v=", file) < 0 ||
                 emit_eval_statement(file, emitter, expressions[0], 0u) < 0 ||
                 fputs(";if(!v)return -1;Py_DECREF(v);return 0;}", file) < 0)
                 goto fail;
             break;
+        }
         case WRTC_PY_STMT_ASSIGN:
+            if (statement->expression_count == 2u &&
+                statement->expressions[1].kind == WRTC_PY_EXPR_NAME) {
+                char target[64];
+                int typed;
+                slot = slot_index(emitter,
+                                  statement->expressions[1].operation);
+                if (slot != (size_t)-1 && scalar_representation(
+                        emitter->slot_representations[slot])) {
+                    (void)snprintf(
+                        target, sizeof target,
+                        emitter->slot_representations[slot] ==
+                                WRTC_NATIVE_REPR_DOUBLE
+                            ? "f->scalar_d[%zu]" : "f->scalar_i[%zu]",
+                        slot);
+                    typed = emit_scalar_expression(
+                        file, emitter, &statement->expressions[0],
+                        "s->expressions[0]", target);
+                    if (typed < 0) goto fail;
+                    if (typed) {
+                        if (fprintf(file, "f->scalar_mask|=UINT64_C(1)<<%zu;"
+                                          "return 0;}", slot) < 0)
+                            goto fail;
+                        break;
+                    }
+                }
+            }
             if (fputs("v=", file) < 0 ||
                 emit_eval_statement(file, emitter, expressions[0], 0u) < 0 ||
                 fputs(";if(!v)return -1;", file) < 0)
@@ -1140,21 +2392,42 @@ static int emit_statement(AotEmitter *emitter,
                 goto fail;
             break;
         case WRTC_PY_STMT_IF:
-            if (fputs("v=", file) < 0 ||
-                emit_eval_statement(file, emitter, expressions[0], 0u) < 0 ||
-                fputs(";if(!v)return -1;{int t=PyObject_IsTrue(v);"
-                      "Py_DECREF(v);if(t<0)return -1;if(t)return ", file) < 0 ||
+        {
+            int typed;
+            if (fputs("{int t;", file) < 0) goto fail;
+            typed = emit_scalar_expression(
+                file, emitter, &statement->expressions[0],
+                "s->expressions[0]", "t");
+            if (typed < 0) goto fail;
+            if (!typed &&
+                (fputs("v=", file) < 0 ||
+                 emit_eval_statement(file, emitter, expressions[0], 0u) < 0 ||
+                 fputs(";if(!v)return -1;t=PyObject_IsTrue(v);"
+                       "Py_DECREF(v);if(t<0)return -1;", file) < 0))
+                goto fail;
+            if (fputs("if(t)return ", file) < 0 ||
                 function_prefix(file, emitter, "was", body) < 0 ||
                 fputs("(f,s->body,flow);return ", file) < 0 ||
                 function_prefix(file, emitter, "was", orelse) < 0 ||
                 fputs("(f,s->orelse,flow);}}", file) < 0)
                 goto fail;
             break;
+        }
         case WRTC_PY_STMT_WHILE:
-            if (fputs("for(;;){int t;v=", file) < 0 ||
-                emit_eval_statement(file, emitter, expressions[0], 0u) < 0 ||
-                fputs(";if(!v)return -1;t=PyObject_IsTrue(v);Py_DECREF(v);"
-                      "if(t<0)return -1;if(!t)return ", file) < 0 ||
+        {
+            int typed;
+            if (fputs("for(;;){int t;", file) < 0) goto fail;
+            typed = emit_scalar_expression(
+                file, emitter, &statement->expressions[0],
+                "s->expressions[0]", "t");
+            if (typed < 0) goto fail;
+            if (!typed &&
+                (fputs("v=", file) < 0 ||
+                 emit_eval_statement(file, emitter, expressions[0], 0u) < 0 ||
+                 fputs(";if(!v)return -1;t=PyObject_IsTrue(v);Py_DECREF(v);"
+                       "if(t<0)return -1;", file) < 0))
+                goto fail;
+            if (fputs("if(!t)return ", file) < 0 ||
                 function_prefix(file, emitter, "was", orelse) < 0 ||
                 fputs("(f,s->orelse,flow);if(", file) < 0 ||
                 function_prefix(file, emitter, "was", body) < 0 ||
@@ -1163,6 +2436,7 @@ static int emit_statement(AotEmitter *emitter,
                       "return 0;*flow=WRTC_FLOW_NORMAL;}}", file) < 0)
                 goto fail;
             break;
+        }
         case WRTC_PY_STMT_FOR:
             if (statement->iterator_is_range &&
                 statement->expressions[0].kind == WRTC_PY_EXPR_NAME &&
@@ -1174,13 +2448,45 @@ static int emit_statement(AotEmitter *emitter,
                 statement->expressions[1].child_count == 2u) {
                 const size_t count_id = expression_id(
                     emitter, &statement->expressions[1].children[1]);
+                int typed;
                 if (count_id == (size_t)-1 ||
-                    fputs("{Py_ssize_t wi,wn;int broke=0;v=", file) < 0 ||
-                    function_prefix(file, emitter, "wae", count_id) < 0 ||
-                    fputs("(f,&s->expressions[1].children[1]);if(!v)return -1;"
-                          "wn=PyNumber_AsSsize_t(v,PyExc_OverflowError);"
-                          "Py_DECREF(v);if(wn==-1&&PyErr_Occurred())return -1;"
-                          "for(wi=0;wi<wn;wi++){if(", file) < 0 ||
+                    fputs("{Py_ssize_t wi,wn;int broke=0;", file) < 0)
+                    goto fail;
+                typed = emit_scalar_expression(
+                    file, emitter, &statement->expressions[1].children[1],
+                    "s->expressions[1].children[1]", "wn");
+                if (typed < 0) goto fail;
+                if (!typed &&
+                    statement->expressions[1].children[1].kind ==
+                        WRTC_PY_EXPR_NAME) {
+                    size_t scalar_slot = slot_index(
+                        emitter,
+                        statement->expressions[1].children[1].operation);
+                    if (scalar_slot != (size_t)-1 &&
+                        scalar_representation(
+                            emitter->slot_representations[scalar_slot]) &&
+                        emitter->slot_representations[scalar_slot] !=
+                            WRTC_NATIVE_REPR_DOUBLE) {
+                        if (fprintf(file,
+                                    "if((f->scalar_mask&(UINT64_C(1)<<%zu))"
+                                    "==0u){PyErr_SetString("
+                                    "PyExc_UnboundLocalError,"
+                                    "\"uninitialized scalar loop bound\");"
+                                    "return -1;}wn=(Py_ssize_t)f->scalar_i[%zu];",
+                                    scalar_slot, scalar_slot) < 0)
+                            goto fail;
+                        typed = 1;
+                    }
+                }
+                if (!typed &&
+                    (fputs("v=", file) < 0 ||
+                     function_prefix(file, emitter, "wae", count_id) < 0 ||
+                     fputs("(f,&s->expressions[1].children[1]);if(!v)return -1;"
+                           "wn=PyNumber_AsSsize_t(v,PyExc_OverflowError);"
+                           "Py_DECREF(v);if(wn==-1&&PyErr_Occurred())return -1;",
+                           file) < 0))
+                    goto fail;
+                if (fputs("for(wi=0;wi<wn;wi++){if(", file) < 0 ||
                     function_prefix(file, emitter, "was", body) < 0 ||
                     fputs("(f,s->body,flow)<0)return -1;"
                           "if(*flow==WRTC_FLOW_BREAK){*flow=WRTC_FLOW_NORMAL;"
@@ -1191,9 +2497,23 @@ static int emit_statement(AotEmitter *emitter,
                     goto fail;
                 break;
             }
-            if (fputs("{PyObject*i,*x;int broke=0;v=", file) < 0 ||
+            if (fputs("{PyObject*i,*x;Py_ssize_t wi;int broke=0;v=", file) < 0 ||
                 emit_eval_statement(file, emitter, expressions[1], 1u) < 0 ||
-                fputs(";if(!v)return -1;i=PyObject_GetIter(v);Py_DECREF(v);"
+                fputs(";if(!v)return -1;if(PyList_CheckExact(v)){"
+                      "for(wi=0;wi<PyList_GET_SIZE(v);wi++){"
+                      "x=Py_NewRef(PyList_GET_ITEM(v,wi));if(", file) < 0 ||
+                function_prefix(file, emitter, "wat", targets[0]) < 0 ||
+                fputs("(f,&s->expressions[0],x)<0){Py_DECREF(x);Py_DECREF(v);"
+                      "return -1;}Py_DECREF(x);if(", file) < 0 ||
+                function_prefix(file, emitter, "was", body) < 0 ||
+                fputs("(f,s->body,flow)<0){Py_DECREF(v);return -1;}"
+                      "if(*flow==WRTC_FLOW_BREAK){*flow=WRTC_FLOW_NORMAL;"
+                      "broke=1;break;}if(*flow==WRTC_FLOW_RETURN){Py_DECREF(v);"
+                      "return 0;}*flow=WRTC_FLOW_NORMAL;}Py_DECREF(v);"
+                      "if(!broke)return ", file) < 0 ||
+                function_prefix(file, emitter, "was", orelse) < 0 ||
+                fputs("(f,s->orelse,flow);return 0;}"
+                      "i=PyObject_GetIter(v);Py_DECREF(v);"
                       "if(!i)return -1;for(;;){x=PyIter_Next(i);if(!x){"
                       "Py_DECREF(i);if(PyErr_Occurred())return -1;break;}if(",
                       file) < 0 ||
@@ -1349,7 +2669,7 @@ static int emit_suite(AotEmitter *emitter, const WrtcPyStmtIR *statements,
             return -1;
         }
     id = emitter->suite_id++;
-    if (fputs("static int WRTC_AOT_UNUSED ", file) < 0 ||
+    if (fputs("static inline int WRTC_AOT_UNUSED ", file) < 0 ||
         function_prefix(file, emitter, "was", id) < 0 ||
         fputs("(WrtcRegionFrame*f,const WrtcPyStmtIR*s,WrtcFlow*flow){"
               "(void)f;(void)s;",
@@ -1412,6 +2732,9 @@ int wrtc_aot_emit_region(FILE *file, size_t class_index, size_t region_index,
     for (index = 0u; index < region->body->local_count; index++)
         if (add_slot(&emitter, region->body->local_names[index]) < 0)
             return -1;
+    discover_scalar_locals(&emitter, region->body->statements,
+                           region->body->statement_count);
+    finalize_scalar_locals(&emitter);
     if (emit_suite(&emitter, region->body->statements,
                    region->body->statement_count, &root) < 0)
         return -1;
@@ -1449,14 +2772,14 @@ int wrtc_aot_emit_region(FILE *file, size_t class_index, size_t region_index,
                 return -1;
         if (fputs("return wafg(f,n);}", file) < 0) return -1;
     }
-    if (fputs("static int ", file) < 0 ||
+    if (fputs("static inline int ", file) < 0 ||
         function_prefix(file, &emitter, "wad", 0u) < 0 ||
         fputs("(PyObject*self,PyObject*const*args,Py_ssize_t nargs,"
               "PyObject*kwnames,const WrtcBoxedNativeHooks*hooks,"
               "PyObject**out){WrtcRegionFrame f;"
               "WrtcFlow flow=WRTC_FLOW_NORMAL;int z=-1;(void)args;", file) < 0 ||
         fprintf(file, "f.globals=%s;", globals_symbol) < 0 ||
-        fputs("f.initialized_mask=0u;f.owned_mask=0u;"
+        fputs("f.scalar_mask=0u;f.initialized_mask=0u;f.owned_mask=0u;"
               "f.return_value=NULL;f.hooks=hooks;", file) < 0 ||
         fputs("if(!f.globals){PyErr_SetString(PyExc_SystemError,"
               "\"AOT globals are unavailable\");return -1;}"
@@ -1507,8 +2830,9 @@ int wrtc_aot_emit_region(FILE *file, size_t class_index, size_t region_index,
                 class_index, region_index) < 0 ||
         fputs("if(flow==WRTC_FLOW_BREAK||flow==WRTC_FLOW_CONTINUE){"
               "PyErr_SetString(PyExc_SyntaxError,\"loop control escaped AOT "
-              "region\");goto done;}*out=f.return_value?f.return_value:"
-              "Py_NewRef(Py_None);f.return_value=NULL;z=0;done:wafc(&f);"
+              "region\");goto done;}if(out){*out=f.return_value?f.return_value:"
+              "Py_NewRef(Py_None);f.return_value=NULL;}else{"
+              "Py_CLEAR(f.return_value);}z=0;done:wafc(&f);"
               "return z;}", file) < 0)
         return -1;
     return 0;

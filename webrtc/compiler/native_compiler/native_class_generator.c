@@ -1525,18 +1525,29 @@ static int emit_class(FILE *file, const char *module,
             const size_t direct_manifest_index = region_manifest_index(
                 program, class_index, region_index);
             if (fprintf(file,
+                    "static inline int WRTC_AOT_UNUSED wu%zu_%zu(PyObject*self,"
+                    "PyObject*const*args,Py_ssize_t nargs,PyObject*kwnames,"
+                    "PyObject**out){int status=wad%zu_%zu_0(self,args,nargs,"
+                    "kwnames,NULL,out);if(status>0)PyErr_SetString("
+                    "PyExc_SystemError,\"invalid arguments reached direct "
+                    "internal ABI\");return status==0?0:-1;}"
+                    "static int WRTC_AOT_UNUSED wv%zu_%zu(PyObject*self,"
+                    "PyObject*const*args,Py_ssize_t nargs,PyObject*kwnames,"
+                    "PyObject**out){WrtcSchedulerContext context;PyObject*r;"
+                    "if(!wg(self,%zu,%zu,&context)){"
+                    "r=wf(self,%zu,args,nargs,kwnames);if(!r)return -1;"
+                    "if(out)*out=r;else Py_DECREF(r);return 0;}"
+                    "return wu%zu_%zu(self,args,nargs,kwnames,out);}"
                     "static PyObject*WRTC_AOT_UNUSED wi%zu_%zu(PyObject*self,"
                     "PyObject*const*args,Py_ssize_t nargs,PyObject*kwnames){"
-                    "PyObject*result=NULL;WrtcSchedulerContext context;int status;"
-                    "if(!wg(self,%zu,%zu,&context))return wf(self,%zu,args,nargs,kwnames);"
-                    "status=wad%zu_%zu_0(self,args,"
-                    "nargs,kwnames,NULL,&result);if(status==0)return result;"
-                    "if(status>0)PyErr_SetString(PyExc_SystemError,"
-                    "\"invalid arguments reached direct internal ABI\");"
-                    "return NULL;}\n",
+                    "PyObject*result=NULL;if(wv%zu_%zu(self,args,nargs,kwnames,"
+                    "&result)<0)return NULL;return result;}\n",
+                    class_index, region_index, class_index, region_index,
                     class_index, region_index, class_index,
                     direct_manifest_index, direct_manifest_index,
-                    class_index, region_index) < 0)
+                    class_index, region_index,
+                    class_index, region_index, class_index,
+                    region_index) < 0)
                 return -1;
         }
         if (fprintf(file,
@@ -1606,6 +1617,15 @@ static int emit_class(FILE *file, const char *module,
                      fputs("||guarded->u.f.mode!=WRTC_STORAGE_NATIVE", file) < 0) ||
                     (field->storage_kind == WRTC_NATIVE_FIELD_MIN_HEAP &&
                      fputs("||guarded->u.h.mode!=WRTC_STORAGE_NATIVE", file) < 0) ||
+                    (field->storage_kind == WRTC_NATIVE_FIELD_SCALAR &&
+                     fprintf(file, "||guarded->u.s.tag!=%s",
+                             field->type == WRTC_TYPE_BOOL
+                                 ? "WRTC_SCALAR_BOOL"
+                                 : field->declared_type != NULL &&
+                                           strcmp(field->declared_type,
+                                                  "float") == 0
+                                       ? "WRTC_SCALAR_DOUBLE"
+                                       : "WRTC_SCALAR_INT64") < 0) ||
                     (field->storage_kind == WRTC_NATIVE_FIELD_ATOMIC_UINT32 &&
                      fputs("||!guarded->u.a.initialized", file) < 0) ||
                     (field->storage_kind == WRTC_NATIVE_FIELD_MPSC &&
@@ -2286,7 +2306,7 @@ static int emit_native_class_extension(
         return -1;
     if (fputs("#define PY_SSIZE_T_CLEAN\n#include <Python.h>\n"
               "#include <structmember.h>\n#include <stddef.h>\n"
-              "#include <stdint.h>\n#include <string.h>\n"
+              "#include <stdint.h>\n#include <string.h>\n#include <math.h>\n"
               "#if PY_VERSION_HEX < 0x030C0000\n"
               "#error \"native heap data requires CPython 3.12 or newer\"\n"
               "#endif\n"
@@ -2520,8 +2540,14 @@ static int emit_native_class_extension(
             if (wrtc_aot_region_direct_supported(
                     program, operations, index, region_index) &&
                 fprintf(file,
+                        "static int WRTC_AOT_UNUSED wu%zu_%zu(PyObject*,PyObject*const*,"
+                        "Py_ssize_t,PyObject*,PyObject**);"
+                        "static int WRTC_AOT_UNUSED wv%zu_%zu(PyObject*,PyObject*const*,"
+                        "Py_ssize_t,PyObject*,PyObject**);"
                         "static PyObject*WRTC_AOT_UNUSED wi%zu_%zu(PyObject*,PyObject*const*,"
                         "Py_ssize_t,PyObject*);",
+                        index, region_index,
+                        index, region_index,
                         index, region_index) < 0)
                 return -1;
     }
@@ -2534,7 +2560,8 @@ static int emit_native_class_extension(
             return -1;
     }
     if (has_direct) {
-        if (fputs("static const char*grn[]={", file) < 0) return -1;
+        if (fputs("static const char*WRTC_AOT_UNUSED grn[]={", file) < 0)
+            return -1;
         for (index = 0u; index < program->class_count; index++) {
             size_t region_index;
             for (region_index = 0u;
@@ -2549,10 +2576,14 @@ static int emit_native_class_extension(
     }
     if (fprintf(file,
                 "struct MS{PyObject*t[%zu];PyObject*sg[%zu];PyObject*ot[%zu];"
+                "unsigned int nv[%zu];unsigned int ov[%zu];"
                 "PyObject*nt;PyObject*wt;PyObject*rt[%zu];PyObject*fd[%zu];"
-                "PyObject*hr[7];PyObject*od[%zu];PyObject*nd[%zu];"
+                "PyObject*hr[7];PyObject*hn[6];unsigned int hv[2];"
+                "PyObject*od[%zu];PyObject*nd[%zu];"
                 "uint64_t invalidation_epoch;unsigned active;};"
                 "static size_t mlive=0u;",
+                program->class_count,
+                program->class_count,
                 program->class_count,
                 program->class_count,
                 program->class_count,
@@ -2581,12 +2612,10 @@ static int emit_native_class_extension(
             "WrtcSchedulerContext*c){MS*s=sm(o);PyObject*current,*dict;"
             "if(!s||!s->active||Py_TYPE(o)!=(PyTypeObject*)s->t[ci])"
             "return 0;"
-            "dict=PyType_GetDict((PyTypeObject*)s->ot[ci]);"
-            "current=dict?PyDict_GetItemString(dict,grn[ri]):NULL;"
-            "if(current!=s->od[ri]){s->invalidation_epoch++;return 0;}"
-            "dict=PyType_GetDict((PyTypeObject*)s->t[ci]);"
-            "current=dict?PyDict_GetItemString(dict,grn[ri]):NULL;"
-            "if(current!=s->nd[ri]){s->invalidation_epoch++;return 0;}"
+            "if(((PyTypeObject*)s->ot[ci])->tp_version_tag==s->ov[ci]&&"
+            "((PyTypeObject*)s->t[ci])->tp_version_tag==s->nv[ci])goto valid;"
+            "(void)current;(void)dict;(void)ri;s->invalidation_epoch++;"
+            "return 0;valid:"
             "c->module=s;c->receiver=o;"
             "c->epoch=s->invalidation_epoch;return 1;}"
             "static PyObject*wf(PyObject*o,size_t ri,PyObject*const*a,"
@@ -2612,17 +2641,20 @@ static int emit_native_class_extension(
             "PyObject*small[9],**call=small;Py_ssize_t argc,i;int cancelled;"
             "if(!s||!s->hr[0]||(Py_TYPE(h)!=(PyTypeObject*)s->hr[0]&&"
             "Py_TYPE(h)!=(PyTypeObject*)s->hr[6]))goto dynamic;"
-            "d=PyType_GetDict((PyTypeObject*)s->hr[0]);for(i=1;i<6;i++){v=PyDict_GetItemString(d,"
-            "i==1?\"_run\":i==2?\"_callback\":i==3?\"_args\":i==4?\"_cancelled\":\"_context\");"
-            "if(v!=s->hr[i])goto dynamic;}args=PyObject_GetAttrString(h,\"_args\");"
+            "if(Py_TYPE(h)->tp_version_tag!=s->hv[Py_TYPE(h)==(PyTypeObject*)s->hr[6]])goto dynamic;"
+            "(void)d;args=Py_TYPE(s->hr[3])->tp_descr_get(s->hr[3],h,"
+            "(PyObject*)Py_TYPE(h));"
             "if(!args)return NULL;if(!PyTuple_CheckExact(args)){Py_CLEAR(args);goto dynamic;}"
-            "v=PyObject_GetAttrString(h,\"_cancelled\");if(!v)goto done;cancelled=PyObject_IsTrue(v);Py_DECREF(v);"
+            "v=Py_TYPE(s->hr[4])->tp_descr_get(s->hr[4],h,(PyObject*)Py_TYPE(h));"
+            "if(!v)goto done;cancelled=PyObject_IsTrue(v);Py_DECREF(v);"
             "if(cancelled<0)goto done;if(cancelled){r=Py_NewRef(Py_None);goto done;}"
-            "cb=PyObject_GetAttrString(h,\"_callback\");ctx=PyObject_GetAttrString(h,\"_context\");"
-            "if(!cb||!ctx)goto done;run=PyObject_GetAttrString(ctx,\"run\");if(!run)goto done;"
-            "argc=PyTuple_GET_SIZE(args);if(argc+1>9){call=PyMem_Malloc((size_t)(argc+1)*sizeof(*call));"
+            "cb=Py_TYPE(s->hr[2])->tp_descr_get(s->hr[2],h,(PyObject*)Py_TYPE(h));"
+            "ctx=Py_TYPE(s->hr[5])->tp_descr_get(s->hr[5],h,(PyObject*)Py_TYPE(h));"
+            "if(!cb||!ctx)goto done;argc=PyTuple_GET_SIZE(args);"
+            "if(argc+2>9){call=PyMem_Malloc((size_t)(argc+2)*sizeof(*call));"
             "if(!call){PyErr_NoMemory();goto done;}}call[0]=cb;for(i=0;i<argc;i++)call[i+1]=PyTuple_GET_ITEM(args,i);"
-            "wrtc_native_allocation_pause();r=PyObject_Vectorcall(run,call,(size_t)(argc+1),NULL);"
+            "for(i=argc;i>0;i--)call[i+1]=call[i];call[0]=ctx;call[1]=cb;"
+            "wrtc_native_allocation_pause();r=PyObject_VectorcallMethod(s->hn[5],call,(size_t)(argc+2),NULL);"
             "wrtc_native_allocation_resume();if(call!=small){PyMem_Free(call);call=small;}"
             "if(r)goto done;PyErr_Fetch(&et,&ev,&tb);PyErr_NormalizeException(&et,&ev,&tb);"
             "if(et&&(PyErr_GivenExceptionMatches(et,PyExc_SystemExit)||PyErr_GivenExceptionMatches(et,PyExc_KeyboardInterrupt))){"
@@ -2641,7 +2673,8 @@ static int emit_native_class_extension(
             "v=PyObject_CallOneArg(ceh,cd);if(!v)goto handler_raised;Py_DECREF(v);r=Py_NewRef(Py_None);goto handled;"
             "handler_fail:PyErr_Clear();PyErr_Restore(et,ev,tb);et=ev=tb=NULL;handled:Py_XDECREF(et);Py_XDECREF(ev);Py_XDECREF(tb);goto done;"
             "handler_raised:Py_CLEAR(et);Py_CLEAR(ev);Py_CLEAR(tb);goto done;"
-            "dynamic:run=PyObject_GetAttrString(h,\"_run\");if(run)r=PyObject_CallNoArgs(run);"
+            "dynamic:run=s&&s->hn[0]?PyObject_GetAttr(h,s->hn[0]):PyObject_GetAttrString(h,\"_run\");"
+            "if(run)r=PyObject_CallNoArgs(run);"
             "done:if(call!=small)PyMem_Free(call);Py_XDECREF(ceh);Py_XDECREF(src);Py_XDECREF(cd);Py_XDECREF(msg);"
             "Py_XDECREF(dbg);Py_XDECREF(fmt);Py_XDECREF(fm);Py_XDECREF(run);Py_XDECREF(ctx);Py_XDECREF(cb);"
             "Py_XDECREF(args);Py_XDECREF(hl);return r;}", file) < 0)
@@ -2746,7 +2779,8 @@ static int emit_native_class_extension(
         if (fprintf(file, "Py_VISIT(s->fd[%zu]);", index) < 0) return -1;
     if (fputs("Py_VISIT(s->nt);Py_VISIT(s->wt);", file) < 0) return -1;
     if (has_handle_run &&
-        fputs("{size_t i;for(i=0u;i<7u;i++)Py_VISIT(s->hr[i]);}", file) < 0)
+        fputs("{size_t i;for(i=0u;i<7u;i++)Py_VISIT(s->hr[i]);"
+              "for(i=0u;i<6u;i++)Py_VISIT(s->hn[i]);}", file) < 0)
         return -1;
     if (fprintf(file,
                 "{size_t i;for(i=0u;i<%zuu;i++){Py_VISIT(s->od[i]);"
@@ -2769,7 +2803,8 @@ static int emit_native_class_extension(
         if (fprintf(file, "Py_CLEAR(s->fd[%zu]);", index) < 0) return -1;
     if (fputs("Py_CLEAR(s->nt);Py_CLEAR(s->wt);", file) < 0) return -1;
     if (has_handle_run &&
-        fputs("{size_t i;for(i=0u;i<7u;i++)Py_CLEAR(s->hr[i]);}", file) < 0)
+        fputs("{size_t i;for(i=0u;i<7u;i++)Py_CLEAR(s->hr[i]);"
+              "for(i=0u;i<6u;i++)Py_CLEAR(s->hn[i]);}", file) < 0)
         return -1;
     if (fprintf(file,
                 "{size_t i;for(i=0u;i<%zuu;i++){Py_CLEAR(s->od[i]);"
@@ -2852,13 +2887,18 @@ static int emit_native_class_extension(
         free(record_module);
     }
     if (has_handle_run && fputs(
-            "{static const char*n[]={\"_run\",\"_callback\",\"_args\",\"_cancelled\",\"_context\"};"
+            "{static const char*n[]={\"_run\",\"_callback\",\"_args\",\"_cancelled\",\"_context\",\"run\"};"
             "PyObject*x=PyImport_ImportModule(\"asyncio.events\");PyObject*d;size_t i;"
             "if(!x)goto error;s->hr[0]=PyObject_GetAttrString(x,\"Handle\");"
             "s->hr[6]=PyObject_GetAttrString(x,\"TimerHandle\");Py_DECREF(x);"
             "if(!s->hr[0]||!PyType_Check(s->hr[0])||!s->hr[6]||!PyType_Check(s->hr[6]))goto error;d=PyType_GetDict((PyTypeObject*)s->hr[0]);"
-            "for(i=0u;i<5u;i++){PyObject*v=PyDict_GetItemString(d,n[i]);if(!v){PyErr_Format(PyExc_ImportError,"
-            "\"asyncio Handle descriptor %s is unavailable\",n[i]);goto error;}s->hr[i+1u]=Py_NewRef(v);}}",
+            "for(i=0u;i<6u;i++){s->hn[i]=PyUnicode_InternFromString(n[i]);if(!s->hn[i])goto error;if(i<5u){"
+            "PyObject*v=PyDict_GetItemString(d,n[i]);if(!v||!Py_TYPE(v)->tp_descr_get){PyErr_Format(PyExc_ImportError,"
+            "\"asyncio Handle descriptor %s is unavailable\",n[i]);goto error;}s->hr[i+1u]=Py_NewRef(v);}}"
+            "if(!PyUnstable_Type_AssignVersionTag((PyTypeObject*)s->hr[0])||"
+            "!PyUnstable_Type_AssignVersionTag((PyTypeObject*)s->hr[6]))goto error;"
+            "s->hv[0]=((PyTypeObject*)s->hr[0])->tp_version_tag;"
+            "s->hv[1]=((PyTypeObject*)s->hr[6])->tp_version_tag;}",
             file) < 0)
         return -1;
     for (index = 0u; index < program->class_count; index++) {
@@ -2933,6 +2973,17 @@ static int emit_native_class_extension(
                             manifest_index, manifest_index) < 0)
                     return -1;
             }
+    }
+    if (has_direct) {
+        for (index = 0u; index < program->class_count; index++)
+            if (fprintf(file,
+                        "if(!PyUnstable_Type_AssignVersionTag((PyTypeObject*)"
+                        "s->ot[%zu])||!PyUnstable_Type_AssignVersionTag("
+                        "(PyTypeObject*)s->t[%zu]))goto error;"
+                        "s->ov[%zu]=((PyTypeObject*)s->ot[%zu])->tp_version_tag;"
+                        "s->nv[%zu]=((PyTypeObject*)s->t[%zu])->tp_version_tag;",
+                        index, index, index, index, index, index) < 0)
+                return -1;
     }
     {
         size_t class_index, region_index, call_index, fusion_index = 0u;

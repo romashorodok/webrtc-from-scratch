@@ -736,6 +736,7 @@ static int parse_region_decorator(const WrtcCompilerCore *core,
     PyObject *effects = call_keyword(decorator, "effects");
     PyObject *fusion = call_keyword(decorator, "fusion");
     PyObject *execute = call_keyword(decorator, "execute");
+    PyObject *call_returns = call_keyword(decorator, "call_returns");
     if (policy != NULL && final_name_is(policy, "required"))
         region->policy = WRTC_REGION_REQUIRED;
     else if (policy != NULL && final_name_is(policy, "preferred"))
@@ -817,6 +818,128 @@ static int parse_region_decorator(const WrtcCompilerCore *core,
         Py_XDECREF(workers);
         Py_XDECREF(key);
     }
+    if (call_returns != NULL) {
+        PyObject *keys = NULL, *values = NULL;
+        Py_ssize_t index, count;
+        if (!is_kind(call_returns, "Dict") ||
+            (keys = attr(call_returns, "keys")) == NULL ||
+            (values = attr(call_returns, "values")) == NULL ||
+            (count = PySequence_Size(keys)) < 0 ||
+            PySequence_Size(values) != count) {
+            Py_XDECREF(values);
+            Py_XDECREF(keys);
+            Py_XDECREF(call_returns);
+            Py_XDECREF(execute);
+            Py_XDECREF(fusion);
+            Py_XDECREF(effects);
+            Py_XDECREF(policy);
+            Py_XDECREF(args);
+            return diagnostic(core, decorator,
+                              "call_returns must be a dictionary");
+        }
+        if (count != 0) {
+            region->call_result_contracts = calloc(
+                (size_t)count, sizeof(*region->call_result_contracts));
+            if (region->call_result_contracts == NULL) {
+                Py_DECREF(values);
+                Py_DECREF(keys);
+                Py_DECREF(call_returns);
+                Py_XDECREF(execute);
+                Py_XDECREF(fusion);
+                Py_XDECREF(effects);
+                Py_XDECREF(policy);
+                Py_XDECREF(args);
+                return PyErr_NoMemory(), -1;
+            }
+        }
+        for (index = 0; index < count; index++) {
+            PyObject *key_node = PySequence_GetItem(keys, index);
+            PyObject *value_node = PySequence_GetItem(values, index);
+            PyObject *representation_node =
+                value_node != NULL && is_kind(value_node, "Subscript")
+                    ? attr(value_node, "value")
+                    : Py_XNewRef(value_node);
+            PyObject *key_value = key_node != NULL ? attr(key_node, "value") : NULL;
+            const char *target = key_value != NULL && PyUnicode_Check(key_value)
+                                     ? PyUnicode_AsUTF8(key_value) : NULL;
+            WrtcNativeCallResultRepresentation representation =
+                WRTC_CALL_RESULT_BOXED;
+            WrtcNativeCallABI call_abi = WRTC_CALL_ABI_PYTHON;
+            char *pinned_call = value_node == NULL
+                                    ? NULL
+                                    : string_call_argument(
+                                          value_node, "pinned_semantics");
+            if ((representation_node != NULL &&
+                 final_name_is(representation_node, "float")) ||
+                representation_width(value_node, "float_") == 64u)
+                representation = WRTC_CALL_RESULT_DOUBLE;
+            else if (representation_node != NULL &&
+                     final_name_is(representation_node, "bool"))
+                representation = WRTC_CALL_RESULT_BOOL;
+            else if (representation_width(value_node, "sint") == 64u)
+                representation = WRTC_CALL_RESULT_INT64;
+            if (pinned_call != NULL &&
+                strcmp(pinned_call, "monotonic_clock") == 0) {
+                representation = WRTC_CALL_RESULT_DOUBLE;
+                call_abi = WRTC_CALL_ABI_MONOTONIC_CLOCK;
+            } else if (pinned_call != NULL &&
+                       strcmp(pinned_call, "float_min") == 0) {
+                representation = WRTC_CALL_RESULT_DOUBLE;
+                call_abi = WRTC_CALL_ABI_FLOAT_MIN;
+            } else if (pinned_call != NULL &&
+                       strcmp(pinned_call, "float_max") == 0) {
+                representation = WRTC_CALL_RESULT_DOUBLE;
+                call_abi = WRTC_CALL_ABI_FLOAT_MAX;
+            } else if (pinned_call != NULL &&
+                       strcmp(pinned_call, "float_ulp") == 0) {
+                representation = WRTC_CALL_RESULT_DOUBLE;
+                call_abi = WRTC_CALL_ABI_FLOAT_ULP;
+            }
+            if (target == NULL || representation == WRTC_CALL_RESULT_BOXED) {
+                free(pinned_call);
+                Py_XDECREF(representation_node);
+                Py_XDECREF(key_value);
+                Py_XDECREF(value_node);
+                Py_XDECREF(key_node);
+                Py_DECREF(values);
+                Py_DECREF(keys);
+                Py_DECREF(call_returns);
+                Py_XDECREF(execute);
+                Py_XDECREF(fusion);
+                Py_XDECREF(effects);
+                Py_XDECREF(policy);
+                Py_XDECREF(args);
+                return diagnostic(
+                    core, decorator,
+                    "call_returns entries require string call targets and "
+                    "float_[64], sint[64], bool, or a supported "
+                    "pinned_semantics call ABI");
+            }
+            region->call_result_contracts[index].target = copy_text(target);
+            region->call_result_contracts[index].representation = representation;
+            region->call_result_contracts[index].call_abi = call_abi;
+            region->call_result_contract_count++;
+            free(pinned_call);
+            Py_DECREF(representation_node);
+            Py_DECREF(key_value);
+            Py_DECREF(value_node);
+            Py_DECREF(key_node);
+            if (region->call_result_contracts[index].target == NULL) {
+                Py_DECREF(values);
+                Py_DECREF(keys);
+                Py_DECREF(call_returns);
+                Py_XDECREF(execute);
+                Py_XDECREF(fusion);
+                Py_XDECREF(effects);
+                Py_XDECREF(policy);
+                Py_XDECREF(args);
+                return PyErr_NoMemory(), -1;
+            }
+        }
+        Py_DECREF(values);
+        Py_DECREF(keys);
+    }
+    Py_XDECREF(call_returns);
     Py_XDECREF(execute);
     Py_XDECREF(fusion);
     Py_XDECREF(effects);
@@ -868,6 +991,25 @@ static int analyze_region_body(PyObject *node, WrtcNativeRegionIR *region) {
                 function != NULL && is_kind(function, "Attribute");
             Py_XDECREF(keywords);
             Py_XDECREF(arguments);
+        }
+        if (name != NULL) {
+            size_t contract_index;
+            for (contract_index = 0u;
+                 contract_index < region->call_result_contract_count;
+                 contract_index++) {
+                WrtcNativeCallResultContractIR *contract =
+                    &region->call_result_contracts[contract_index];
+                if (strcmp(contract->target, name) == 0) {
+                    region->calls[region->call_count].result_representation =
+                        contract->representation;
+                    region->calls[region->call_count]
+                        .result_contract_proven = 1u;
+                    region->calls[region->call_count].call_abi =
+                        contract->call_abi;
+                    contract->matched = 1u;
+                    break;
+                }
+            }
         }
         if (region->call_count == 0u)
             region->direct_call_target = copy_text(name);
@@ -1224,6 +1366,8 @@ static int analyze_class(const WrtcCompilerCore *core, PyObject *node,
                 field->storage_kind = WRTC_NATIVE_FIELD_PYOBJECT;
             field->heap_key =
                 find_call_keyword_text(annotation, "min_heap", "key");
+            field->heap_key_type =
+                find_call_keyword_text(annotation, "min_heap", "key_type");
             field->heap_ordering =
                 find_call_keyword_text(annotation, "min_heap", "ordering");
             field->owner = find_string_call(annotation, "owned_by");
@@ -1361,6 +1505,24 @@ static int analyze_class(const WrtcCompilerCore *core, PyObject *node,
                             Py_DECREF(statement);
                         }
                         Py_XDECREF(statements);
+                        for (statement_index = 0;
+                             statement_index <
+                                 (Py_ssize_t)region->call_result_contract_count;
+                             statement_index++) {
+                            WrtcNativeCallResultContractIR *contract =
+                                &region->call_result_contracts[statement_index];
+                            if (!contract->matched) {
+                                PyErr_Format(
+                                    PyExc_ValueError,
+                                    "call_returns target '%s' is absent from "
+                                    "region %s",
+                                    contract->target, region->name);
+                                Py_XDECREF(decorator);
+                                Py_XDECREF(member_decorators);
+                                Py_DECREF(member);
+                                goto error;
+                            }
+                        }
                     }
                 }
                 Py_XDECREF(decorator);
@@ -3102,9 +3264,37 @@ static PyObject *remaining_calls_report(
                                    : class_ir->filename)) < 0 ||
             dict_set_owned(call, "direct_callee_resolved",
                            PyBool_FromLong(edge->resolved)) < 0 ||
+            dict_set_owned(
+                call, "result_representation",
+                PyUnicode_FromString(
+                    edge->result_representation == WRTC_CALL_RESULT_DOUBLE
+                        ? "double"
+                        : edge->result_representation == WRTC_CALL_RESULT_INT64
+                              ? "int64_t"
+                              : edge->result_representation ==
+                                        WRTC_CALL_RESULT_BOOL
+                                    ? "bool"
+                                    : "PyObject*")) < 0 ||
+            dict_set_owned(call, "result_contract_proven",
+                           PyBool_FromLong(edge->result_contract_proven)) < 0 ||
+            dict_set_owned(
+                call, "call_abi",
+                PyUnicode_FromString(
+                    edge->call_abi == WRTC_CALL_ABI_MONOTONIC_CLOCK
+                        ? "monotonic_clock"
+                        : edge->call_abi == WRTC_CALL_ABI_FLOAT_MIN
+                              ? "float_min"
+                              : edge->call_abi == WRTC_CALL_ABI_FLOAT_MAX
+                                    ? "float_max"
+                                    : edge->call_abi == WRTC_CALL_ABI_FLOAT_ULP
+                                          ? "float_ulp"
+                                          : "python")) < 0 ||
             PyDict_SetItemString(call, "resolved_callee", callee) < 0 ||
             dict_set_owned(call, "execution",
-                           PyUnicode_FromString("python_call")) < 0 ||
+                           PyUnicode_FromString(
+                               edge->result_contract_proven
+                                   ? "python_call_with_typed_result"
+                                   : "python_call")) < 0 ||
             PyList_Append(calls, call) < 0) {
             Py_XDECREF(callee);
             Py_XDECREF(call);
@@ -3658,6 +3848,11 @@ PyObject *wrtc_native_class_capability_report(
                                field->heap_key == NULL
                                    ? Py_NewRef(Py_None)
                                    : PyUnicode_FromString(field->heap_key)) < 0 ||
+                dict_set_owned(field_report, "heap_key_type",
+                               field->heap_key_type == NULL
+                                   ? Py_NewRef(Py_None)
+                                   : PyUnicode_FromString(
+                                         field->heap_key_type)) < 0 ||
                 dict_set_owned(
                     field_report, "heap_ordering",
                     field->heap_ordering == NULL
@@ -4310,6 +4505,7 @@ void wrtc_native_class_free(WrtcNativeClassProgram *program) {
             free(class_ir->fields[index].declared_type);
             free(class_ir->fields[index].owner);
             free(class_ir->fields[index].heap_key);
+            free(class_ir->fields[index].heap_key_type);
             free(class_ir->fields[index].heap_ordering);
             free(class_ir->fields[index].queue_capacity);
             free(class_ir->fields[index].reactor_capacity);
@@ -4334,6 +4530,13 @@ void wrtc_native_class_free(WrtcNativeClassProgram *program) {
                  call_index < class_ir->regions[index].call_count;
                  call_index++)
                 free(class_ir->regions[index].calls[call_index].target);
+            for (call_index = 0u;
+                 call_index <
+                     class_ir->regions[index].call_result_contract_count;
+                 call_index++)
+                free(class_ir->regions[index]
+                         .call_result_contracts[call_index].target);
+            free(class_ir->regions[index].call_result_contracts);
             free(class_ir->regions[index].calls);
             wrtc_py_suite_ir_free(class_ir->regions[index].body);
             wrtc_py_signature_ir_free(class_ir->regions[index].signature);

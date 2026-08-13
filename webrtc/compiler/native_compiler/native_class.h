@@ -75,6 +75,21 @@ typedef enum {
     WRTC_REACTOR_HOOK_RESCHEDULE
 } WrtcReactorHookKind;
 
+typedef enum {
+    WRTC_CALL_RESULT_BOXED = 0,
+    WRTC_CALL_RESULT_INT64,
+    WRTC_CALL_RESULT_DOUBLE,
+    WRTC_CALL_RESULT_BOOL
+} WrtcNativeCallResultRepresentation;
+
+typedef enum {
+    WRTC_CALL_ABI_PYTHON = 0,
+    WRTC_CALL_ABI_MONOTONIC_CLOCK,
+    WRTC_CALL_ABI_FLOAT_MIN,
+    WRTC_CALL_ABI_FLOAT_MAX,
+    WRTC_CALL_ABI_FLOAT_ULP
+} WrtcNativeCallABI;
+
 typedef struct {
     char *target;
     WrtcSourceSpan span;
@@ -89,7 +104,17 @@ typedef struct {
     WrtcReactorHookKind reactor_hook;
     unsigned reactor_hook_shape_proven : 1;
     unsigned attribute_call : 1;
+    WrtcNativeCallResultRepresentation result_representation;
+    WrtcNativeCallABI call_abi;
+    unsigned result_contract_proven : 1;
 } WrtcNativeCallEdgeIR;
+
+typedef struct {
+    char *target;
+    WrtcNativeCallResultRepresentation representation;
+    WrtcNativeCallABI call_abi;
+    unsigned matched : 1;
+} WrtcNativeCallResultContractIR;
 
 typedef struct {
     char *name;
@@ -98,6 +123,7 @@ typedef struct {
     char *declared_type;
     char *owner;
     char *heap_key;
+    char *heap_key_type;
     char *heap_ordering;
     char *queue_capacity;
     char *queue_item_type;
@@ -142,9 +168,11 @@ typedef struct {
     WrtcPySuiteIR *body;
     WrtcPySignatureIR *signature;
     WrtcNativeCallEdgeIR *calls;
+    WrtcNativeCallResultContractIR *call_result_contracts;
     WrtcRegionPolicy policy;
     unsigned capabilities;
     size_t call_count;
+    size_t call_result_contract_count;
     size_t loop_count;
     size_t bounded_loop_count;
     unsigned fusion_requested : 1;

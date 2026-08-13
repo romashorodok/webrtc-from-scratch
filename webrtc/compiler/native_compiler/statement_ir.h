@@ -66,6 +66,8 @@ typedef struct WrtcPyExprIR {
     WrtcPyBinaryOp binary_operation;
     PyObject *cached_constant;
     PyObject *cached_keyword_names;
+    /* Interned attribute spelling used by vectorcall-method lowering. */
+    PyObject *cached_attribute_name;
 } WrtcPyExprIR;
 
 typedef enum {

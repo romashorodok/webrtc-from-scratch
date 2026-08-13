@@ -17,6 +17,7 @@ from asyncio.base_events import (
 from typing import TYPE_CHECKING
 
 import pymeta
+from pymeta.cpython import pinned_semantics
 
 if TYPE_CHECKING:
     from .loop import LoopConfig, WebRTCSelectorEventLoop
@@ -61,16 +62,22 @@ class ReactorScheduler:
             handle._scheduled = False
             loop._timer_cancelled_count = loop._timer_cancelled_count - 1
 
-    @pymeta.region(pymeta.required, effects=pymeta.effects(owner="reactor", suspend=pymeta.never))
+    @pymeta.region(
+        pymeta.required,
+        effects=pymeta.effects(owner="reactor", suspend=pymeta.never),
+        call_returns={
+            "loop.time": pinned_semantics("monotonic_clock"),
+        },
+    )
     def compute_timeout(self, loop: "WebRTCSelectorEventLoop") -> float | None:
         if loop._ready or loop._stopping:
             return 0.0
         if not loop._scheduled:
             return None
-        return min(
-            max(0.0, loop._scheduled[0]._when - loop.time()),
-            MAXIMUM_SELECT_TIMEOUT,
-        )
+        timeout = loop._scheduled[0]._when - loop.time()
+        if not timeout > 0.0:
+            timeout = 0.0
+        return min(timeout, MAXIMUM_SELECT_TIMEOUT)
 
     @pymeta.region(pymeta.required, effects=pymeta.effects(owner="reactor", suspend=pymeta.never))
     def process_selector_events(
@@ -91,10 +98,21 @@ class ReactorScheduler:
                 else:
                     loop._ready.append(writer)
 
-    @pymeta.region(pymeta.required, effects=pymeta.effects(owner="reactor", suspend=pymeta.never))
+    @pymeta.region(
+        pymeta.required,
+        effects=pymeta.effects(owner="reactor", suspend=pymeta.never),
+        call_returns={
+            "loop.time": pinned_semantics("monotonic_clock"),
+            "math.ulp": pinned_semantics("float_ulp"),
+        },
+    )
     def promote_due_timers(self, loop: "WebRTCSelectorEventLoop") -> None:
         now = loop.time()
-        deadline = now + max(loop._clock_resolution, math.ulp(now))
+        ulp = math.ulp(now)
+        if ulp > loop._clock_resolution:
+            deadline = now + ulp
+        else:
+            deadline = now + loop._clock_resolution
         while loop._scheduled:
             handle = loop._scheduled[0]
             if handle._when >= deadline:
@@ -103,7 +121,11 @@ class ReactorScheduler:
             handle._scheduled = False
             loop._ready.append(handle)
 
-    @pymeta.region(pymeta.required, effects=pymeta.effects(owner="reactor", suspend=pymeta.never))
+    @pymeta.region(
+        pymeta.required,
+        effects=pymeta.effects(owner="reactor", suspend=pymeta.never),
+        call_returns={"loop.time": pinned_semantics("monotonic_clock")},
+    )
     def run_ready_snapshot(self, loop: "WebRTCSelectorEventLoop") -> None:
         count = len(loop._ready)
         debug = loop._debug

@@ -263,6 +263,17 @@ static PyObject *tracked_get_attr_string(PyObject *owner, const char *name) {
     return result;
 }
 
+static PyObject *tracked_get_attr(PyObject *owner, PyObject *name) {
+    PyObject *result = PyObject_GetAttr(owner, name);
+    if (result != NULL) {
+        wrtc_native_allocation_alloc(
+            WRTC_NATIVE_ALLOC_ATTRIBUTE_OR_BOUND_METHOD);
+        wrtc_native_allocation_free(
+            WRTC_NATIVE_ALLOC_ATTRIBUTE_OR_BOUND_METHOD);
+    }
+    return result;
+}
+
 static PyObject *lookup_name(WrtcBoxedFrame *frame, const char *name) {
     PyObject *value = PyDict_GetItemString(frame->locals, name);
     PyObject *builtins;
@@ -336,6 +347,13 @@ static int initialize_expression(WrtcPyExprIR *expression,
                              (Py_ssize_t)index, name);
         }
     }
+    if (expression->kind == WRTC_PY_EXPR_ATTRIBUTE &&
+        expression->operation != NULL &&
+        expression->cached_attribute_name == NULL) {
+        expression->cached_attribute_name =
+            PyUnicode_InternFromString(expression->operation);
+        if (expression->cached_attribute_name == NULL) return -1;
+    }
     for (index = 0u; index < expression->child_count; index++)
         if (initialize_expression(&expression->children[index], globals) < 0)
             return -1;
@@ -370,6 +388,7 @@ static void clear_expression(WrtcPyExprIR *expression) {
     size_t index;
     Py_CLEAR(expression->cached_constant);
     Py_CLEAR(expression->cached_keyword_names);
+    Py_CLEAR(expression->cached_attribute_name);
     for (index = 0u; index < expression->child_count; index++)
         clear_expression(&expression->children[index]);
 }
@@ -875,7 +894,14 @@ static PyObject *evaluate_impl(const WrtcPyExprIR *expression,
         case WRTC_PY_EXPR_ATTRIBUTE:
             first = evaluate(&expression->children[0], frame);
             if (first == NULL) return NULL;
-            result = tracked_get_attr_string(first, expression->operation);
+            if (expression->cached_attribute_name == NULL) {
+                Py_DECREF(first);
+                PyErr_SetString(PyExc_SystemError,
+                                "attribute-name cache is uninitialized");
+                return NULL;
+            }
+            result = tracked_get_attr(
+                first, expression->cached_attribute_name);
             Py_DECREF(first);
             return result;
         case WRTC_PY_EXPR_CONSTANT:
@@ -1032,7 +1058,14 @@ static int assign_target(const WrtcPyExprIR *target, PyObject *value,
         case WRTC_PY_EXPR_ATTRIBUTE:
             owner = evaluate(&target->children[0], frame);
             if (owner == NULL) return -1;
-            status = PyObject_SetAttrString(owner, target->operation, value);
+            if (target->cached_attribute_name == NULL) {
+                Py_DECREF(owner);
+                PyErr_SetString(PyExc_SystemError,
+                                "attribute-name cache is uninitialized");
+                return -1;
+            }
+            status = PyObject_SetAttr(
+                owner, target->cached_attribute_name, value);
             Py_DECREF(owner);
             return status;
         case WRTC_PY_EXPR_SUBSCRIPT:

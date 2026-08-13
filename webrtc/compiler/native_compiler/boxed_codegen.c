@@ -102,7 +102,7 @@ static int emit_expression_initializer(
         fputc(',', output) == EOF ||
         emit_pointer(output, context->prefix, "expr_children", identifier,
                      expression->child_count) < 0 ||
-        fprintf(output, ",%zu,%zu,%zu,%d,NULL,NULL}", expression->child_count,
+        fprintf(output, ",%zu,%zu,%zu,%d,NULL,NULL,NULL}", expression->child_count,
                 expression->positional_count,
                 expression->keyword_count, (int)expression->binary_operation) < 0)
         return -1;
@@ -408,7 +408,8 @@ int wrtc_boxed_emit_runtime(FILE *output) {
         "char**keyword_names;struct WrtcPyExprIR*children;"
         "size_t child_count,positional_count,keyword_count;"
         "WrtcPyBinaryOp binary_operation;PyObject*cached_constant;"
-        "PyObject*cached_keyword_names;}WrtcPyExprIR;\n"
+        "PyObject*cached_keyword_names;PyObject*cached_attribute_name;}"
+        "WrtcPyExprIR;\n"
         "typedef enum{WRTC_PY_STMT_EXPR=0,WRTC_PY_STMT_ASSIGN,"
         "WRTC_PY_STMT_AUGMENTED_ASSIGN,WRTC_PY_STMT_IF,WRTC_PY_STMT_WHILE,"
         "WRTC_PY_STMT_FOR,WRTC_PY_STMT_TRY,WRTC_PY_STMT_TRY_FINALLY,"

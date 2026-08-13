@@ -87,6 +87,7 @@ TimerQueue = Annotated[
     object,
     storage.min_heap(
         key="_when",
+        key_type=float,
         ordering=pinned_semantics("heapq"),
     )
     | owned_by("reactor"),
@@ -117,6 +118,7 @@ class WebRTCSelectorEventLoop(asyncio.SelectorEventLoop):
         object,
         storage.min_heap(
             key="_when",
+            key_type=float,
             ordering=pinned_semantics("heapq"),
         )
         | owned_by("reactor"),
@@ -271,6 +273,7 @@ class WebRTCSelectorEventLoop(asyncio.SelectorEventLoop):
     @pymeta.region(
         pymeta.required,
         effects=pymeta.effects(writes={"self._scheduled"}, owner="reactor"),
+        call_returns={"self.time": pinned_semantics("monotonic_clock")},
     )
     def call_later(
         self,
