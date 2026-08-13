@@ -1521,6 +1521,24 @@ static int emit_class(FILE *file, const char *module,
                           class_ir->regions[region_index].name);
             return -1;
         }
+        if (direct) {
+            const size_t direct_manifest_index = region_manifest_index(
+                program, class_index, region_index);
+            if (fprintf(file,
+                    "static PyObject*WRTC_AOT_UNUSED wi%zu_%zu(PyObject*self,"
+                    "PyObject*const*args,Py_ssize_t nargs,PyObject*kwnames){"
+                    "PyObject*result=NULL;WrtcSchedulerContext context;int status;"
+                    "if(!wg(self,%zu,%zu,&context))return wf(self,%zu,args,nargs,kwnames);"
+                    "status=wad%zu_%zu_0(self,args,"
+                    "nargs,kwnames,NULL,&result);if(status==0)return result;"
+                    "if(status>0)PyErr_SetString(PyExc_SystemError,"
+                    "\"invalid arguments reached direct internal ABI\");"
+                    "return NULL;}\n",
+                    class_index, region_index, class_index,
+                    direct_manifest_index, direct_manifest_index,
+                    class_index, region_index) < 0)
+                return -1;
+        }
         if (fprintf(file,
                     "static PyObject*w%zu_%zu(PyObject*self,"
                     "PyObject*const*args,Py_ssize_t nargs,PyObject*kwnames){"
@@ -2489,6 +2507,24 @@ static int emit_native_class_extension(
             "wrtc_native_reset_allocation_counters,METH_NOARGS,NULL},"
             "{NULL,NULL,0,NULL}};", file) < 0)
         return -1;
+    /* Proven calls inside a direct graph use these guard-free internal
+     * entry points.  Declare the complete closure before emitting any class
+     * so cross-class and forward calls never fall back through a public
+     * vectorcall wrapper.  The public root performs the descriptor/type and
+     * representation guards before entering this ABI. */
+    for (index = 0u; index < program->class_count; index++) {
+        size_t region_index;
+        for (region_index = 0u;
+             region_index < program->classes[index].region_count;
+             region_index++)
+            if (wrtc_aot_region_direct_supported(
+                    program, operations, index, region_index) &&
+                fprintf(file,
+                        "static PyObject*WRTC_AOT_UNUSED wi%zu_%zu(PyObject*,PyObject*const*,"
+                        "Py_ssize_t,PyObject*);",
+                        index, region_index) < 0)
+                return -1;
+    }
     for (index = 0u; index < program->class_count; index++) {
         if (emit_class(file, module, program, operations,
                        &program->classes[index], index) < 0)
@@ -2542,17 +2578,15 @@ static int emit_native_class_extension(
         return -1;
     if (has_direct && fputs(
             "static int wg(PyObject*o,size_t ci,size_t ri,"
-            "WrtcSchedulerContext*c){MS*s=sm(o);PyObject*current;"
+            "WrtcSchedulerContext*c){MS*s=sm(o);PyObject*current,*dict;"
             "if(!s||!s->active||Py_TYPE(o)!=(PyTypeObject*)s->t[ci])"
             "return 0;"
-            "current=PyObject_GetAttrString(s->ot[ci],grn[ri]);"
-            "if(!current){PyErr_Clear();s->invalidation_epoch++;return 0;}"
-            "if(current!=s->od[ri]){Py_DECREF(current);"
-            "s->invalidation_epoch++;return 0;}Py_DECREF(current);"
-            "current=PyObject_GetAttrString(s->t[ci],grn[ri]);"
-            "if(!current){PyErr_Clear();s->invalidation_epoch++;return 0;}"
-            "if(current!=s->nd[ri]){Py_DECREF(current);"
-            "s->invalidation_epoch++;return 0;}Py_DECREF(current);"
+            "dict=PyType_GetDict((PyTypeObject*)s->ot[ci]);"
+            "current=dict?PyDict_GetItemString(dict,grn[ri]):NULL;"
+            "if(current!=s->od[ri]){s->invalidation_epoch++;return 0;}"
+            "dict=PyType_GetDict((PyTypeObject*)s->t[ci]);"
+            "current=dict?PyDict_GetItemString(dict,grn[ri]):NULL;"
+            "if(current!=s->nd[ri]){s->invalidation_epoch++;return 0;}"
             "c->module=s;c->receiver=o;"
             "c->epoch=s->invalidation_epoch;return 1;}"
             "static PyObject*wf(PyObject*o,size_t ri,PyObject*const*a,"
@@ -2573,9 +2607,10 @@ static int emit_native_class_extension(
         return -1;
     if (has_handle_run && fputs(
             "static PyObject*WRTC_AOT_UNUSED whr(PyObject*l,PyObject*h){MS*s=sm(l);"
-            "PyObject*d,*v,*hl=NULL,*cb=NULL,*args=NULL,*ctx=NULL,*run=NULL,*full=NULL,*r=NULL;"
+            "PyObject*d,*v,*hl=NULL,*cb=NULL,*args=NULL,*ctx=NULL,*run=NULL,*r=NULL;"
             "PyObject*et=NULL,*ev=NULL,*tb=NULL,*fm=NULL,*fmt=NULL,*dbg=NULL,*msg=NULL,*cd=NULL,*src=NULL,*ceh=NULL;"
-            "int cancelled,i;if(!s||!s->hr[0]||(Py_TYPE(h)!=(PyTypeObject*)s->hr[0]&&"
+            "PyObject*small[9],**call=small;Py_ssize_t argc,i;int cancelled;"
+            "if(!s||!s->hr[0]||(Py_TYPE(h)!=(PyTypeObject*)s->hr[0]&&"
             "Py_TYPE(h)!=(PyTypeObject*)s->hr[6]))goto dynamic;"
             "d=PyType_GetDict((PyTypeObject*)s->hr[0]);for(i=1;i<6;i++){v=PyDict_GetItemString(d,"
             "i==1?\"_run\":i==2?\"_callback\":i==3?\"_args\":i==4?\"_cancelled\":\"_context\");"
@@ -2585,9 +2620,11 @@ static int emit_native_class_extension(
             "if(cancelled<0)goto done;if(cancelled){r=Py_NewRef(Py_None);goto done;}"
             "cb=PyObject_GetAttrString(h,\"_callback\");ctx=PyObject_GetAttrString(h,\"_context\");"
             "if(!cb||!ctx)goto done;run=PyObject_GetAttrString(ctx,\"run\");if(!run)goto done;"
-            "full=PyTuple_New(PyTuple_GET_SIZE(args)+1);if(!full)goto done;PyTuple_SET_ITEM(full,0,Py_NewRef(cb));"
-            "for(i=0;i<PyTuple_GET_SIZE(args);i++)PyTuple_SET_ITEM(full,i+1,Py_NewRef(PyTuple_GET_ITEM(args,i)));"
-            "r=PyObject_Call(run,full,NULL);if(r)goto done;PyErr_Fetch(&et,&ev,&tb);PyErr_NormalizeException(&et,&ev,&tb);"
+            "argc=PyTuple_GET_SIZE(args);if(argc+1>9){call=PyMem_Malloc((size_t)(argc+1)*sizeof(*call));"
+            "if(!call){PyErr_NoMemory();goto done;}}call[0]=cb;for(i=0;i<argc;i++)call[i+1]=PyTuple_GET_ITEM(args,i);"
+            "wrtc_native_allocation_pause();r=PyObject_Vectorcall(run,call,(size_t)(argc+1),NULL);"
+            "wrtc_native_allocation_resume();if(call!=small){PyMem_Free(call);call=small;}"
+            "if(r)goto done;PyErr_Fetch(&et,&ev,&tb);PyErr_NormalizeException(&et,&ev,&tb);"
             "if(et&&(PyErr_GivenExceptionMatches(et,PyExc_SystemExit)||PyErr_GivenExceptionMatches(et,PyExc_KeyboardInterrupt))){"
             "PyErr_Restore(et,ev,tb);et=ev=tb=NULL;goto done;}fm=PyImport_ImportModule(\"asyncio.format_helpers\");"
             "if(!fm)goto handler_fail;fmt=PyObject_GetAttrString(fm,\"_format_callback_source\");"
@@ -2605,8 +2642,9 @@ static int emit_native_class_extension(
             "handler_fail:PyErr_Clear();PyErr_Restore(et,ev,tb);et=ev=tb=NULL;handled:Py_XDECREF(et);Py_XDECREF(ev);Py_XDECREF(tb);goto done;"
             "handler_raised:Py_CLEAR(et);Py_CLEAR(ev);Py_CLEAR(tb);goto done;"
             "dynamic:run=PyObject_GetAttrString(h,\"_run\");if(run)r=PyObject_CallNoArgs(run);"
-            "done:Py_XDECREF(ceh);Py_XDECREF(src);Py_XDECREF(cd);Py_XDECREF(msg);Py_XDECREF(dbg);Py_XDECREF(fmt);Py_XDECREF(fm);"
-            "Py_XDECREF(full);Py_XDECREF(run);Py_XDECREF(ctx);Py_XDECREF(cb);Py_XDECREF(args);Py_XDECREF(hl);return r;}", file) < 0)
+            "done:if(call!=small)PyMem_Free(call);Py_XDECREF(ceh);Py_XDECREF(src);Py_XDECREF(cd);Py_XDECREF(msg);"
+            "Py_XDECREF(dbg);Py_XDECREF(fmt);Py_XDECREF(fm);Py_XDECREF(run);Py_XDECREF(ctx);Py_XDECREF(cb);"
+            "Py_XDECREF(args);Py_XDECREF(hl);return r;}", file) < 0)
         return -1;
     if (has_constructors) {
         if (fputs("static PyObject*wwa(PyObject*o,size_t ci,int*h){MS*s=sm(o);"

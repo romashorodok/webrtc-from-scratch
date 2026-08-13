@@ -160,6 +160,43 @@ static int statements_supported(const WrtcPyStmtIR *statements, size_t count) {
     return 1;
 }
 
+static int expression_uses_name(const WrtcPyExprIR *expression,
+                                const char *name) {
+    size_t index;
+    if (expression == NULL || name == NULL) return 0;
+    if (expression->kind == WRTC_PY_EXPR_NAME &&
+        expression->operation != NULL &&
+        strcmp(expression->operation, name) == 0)
+        return 1;
+    for (index = 0u; index < expression->child_count; index++)
+        if (expression_uses_name(&expression->children[index], name))
+            return 1;
+    return 0;
+}
+
+static int statements_use_name(const WrtcPyStmtIR *statements, size_t count,
+                               const char *name) {
+    size_t statement_index, expression_index;
+    for (statement_index = 0u; statement_index < count; statement_index++) {
+        const WrtcPyStmtIR *statement = &statements[statement_index];
+        for (expression_index = 0u;
+             expression_index < statement->expression_count;
+             expression_index++)
+            if (expression_uses_name(
+                    &statement->expressions[expression_index], name))
+                return 1;
+        if (statements_use_name(statement->body, statement->body_count, name) ||
+            statements_use_name(statement->orelse, statement->orelse_count,
+                                name) ||
+            statements_use_name(statement->finalbody,
+                                statement->finalbody_count, name) ||
+            statements_use_name(statement->handlers,
+                                statement->handler_count, name))
+            return 1;
+    }
+    return 0;
+}
+
 static int signature_supported(const WrtcPySignatureIR *signature) {
     size_t index;
     int saw_varargs = 0;
@@ -309,10 +346,9 @@ int wrtc_aot_emit_runtime(FILE *file) {
         "uint64_t initialized_mask;uint64_t owned_mask;PyObject*globals;"
         "PyObject*return_value;const WrtcBoxedNativeHooks*hooks;}"
         "WrtcRegionFrame;"
-        "void wafc(WrtcRegionFrame*f){size_t i;uint64_t m=f->owned_mask;"
-        "for(i=0u;i<WRTC_REGION_SLOT_COUNT;i++)if((m&(UINT64_C(1)<<i))!=0u)"
-        "Py_DECREF(f->values[i]);Py_XDECREF(f->return_value);"
-        "memset(f,0,sizeof(*f));}"
+        "void wafc(WrtcRegionFrame*f){size_t i=0u;uint64_t m=f->owned_mask;"
+        "while(m){if((m&UINT64_C(1))!=0u)Py_DECREF(f->values[i]);"
+        "m>>=1u;i++;}Py_XDECREF(f->return_value);}"
         "int wafb(WrtcRegionFrame*f,size_t i,PyObject*v,int owned){"
         "uint64_t b=UINT64_C(1)<<i;if(i>=WRTC_REGION_SLOT_COUNT){"
         "PyErr_SetString(PyExc_SystemError,\"AOT frame slot overflow\");"
@@ -656,7 +692,7 @@ native_fail:
                 fprintf(file, "(f,&e->children[%zu]);if(!a[%zu])goto done;",
                         index + 1u, index) < 0)
                 goto fail;
-        if (fprintf(file, "r=w%zu_%zu(recv,a,%zu,e->cached_keyword_names);",
+        if (fprintf(file, "r=wi%zu_%zu(recv,a,%zu,e->cached_keyword_names);",
                     native_call->target_class, native_call->target_region,
                     expression->positional_count) < 0 ||
             (argc != 0u && fputs("done:", file) < 0) ||
@@ -917,7 +953,7 @@ static int emit_target(AotEmitter *emitter, const WrtcPyExprIR *target,
                 return -1;
             }
     }
-    if (fputs("static int ", file) < 0 ||
+    if (fputs("static int WRTC_AOT_UNUSED ", file) < 0 ||
         function_prefix(file, emitter, "wat", id) < 0 ||
         fputs("(WrtcRegionFrame*f,const WrtcPyExprIR*t,PyObject*v){"
               "const WrtcPyExprIR*e=t;(void)e;", file) < 0)
@@ -1128,6 +1164,33 @@ static int emit_statement(AotEmitter *emitter,
                 goto fail;
             break;
         case WRTC_PY_STMT_FOR:
+            if (statement->iterator_is_range &&
+                statement->expressions[0].kind == WRTC_PY_EXPR_NAME &&
+                !statements_use_name(statement->body, statement->body_count,
+                                     statement->expressions[0].operation) &&
+                statement->expressions[1].kind == WRTC_PY_EXPR_CALL &&
+                statement->expressions[1].positional_count == 1u &&
+                statement->expressions[1].keyword_count == 0u &&
+                statement->expressions[1].child_count == 2u) {
+                const size_t count_id = expression_id(
+                    emitter, &statement->expressions[1].children[1]);
+                if (count_id == (size_t)-1 ||
+                    fputs("{Py_ssize_t wi,wn;int broke=0;v=", file) < 0 ||
+                    function_prefix(file, emitter, "wae", count_id) < 0 ||
+                    fputs("(f,&s->expressions[1].children[1]);if(!v)return -1;"
+                          "wn=PyNumber_AsSsize_t(v,PyExc_OverflowError);"
+                          "Py_DECREF(v);if(wn==-1&&PyErr_Occurred())return -1;"
+                          "for(wi=0;wi<wn;wi++){if(", file) < 0 ||
+                    function_prefix(file, emitter, "was", body) < 0 ||
+                    fputs("(f,s->body,flow)<0)return -1;"
+                          "if(*flow==WRTC_FLOW_BREAK){*flow=WRTC_FLOW_NORMAL;"
+                          "broke=1;break;}if(*flow==WRTC_FLOW_RETURN)return 0;"
+                          "*flow=WRTC_FLOW_NORMAL;}if(!broke)return ", file) < 0 ||
+                    function_prefix(file, emitter, "was", orelse) < 0 ||
+                    fputs("(f,s->orelse,flow);return 0;}}", file) < 0)
+                    goto fail;
+                break;
+            }
             if (fputs("{PyObject*i,*x;int broke=0;v=", file) < 0 ||
                 emit_eval_statement(file, emitter, expressions[1], 1u) < 0 ||
                 fputs(";if(!v)return -1;i=PyObject_GetIter(v);Py_DECREF(v);"
@@ -1390,10 +1453,11 @@ int wrtc_aot_emit_region(FILE *file, size_t class_index, size_t region_index,
         function_prefix(file, &emitter, "wad", 0u) < 0 ||
         fputs("(PyObject*self,PyObject*const*args,Py_ssize_t nargs,"
               "PyObject*kwnames,const WrtcBoxedNativeHooks*hooks,"
-              "PyObject**out){WrtcRegionFrame f={0};"
+              "PyObject**out){WrtcRegionFrame f;"
               "WrtcFlow flow=WRTC_FLOW_NORMAL;int z=-1;(void)args;", file) < 0 ||
         fprintf(file, "f.globals=%s;", globals_symbol) < 0 ||
-        fputs("f.hooks=hooks;", file) < 0 ||
+        fputs("f.initialized_mask=0u;f.owned_mask=0u;"
+              "f.return_value=NULL;f.hooks=hooks;", file) < 0 ||
         fputs("if(!f.globals){PyErr_SetString(PyExc_SystemError,"
               "\"AOT globals are unavailable\");return -1;}"
               "if(wafb(&f,0u,self,0)<0)goto done;", file) < 0)
