@@ -51,6 +51,95 @@ def test_compiler_emits_native_selector_heap_type(
         event_loop._reset_native_selection_for_tests()
 
 
+def test_scheduler_ingress_uses_guarded_direct_storage_graph(
+    native_event_loop_artifact: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WEBRTC_EVENT_LOOP_NATIVE", str(native_event_loop_artifact))
+    event_loop._reset_native_selection_for_tests()
+    loop = event_loop.new_event_loop(require_native=True)
+    factory = event_loop._diagnostic_factories[native_event_loop_artifact]
+    module = factory.__self__
+    loop_type = type(loop)
+    installed_call_soon = vars(loop_type)["_call_soon"]
+
+    backends = set(module.__pymeta_native_region_backends__)
+    assert module.__pymeta_pyobject_region_backend__ == "aot_direct_graph"
+    for method in (
+        "_run_once", "call_soon", "_call_soon", "call_at", "call_later",
+        "call_soon_threadsafe",
+    ):
+        assert (
+            f"WebRTCSelectorEventLoop.{method}=aot_direct_graph" in backends
+        )
+    assert (
+        "WebRTCSelectorEventLoop._call_soon=aot_direct_graph" in backends
+    )
+    assert "WebRTCSelectorEventLoop._call_at=aot_direct_graph" in backends
+    assert (
+        "WebRTCSelectorEventLoop._run_once->ReactorScheduler.run_once"
+        in module.__pymeta_native_call_graph__
+    )
+    assert module.__pymeta_native_operation_abi__ == (
+        "typed_results;ownership;nullability;exception_edges"
+    )
+    assert "pre_mutation" in module.__pymeta_native_guard_policy__
+    assert "unbound_descriptors" in module.__pymeta_native_cache_policy__
+    graph = set(module.__pymeta_native_call_graph__)
+    required_sources = {
+        edge.split("->", 1)[0]
+        for edge in graph
+        if edge.split("->", 1)[0] in dict(
+            entry.rsplit("=", 1) for entry in backends
+        )
+    }
+    region_backends = dict(entry.rsplit("=", 1) for entry in backends)
+    pending = [
+        f"WebRTCSelectorEventLoop.{method}"
+        for method in (
+            "_run_once", "call_soon", "_call_soon", "call_at",
+            "call_later", "call_soon_threadsafe",
+        )
+    ]
+    visited: set[str] = set()
+    while pending:
+        source = pending.pop()
+        if source in visited:
+            continue
+        visited.add(source)
+        assert region_backends[source] == "aot_direct_graph"
+        for edge in graph:
+            owner, target = edge.split("->", 1)
+            if owner == source and target in region_backends:
+                pending.append(target)
+    assert required_sources
+
+    try:
+        module.__pymeta_reset_native_allocation_counters__()
+        loop._call_soon(lambda: None, (), None)
+        timer = loop._call_at(loop.time() + 60.0, lambda: None, (), None)
+        counters = module.__pymeta_native_allocation_counters__()
+        assert counters["native_materialization.allocations"] == 0
+        timer.cancel()
+
+        def replacement(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("cached original fallback was not used")
+
+        loop_type._call_soon = replacement
+        assert vars(loop_type)["_call_soon"] is replacement
+        module.__pymeta_reset_native_allocation_counters__()
+        handle = installed_call_soon.__get__(loop, loop_type)(
+            lambda: None, (), None
+        )
+        counters = module.__pymeta_native_allocation_counters__()
+        assert isinstance(handle, asyncio.Handle)
+        assert counters["fallback_deoptimization.allocations"] == 1
+    finally:
+        loop_type._call_soon = installed_call_soon
+        loop.close()
+        event_loop._reset_native_selection_for_tests()
+
+
 def test_compiled_loop_preserves_ready_snapshot_and_timer_cancellation(
     native_event_loop_artifact: Path,
     monkeypatch: pytest.MonkeyPatch,

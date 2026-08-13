@@ -24,6 +24,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger("asyncio")
 
 
+def _compact_cancelled_timers(scheduled: list[asyncio.TimerHandle]) -> int:
+    """Stable Python reference for the native in-place heap compactor."""
+    retained = []
+    removed = 0
+    for handle in scheduled:
+        if handle._cancelled:
+            handle._scheduled = False
+            removed += 1
+        else:
+            retained.append(handle)
+    scheduled[:] = retained
+    heapq.heapify(scheduled)
+    return removed
+
+
 @pymeta.native_class(pymeta.compact_object, gc=pymeta.tracked, weakrefs=False)
 class ReactorScheduler:
     __slots__ = ("_config",)
@@ -33,26 +48,18 @@ class ReactorScheduler:
 
     @pymeta.region(pymeta.required, effects=pymeta.effects(owner="reactor", suspend=pymeta.never))
     def remove_cancelled_timers(self, loop: "WebRTCSelectorEventLoop") -> None:
-        scheduled = loop._scheduled
         if (
-            len(scheduled) > _MIN_SCHEDULED_TIMER_HANDLES
-            and loop._timer_cancelled_count / len(scheduled)
+            len(loop._scheduled) > _MIN_SCHEDULED_TIMER_HANDLES
+            and loop._timer_cancelled_count / len(loop._scheduled)
             > _MIN_CANCELLED_TIMER_HANDLES_FRACTION
         ):
-            retained = []
-            for handle in scheduled:
-                if handle._cancelled:
-                    handle._scheduled = False
-                else:
-                    retained.append(handle)
-            scheduled[:] = retained
-            heapq.heapify(scheduled)
+            _compact_cancelled_timers(loop._scheduled)
             loop._timer_cancelled_count = 0
             return
-        while scheduled and scheduled[0]._cancelled:
-            handle = heapq.heappop(scheduled)
+        while loop._scheduled and loop._scheduled[0]._cancelled:
+            handle = heapq.heappop(loop._scheduled)
             handle._scheduled = False
-            loop._timer_cancelled_count -= 1
+            loop._timer_cancelled_count = loop._timer_cancelled_count - 1
 
     @pymeta.region(pymeta.required, effects=pymeta.effects(owner="reactor", suspend=pymeta.never))
     def compute_timeout(self, loop: "WebRTCSelectorEventLoop") -> float | None:

@@ -159,6 +159,62 @@ static int add_operation(Analyzer *analyzer, size_t proof_index,
     operation->region_class_index = analyzer->region_class_index;
     operation->region_index = analyzer->region_index;
     operation->field_proof_index = proof_index;
+    operation->has_exception_edge = 1u;
+    switch (kind) {
+        case WRTC_NATIVE_OP_ALIAS_BIND:
+            operation->result_representation =
+                WRTC_NATIVE_REPR_STORAGE_POINTER;
+            operation->result_ownership = WRTC_NATIVE_OWNERSHIP_BORROWED;
+            break;
+        case WRTC_NATIVE_OP_LENGTH:
+        case WRTC_NATIVE_OP_HEAP_COMPACT_CANCELLED:
+        case WRTC_NATIVE_OP_MPSC_QSIZE:
+        case WRTC_NATIVE_OP_SPSC_QSIZE:
+            operation->result_representation = WRTC_NATIVE_REPR_PY_SSIZE_T;
+            break;
+        case WRTC_NATIVE_OP_TRUTH:
+        case WRTC_NATIVE_OP_MPSC_EMPTY:
+        case WRTC_NATIVE_OP_SPSC_EMPTY:
+        case WRTC_NATIVE_OP_SELECTOR_IS_CURRENT:
+            operation->result_representation = WRTC_NATIVE_REPR_BOOL;
+            break;
+        case WRTC_NATIVE_OP_SCALAR_READ: {
+            const WrtcNativeFieldOperationProof *field_proof =
+                &analyzer->table->fields[proof_index];
+            const WrtcNativeFieldIR *field =
+                &analyzer->program->classes[field_proof->class_index]
+                     .fields[field_proof->field_index];
+            operation->result_representation =
+                field->type == WRTC_TYPE_BOOL ? WRTC_NATIVE_REPR_BOOL :
+                field->declared_type != NULL &&
+                        strcmp(field->declared_type, "float") == 0
+                    ? WRTC_NATIVE_REPR_DOUBLE : WRTC_NATIVE_REPR_INT64;
+            break;
+        }
+        case WRTC_NATIVE_OP_ROOT_READ:
+            operation->result_representation =
+                WRTC_NATIVE_REPR_BORROWED_PYOBJECT;
+            operation->result_ownership = WRTC_NATIVE_OWNERSHIP_BORROWED;
+            operation->result_nullable = 1u;
+            break;
+        case WRTC_NATIVE_OP_FIFO_POPLEFT:
+        case WRTC_NATIVE_OP_HEAP_POP:
+        case WRTC_NATIVE_OP_MPSC_GET_NOWAIT:
+        case WRTC_NATIVE_OP_SPSC_GET_NOWAIT:
+            operation->result_representation =
+                WRTC_NATIVE_REPR_OWNED_PYOBJECT;
+            operation->result_ownership = WRTC_NATIVE_OWNERSHIP_OWNED;
+            operation->result_nullable = 1u;
+            break;
+        case WRTC_NATIVE_OP_ITERATE:
+            operation->result_representation =
+                WRTC_NATIVE_REPR_BORROWED_PYOBJECT;
+            operation->result_ownership = WRTC_NATIVE_OWNERSHIP_BORROWED;
+            break;
+        default:
+            operation->result_representation = WRTC_NATIVE_REPR_VOID;
+            break;
+    }
     operation->alias_name = copy_text(alias_name);
     operation->detail = copy_text(detail);
     if ((alias_name != NULL && operation->alias_name == NULL) ||
@@ -294,6 +350,18 @@ static int analyze_call(Analyzer *analyzer,
             return add_operation(analyzer, proof_index,
                                  WRTC_NATIVE_OP_LENGTH, expression->span,
                                  NULL, NULL);
+    }
+    if (function->kind == WRTC_PY_EXPR_NAME &&
+        strcmp(function->operation, "_compact_cancelled_timers") == 0 &&
+        expression->positional_count == 1u &&
+        expression->keyword_count == 0u) {
+        proof_index = expression_field(analyzer, &expression->children[1]);
+        if (proof_index != (size_t)-1 &&
+            proof_field(analyzer, proof_index)->storage_kind ==
+                WRTC_NATIVE_FIELD_MIN_HEAP)
+            return add_operation(analyzer, proof_index,
+                                 WRTC_NATIVE_OP_HEAP_COMPACT_CANCELLED,
+                                 expression->span, NULL, NULL);
     }
     if (function->kind == WRTC_PY_EXPR_ATTRIBUTE) {
         proof_index = expression_field(analyzer, &function->children[0]);
@@ -761,7 +829,8 @@ const char *wrtc_native_operation_kind_name(WrtcNativeOperationKind kind) {
         "alias_bind", "scalar_read", "scalar_write",
         "scalar_augmented_write", "length", "truth", "root_read",
         "iterate", "slice_assign", "fifo_append", "fifo_popleft",
-        "heapify", "heap_push", "heap_pop", "atomic_load", "atomic_store",
+        "heapify", "heap_push", "heap_pop", "heap_compact_cancelled",
+        "atomic_load", "atomic_store",
         "atomic_compare_exchange",
         "mpsc_put_nowait", "mpsc_get_nowait", "mpsc_qsize",
         "mpsc_empty", "mpsc_close", "spsc_put_nowait",

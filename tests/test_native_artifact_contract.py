@@ -21,6 +21,8 @@ from webrtc.compiler.native_artifact import (
     NativeModuleRequirements,
     validate_native_artifact,
     validate_native_class_profile,
+    _validate_direct_hot_graph,
+    _validate_direct_metadata,
 )
 
 
@@ -119,6 +121,9 @@ def test_multi_source_artifact_metadata_is_validated(
     manifest_hash = source_manifest_sha256((primary, helper))
     module.__pymeta_source_manifest_sha256__ = manifest_hash
     module.__pymeta_policy_sha256__ = "policy"
+    module.__pymeta_pyobject_region_backend__ = "boxed_ir"
+    module.__pymeta_native_region_backends__ = ()
+    module.__pymeta_native_call_graph__ = ()
     requirements = NativeModuleRequirements(
         module_name="generic_native",
         source_path=primary,
@@ -133,3 +138,70 @@ def test_multi_source_artifact_metadata_is_validated(
         match="source_manifest_sha256",
     ):
         validate_native_artifact(module, requirements)
+
+
+def test_promoted_hot_graph_rejects_boxed_reachable_regions(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "loop.py"
+    source.write_text("pass\n", encoding="utf-8")
+    requirements = NativeModuleRequirements(
+        module_name="loop_native",
+        source_path=source,
+        classes={
+            "Loop": NativeClassRequirement(object, ("_run_once",)),
+        },
+    )
+    with pytest.raises(
+        NativeArtifactCompatibilityError, match="not aot_direct_graph"
+    ):
+        _validate_direct_hot_graph(
+            "aot_direct_graph",
+            {
+                "Loop._run_once": "aot_direct_graph",
+                "Scheduler.run_once": "boxed_ir",
+            },
+            ("Loop._run_once->Scheduler.run_once",),
+            requirements,
+        )
+    with pytest.raises(
+        NativeArtifactCompatibilityError, match="references boxed executor"
+    ):
+        _validate_direct_hot_graph(
+            "aot_direct_graph",
+            {"Loop._run_once": "aot_direct_graph"},
+            ("Loop._run_once->wrtc_boxed_execute",),
+            requirements,
+        )
+    with pytest.raises(
+        NativeArtifactCompatibilityError, match="compatibility ABI"
+    ):
+        _validate_direct_hot_graph(
+            "aot_direct_graph",
+            {"Loop._run_once": "aot_direct_graph"},
+            ("Loop._run_once->wrtc_aot_pyobject",),
+            requirements,
+        )
+
+
+def test_direct_region_requires_guard_cache_and_ownership_metadata() -> None:
+    module = ModuleType("direct_native")
+    with pytest.raises(
+        NativeArtifactCompatibilityError, match="contract is incomplete"
+    ):
+        _validate_direct_metadata(module)
+
+    module.__pymeta_native_operation_abi__ = (
+        "typed_results;ownership;nullability;exception_edges"
+    )
+    module.__pymeta_native_guard_policy__ = (
+        "exact_receiver;native_storage;original_descriptor;"
+        "installed_descriptor;pre_mutation"
+    )
+    module.__pymeta_native_cache_policy__ = (
+        "unbound_descriptors;module_owned;traverse;clear;free"
+    )
+    module.__pymeta_native_invalidation_policy__ = (
+        "module_epoch;entry_guard;fallback_before_mutation"
+    )
+    _validate_direct_metadata(module)

@@ -74,7 +74,17 @@ def test_scheduler_regions_are_required_and_facade_is_thin() -> None:
         "run_once",
     )
     assert all(pymeta.metadata(getattr(ReactorScheduler, name)).required for name in required_methods)
-    assert pymeta.metadata(WebRTCSelectorEventLoop._run_once).required
+    assert all(
+        pymeta.metadata(getattr(WebRTCSelectorEventLoop, name)).required
+        for name in (
+            "_run_once",
+            "call_soon",
+            "_call_soon",
+            "call_at",
+            "call_later",
+            "call_soon_threadsafe",
+        )
+    )
 
     loop = WebRTCSelectorEventLoop()
     seen: list[str] = []

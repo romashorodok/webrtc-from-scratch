@@ -11,7 +11,11 @@
 typedef enum {
     WRTC_STORAGE_EMPTY = 0,
     WRTC_STORAGE_NATIVE,
-    WRTC_STORAGE_BOXED
+    WRTC_STORAGE_BOXED,
+    /* Native storage was exposed through its Python descriptor.  This is a
+     * permanent compatibility state: an escaped container is never adopted
+     * again, even if its reference count later drops back to one. */
+    WRTC_STORAGE_ESCAPED
 } WrtcStorageMode;
 
 typedef enum {
@@ -48,6 +52,9 @@ typedef struct {
     size_t capacity;
     size_t size;
 } WrtcNativeMinHeap;
+
+/* A proven direct predicate: it must not execute Python or raise. */
+typedef int (*WrtcNativeHeapKeep)(PyObject *item, void *context);
 
 typedef struct {
     _Atomic uint_least32_t value;
@@ -128,11 +135,15 @@ int wrtc_native_fifo_traverse(WrtcNativeFifo *fifo, visitproc visit,
                               void *argument);
 int wrtc_native_fifo_activate(WrtcNativeFifo *fifo, size_t capacity);
 int wrtc_native_fifo_set_boxed(WrtcNativeFifo *fifo, PyObject *value);
+int wrtc_native_fifo_adopt_initial(WrtcNativeFifo *fifo, PyObject *value);
 int wrtc_native_fifo_try_adopt(WrtcNativeFifo *fifo);
 PyObject *wrtc_native_fifo_get(WrtcNativeFifo *fifo,
                                const char *field_name);
 int wrtc_native_fifo_delete(WrtcNativeFifo *fifo, const char *field_name);
 Py_ssize_t wrtc_native_fifo_snapshot(const WrtcNativeFifo *fifo);
+int wrtc_native_fifo_truth(const WrtcNativeFifo *fifo);
+PyObject *wrtc_native_fifo_borrow(const WrtcNativeFifo *fifo,
+                                  Py_ssize_t index);
 int wrtc_native_fifo_append(WrtcNativeFifo *fifo, PyObject *value);
 PyObject *wrtc_native_fifo_popleft(WrtcNativeFifo *fifo);
 
@@ -142,6 +153,7 @@ int wrtc_native_heap_traverse(WrtcNativeMinHeap *heap, visitproc visit,
                               void *argument);
 int wrtc_native_heap_activate(WrtcNativeMinHeap *heap, size_t capacity);
 int wrtc_native_heap_set_boxed(WrtcNativeMinHeap *heap, PyObject *value);
+int wrtc_native_heap_adopt_initial(WrtcNativeMinHeap *heap, PyObject *value);
 int wrtc_native_heap_try_adopt(WrtcNativeMinHeap *heap);
 PyObject *wrtc_native_heap_get(WrtcNativeMinHeap *heap,
                                const char *field_name);
@@ -151,6 +163,12 @@ int wrtc_native_heap_push(WrtcNativeMinHeap *heap, PyObject *value);
 PyObject *wrtc_native_heap_pop(WrtcNativeMinHeap *heap);
 int wrtc_native_heap_heapify(WrtcNativeMinHeap *heap);
 Py_ssize_t wrtc_native_heap_snapshot(const WrtcNativeMinHeap *heap);
+int wrtc_native_heap_truth(const WrtcNativeMinHeap *heap);
+PyObject *wrtc_native_heap_borrow(const WrtcNativeMinHeap *heap,
+                                  Py_ssize_t index);
+size_t wrtc_native_heap_compact(WrtcNativeMinHeap *heap,
+                                WrtcNativeHeapKeep keep, void *context);
+Py_ssize_t wrtc_native_heap_compact_cancelled(WrtcNativeMinHeap *heap);
 PyObject *wrtc_native_heap_root(const WrtcNativeMinHeap *heap);
 
 void wrtc_native_atomic_uint32_init(WrtcNativeAtomicUint32 *slot);

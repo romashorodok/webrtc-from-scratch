@@ -59,7 +59,10 @@ def _policy_document() -> dict[str, object]:
         "module_name": "event_loop_native",
         "factory": NATIVE_FACTORY,
         "native_class": NATIVE_CLASS,
-        "required_methods": ["_run_once"],
+        "required_methods": [
+            "_run_once", "call_soon", "_call_soon", "call_at",
+            "call_later", "call_soon_threadsafe",
+        ],
         "sources": [path.name for path in SOURCE_PATHS],
     }
 
@@ -73,7 +76,10 @@ DEVELOPMENT_POLICY_SHA256 = policy_sha256(
         "module_name": "loop_native",
         "factory": NATIVE_FACTORY,
         "native_class": NATIVE_CLASS,
-        "required_methods": ["_run_once"],
+        "required_methods": [
+            "_run_once", "call_soon", "_call_soon", "call_at",
+            "call_later", "call_soon_threadsafe",
+        ],
         "sources": [path.name for path in SOURCE_PATHS],
     }
 )
@@ -102,7 +108,10 @@ NATIVE_REQUIREMENTS = NativeModuleRequirements(
     classes={
         NATIVE_CLASS: NativeClassRequirement(
             base=asyncio.SelectorEventLoop,
-            required_methods=("_run_once",),
+            required_methods=(
+                "_run_once", "call_soon", "_call_soon", "call_at",
+                "call_later", "call_soon_threadsafe",
+            ),
         )
     },
     metadata=ARTIFACT_POLICY_METADATA,
@@ -126,7 +135,10 @@ DEVELOPMENT_REQUIREMENTS = NativeModuleRequirements(
     classes={
         NATIVE_CLASS: NativeClassRequirement(
             base=asyncio.SelectorEventLoop,
-            required_methods=("_run_once",),
+            required_methods=(
+                "_run_once", "call_soon", "_call_soon", "call_at",
+                "call_later", "call_soon_threadsafe",
+            ),
         )
     },
     metadata=DEVELOPMENT_ARTIFACT_METADATA,

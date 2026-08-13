@@ -217,8 +217,13 @@ class CommandInbox:
         ),
     )
     def merge_into(self, loop: "WebRTCSelectorEventLoop") -> None:
-        for command in self.drain_snapshot():
-            dispatch_command(loop, command)
+        # Drain the fixed native MPSC snapshot directly into the loop FIFO.
+        # Keeping this spelling in ordinary Python preserves the reference
+        # implementation while allowing the direct graph to fuse the queue
+        # transfer without constructing the public drain_snapshot tuple.
+        for _ in range(self._queue.qsize()):
+            command = self._queue.get_nowait()
+            self.dispatch(loop, command)
         self._notified.store(False)
         # Close the enqueue/reset race: a producer that observed the old true
         # pending bit did not write the self-pipe.
@@ -226,6 +231,20 @@ class CommandInbox:
             _, should_wake = self._notified.compare_exchange(False, True)
             if should_wake:
                 loop._write_to_self()
+
+    @pymeta.region(
+        pymeta.required,
+        effects=pymeta.effects(
+            writes={"loop._ready"}, owner="reactor", suspend=pymeta.never
+        ),
+    )
+    def dispatch(
+        self, loop: "WebRTCSelectorEventLoop", command: Command
+    ) -> None:
+        if command.kind in (CommandKind.CALLBACK, CommandKind.WORKER_RESULT):
+            loop._ready.append(command.payload)
+        else:
+            dispatch_control_command(loop, command)
 
     @pymeta.region(
         pymeta.required,
@@ -244,14 +263,20 @@ class CommandInbox:
 
 
 def dispatch_command(loop: "WebRTCSelectorEventLoop", command: Command) -> None:
-    if command.kind in (CommandKind.CALLBACK, CommandKind.WORKER_RESULT):
-        loop._ready.append(command.payload)
-    elif command.kind is CommandKind.REGISTER_FD:
+    """Compatibility entry point for callers outside the compiled graph."""
+    loop._command_inbox.dispatch(loop, command)
+
+
+def dispatch_control_command(
+    loop: "WebRTCSelectorEventLoop", command: Command
+) -> None:
+    """Generic boundary for the uncommon descriptor-control commands."""
+    if command.kind is CommandKind.REGISTER_FD:
         fd, callback, args = command.payload  # type: ignore[misc]
         loop.add_reader(fd, callback, *args)
     elif command.kind is CommandKind.REMOVE_FD:
         loop.remove_reader(command.payload)
     elif command.kind is CommandKind.STOP:
         loop.stop()
-    else:  # defensive against foreign enum-like values
+    else:
         raise ValueError(f"unsupported event-loop command: {command.kind!r}")

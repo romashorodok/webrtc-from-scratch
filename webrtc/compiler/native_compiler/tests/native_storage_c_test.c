@@ -25,6 +25,37 @@ static int count_visit(PyObject *object, void *argument) {
     return 0;
 }
 
+static int keep_even(PyObject *item, void *context) {
+    long value = PyLong_AsLong(item);
+    (void)context;
+    return value >= 0 && (value & 1L) == 0L;
+}
+
+static int heap_compaction_test(void) {
+    WrtcNativeMinHeap heap;
+    PyObject *one = PyLong_FromLong(1);
+    PyObject *two = PyLong_FromLong(2);
+    PyObject *three = PyLong_FromLong(3);
+    PyObject *remaining;
+    wrtc_native_heap_init(&heap);
+    CHECK(one != NULL && two != NULL && three != NULL);
+    CHECK(wrtc_native_heap_activate(&heap, 3u) == 0);
+    CHECK(wrtc_native_heap_push(&heap, one) == 0);
+    CHECK(wrtc_native_heap_push(&heap, two) == 0);
+    CHECK(wrtc_native_heap_push(&heap, three) == 0);
+    CHECK(wrtc_native_heap_compact(&heap, keep_even, NULL) == 2u);
+    CHECK(wrtc_native_heap_snapshot(&heap) == 1);
+    CHECK(wrtc_native_heap_borrow(&heap, 0) == two);
+    remaining = wrtc_native_heap_pop(&heap);
+    CHECK(remaining == two);
+    Py_DECREF(remaining);
+    wrtc_native_heap_clear(&heap);
+    Py_DECREF(one);
+    Py_DECREF(two);
+    Py_DECREF(three);
+    return 0;
+}
+
 static int eligibility_test(void) {
     WrtcNativeFieldIR field = {0};
     const char *reason = NULL;
@@ -136,8 +167,10 @@ static int fifo_test(void) {
     {
         PyObject *exposed = wrtc_native_fifo_get(&fifo, "ready");
         CHECK(exposed != NULL && exposed == fifo.boxed);
+        CHECK(fifo.mode == WRTC_STORAGE_ESCAPED);
         CHECK(PyObject_RichCompareBool(exposed, reference, Py_EQ) == 1);
         Py_DECREF(exposed);
+        CHECK(wrtc_native_fifo_try_adopt(&fifo) == 0);
     }
     {
         PyObject *assigned = PyObject_CallNoArgs(deque_type);
@@ -148,6 +181,21 @@ static int fifo_test(void) {
         CHECK(exposed == assigned);
         Py_DECREF(exposed);
         Py_DECREF(assigned);
+    }
+    {
+        PyObject *empty = PyObject_CallNoArgs(deque_type);
+        PyObject *exposed;
+        CHECK(empty != NULL);
+        wrtc_native_fifo_clear(&fifo);
+        CHECK(wrtc_native_fifo_adopt_initial(&fifo, empty) == 0);
+        CHECK(fifo.mode == WRTC_STORAGE_NATIVE);
+        CHECK(wrtc_native_fifo_truth(&fifo) == 0);
+        exposed = wrtc_native_fifo_get(&fifo, "ready");
+        CHECK(exposed != NULL);
+        CHECK(fifo.mode == WRTC_STORAGE_ESCAPED);
+        CHECK(wrtc_native_fifo_try_adopt(&fifo) == 0);
+        Py_DECREF(exposed);
+        Py_DECREF(empty);
     }
     {
         PyObject *assigned = PyObject_CallNoArgs(deque_type);
@@ -251,6 +299,21 @@ static int heap_test(void) {
         Py_DECREF(assigned);
     }
     {
+        PyObject *empty = PyList_New(0);
+        PyObject *exposed;
+        CHECK(empty != NULL);
+        wrtc_native_heap_clear(&heap);
+        CHECK(wrtc_native_heap_adopt_initial(&heap, empty) == 0);
+        CHECK(heap.mode == WRTC_STORAGE_NATIVE);
+        CHECK(wrtc_native_heap_truth(&heap) == 0);
+        exposed = wrtc_native_heap_get(&heap, "timers");
+        CHECK(exposed != NULL);
+        CHECK(heap.mode == WRTC_STORAGE_ESCAPED);
+        CHECK(wrtc_native_heap_try_adopt(&heap) == 0);
+        Py_DECREF(exposed);
+        Py_DECREF(empty);
+    }
+    {
         PyObject *assigned = PyList_New(0);
         CHECK(assigned != NULL);
         CHECK(wrtc_native_heap_set_boxed(&heap, assigned) == 0);
@@ -306,6 +369,7 @@ int main(void) {
     Py_Initialize();
     CHECK(eligibility_test() == 0);
     CHECK(ownership_test() == 0);
+    CHECK(heap_compaction_test() == 0);
     CHECK(scalar_test() == 0);
     CHECK(fifo_test() == 0);
     CHECK(heap_test() == 0);

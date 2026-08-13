@@ -381,12 +381,13 @@ int wrtc_boxed_emit_module_globals(FILE *output, const char *symbol,
 
 int wrtc_boxed_emit_runtime(FILE *output) {
     static const char marker[] =
-        "typedef enum {\n    WRTC_FLOW_NORMAL";
+        "#define WRTC_ALLOCATION_REGION_LIMIT";
     const char *source = (const char *)wrtc_boxed_executor_source;
     const char *implementation = strstr(source, marker);
     static const char declarations[] =
         "#define PY_SSIZE_T_CLEAN\n#include <Python.h>\n"
-        "#include <stddef.h>\n#include <stdlib.h>\n#include <string.h>\n"
+        "#include <stddef.h>\n#include <stdint.h>\n#include <stdio.h>\n"
+        "#include <stdlib.h>\n#include <string.h>\n"
         "typedef struct{int line,column,end_line,end_column;}WrtcSourceSpan;\n"
         "typedef enum{WRTC_PY_EXPR_NAME=0,WRTC_PY_EXPR_ATTRIBUTE,"
         "WRTC_PY_EXPR_CONSTANT,WRTC_PY_EXPR_CALL,WRTC_PY_EXPR_BINARY,"
@@ -440,6 +441,18 @@ int wrtc_boxed_emit_runtime(FILE *output) {
         "PyObject*,void*,int*);"
         "typedef struct{void*context;WrtcBoxedNativeEvaluate evaluate;"
         "WrtcBoxedNativeAssign assign;}WrtcBoxedNativeHooks;\n"
+        "typedef enum{WRTC_NATIVE_ALLOC_REGION_FRAME=0,"
+        "WRTC_NATIVE_ALLOC_LOCALS_DICTIONARY,"
+        "WRTC_NATIVE_ALLOC_TEMPORARY_TUPLE,WRTC_NATIVE_ALLOC_TEMPORARY_LIST,"
+        "WRTC_NATIVE_ALLOC_KEYWORD_DICTIONARY,"
+        "WRTC_NATIVE_ALLOC_ARGUMENT_VECTOR_OVERFLOW,"
+        "WRTC_NATIVE_ALLOC_ATTRIBUTE_OR_BOUND_METHOD,"
+        "WRTC_NATIVE_ALLOC_BOXED_TEMPORARY,"
+        "WRTC_NATIVE_ALLOC_COMPILER_SCRATCH_BUFFER,"
+        "WRTC_NATIVE_ALLOC_FALLBACK_DEOPTIMIZATION,"
+        "WRTC_NATIVE_ALLOC_SCHEDULER_CONTAINER_GROWTH,"
+        "WRTC_NATIVE_ALLOC_NATIVE_MATERIALIZATION,"
+        "WRTC_NATIVE_ALLOC_CATEGORY_COUNT}WrtcNativeAllocationCategory;\n"
         "int wrtc_boxed_execute_with_hooks(const WrtcPySuiteIR*,PyObject*,"
         "PyObject*,const WrtcBoxedNativeHooks*,PyObject**);"
         "PyObject*wrtc_boxed_hook_evaluate(const WrtcPyExprIR*,void*);"
@@ -448,6 +461,15 @@ int wrtc_boxed_emit_runtime(FILE *output) {
         "void wrtc_boxed_suite_clear(WrtcPySuiteIR*);"
         "int wrtc_boxed_bind_method(const WrtcBoxedSignature*,PyObject*,"
         "PyObject*const*,Py_ssize_t,PyObject*,PyObject**);"
+        "void wrtc_native_allocation_region_enter(const char*);"
+        "void wrtc_native_allocation_region_leave(void);"
+        "void wrtc_native_allocation_pause(void);"
+        "void wrtc_native_allocation_resume(void);"
+        "void wrtc_native_allocation_alloc(WrtcNativeAllocationCategory);"
+        "void wrtc_native_allocation_free(WrtcNativeAllocationCategory);"
+        "void wrtc_native_allocation_release_locals(PyObject*);"
+        "PyObject*wrtc_native_allocation_counters(PyObject*,PyObject*);"
+        "PyObject*wrtc_native_reset_allocation_counters(PyObject*,PyObject*);"
         "void wrtc_boxed_signature_clear(WrtcBoxedSignature*signature);\n";
     if (output == NULL || implementation == NULL ||
         fputs(declarations, output) < 0 ||

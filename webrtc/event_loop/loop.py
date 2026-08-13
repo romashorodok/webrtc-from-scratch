@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import heapq
 
 from enum import IntEnum
 from typing import Annotated, Callable
@@ -192,6 +193,107 @@ class WebRTCSelectorEventLoop(asyncio.SelectorEventLoop):
     def _run_once(self) -> None:
         self._scheduler.run_once(self)
 
+    @pymeta.region(
+        pymeta.required,
+        effects=pymeta.effects(writes={"self._ready"}, owner="reactor"),
+    )
+    def call_soon(
+        self,
+        callback: Callable[..., object],
+        *args: object,
+        context: contextvars.Context | None = None,
+    ) -> asyncio.Handle:
+        self._check_closed()
+        if self._debug:
+            self._check_thread()
+            self._check_callback(callback, "call_soon")
+        handle = self._call_soon(callback, args, context)
+        if handle._source_traceback:
+            handle._source_traceback.pop()
+        return handle
+
+    @pymeta.region(
+        pymeta.required,
+        effects=pymeta.effects(writes={"self._ready"}, owner="reactor"),
+    )
+    def _call_soon(
+        self,
+        callback: Callable[..., object],
+        args: tuple[object, ...],
+        context: contextvars.Context | None,
+    ) -> asyncio.Handle:
+        handle = asyncio.Handle(callback, args, self, context=context)
+        if handle._source_traceback:
+            handle._source_traceback.pop()
+        self._ready.append(handle)
+        return handle
+
+    @pymeta.region(
+        pymeta.required,
+        effects=pymeta.effects(writes={"self._scheduled"}, owner="reactor"),
+    )
+    def call_at(
+        self,
+        when: float,
+        callback: Callable[..., object],
+        *args: object,
+        context: contextvars.Context | None = None,
+    ) -> asyncio.TimerHandle:
+        if when is None:
+            raise TypeError("when cannot be None")
+        self._check_closed()
+        if self._debug:
+            self._check_thread()
+            self._check_callback(callback, "call_at")
+        timer = self._call_at(when, callback, args, context)
+        if timer._source_traceback:
+            timer._source_traceback.pop()
+        return timer
+
+    @pymeta.region(
+        pymeta.required,
+        effects=pymeta.effects(writes={"self._scheduled"}, owner="reactor"),
+    )
+    def _call_at(
+        self,
+        when: float,
+        callback: Callable[..., object],
+        args: tuple[object, ...],
+        context: contextvars.Context | None,
+    ) -> asyncio.TimerHandle:
+        timer = asyncio.TimerHandle(when, callback, args, self, context=context)
+        if timer._source_traceback:
+            timer._source_traceback.pop()
+        heapq.heappush(self._scheduled, timer)
+        timer._scheduled = True
+        return timer
+
+    @pymeta.region(
+        pymeta.required,
+        effects=pymeta.effects(writes={"self._scheduled"}, owner="reactor"),
+    )
+    def call_later(
+        self,
+        delay: float,
+        callback: Callable[..., object],
+        *args: object,
+        context: contextvars.Context | None = None,
+    ) -> asyncio.TimerHandle:
+        if delay is None:
+            raise TypeError("delay must not be None")
+        self._check_closed()
+        if self._debug:
+            self._check_thread()
+            self._check_callback(callback, "call_at")
+        timer = self._call_at(self.time() + delay, callback, args, context)
+        if timer._source_traceback:
+            timer._source_traceback.pop()
+        return timer
+
+    @pymeta.region(
+        pymeta.required,
+        effects=pymeta.effects(owner="shared", synchronize=pymeta.synchronize),
+    )
     def call_soon_threadsafe(
         self,
         callback: Callable[..., object],

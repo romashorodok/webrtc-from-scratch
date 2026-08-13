@@ -278,9 +278,30 @@ assert len(module.__pymeta_cpython_source_revision__) == 40
 assert module.__pymeta_cache_tag__ == (sys.implementation.cache_tag or "")
 assert module.__pymeta_abi_flags__ == getattr(sys, "abiflags", "")
 assert module.__pymeta_optimization__ == "release"
+assert module.__pymeta_pyobject_region_backend__ == "boxed_ir"
+assert "GenericHeap.mutate=boxed_ir" in module.__pymeta_native_region_backends__
+assert "GenericHeap.close=aot_pyobject" in module.__pymeta_native_region_backends__
+assert "GenericHeap.orchestrate=aot_pyobject" in module.__pymeta_native_region_backends__
+assert (
+    "GenericHeap.mutate->wrtc_boxed_execute"
+    in module.__pymeta_native_call_graph__
+)
+assert (
+    "GenericHeap.close->wrtc_aot_pyobject"
+    in module.__pymeta_native_call_graph__
+)
+assert callable(module.__pymeta_native_allocation_counters__)
+assert callable(module.__pymeta_reset_native_allocation_counters__)
+module.__pymeta_reset_native_allocation_counters__()
 created = module.create_component()
 assert type(created) is module.GenericHeap
 assert created.payload == 7
+counters = module.__pymeta_native_allocation_counters__()
+assert counters["locals_dictionary.allocations"] == 1
+assert counters["locals_dictionary.allocations"] == counters["locals_dictionary.frees"]
+assert counters["locals_dictionary.live"] == 0
+assert counters["fallback_deoptimization.allocations"] == 1
+assert counters["region.create_component.fallback_deoptimization.allocations"] == 1
 explicit = module.create_component(11)
 assert type(explicit) is module.GenericHeap
 assert explicit.payload == 11

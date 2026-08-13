@@ -55,7 +55,14 @@ def test_policy_hash_covers_normalized_target_and_required_surface() -> None:
         "module_name": "event_loop_native",
         "factory": "new_event_loop",
         "native_class": "WebRTCSelectorEventLoop",
-        "required_methods": ["_run_once"],
+        "required_methods": [
+            "_run_once",
+            "call_soon",
+            "_call_soon",
+            "call_at",
+            "call_later",
+            "call_soon_threadsafe",
+        ],
         "sources": [
                 "atomic.py",
                 "commands.py",

@@ -2910,6 +2910,7 @@ static int operation_kind_lowerable(WrtcNativeOperationKind kind) {
            kind == WRTC_NATIVE_OP_HEAPIFY ||
            kind == WRTC_NATIVE_OP_HEAP_PUSH ||
            kind == WRTC_NATIVE_OP_HEAP_POP ||
+           kind == WRTC_NATIVE_OP_HEAP_COMPACT_CANCELLED ||
            kind == WRTC_NATIVE_OP_ATOMIC_LOAD ||
            kind == WRTC_NATIVE_OP_ATOMIC_STORE ||
            kind == WRTC_NATIVE_OP_MPSC_PUT_NOWAIT ||

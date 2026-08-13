@@ -24,6 +24,7 @@ typedef enum {
     WRTC_NATIVE_OP_HEAPIFY,
     WRTC_NATIVE_OP_HEAP_PUSH,
     WRTC_NATIVE_OP_HEAP_POP,
+    WRTC_NATIVE_OP_HEAP_COMPACT_CANCELLED,
     WRTC_NATIVE_OP_ATOMIC_LOAD,
     WRTC_NATIVE_OP_ATOMIC_STORE,
     WRTC_NATIVE_OP_ATOMIC_COMPARE_EXCHANGE,
@@ -45,6 +46,25 @@ typedef enum {
     WRTC_NATIVE_OP_UNSUPPORTED_ESCAPE
 } WrtcNativeOperationKind;
 
+/* ABI facts consumed by direct code generation.  These describe the kernel
+ * result itself, before any compatibility-tier boxing takes place. */
+typedef enum {
+    WRTC_NATIVE_REPR_VOID = 0,
+    WRTC_NATIVE_REPR_PY_SSIZE_T,
+    WRTC_NATIVE_REPR_INT64,
+    WRTC_NATIVE_REPR_DOUBLE,
+    WRTC_NATIVE_REPR_BOOL,
+    WRTC_NATIVE_REPR_BORROWED_PYOBJECT,
+    WRTC_NATIVE_REPR_OWNED_PYOBJECT,
+    WRTC_NATIVE_REPR_STORAGE_POINTER
+} WrtcNativeRepresentation;
+
+typedef enum {
+    WRTC_NATIVE_OWNERSHIP_NONE = 0,
+    WRTC_NATIVE_OWNERSHIP_BORROWED,
+    WRTC_NATIVE_OWNERSHIP_OWNED
+} WrtcNativeOwnership;
+
 typedef struct {
     WrtcNativeOperationKind kind;
     WrtcSourceSpan span;
@@ -52,6 +72,10 @@ typedef struct {
     size_t region_class_index;
     size_t region_index;
     size_t field_proof_index;
+    WrtcNativeRepresentation result_representation;
+    WrtcNativeOwnership result_ownership;
+    unsigned result_nullable : 1;
+    unsigned has_exception_edge : 1;
     char *alias_name;
     char *detail;
 } WrtcNativeOperationIR;

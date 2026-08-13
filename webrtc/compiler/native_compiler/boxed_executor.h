@@ -31,6 +31,22 @@ typedef struct {
     WrtcBoxedNativeAssign assign;
 } WrtcBoxedNativeHooks;
 
+typedef enum {
+    WRTC_NATIVE_ALLOC_REGION_FRAME = 0,
+    WRTC_NATIVE_ALLOC_LOCALS_DICTIONARY,
+    WRTC_NATIVE_ALLOC_TEMPORARY_TUPLE,
+    WRTC_NATIVE_ALLOC_TEMPORARY_LIST,
+    WRTC_NATIVE_ALLOC_KEYWORD_DICTIONARY,
+    WRTC_NATIVE_ALLOC_ARGUMENT_VECTOR_OVERFLOW,
+    WRTC_NATIVE_ALLOC_ATTRIBUTE_OR_BOUND_METHOD,
+    WRTC_NATIVE_ALLOC_BOXED_TEMPORARY,
+    WRTC_NATIVE_ALLOC_COMPILER_SCRATCH_BUFFER,
+    WRTC_NATIVE_ALLOC_FALLBACK_DEOPTIMIZATION,
+    WRTC_NATIVE_ALLOC_SCHEDULER_CONTAINER_GROWTH,
+    WRTC_NATIVE_ALLOC_NATIVE_MATERIALIZATION,
+    WRTC_NATIVE_ALLOC_CATEGORY_COUNT
+} WrtcNativeAllocationCategory;
+
 /*
  * Execute a lowered native-region suite with ordinary CPython PyObject
  * operations.  globals and locals must be dictionaries containing the
@@ -55,5 +71,15 @@ int wrtc_boxed_bind_method(const WrtcBoxedSignature *signature, PyObject *self,
                            PyObject *keyword_names, PyObject **locals);
 int wrtc_boxed_suite_initialize(WrtcPySuiteIR *suite, PyObject *globals);
 void wrtc_boxed_suite_clear(WrtcPySuiteIR *suite);
+void wrtc_native_allocation_region_enter(const char *name);
+void wrtc_native_allocation_region_leave(void);
+void wrtc_native_allocation_pause(void);
+void wrtc_native_allocation_resume(void);
+void wrtc_native_allocation_alloc(WrtcNativeAllocationCategory category);
+void wrtc_native_allocation_free(WrtcNativeAllocationCategory category);
+void wrtc_native_allocation_release_locals(PyObject *locals);
+PyObject *wrtc_native_allocation_counters(PyObject *self, PyObject *unused);
+PyObject *wrtc_native_reset_allocation_counters(PyObject *self,
+                                                PyObject *unused);
 
 #endif

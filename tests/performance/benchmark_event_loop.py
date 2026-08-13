@@ -248,14 +248,29 @@ def _run_scenario(
 def _timed_probe(factory: Callable[[], asyncio.AbstractEventLoop], scenario: Scenario,
                  config: BenchmarkConfig, *, latency: bool) -> dict[str, Any]:
     loop = factory()
+    cancelled_handles: list[asyncio.TimerHandle] = []
+    if scenario == "cancelled":
+        far_future = loop.time() + 60.0
+        cancelled_handles = [
+            loop.call_at(far_future + index * 1e-9, lambda: None)
+            for index in range(config.cancelled_timer_count)
+        ]
+        for handle in cancelled_handles:
+            handle.cancel()
     gc_enabled = gc.isenabled()
     gc.disable()
     wall_start = time.perf_counter()
     cpu_start = time.process_time()
     try:
-        callbacks, wakeups, samples = _run_scenario(
-            loop, scenario, config, sample_latency=latency
-        )
+        if scenario == "cancelled":
+            loop.call_soon(loop.stop)
+            loop.run_forever()
+            callbacks, wakeups = len(cancelled_handles), 0
+            samples = _BoundedLatency(config.latency_sample_limit)
+        else:
+            callbacks, wakeups, samples = _run_scenario(
+                loop, scenario, config, sample_latency=latency
+            )
     finally:
         cpu_seconds = time.process_time() - cpu_start
         wall_seconds = time.perf_counter() - wall_start
@@ -278,39 +293,186 @@ def _timed_probe(factory: Callable[[], asyncio.AbstractEventLoop], scenario: Sce
     }
 
 
-def _allocation_probe(factory: Callable[[], asyncio.AbstractEventLoop],
-                      operations: int) -> dict[str, int]:
+def _trace_category(traceback: object) -> str:
+    filenames = tuple(
+        str(getattr(frame, "filename", "")).replace("\\", "/")
+        for frame in traceback  # type: ignore[union-attr]
+    )
+    benchmark = str(Path(__file__).resolve()).replace("\\", "/")
+    if any(name == benchmark or name.endswith("/tracemalloc.py")
+           for name in filenames):
+        return "benchmark_harness"
+    if any(any(part in name for part in
+               ("/asyncio/", "/selectors.py", "/socket.py"))
+           for name in filenames):
+        return "selector_callback_external"
+    if any("/webrtc/" in name or "generated.c" in name
+           for name in filenames):
+        return "compiler_or_event_loop"
+    return "python_runtime_other"
+
+
+def _allocation_epoch(
+    factory: Callable[[], asyncio.AbstractEventLoop],
+    scenario: Scenario,
+    operations: int,
+    *,
+    close_loop: bool = True,
+    baseline: tracemalloc.Snapshot | None = None,
+) -> tuple[int, list[tracemalloc.StatisticDiff], int, int]:
     loop = factory()
     completed = 0
+    submitted = 0
+    cancelled: list[asyncio.TimerHandle] = []
+    receiver: socket.socket | None = None
+    sender: socket.socket | None = None
 
     def callback() -> None:
         nonlocal completed
         completed += 1
 
-    # Warm every cache and allocator size class used by the fixed workload.
-    for _ in range(operations):
-        loop.call_soon(callback)
-    loop.call_soon(loop.stop)
-    loop.run_forever()
-    gc.collect()
-    tracemalloc.start()
-    before = tracemalloc.take_snapshot()
-    for _ in range(operations):
-        loop.call_soon(callback)
-    loop.call_soon(loop.stop)
+    if scenario == "cancelled":
+        far_future = loop.time() + 60.0
+        cancelled = [
+            loop.call_at(far_future + index * 1e-9, callback)
+            for index in range(operations)
+        ]
+        for handle in cancelled:
+            handle.cancel()
+    elif scenario == "udp":
+        receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        receiver.bind(("127.0.0.1", 0))
+        receiver.setblocking(False)
+
+        def receive() -> None:
+            nonlocal completed
+            while completed < operations:
+                try:
+                    receiver.recv(64)
+                except BlockingIOError:
+                    break
+                completed += 1
+            if completed >= operations:
+                loop.stop()
+
+        def submit() -> None:
+            nonlocal submitted
+            assert receiver is not None and sender is not None
+            remaining = operations - submitted
+            for _ in range(min(64, remaining)):
+                sender.sendto(b"x", receiver.getsockname())
+                submitted += 1
+            if submitted < operations:
+                loop.call_soon(submit)
+
+        loop.add_reader(receiver.fileno(), receive)
+
+    owns_trace = baseline is None
+    if owns_trace:
+        gc.collect()
+        tracemalloc.start(16)
+        baseline = tracemalloc.take_snapshot()
+    if scenario in ("idle", "ready"):
+        for _ in range(operations):
+            loop.call_soon(callback)
+    elif scenario == "timers":
+        deadline = loop.time()
+        for _ in range(operations):
+            loop.call_at(deadline, callback)
+    elif scenario == "cancelled":
+        completed = len(cancelled)
+    elif scenario == "cross-thread":
+        for _ in range(operations):
+            loop.call_soon_threadsafe(callback)
+    elif scenario == "udp":
+        loop.call_soon(submit)
+    if scenario != "udp":
+        loop.call_soon(loop.stop)
     loop.run_forever()
     after = tracemalloc.take_snapshot()
-    differences = after.compare_to(before, "traceback")
+    assert baseline is not None
+    differences = after.compare_to(baseline, "traceback")
     current, peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    loop.close()
+    if owns_trace:
+        tracemalloc.stop()
+    if receiver is not None:
+        loop.remove_reader(receiver.fileno())
+        receiver.close()
+    if sender is not None:
+        sender.close()
+    if close_loop:
+        loop.close()
+    return completed, differences, current, peak
+
+
+def _allocation_probe(factory: Callable[[], asyncio.AbstractEventLoop],
+                      scenario: Scenario, operations: int) -> dict[str, Any]:
+    epochs: list[dict[str, Any]] = []
+    loop = factory()
+    # One unreported epoch warms Python, selector, and allocator caches. Five
+    # measured epochs make a monotonic retained-growth regression observable.
+    try:
+        _allocation_epoch(
+            lambda: loop, scenario, operations, close_loop=False
+        )
+        gc.collect()
+        tracemalloc.start(16)
+        baseline = tracemalloc.take_snapshot()
+        for _ in range(5):
+            completed, differences, current, peak = _allocation_epoch(
+                lambda: loop, scenario, operations, close_loop=False,
+                baseline=baseline,
+            )
+            categories: dict[str, dict[str, int]] = {}
+            for item in differences:
+                category = _trace_category(item.traceback)
+                values = categories.setdefault(category, {"blocks": 0, "bytes": 0})
+                values["blocks"] += item.count_diff
+                values["bytes"] += item.size_diff
+            workload_categories = (
+                values for name, values in categories.items()
+                if name != "benchmark_harness"
+            )
+            workload_totals = tuple(workload_categories)
+            epochs.append({
+                "completed": completed,
+                "retained_blocks": sum(
+                    values["blocks"] for values in workload_totals
+                ),
+                "retained_bytes": sum(
+                    values["bytes"] for values in workload_totals
+                ),
+                "peak_traced_bytes": peak,
+                "current_traced_bytes": current,
+                "trace_categories": categories,
+            })
+    finally:
+        if tracemalloc.is_tracing():
+            tracemalloc.stop()
+        loop.close()
+    tail = epochs[-3:]
+    block_span = max(item["retained_blocks"] for item in tail) - min(
+        item["retained_blocks"] for item in tail
+    )
+    byte_span = max(item["retained_bytes"] for item in tail) - min(
+        item["retained_bytes"] for item in tail
+    )
+    plateau = block_span <= 8 and byte_span <= 4_096
+    final = epochs[-1]
     return {
+        "scenario": scenario,
         "operations": operations,
-        "completed": completed - operations,
-        "retained_blocks": sum(item.count_diff for item in differences),
-        "retained_bytes": sum(item.size_diff for item in differences),
-        "peak_traced_bytes": peak,
-        "current_traced_bytes": current,
+        "completed": final["completed"],
+        "retained_blocks": final["retained_blocks"],
+        "retained_bytes": final["retained_bytes"],
+        "peak_traced_bytes": final["peak_traced_bytes"],
+        "current_traced_bytes": final["current_traced_bytes"],
+        "trace_categories": final["trace_categories"],
+        "epochs": epochs,
+        "plateau": plateau,
+        "plateau_tail_block_span": block_span,
+        "plateau_tail_byte_span": byte_span,
     }
 
 
@@ -342,16 +504,57 @@ def _selector_probe(factory: Callable[[], asyncio.AbstractEventLoop],
     return {"iterations": iterations, "polls": polls}
 
 
-def _native_allocation_counters(factory: Callable[[], asyncio.AbstractEventLoop]) -> dict[str, Any]:
+def _native_allocation_counters(
+    factory: Callable[[], asyncio.AbstractEventLoop],
+    scenario: Scenario,
+    operations: int,
+) -> dict[str, Any]:
     loop = factory()
     try:
-        module = sys.modules.get(type(loop).__module__)
+        # Extension module functions retain their defining module as
+        # ``__self__``.  The validated artifact loader deliberately does not
+        # publish that module through sys.modules, so prefer the factory's
+        # owner and keep the registry lookup for conventional import paths.
+        module = getattr(factory, "__self__", None)
+        if module is None:
+            module = sys.modules.get(type(loop).__module__)
+        if module is None:
+            from webrtc import event_loop
+            from webrtc.event_loop import compile_policy
+
+            candidates = compile_policy.artifact_candidates()
+            if len(candidates) != 1:
+                raise RuntimeError("native artifact path is ambiguous")
+            cached_factory = event_loop._diagnostic_factories.get(
+                candidates[0].expanduser().resolve()
+            )
+            module = getattr(cached_factory, "__self__", None)
         reader = getattr(module, "__pymeta_native_allocation_counters__", None)
+        reset = getattr(
+            module, "__pymeta_reset_native_allocation_counters__", None
+        )
         if not callable(reader):
-            return {"available": False, "reason": "artifact is not instrumented"}
+            raise RuntimeError(
+                "native artifact is not instrumented: missing "
+                "__pymeta_native_allocation_counters__"
+            )
+        if not callable(reset):
+            raise RuntimeError(
+                "native artifact is not instrumented: missing "
+                "__pymeta_reset_native_allocation_counters__"
+            )
+        # Warm the exact scenario so retained FIFO/heap capacity and generated
+        # call caches are established before compiler-internal accounting.
+        _allocation_epoch(
+            lambda: loop, scenario, operations, close_loop=False
+        )
+        reset()
         before = dict(reader())
-        loop.call_soon(loop.stop)
-        loop.run_forever()
+        measured_loop = loop
+        loop = None
+        _allocation_epoch(
+            lambda: measured_loop, scenario, operations, close_loop=False
+        )
         after = dict(reader())
         keys = set(before) | set(after)
         return {
@@ -362,7 +565,10 @@ def _native_allocation_counters(factory: Callable[[], asyncio.AbstractEventLoop]
                       for key in sorted(keys)},
         }
     finally:
-        loop.close()
+        if 'measured_loop' in locals():
+            measured_loop.close()
+        if loop is not None:
+            loop.close()
 
 
 def _native_artifact_metadata(factory: Callable[[], asyncio.AbstractEventLoop]) -> dict[str, Any]:
@@ -396,9 +602,12 @@ def run_worker(mode: Mode, scenario: Scenario, config: BenchmarkConfig) -> dict[
     factory, resolved = _loop_factory(mode)
     throughput = _timed_probe(factory, scenario, config, latency=False)
     latency = _timed_probe(factory, scenario, config, latency=True)
-    allocations = _allocation_probe(factory, config.allocation_operations)
+    allocations = _allocation_probe(
+        factory, scenario, config.allocation_operations
+    )
     selector = _selector_probe(factory)
-    native_allocations = (_native_allocation_counters(factory)
+    native_allocations = (_native_allocation_counters(
+                              factory, scenario, config.allocation_operations)
                           if mode == "native-required" else {"available": False})
     artifact = (_native_artifact_metadata(factory)
                 if mode == "native-required" else None)
@@ -480,8 +689,13 @@ def _summaries(samples: list[dict[str, Any]], scenarios: tuple[Scenario, ...]) -
                            for sample in by_mode["native-required"]]
         counter_pass = bool(counter_samples) and all(
             sample.get("available") and
-            all(value == 0 for value in sample.get("delta", {}).values())
+            all(value == 0 for key, value in sample.get("delta", {}).items()
+                if key.endswith(".allocations"))
             for sample in counter_samples
+        )
+        plateau_pass = all(
+            bool(sample["allocations"].get("plateau"))
+            for sample in by_mode["native-required"]
         )
         idle_cpu_pass = True
         if scenario == "idle":
@@ -500,6 +714,7 @@ def _summaries(samples: list[dict[str, Any]], scenarios: tuple[Scenario, ...]) -
             "latency": p99["native-required"] <= latency_limit,
             "python_allocations": allocation_pass,
             "native_internal_allocations": counter_pass,
+            "retained_memory_plateau": plateau_pass,
             "idle_cpu": idle_cpu_pass,
         }
         result[scenario] = {

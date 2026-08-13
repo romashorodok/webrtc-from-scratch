@@ -106,6 +106,33 @@ def test_native_members_preserve_assignment_identity_and_readback(
         loop.close()
 
 
+def test_ready_and_scheduled_escape_once_and_remain_live(
+    native_module: object,
+) -> None:
+    loop = native_module.new_event_loop()  # type: ignore[attr-defined]
+    trace: list[str] = []
+    try:
+        ready = loop._ready
+        scheduled = loop._scheduled
+        assert loop._ready is ready
+        assert loop._scheduled is scheduled
+
+        loop.call_soon(trace.append, "ready")
+        ready.append(asyncio.Handle(trace.append, ("external",), loop))
+        loop.call_at(loop.time(), trace.append, "timer")
+
+        assert loop._ready is ready
+        assert loop._scheduled is scheduled
+        assert len(ready) == 2
+        assert len(scheduled) == 1
+        loop._run_once()
+        assert trace == ["ready", "external", "timer"]
+        assert loop._ready is ready
+        assert loop._scheduled is scheduled
+    finally:
+        loop.close()
+
+
 def test_deleted_native_member_matches_object_slot_errors(native_module: object) -> None:
     loop = native_module.new_event_loop()  # type: ignore[attr-defined]
     original = loop._ready

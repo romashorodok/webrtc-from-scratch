@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "native_storage.h"
+#include "boxed_executor.h"
 
 static int missing(const char *name) {
     PyErr_Format(PyExc_AttributeError, "%s", name == NULL ? "field" : name);
@@ -634,6 +635,9 @@ static void fifo_native_clear(WrtcNativeFifo *fifo) {
         const size_t position = (fifo->head + index) % fifo->capacity;
         Py_CLEAR(fifo->items[position]);
     }
+    if (fifo->items != NULL)
+        wrtc_native_allocation_free(
+            WRTC_NATIVE_ALLOC_SCHEDULER_CONTAINER_GROWTH);
     free(fifo->items);
     fifo->items = NULL;
     fifo->capacity = fifo->head = fifo->size = 0u;
@@ -644,7 +648,8 @@ void wrtc_native_fifo_init(WrtcNativeFifo *fifo) {
 }
 
 void wrtc_native_fifo_clear(WrtcNativeFifo *fifo) {
-    if (fifo->mode == WRTC_STORAGE_BOXED) Py_CLEAR(fifo->boxed);
+    if (fifo->mode == WRTC_STORAGE_BOXED ||
+        fifo->mode == WRTC_STORAGE_ESCAPED) Py_CLEAR(fifo->boxed);
     if (fifo->mode == WRTC_STORAGE_NATIVE) fifo_native_clear(fifo);
     fifo->mode = WRTC_STORAGE_EMPTY;
 }
@@ -652,7 +657,8 @@ void wrtc_native_fifo_clear(WrtcNativeFifo *fifo) {
 int wrtc_native_fifo_traverse(WrtcNativeFifo *fifo, visitproc visit,
                               void *argument) {
     size_t index;
-    if (fifo->mode == WRTC_STORAGE_BOXED && fifo->boxed != NULL)
+    if ((fifo->mode == WRTC_STORAGE_BOXED ||
+         fifo->mode == WRTC_STORAGE_ESCAPED) && fifo->boxed != NULL)
         return visit(fifo->boxed, argument);
     if (fifo->mode == WRTC_STORAGE_NATIVE)
         for (index = 0u; index < fifo->size; index++) {
@@ -674,6 +680,8 @@ int wrtc_native_fifo_activate(WrtcNativeFifo *fifo, size_t capacity) {
     if (capacity == 0u) capacity = 8u;
     items = calloc(capacity, sizeof(*items));
     if (items == NULL) return PyErr_NoMemory(), -1;
+    wrtc_native_allocation_alloc(
+        WRTC_NATIVE_ALLOC_SCHEDULER_CONTAINER_GROWTH);
     fifo->items = items;
     fifo->capacity = capacity;
     fifo->mode = WRTC_STORAGE_NATIVE;
@@ -686,6 +694,27 @@ int wrtc_native_fifo_set_boxed(WrtcNativeFifo *fifo, PyObject *value) {
     fifo->boxed = owned;
     fifo->mode = WRTC_STORAGE_BOXED;
     return 0;
+}
+
+int wrtc_native_fifo_adopt_initial(WrtcNativeFifo *fifo, PyObject *value) {
+    PyObject *collections = NULL, *deque = NULL;
+    int exact = 0;
+    if (fifo->mode != WRTC_STORAGE_EMPTY) {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "initial FIFO adoption requires empty storage");
+        return -1;
+    }
+    collections = PyImport_ImportModule("collections");
+    deque = collections == NULL
+                ? NULL : PyObject_GetAttrString(collections, "deque");
+    if (deque != NULL)
+        exact = Py_IS_TYPE(value, (PyTypeObject *)deque) &&
+                PyObject_Length(value) == 0;
+    Py_XDECREF(deque);
+    Py_XDECREF(collections);
+    if (PyErr_Occurred()) return -1;
+    if (exact) return wrtc_native_fifo_activate(fifo, 8u);
+    return wrtc_native_fifo_set_boxed(fifo, value);
 }
 
 int wrtc_native_fifo_append(WrtcNativeFifo *fifo, PyObject *value);
@@ -747,9 +776,13 @@ static int fifo_grow(WrtcNativeFifo *fifo) {
     PyObject **items = calloc(capacity, sizeof(*items));
     size_t index;
     if (items == NULL) return PyErr_NoMemory(), -1;
+    wrtc_native_allocation_alloc(
+        WRTC_NATIVE_ALLOC_SCHEDULER_CONTAINER_GROWTH);
     for (index = 0u; index < fifo->size; index++)
         items[index] =
             fifo->items[(fifo->head + index) % fifo->capacity];
+    wrtc_native_allocation_free(
+        WRTC_NATIVE_ALLOC_SCHEDULER_CONTAINER_GROWTH);
     free(fifo->items);
     fifo->items = items;
     fifo->capacity = capacity;
@@ -758,7 +791,8 @@ static int fifo_grow(WrtcNativeFifo *fifo) {
 }
 
 int wrtc_native_fifo_append(WrtcNativeFifo *fifo, PyObject *value) {
-    if (fifo->mode == WRTC_STORAGE_BOXED) {
+    if (fifo->mode == WRTC_STORAGE_BOXED ||
+        fifo->mode == WRTC_STORAGE_ESCAPED) {
         PyObject *result =
             PyObject_CallMethod(fifo->boxed, "append", "O", value);
         if (result == NULL) return -1;
@@ -778,7 +812,8 @@ int wrtc_native_fifo_append(WrtcNativeFifo *fifo, PyObject *value) {
 
 PyObject *wrtc_native_fifo_popleft(WrtcNativeFifo *fifo) {
     PyObject *value;
-    if (fifo->mode == WRTC_STORAGE_BOXED)
+    if (fifo->mode == WRTC_STORAGE_BOXED ||
+        fifo->mode == WRTC_STORAGE_ESCAPED)
         return PyObject_CallMethod(fifo->boxed, "popleft", NULL);
     if (fifo->mode != WRTC_STORAGE_NATIVE || fifo->size == 0u) {
         PyErr_SetString(PyExc_IndexError, "pop from an empty deque");
@@ -794,17 +829,44 @@ PyObject *wrtc_native_fifo_popleft(WrtcNativeFifo *fifo) {
 Py_ssize_t wrtc_native_fifo_snapshot(const WrtcNativeFifo *fifo) {
     if (fifo->mode == WRTC_STORAGE_NATIVE)
         return (Py_ssize_t)fifo->size;
-    if (fifo->mode == WRTC_STORAGE_BOXED)
+    if (fifo->mode == WRTC_STORAGE_BOXED ||
+        fifo->mode == WRTC_STORAGE_ESCAPED)
         return PyObject_Length(fifo->boxed);
     PyErr_SetString(PyExc_AttributeError, "FIFO storage is deleted");
     return -1;
+}
+
+int wrtc_native_fifo_truth(const WrtcNativeFifo *fifo) {
+    Py_ssize_t size = wrtc_native_fifo_snapshot(fifo);
+    return size < 0 ? -1 : size != 0;
+}
+
+PyObject *wrtc_native_fifo_borrow(const WrtcNativeFifo *fifo,
+                                  Py_ssize_t index) {
+    if (fifo->mode == WRTC_STORAGE_NATIVE) {
+        if (index < 0) index += (Py_ssize_t)fifo->size;
+        if (index < 0 || (size_t)index >= fifo->size) {
+            PyErr_SetString(PyExc_IndexError, "deque index out of range");
+            return NULL;
+        }
+        return fifo->items[(fifo->head + (size_t)index) % fifo->capacity];
+    }
+    if (fifo->mode == WRTC_STORAGE_BOXED ||
+        fifo->mode == WRTC_STORAGE_ESCAPED) {
+        PyErr_SetString(PyExc_TypeError,
+                        "borrowed FIFO access requires native storage");
+        return NULL;
+    }
+    (void)missing("FIFO storage");
+    return NULL;
 }
 
 PyObject *wrtc_native_fifo_get(WrtcNativeFifo *fifo,
                                const char *field_name) {
     PyObject *collections, *deque, *items, *value;
     size_t index;
-    if (fifo->mode == WRTC_STORAGE_BOXED) return Py_NewRef(fifo->boxed);
+    if (fifo->mode == WRTC_STORAGE_BOXED ||
+        fifo->mode == WRTC_STORAGE_ESCAPED) return Py_NewRef(fifo->boxed);
     if (fifo->mode != WRTC_STORAGE_NATIVE) {
         (void)missing(field_name);
         return NULL;
@@ -823,9 +885,11 @@ PyObject *wrtc_native_fifo_get(WrtcNativeFifo *fifo,
     Py_XDECREF(collections);
     Py_DECREF(items);
     if (value == NULL) return NULL;
+    wrtc_native_allocation_alloc(WRTC_NATIVE_ALLOC_NATIVE_MATERIALIZATION);
+    wrtc_native_allocation_free(WRTC_NATIVE_ALLOC_NATIVE_MATERIALIZATION);
     wrtc_native_fifo_clear(fifo);
     fifo->boxed = Py_NewRef(value);
-    fifo->mode = WRTC_STORAGE_BOXED;
+    fifo->mode = WRTC_STORAGE_ESCAPED;
     return value;
 }
 
@@ -838,6 +902,9 @@ int wrtc_native_fifo_delete(WrtcNativeFifo *fifo, const char *field_name) {
 static void heap_native_clear(WrtcNativeMinHeap *heap) {
     size_t index;
     for (index = 0u; index < heap->size; index++) Py_CLEAR(heap->items[index]);
+    if (heap->items != NULL)
+        wrtc_native_allocation_free(
+            WRTC_NATIVE_ALLOC_SCHEDULER_CONTAINER_GROWTH);
     free(heap->items);
     heap->items = NULL;
     heap->capacity = heap->size = 0u;
@@ -848,7 +915,8 @@ void wrtc_native_heap_init(WrtcNativeMinHeap *heap) {
 }
 
 void wrtc_native_heap_clear(WrtcNativeMinHeap *heap) {
-    if (heap->mode == WRTC_STORAGE_BOXED) Py_CLEAR(heap->boxed);
+    if (heap->mode == WRTC_STORAGE_BOXED ||
+        heap->mode == WRTC_STORAGE_ESCAPED) Py_CLEAR(heap->boxed);
     if (heap->mode == WRTC_STORAGE_NATIVE) heap_native_clear(heap);
     heap->mode = WRTC_STORAGE_EMPTY;
 }
@@ -856,7 +924,8 @@ void wrtc_native_heap_clear(WrtcNativeMinHeap *heap) {
 int wrtc_native_heap_traverse(WrtcNativeMinHeap *heap, visitproc visit,
                               void *argument) {
     size_t index;
-    if (heap->mode == WRTC_STORAGE_BOXED && heap->boxed != NULL)
+    if ((heap->mode == WRTC_STORAGE_BOXED ||
+         heap->mode == WRTC_STORAGE_ESCAPED) && heap->boxed != NULL)
         return visit(heap->boxed, argument);
     if (heap->mode == WRTC_STORAGE_NATIVE)
         for (index = 0u; index < heap->size; index++) {
@@ -875,6 +944,8 @@ int wrtc_native_heap_activate(WrtcNativeMinHeap *heap, size_t capacity) {
     if (capacity == 0u) capacity = 8u;
     heap->items = calloc(capacity, sizeof(*heap->items));
     if (heap->items == NULL) return PyErr_NoMemory(), -1;
+    wrtc_native_allocation_alloc(
+        WRTC_NATIVE_ALLOC_SCHEDULER_CONTAINER_GROWTH);
     heap->capacity = capacity;
     heap->mode = WRTC_STORAGE_NATIVE;
     return 0;
@@ -886,6 +957,17 @@ int wrtc_native_heap_set_boxed(WrtcNativeMinHeap *heap, PyObject *value) {
     heap->boxed = owned;
     heap->mode = WRTC_STORAGE_BOXED;
     return 0;
+}
+
+int wrtc_native_heap_adopt_initial(WrtcNativeMinHeap *heap, PyObject *value) {
+    if (heap->mode != WRTC_STORAGE_EMPTY) {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "initial heap adoption requires empty storage");
+        return -1;
+    }
+    if (PyList_CheckExact(value) && PyList_GET_SIZE(value) == 0)
+        return wrtc_native_heap_activate(heap, 8u);
+    return wrtc_native_heap_set_boxed(heap, value);
 }
 
 int wrtc_native_heap_try_adopt(WrtcNativeMinHeap *heap) {
@@ -914,6 +996,10 @@ static int heap_grow(WrtcNativeMinHeap *heap) {
     PyObject **items =
         realloc(heap->items, capacity * sizeof(*items));
     if (items == NULL) return PyErr_NoMemory(), -1;
+    wrtc_native_allocation_alloc(
+        WRTC_NATIVE_ALLOC_SCHEDULER_CONTAINER_GROWTH);
+    wrtc_native_allocation_free(
+        WRTC_NATIVE_ALLOC_SCHEDULER_CONTAINER_GROWTH);
     heap->items = items;
     heap->capacity = capacity;
     return 0;
@@ -968,7 +1054,8 @@ static int heap_siftup(WrtcNativeMinHeap *heap, size_t position) {
 }
 
 int wrtc_native_heap_push(WrtcNativeMinHeap *heap, PyObject *value) {
-    if (heap->mode == WRTC_STORAGE_BOXED) {
+    if (heap->mode == WRTC_STORAGE_BOXED ||
+        heap->mode == WRTC_STORAGE_ESCAPED) {
         PyObject *module = PyImport_ImportModule("heapq");
         PyObject *result = module == NULL
                                ? NULL : PyObject_CallMethod(
@@ -991,7 +1078,8 @@ int wrtc_native_heap_push(WrtcNativeMinHeap *heap, PyObject *value) {
 
 PyObject *wrtc_native_heap_pop(WrtcNativeMinHeap *heap) {
     PyObject *last, *result;
-    if (heap->mode == WRTC_STORAGE_BOXED) {
+    if (heap->mode == WRTC_STORAGE_BOXED ||
+        heap->mode == WRTC_STORAGE_ESCAPED) {
         PyObject *module = PyImport_ImportModule("heapq");
         result = module == NULL
                      ? NULL : PyObject_CallMethod(
@@ -1018,7 +1106,8 @@ PyObject *wrtc_native_heap_pop(WrtcNativeMinHeap *heap) {
 
 int wrtc_native_heap_heapify(WrtcNativeMinHeap *heap) {
     size_t position;
-    if (heap->mode == WRTC_STORAGE_BOXED) {
+    if (heap->mode == WRTC_STORAGE_BOXED ||
+        heap->mode == WRTC_STORAGE_ESCAPED) {
         PyObject *module = PyImport_ImportModule("heapq");
         PyObject *result = module == NULL
                                ? NULL : PyObject_CallMethod(
@@ -1042,14 +1131,93 @@ int wrtc_native_heap_heapify(WrtcNativeMinHeap *heap) {
 Py_ssize_t wrtc_native_heap_snapshot(const WrtcNativeMinHeap *heap) {
     if (heap->mode == WRTC_STORAGE_NATIVE)
         return (Py_ssize_t)heap->size;
-    if (heap->mode == WRTC_STORAGE_BOXED)
+    if (heap->mode == WRTC_STORAGE_BOXED ||
+        heap->mode == WRTC_STORAGE_ESCAPED)
         return PyObject_Length(heap->boxed);
     PyErr_SetString(PyExc_AttributeError, "heap storage is deleted");
     return -1;
 }
 
+int wrtc_native_heap_truth(const WrtcNativeMinHeap *heap) {
+    Py_ssize_t size = wrtc_native_heap_snapshot(heap);
+    return size < 0 ? -1 : size != 0;
+}
+
+PyObject *wrtc_native_heap_borrow(const WrtcNativeMinHeap *heap,
+                                  Py_ssize_t index) {
+    if (heap->mode == WRTC_STORAGE_NATIVE) {
+        if (index < 0) index += (Py_ssize_t)heap->size;
+        if (index < 0 || (size_t)index >= heap->size) {
+            PyErr_SetString(PyExc_IndexError, "list index out of range");
+            return NULL;
+        }
+        return heap->items[(size_t)index];
+    }
+    if (heap->mode == WRTC_STORAGE_BOXED ||
+        heap->mode == WRTC_STORAGE_ESCAPED) {
+        PyErr_SetString(PyExc_TypeError,
+                        "borrowed heap access requires native storage");
+        return NULL;
+    }
+    (void)missing("heap storage");
+    return NULL;
+}
+
+size_t wrtc_native_heap_compact(WrtcNativeMinHeap *heap,
+                                WrtcNativeHeapKeep keep, void *context) {
+    size_t read, write = 0u, removed;
+    if (heap->mode != WRTC_STORAGE_NATIVE || keep == NULL) {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "heap compaction requires guarded native storage");
+        return (size_t)-1;
+    }
+    for (read = 0u; read < heap->size; read++) {
+        PyObject *item = heap->items[read];
+        if (keep(item, context))
+            heap->items[write++] = item;
+        else
+            Py_DECREF(item);
+    }
+    removed = heap->size - write;
+    while (write < heap->size) heap->items[write++] = NULL;
+    heap->size -= removed;
+    return removed;
+}
+
+Py_ssize_t wrtc_native_heap_compact_cancelled(WrtcNativeMinHeap *heap) {
+    size_t read, write = 0u, removed = 0u;
+    PyObject *cancelled = NULL;
+    int truth;
+    if (heap == NULL || heap->mode != WRTC_STORAGE_NATIVE) {
+        PyErr_SetString(PyExc_TypeError,
+                        "cancelled-timer compaction requires native heap");
+        return -1;
+    }
+    for (read = 0u; read < heap->size; read++) {
+        PyObject *item = heap->items[read];
+        cancelled = PyObject_GetAttrString(item, "_cancelled");
+        if (cancelled == NULL) return -1;
+        truth = PyObject_IsTrue(cancelled);
+        Py_DECREF(cancelled);
+        if (truth < 0) return -1;
+        if (truth) {
+            if (PyObject_SetAttrString(item, "_scheduled", Py_False) < 0)
+                return -1;
+            Py_DECREF(item);
+            removed++;
+        } else {
+            heap->items[write++] = item;
+        }
+    }
+    while (write < heap->size) heap->items[write++] = NULL;
+    heap->size -= removed;
+    if (wrtc_native_heap_heapify(heap) < 0) return -1;
+    return (Py_ssize_t)removed;
+}
+
 PyObject *wrtc_native_heap_root(const WrtcNativeMinHeap *heap) {
-    if (heap->mode == WRTC_STORAGE_BOXED)
+    if (heap->mode == WRTC_STORAGE_BOXED ||
+        heap->mode == WRTC_STORAGE_ESCAPED)
         return PySequence_GetItem(heap->boxed, 0);
     if (heap->mode != WRTC_STORAGE_NATIVE || heap->size == 0u) {
         PyErr_SetString(PyExc_IndexError, "list index out of range");
@@ -1062,19 +1230,22 @@ PyObject *wrtc_native_heap_get(WrtcNativeMinHeap *heap,
                                const char *field_name) {
     PyObject *value;
     size_t index;
-    if (heap->mode == WRTC_STORAGE_BOXED) return Py_NewRef(heap->boxed);
+    if (heap->mode == WRTC_STORAGE_BOXED ||
+        heap->mode == WRTC_STORAGE_ESCAPED) return Py_NewRef(heap->boxed);
     if (heap->mode != WRTC_STORAGE_NATIVE) {
         (void)missing(field_name);
         return NULL;
     }
     value = PyList_New((Py_ssize_t)heap->size);
     if (value == NULL) return NULL;
+    wrtc_native_allocation_alloc(WRTC_NATIVE_ALLOC_NATIVE_MATERIALIZATION);
+    wrtc_native_allocation_free(WRTC_NATIVE_ALLOC_NATIVE_MATERIALIZATION);
     for (index = 0u; index < heap->size; index++)
         PyList_SET_ITEM(value, (Py_ssize_t)index,
                         Py_NewRef(heap->items[index]));
     wrtc_native_heap_clear(heap);
     heap->boxed = Py_NewRef(value);
-    heap->mode = WRTC_STORAGE_BOXED;
+    heap->mode = WRTC_STORAGE_ESCAPED;
     return value;
 }
 

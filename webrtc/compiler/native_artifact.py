@@ -25,6 +25,9 @@ class NativeArtifactCompatibilityError(RuntimeError):
     """A compiled module is absent, stale, or does not expose its native contract."""
 
 
+_REGION_BACKENDS = frozenset({"boxed_ir", "aot_pyobject", "aot_direct_graph"})
+
+
 @dataclass(frozen=True, slots=True)
 class NativeClassRequirement:
     """One generated heap type and the approved CPython base it must derive from."""
@@ -141,6 +144,38 @@ def validate_native_artifact(
             "native artifact policy mismatch: " + ", ".join(policy_mismatches)
         )
 
+    backend = getattr(module, "__pymeta_pyobject_region_backend__", None)
+    if backend not in _REGION_BACKENDS:
+        raise NativeArtifactCompatibilityError(
+            f"native artifact has invalid region backend: {backend!r}"
+        )
+    region_entries = getattr(module, "__pymeta_native_region_backends__", None)
+    call_graph = getattr(module, "__pymeta_native_call_graph__", None)
+    if not isinstance(region_entries, tuple) or not all(
+        isinstance(entry, str) and "=" in entry for entry in region_entries
+    ):
+        raise NativeArtifactCompatibilityError(
+            "native artifact region backend manifest is missing or invalid"
+        )
+    if not isinstance(call_graph, tuple) or not all(
+        isinstance(edge, str) and "->" in edge for edge in call_graph
+    ):
+        raise NativeArtifactCompatibilityError(
+            "native artifact call-graph manifest is missing or invalid"
+        )
+    region_backends = dict(entry.rsplit("=", 1) for entry in region_entries)
+    if any(value not in _REGION_BACKENDS for value in region_backends.values()):
+        raise NativeArtifactCompatibilityError(
+            "native artifact region backend manifest contains an invalid backend"
+        )
+    if "aot_direct_graph" in region_backends.values():
+        _validate_direct_metadata(module)
+    expected_policy = dict(expected_metadata)
+    if expected_policy.get("performance_adopted") == "true":
+        _validate_direct_hot_graph(
+            backend, region_backends, call_graph, requirements
+        )
+
     for name in requirements.functions:
         value = getattr(module, name, None)
         if not inspect.isbuiltin(value) or getattr(value, "__module__", None) != module.__name__:
@@ -174,6 +209,84 @@ def validate_native_artifact(
                 raise NativeArtifactCompatibilityError(
                     f"required method {name}.{method_name} is not installed natively"
                 )
+
+
+def _validate_direct_hot_graph(
+    backend: str,
+    region_backends: Mapping[str, str],
+    call_graph: tuple[str, ...],
+    requirements: NativeModuleRequirements,
+) -> None:
+    """Fail closed unless every required reachable region is direct AOT."""
+    if backend != "aot_direct_graph":
+        raise NativeArtifactCompatibilityError(
+            "performance-adopted artifact must use aot_direct_graph"
+        )
+    adjacency: dict[str, list[str]] = {}
+    for edge in call_graph:
+        source, target = edge.split("->", 1)
+        adjacency.setdefault(source, []).append(target)
+    pending = [
+        f"{class_name}.{method_name}"
+        for class_name, requirement in requirements.classes.items()
+        for method_name in requirement.required_methods
+    ]
+    visited: set[str] = set()
+    while pending:
+        region = pending.pop()
+        if region in visited:
+            continue
+        visited.add(region)
+        if region_backends.get(region) != "aot_direct_graph":
+            raise NativeArtifactCompatibilityError(
+                f"required hot-graph region is not aot_direct_graph: {region}"
+            )
+        for target in adjacency.get(region, ()):
+            if any(
+                forbidden in target
+                for forbidden in (
+                    "wrtc_boxed_execute",
+                    "wrtc_boxed_bind",
+                    "wrtc_boxed_hook",
+                    "wrtc_aot_pyobject",
+                    "expression_hook",
+                    "aot_pyobject",
+                )
+            ):
+                raise NativeArtifactCompatibilityError(
+                    f"required hot graph references boxed executor or "
+                    f"compatibility ABI: {region}->{target}"
+                )
+            if target in region_backends:
+                pending.append(target)
+
+
+def _validate_direct_metadata(module: ModuleType) -> None:
+    """Require the ownership and deoptimization contract for direct regions."""
+    contracts = {
+        "__pymeta_native_operation_abi__": {
+            "typed_results", "ownership", "nullability", "exception_edges"
+        },
+        "__pymeta_native_guard_policy__": {
+            "exact_receiver", "native_storage", "original_descriptor",
+            "installed_descriptor", "pre_mutation",
+        },
+        "__pymeta_native_cache_policy__": {
+            "unbound_descriptors", "module_owned", "traverse", "clear", "free"
+        },
+        "__pymeta_native_invalidation_policy__": {
+            "module_epoch", "entry_guard", "fallback_before_mutation"
+        },
+    }
+    for attribute, required in contracts.items():
+        value = getattr(module, attribute, None)
+        actual = set(value.split(";")) if isinstance(value, str) else set()
+        missing = sorted(required - actual)
+        if missing:
+            raise NativeArtifactCompatibilityError(
+                f"native direct-graph contract is incomplete: "
+                f"{attribute} missing {', '.join(missing)}"
+            )
 
 
 def _extension_module_name(path: Path) -> str:

@@ -138,7 +138,8 @@ def test_threadsafe_handle_uses_dynamic_run(native_module: object) -> None:
         calls = _profile_handle_run(loop._run_once)
         # The custom loop publishes through its cancellation/claim wrapper;
         # command dispatch later enqueues the wrapper's exact asyncio Handle.
-        assert type(handle) is PublishedHandle
+        assert type(handle).__name__ == PublishedHandle.__name__
+        assert isinstance(handle, (PublishedHandle, native_module.PublishedHandle))  # type: ignore[attr-defined]
         # The wrapper dynamically executes its claim/state transition; only
         # exact asyncio Handle/TimerHandle objects use the C fast path.
         assert calls == 1

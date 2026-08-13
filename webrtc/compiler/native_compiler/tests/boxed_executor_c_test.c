@@ -274,7 +274,7 @@ int main(void) {
         CHECK(PyLong_AsLong(PyDict_GetItemString(bound, "flag")) == 4);
         CHECK(PyLong_AsLong(PyDict_GetItemString(
                   PyDict_GetItemString(bound, "extras"), "extra")) == 5);
-        Py_DECREF(bound);
+        wrtc_native_allocation_release_locals(bound);
         Py_DECREF(kwargs);
         Py_DECREF(args);
         args = Py_BuildValue("(i)", 1);
@@ -283,7 +283,7 @@ int main(void) {
               signature.defaults[1]);
         CHECK(PyLong_AsLong(
                   PyDict_GetItemString(globals, "default_calls")) == 1);
-        Py_DECREF(bound);
+        wrtc_native_allocation_release_locals(bound);
         Py_DECREF(args);
         wrtc_boxed_signature_clear(&signature);
     }
@@ -294,6 +294,25 @@ int main(void) {
               globals, source, "unbound", locals, &result) < 0);
     CHECK(PyErr_ExceptionMatches(PyExc_UnboundLocalError));
     PyErr_Clear();
+
+    {
+        PyObject *counters = wrtc_native_allocation_counters(NULL, NULL);
+        PyObject *fallback = counters == NULL ? NULL : PyDict_GetItemString(
+            counters, "fallback_deoptimization.allocations");
+        PyObject *live = counters == NULL ? NULL : PyDict_GetItemString(
+            counters, "locals_dictionary.live");
+        CHECK(fallback != NULL && PyLong_AsUnsignedLongLong(fallback) >= 6u);
+        CHECK(live != NULL && PyLong_AsUnsignedLongLong(live) == 0u);
+        Py_DECREF(counters);
+        PyObject *reset = wrtc_native_reset_allocation_counters(NULL, NULL);
+        CHECK(reset == Py_None);
+        Py_DECREF(reset);
+        counters = wrtc_native_allocation_counters(NULL, NULL);
+        fallback = counters == NULL ? NULL : PyDict_GetItemString(
+            counters, "fallback_deoptimization.allocations");
+        CHECK(fallback != NULL && PyLong_AsUnsignedLongLong(fallback) == 0u);
+        Py_DECREF(counters);
+    }
 
     Py_DECREF(events);
     Py_DECREF(values);

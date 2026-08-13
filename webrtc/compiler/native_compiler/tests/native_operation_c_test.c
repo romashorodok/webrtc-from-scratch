@@ -113,6 +113,27 @@ static int fixture_test(void) {
         const WrtcNativeOperationIR *operation = &table->operations[index];
         CHECK(operation->evaluation_order == index);
         CHECK(operation->span.line > 0);
+        CHECK(operation->has_exception_edge);
+        if (operation->kind == WRTC_NATIVE_OP_LENGTH)
+            CHECK(operation->result_representation ==
+                  WRTC_NATIVE_REPR_PY_SSIZE_T);
+        if (operation->kind == WRTC_NATIVE_OP_TRUTH)
+            CHECK(operation->result_representation ==
+                  WRTC_NATIVE_REPR_BOOL);
+        if (operation->kind == WRTC_NATIVE_OP_ROOT_READ) {
+            CHECK(operation->result_representation ==
+                  WRTC_NATIVE_REPR_BORROWED_PYOBJECT);
+            CHECK(operation->result_ownership ==
+                  WRTC_NATIVE_OWNERSHIP_BORROWED);
+            CHECK(operation->result_nullable);
+        }
+        if (operation->kind == WRTC_NATIVE_OP_FIFO_POPLEFT ||
+            operation->kind == WRTC_NATIVE_OP_HEAP_POP) {
+            CHECK(operation->result_representation ==
+                  WRTC_NATIVE_REPR_OWNED_PYOBJECT);
+            CHECK(operation->result_ownership ==
+                  WRTC_NATIVE_OWNERSHIP_OWNED);
+        }
         seen |= 1u << (unsigned)operation->kind;
     }
     CHECK((seen & (1u << WRTC_NATIVE_OP_ALIAS_BIND)) != 0u);
@@ -384,7 +405,9 @@ static int scheduler_test(void) {
                   operation->kind == WRTC_NATIVE_OP_ITERATE ||
                   operation->kind == WRTC_NATIVE_OP_SLICE_ASSIGN ||
                   operation->kind == WRTC_NATIVE_OP_HEAPIFY ||
-                  operation->kind == WRTC_NATIVE_OP_HEAP_POP);
+                  operation->kind == WRTC_NATIVE_OP_HEAP_PUSH ||
+                  operation->kind == WRTC_NATIVE_OP_HEAP_POP ||
+                  operation->kind == WRTC_NATIVE_OP_HEAP_COMPACT_CANCELLED);
         } else if (strcmp(field->name, "_state") == 0) {
             atomic++;
             CHECK(operation->kind ==

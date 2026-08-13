@@ -2,10 +2,221 @@
 #include <Python.h>
 
 #include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "boxed_executor.h"
+
+#define WRTC_ALLOCATION_REGION_LIMIT 256u
+#define WRTC_ALLOCATION_REGION_DEPTH 64u
+
+typedef struct {
+    uint64_t allocations;
+    uint64_t frees;
+    uint64_t live;
+    uint64_t peak_live;
+} WrtcNativeAllocationValues;
+
+typedef struct {
+    const char *name;
+    WrtcNativeAllocationValues values[WRTC_NATIVE_ALLOC_CATEGORY_COUNT];
+} WrtcNativeAllocationRegion;
+
+static WrtcNativeAllocationValues
+    wrtc_native_allocation_totals[WRTC_NATIVE_ALLOC_CATEGORY_COUNT];
+static WrtcNativeAllocationRegion
+    wrtc_native_allocation_regions[WRTC_ALLOCATION_REGION_LIMIT];
+static size_t wrtc_native_allocation_region_count;
+static WrtcNativeAllocationRegion *
+    wrtc_native_allocation_region_stack[WRTC_ALLOCATION_REGION_DEPTH];
+static size_t wrtc_native_allocation_region_depth;
+static unsigned wrtc_native_allocation_pause_depth;
+
+static const char *const wrtc_native_allocation_category_names[] = {
+    "region_frame", "locals_dictionary", "temporary_tuple",
+    "temporary_list", "keyword_dictionary", "argument_vector_overflow",
+    "attribute_name_or_bound_method", "boxed_temporary",
+    "compiler_scratch_buffer", "fallback_deoptimization",
+    "scheduler_container_growth", "native_materialization"
+};
+
+static void allocation_values_alloc(WrtcNativeAllocationValues *values) {
+    values->allocations++;
+    values->live++;
+    if (values->live > values->peak_live) values->peak_live = values->live;
+}
+
+static void allocation_values_free(WrtcNativeAllocationValues *values) {
+    values->frees++;
+    if (values->live != 0u) values->live--;
+}
+
+void wrtc_native_allocation_alloc(WrtcNativeAllocationCategory category) {
+    WrtcNativeAllocationRegion *region;
+    if (wrtc_native_allocation_pause_depth != 0u || category < 0 ||
+        category >= WRTC_NATIVE_ALLOC_CATEGORY_COUNT)
+        return;
+    allocation_values_alloc(&wrtc_native_allocation_totals[(size_t)category]);
+    region = wrtc_native_allocation_region_depth == 0u
+                 ? NULL
+                 : wrtc_native_allocation_region_stack[
+                       wrtc_native_allocation_region_depth - 1u];
+    if (region != NULL)
+        allocation_values_alloc(&region->values[(size_t)category]);
+}
+
+void wrtc_native_allocation_free(WrtcNativeAllocationCategory category) {
+    WrtcNativeAllocationRegion *region;
+    if (wrtc_native_allocation_pause_depth != 0u || category < 0 ||
+        category >= WRTC_NATIVE_ALLOC_CATEGORY_COUNT)
+        return;
+    allocation_values_free(&wrtc_native_allocation_totals[(size_t)category]);
+    region = wrtc_native_allocation_region_depth == 0u
+                 ? NULL
+                 : wrtc_native_allocation_region_stack[
+                       wrtc_native_allocation_region_depth - 1u];
+    if (region != NULL)
+        allocation_values_free(&region->values[(size_t)category]);
+}
+
+void wrtc_native_allocation_region_enter(const char *name) {
+    WrtcNativeAllocationRegion *region = NULL;
+    size_t index;
+    if (name == NULL) return;
+    for (index = 0u; index < wrtc_native_allocation_region_count; index++)
+        if (strcmp(wrtc_native_allocation_regions[index].name, name) == 0) {
+            region = &wrtc_native_allocation_regions[index];
+            break;
+        }
+    if (region == NULL &&
+        wrtc_native_allocation_region_count < WRTC_ALLOCATION_REGION_LIMIT) {
+        region = &wrtc_native_allocation_regions[
+            wrtc_native_allocation_region_count++];
+        region->name = name;
+    }
+    if (wrtc_native_allocation_region_depth < WRTC_ALLOCATION_REGION_DEPTH)
+        wrtc_native_allocation_region_stack[
+            wrtc_native_allocation_region_depth++] = region;
+}
+
+void wrtc_native_allocation_region_leave(void) {
+    if (wrtc_native_allocation_region_depth != 0u)
+        wrtc_native_allocation_region_depth--;
+}
+
+void wrtc_native_allocation_pause(void) {
+    wrtc_native_allocation_pause_depth++;
+}
+
+void wrtc_native_allocation_resume(void) {
+    if (wrtc_native_allocation_pause_depth != 0u)
+        wrtc_native_allocation_pause_depth--;
+}
+
+static int allocation_dict_value(PyObject *result, const char *prefix,
+                                 const char *category, const char *field,
+                                 uint64_t value) {
+    char key[512];
+    PyObject *number;
+    int written, status;
+    written = snprintf(key, sizeof key, "%s%s%s.%s", prefix,
+                       prefix[0] == '\0' ? "" : ".", category, field);
+    if (written < 0 || (size_t)written >= sizeof key) {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "native allocation counter key is too long");
+        return -1;
+    }
+    number = PyLong_FromUnsignedLongLong((unsigned long long)value);
+    if (number == NULL) return -1;
+    status = PyDict_SetItemString(result, key, number);
+    Py_DECREF(number);
+    return status;
+}
+
+static int allocation_dict_values(PyObject *result, const char *prefix,
+                                  size_t category,
+                                  const WrtcNativeAllocationValues *values) {
+    const char *name = wrtc_native_allocation_category_names[category];
+    return allocation_dict_value(result, prefix, name, "allocations",
+                                 values->allocations) < 0 ||
+                   allocation_dict_value(result, prefix, name, "frees",
+                                         values->frees) < 0 ||
+                   allocation_dict_value(result, prefix, name, "live",
+                                         values->live) < 0 ||
+                   allocation_dict_value(result, prefix, name, "peak_live",
+                                         values->peak_live) < 0
+               ? -1 : 0;
+}
+
+PyObject *wrtc_native_allocation_counters(PyObject *self, PyObject *unused) {
+    PyObject *result;
+    size_t category, region;
+    (void)self;
+    (void)unused;
+    wrtc_native_allocation_pause();
+    result = PyDict_New();
+    if (result == NULL) goto done;
+    for (category = 0u; category < WRTC_NATIVE_ALLOC_CATEGORY_COUNT;
+         category++)
+        if (allocation_dict_values(result, "", category,
+                                   &wrtc_native_allocation_totals[category]) < 0)
+            goto error;
+    for (region = 0u; region < wrtc_native_allocation_region_count; region++) {
+        char prefix[384];
+        int written = snprintf(prefix, sizeof prefix, "region.%s",
+                               wrtc_native_allocation_regions[region].name);
+        if (written < 0 || (size_t)written >= sizeof prefix) {
+            PyErr_SetString(PyExc_RuntimeError,
+                            "native allocation region name is too long");
+            goto error;
+        }
+        for (category = 0u; category < WRTC_NATIVE_ALLOC_CATEGORY_COUNT;
+             category++)
+            if (allocation_dict_values(
+                    result, prefix, category,
+                    &wrtc_native_allocation_regions[region].values[category]) < 0)
+                goto error;
+    }
+    goto done;
+error:
+    Py_CLEAR(result);
+done:
+    wrtc_native_allocation_resume();
+    return result;
+}
+
+PyObject *wrtc_native_reset_allocation_counters(PyObject *self,
+                                                PyObject *unused) {
+    size_t category, region;
+    (void)self;
+    (void)unused;
+    wrtc_native_allocation_pause();
+    for (category = 0u; category < WRTC_NATIVE_ALLOC_CATEGORY_COUNT;
+         category++) {
+        WrtcNativeAllocationValues *values =
+            &wrtc_native_allocation_totals[category];
+        values->allocations = values->frees = 0u;
+        values->peak_live = values->live;
+    }
+    for (region = 0u; region < wrtc_native_allocation_region_count; region++)
+        for (category = 0u; category < WRTC_NATIVE_ALLOC_CATEGORY_COUNT;
+             category++) {
+            WrtcNativeAllocationValues *values =
+                &wrtc_native_allocation_regions[region].values[category];
+            values->allocations = values->frees = 0u;
+            values->peak_live = values->live;
+        }
+    wrtc_native_allocation_resume();
+    Py_RETURN_NONE;
+}
+
+void wrtc_native_allocation_release_locals(PyObject *locals) {
+    if (locals == NULL) return;
+    wrtc_native_allocation_free(WRTC_NATIVE_ALLOC_LOCALS_DICTIONARY);
+    Py_DECREF(locals);
+}
 
 typedef enum {
     WRTC_FLOW_NORMAL = 0,
@@ -14,19 +225,43 @@ typedef enum {
     WRTC_FLOW_CONTINUE
 } WrtcFlow;
 
-typedef struct {
+typedef struct WrtcBoxedFrame WrtcBoxedFrame;
+typedef PyObject *(*WrtcExternalFrameEvaluate)(
+    void *, const WrtcPyExprIR *);
+typedef PyObject *(*WrtcExternalFrameLocal)(void *, const char *);
+
+struct WrtcBoxedFrame {
     PyObject *globals;
     PyObject *locals;
     PyObject *return_value;
     char **local_names;
     size_t local_count;
     const WrtcBoxedNativeHooks *hooks;
-} WrtcBoxedFrame;
+    void *external_frame;
+    WrtcExternalFrameEvaluate external_evaluate;
+    WrtcExternalFrameLocal external_local;
+};
 
 static PyObject *evaluate(const WrtcPyExprIR *expression,
                           WrtcBoxedFrame *frame);
+static PyObject *evaluate_impl(const WrtcPyExprIR *expression,
+                              WrtcBoxedFrame *frame);
 static int execute_statements(const WrtcPyStmtIR *statements, size_t count,
                               WrtcBoxedFrame *frame, WrtcFlow *flow);
+
+static PyObject *tracked_get_attr_string(PyObject *owner, const char *name) {
+    PyObject *result = PyObject_GetAttrString(owner, name);
+    if (result != NULL) {
+        /* Ownership leaves the compiler immediately through the expression
+         * result; live therefore measures compiler-owned objects, not the
+         * lifetime of objects retained by application code. */
+        wrtc_native_allocation_alloc(
+            WRTC_NATIVE_ALLOC_ATTRIBUTE_OR_BOUND_METHOD);
+        wrtc_native_allocation_free(
+            WRTC_NATIVE_ALLOC_ATTRIBUTE_OR_BOUND_METHOD);
+    }
+    return result;
+}
 
 static PyObject *lookup_name(WrtcBoxedFrame *frame, const char *name) {
     PyObject *value = PyDict_GetItemString(frame->locals, name);
@@ -282,6 +517,8 @@ static PyObject *evaluate_call(const WrtcPyExprIR *expression,
             PyErr_NoMemory();
             goto done;
         }
+        wrtc_native_allocation_alloc(
+            WRTC_NATIVE_ALLOC_ARGUMENT_VECTOR_OVERFLOW);
         memset(stack, 0, argument_count * sizeof(*stack));
     }
     for (index = 0u; index < argument_count; index++) {
@@ -289,12 +526,18 @@ static PyObject *evaluate_call(const WrtcPyExprIR *expression,
         if (value == NULL) goto done;
         stack[index] = value;
     }
+    wrtc_native_allocation_pause();
     result = PyObject_Vectorcall(
         callable, stack, expression->positional_count,
         expression->cached_keyword_names);
+    wrtc_native_allocation_resume();
 done:
     for (index = 0u; index < argument_count; index++) Py_XDECREF(stack[index]);
-    if (stack != small_stack) PyMem_Free(stack);
+    if (stack != small_stack) {
+        wrtc_native_allocation_free(
+            WRTC_NATIVE_ALLOC_ARGUMENT_VECTOR_OVERFLOW);
+        PyMem_Free(stack);
+    }
     Py_DECREF(callable);
     return result;
 }
@@ -379,9 +622,15 @@ static PyObject *evaluate_collection(const WrtcPyExprIR *expression,
                            : PyList_New((Py_ssize_t)expression->child_count);
     size_t index;
     if (result == NULL) return NULL;
+    wrtc_native_allocation_alloc(
+        tuple ? WRTC_NATIVE_ALLOC_TEMPORARY_TUPLE
+              : WRTC_NATIVE_ALLOC_TEMPORARY_LIST);
     for (index = 0u; index < expression->child_count; index++) {
         PyObject *value = evaluate(&expression->children[index], frame);
         if (value == NULL) {
+            wrtc_native_allocation_free(
+                tuple ? WRTC_NATIVE_ALLOC_TEMPORARY_TUPLE
+                      : WRTC_NATIVE_ALLOC_TEMPORARY_LIST);
             Py_DECREF(result);
             return NULL;
         }
@@ -390,6 +639,9 @@ static PyObject *evaluate_collection(const WrtcPyExprIR *expression,
         else
             PyList_SET_ITEM(result, (Py_ssize_t)index, value);
     }
+    wrtc_native_allocation_free(
+        tuple ? WRTC_NATIVE_ALLOC_TEMPORARY_TUPLE
+              : WRTC_NATIVE_ALLOC_TEMPORARY_LIST);
     return result;
 }
 
@@ -398,7 +650,9 @@ static PyObject *evaluate_dict(const WrtcPyExprIR *expression,
     PyObject *result = PyDict_New();
     size_t index;
     if (result == NULL) return NULL;
+    wrtc_native_allocation_alloc(WRTC_NATIVE_ALLOC_KEYWORD_DICTIONARY);
     if (expression->child_count % 2u != 0u) {
+        wrtc_native_allocation_free(WRTC_NATIVE_ALLOC_KEYWORD_DICTIONARY);
         Py_DECREF(result);
         PyErr_SetString(PyExc_SystemError, "invalid boxed dictionary IR");
         return NULL;
@@ -413,12 +667,14 @@ static PyObject *evaluate_dict(const WrtcPyExprIR *expression,
             PyDict_SetItem(result, key, value) < 0) {
             Py_XDECREF(value);
             Py_XDECREF(key);
+            wrtc_native_allocation_free(WRTC_NATIVE_ALLOC_KEYWORD_DICTIONARY);
             Py_DECREF(result);
             return NULL;
         }
         Py_DECREF(value);
         Py_DECREF(key);
     }
+    wrtc_native_allocation_free(WRTC_NATIVE_ALLOC_KEYWORD_DICTIONARY);
     return result;
 }
 
@@ -428,6 +684,7 @@ static PyObject *evaluate_joined_string(const WrtcPyExprIR *expression,
     PyObject *separator = NULL, *result = NULL;
     size_t index;
     if (parts == NULL) return NULL;
+    wrtc_native_allocation_alloc(WRTC_NATIVE_ALLOC_TEMPORARY_TUPLE);
     for (index = 0u; index < expression->child_count; index++) {
         PyObject *part = evaluate(&expression->children[index], frame);
         if (part == NULL) goto done;
@@ -437,6 +694,7 @@ static PyObject *evaluate_joined_string(const WrtcPyExprIR *expression,
     if (separator != NULL) result = PyUnicode_Join(separator, parts);
 done:
     Py_XDECREF(separator);
+    wrtc_native_allocation_free(WRTC_NATIVE_ALLOC_TEMPORARY_TUPLE);
     Py_DECREF(parts);
     return result;
 }
@@ -483,6 +741,7 @@ static void boxed_lambda_capsule_clear(PyObject *capsule) {
         return;
     }
     Py_CLEAR(lambda->globals);
+    wrtc_native_allocation_free(WRTC_NATIVE_ALLOC_COMPILER_SCRATCH_BUFFER);
     PyMem_Free(lambda);
 }
 
@@ -494,6 +753,7 @@ static PyObject *invoke_boxed_lambda(PyObject *capsule, PyObject *args,
     WrtcBoxedFrame frame;
     Py_ssize_t positional, keyword_count = 0;
     size_t index;
+    memset(&frame, 0, sizeof frame);
     if (lambda == NULL || lambda->lambda == NULL ||
         lambda->lambda->child_count != 1u)
         return NULL;
@@ -509,6 +769,7 @@ static PyObject *invoke_boxed_lambda(PyObject *capsule, PyObject *args,
     }
     locals = PyDict_New();
     if (locals == NULL) return NULL;
+    wrtc_native_allocation_alloc(WRTC_NATIVE_ALLOC_LOCALS_DICTIONARY);
     for (index = 0u; index < (size_t)positional; index++)
         if (PyDict_SetItemString(
                 locals, lambda->lambda->keyword_names[index],
@@ -557,7 +818,7 @@ static PyObject *invoke_boxed_lambda(PyObject *capsule, PyObject *args,
     frame.hooks = NULL;
     result = evaluate(&lambda->lambda->children[0], &frame);
 done:
-    Py_DECREF(locals);
+    wrtc_native_allocation_release_locals(locals);
     return result;
 }
 
@@ -573,12 +834,14 @@ static PyObject *evaluate_lambda(const WrtcPyExprIR *expression,
     WrtcBoxedLambda *lambda = PyMem_Calloc(1u, sizeof(*lambda));
     PyObject *capsule, *callable;
     if (lambda == NULL) return PyErr_NoMemory();
+    wrtc_native_allocation_alloc(WRTC_NATIVE_ALLOC_COMPILER_SCRATCH_BUFFER);
     lambda->lambda = expression;
     lambda->globals = Py_NewRef(frame->globals);
     capsule = PyCapsule_New(
         lambda, "wrtc.boxed_lambda", boxed_lambda_capsule_clear);
     if (capsule == NULL) {
         Py_DECREF(lambda->globals);
+        wrtc_native_allocation_free(WRTC_NATIVE_ALLOC_COMPILER_SCRATCH_BUFFER);
         PyMem_Free(lambda);
         return NULL;
     }
@@ -589,6 +852,16 @@ static PyObject *evaluate_lambda(const WrtcPyExprIR *expression,
 
 static PyObject *evaluate(const WrtcPyExprIR *expression,
                           WrtcBoxedFrame *frame) {
+    PyObject *result = evaluate_impl(expression, frame);
+    if (result != NULL) {
+        wrtc_native_allocation_alloc(WRTC_NATIVE_ALLOC_BOXED_TEMPORARY);
+        wrtc_native_allocation_free(WRTC_NATIVE_ALLOC_BOXED_TEMPORARY);
+    }
+    return result;
+}
+
+static PyObject *evaluate_impl(const WrtcPyExprIR *expression,
+                               WrtcBoxedFrame *frame) {
     PyObject *first, *second, *result;
     if (frame->hooks != NULL && frame->hooks->evaluate != NULL) {
         int handled = 0;
@@ -602,7 +875,7 @@ static PyObject *evaluate(const WrtcPyExprIR *expression,
         case WRTC_PY_EXPR_ATTRIBUTE:
             first = evaluate(&expression->children[0], frame);
             if (first == NULL) return NULL;
-            result = PyObject_GetAttrString(first, expression->operation);
+            result = tracked_get_attr_string(first, expression->operation);
             Py_DECREF(first);
             return result;
         case WRTC_PY_EXPR_CONSTANT:
@@ -807,7 +1080,7 @@ static int lvalue_load(const WrtcPyExprIR *target, WrtcBoxedFrame *frame,
     } else if (target->kind == WRTC_PY_EXPR_ATTRIBUTE) {
         lvalue->owner = evaluate(&target->children[0], frame);
         if (lvalue->owner != NULL)
-            lvalue->value = PyObject_GetAttrString(
+            lvalue->value = tracked_get_attr_string(
                 lvalue->owner, target->operation);
     } else if (target->kind == WRTC_PY_EXPR_SUBSCRIPT) {
         lvalue->owner = evaluate(&target->children[0], frame);
@@ -1211,12 +1484,15 @@ int wrtc_boxed_execute_with_hooks(
     WrtcBoxedFrame frame;
     WrtcFlow flow = WRTC_FLOW_NORMAL;
     int status;
+    memset(&frame, 0, sizeof frame);
     if (suite == NULL || !PyDict_Check(globals) ||
         !PyDict_Check(locals) || result == NULL) {
         PyErr_SetString(PyExc_TypeError,
                         "boxed executor requires suite and dict environments");
         return -1;
     }
+    wrtc_native_allocation_alloc(
+        WRTC_NATIVE_ALLOC_FALLBACK_DEOPTIMIZATION);
     frame.globals = globals;
     frame.locals = locals;
     frame.return_value = NULL;
@@ -1227,16 +1503,22 @@ int wrtc_boxed_execute_with_hooks(
         suite->statements, suite->statement_count, &frame, &flow);
     if (status < 0) {
         Py_XDECREF(frame.return_value);
+        wrtc_native_allocation_free(
+            WRTC_NATIVE_ALLOC_FALLBACK_DEOPTIMIZATION);
         return -1;
     }
     if (flow == WRTC_FLOW_BREAK || flow == WRTC_FLOW_CONTINUE) {
         Py_XDECREF(frame.return_value);
         PyErr_SetString(PyExc_SyntaxError,
                         "loop control escaped native region");
+        wrtc_native_allocation_free(
+            WRTC_NATIVE_ALLOC_FALLBACK_DEOPTIMIZATION);
         return -1;
     }
     *result = frame.return_value == NULL
                   ? Py_NewRef(Py_None) : frame.return_value;
+    wrtc_native_allocation_free(
+        WRTC_NATIVE_ALLOC_FALLBACK_DEOPTIMIZATION);
     return 0;
 }
 
@@ -1248,11 +1530,17 @@ int wrtc_boxed_execute(const WrtcPySuiteIR *suite, PyObject *globals,
 
 PyObject *wrtc_boxed_hook_evaluate(
     const WrtcPyExprIR *expression, void *frame) {
-    return evaluate(expression, (WrtcBoxedFrame *)frame);
+    WrtcBoxedFrame *boxed = (WrtcBoxedFrame *)frame;
+    if (boxed->external_evaluate != NULL)
+        return boxed->external_evaluate(boxed->external_frame, expression);
+    return evaluate(expression, boxed);
 }
 
 PyObject *wrtc_boxed_hook_local(const char *name, void *frame) {
-    return lookup_name((WrtcBoxedFrame *)frame, name);
+    WrtcBoxedFrame *boxed = (WrtcBoxedFrame *)frame;
+    if (boxed->external_local != NULL)
+        return boxed->external_local(boxed->external_frame, name);
+    return lookup_name(boxed, name);
 }
 
 int wrtc_boxed_signature_initialize(WrtcBoxedSignature *signature,
@@ -1271,6 +1559,9 @@ int wrtc_boxed_signature_initialize(WrtcBoxedSignature *signature,
         PyErr_NoMemory();
         return -1;
     }
+    if (signature->parameter_count != 0u)
+        wrtc_native_allocation_alloc(
+            WRTC_NATIVE_ALLOC_COMPILER_SCRATCH_BUFFER);
     for (index = 0u; index < signature->parameter_count; index++) {
         const WrtcBoxedParameterSpec *parameter =
             &signature->parameters[index];
@@ -1298,6 +1589,9 @@ void wrtc_boxed_signature_clear(WrtcBoxedSignature *signature) {
     if (signature == NULL || signature->defaults == NULL) return;
     for (index = 0u; index < signature->parameter_count; index++)
         Py_XDECREF(signature->defaults[index]);
+    if (signature->parameter_count != 0u)
+        wrtc_native_allocation_free(
+            WRTC_NATIVE_ALLOC_COMPILER_SCRATCH_BUFFER);
     free(signature->defaults);
     signature->defaults = NULL;
 }
@@ -1344,10 +1638,13 @@ int wrtc_boxed_bind_method(const WrtcBoxedSignature *signature, PyObject *self,
             PyErr_NoMemory();
             return -1;
         }
+        wrtc_native_allocation_alloc(
+            WRTC_NATIVE_ALLOC_ARGUMENT_VECTOR_OVERFLOW);
     }
     *locals = NULL;
     bound = PyDict_New();
     if (bound == NULL) goto error;
+    wrtc_native_allocation_alloc(WRTC_NATIVE_ALLOC_LOCALS_DICTIONARY);
     for (parameter = 0u; parameter < signature->parameter_count; parameter++)
         if (signature->parameters[parameter].kind == WRTC_PY_PARAM_VAR_KEYWORD)
             has_var_keyword = 1;
@@ -1389,15 +1686,18 @@ int wrtc_boxed_bind_method(const WrtcBoxedSignature *signature, PyObject *self,
             PyObject *tail = PyTuple_New(tail_count);
             Py_ssize_t tail_index;
             if (tail == NULL) goto error;
+            wrtc_native_allocation_alloc(WRTC_NATIVE_ALLOC_TEMPORARY_TUPLE);
             for (tail_index = 0; tail_index < tail_count; tail_index++) {
                 Py_ssize_t source = position + tail_index;
                 PyObject *value_at = source == 0 ? self : args[source - 1];
                 PyTuple_SET_ITEM(tail, tail_index, Py_NewRef(value_at));
             }
             if (PyDict_SetItemString(bound, spec->name, tail) < 0) {
+                wrtc_native_allocation_free(WRTC_NATIVE_ALLOC_TEMPORARY_TUPLE);
                 Py_DECREF(tail);
                 goto error;
             }
+            wrtc_native_allocation_free(WRTC_NATIVE_ALLOC_TEMPORARY_TUPLE);
             Py_DECREF(tail);
             position = available;
         } else if (spec->kind == WRTC_PY_PARAM_KEYWORD_ONLY) {
@@ -1416,19 +1716,23 @@ int wrtc_boxed_bind_method(const WrtcBoxedSignature *signature, PyObject *self,
         } else if (spec->kind == WRTC_PY_PARAM_VAR_KEYWORD) {
             PyObject *remaining = PyDict_New();
             if (remaining == NULL) goto error;
+            wrtc_native_allocation_alloc(WRTC_NATIVE_ALLOC_KEYWORD_DICTIONARY);
             for (index = 0; index < keyword_count; index++) {
                 if (consumed[index]) continue;
                 if (PyDict_SetItem(remaining, PyTuple_GET_ITEM(keyword_names, index),
                                    args[nargs + index]) < 0) {
+                    wrtc_native_allocation_free(WRTC_NATIVE_ALLOC_KEYWORD_DICTIONARY);
                     Py_DECREF(remaining);
                     goto error;
                 }
                 consumed[index] = 1u;
             }
             if (PyDict_SetItemString(bound, spec->name, remaining) < 0) {
+                wrtc_native_allocation_free(WRTC_NATIVE_ALLOC_KEYWORD_DICTIONARY);
                 Py_DECREF(remaining);
                 goto error;
             }
+            wrtc_native_allocation_free(WRTC_NATIVE_ALLOC_KEYWORD_DICTIONARY);
             Py_DECREF(remaining);
         }
     }
@@ -1447,12 +1751,20 @@ int wrtc_boxed_bind_method(const WrtcBoxedSignature *signature, PyObject *self,
             goto error;
         }
     }
-    if (consumed != small_consumed) PyMem_Free(consumed);
+    if (consumed != small_consumed) {
+        wrtc_native_allocation_free(
+            WRTC_NATIVE_ALLOC_ARGUMENT_VECTOR_OVERFLOW);
+        PyMem_Free(consumed);
+    }
     *locals = bound;
     return 0;
 error:
-    if (consumed != small_consumed) PyMem_Free(consumed);
-    Py_XDECREF(bound);
+    if (consumed != small_consumed) {
+        wrtc_native_allocation_free(
+            WRTC_NATIVE_ALLOC_ARGUMENT_VECTOR_OVERFLOW);
+        PyMem_Free(consumed);
+    }
+    if (bound != NULL) wrtc_native_allocation_release_locals(bound);
     return -1;
 }
 
@@ -1471,7 +1783,11 @@ int wrtc_boxed_bind(const WrtcBoxedSignature *signature, PyObject *args,
     *locals = NULL;
     positional_count = PyTuple_GET_SIZE(args);
     bound = PyDict_New();
+    if (bound != NULL)
+        wrtc_native_allocation_alloc(WRTC_NATIVE_ALLOC_LOCALS_DICTIONARY);
     remaining = kwargs == NULL ? PyDict_New() : PyDict_Copy(kwargs);
+    if (remaining != NULL)
+        wrtc_native_allocation_alloc(WRTC_NATIVE_ALLOC_KEYWORD_DICTIONARY);
     if (bound == NULL || remaining == NULL) goto error;
     for (index = 0u; index < signature->parameter_count; index++)
         if (signature->parameters[index].kind ==
@@ -1544,6 +1860,7 @@ int wrtc_boxed_bind(const WrtcBoxedSignature *signature, PyObject *args,
             if (PyDict_SetItemString(
                     bound, parameter->name, remaining) < 0)
                 goto error;
+            wrtc_native_allocation_free(WRTC_NATIVE_ALLOC_KEYWORD_DICTIONARY);
             Py_CLEAR(remaining);
         }
     }
@@ -1564,11 +1881,17 @@ int wrtc_boxed_bind(const WrtcBoxedSignature *signature, PyObject *args,
                          signature->name, name == NULL ? "" : name);
         goto error;
     }
-    Py_XDECREF(remaining);
+    if (remaining != NULL) {
+        wrtc_native_allocation_free(WRTC_NATIVE_ALLOC_KEYWORD_DICTIONARY);
+        Py_DECREF(remaining);
+    }
     *locals = bound;
     return 0;
 error:
-    Py_XDECREF(remaining);
-    Py_XDECREF(bound);
+    if (remaining != NULL) {
+        wrtc_native_allocation_free(WRTC_NATIVE_ALLOC_KEYWORD_DICTIONARY);
+        Py_DECREF(remaining);
+    }
+    if (bound != NULL) wrtc_native_allocation_release_locals(bound);
     return -1;
 }

@@ -11,6 +11,7 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Embed Developme
 find_package(Threads REQUIRED)
 
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/aot_codegen.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/boxed_executor.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/native_storage.c")
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/boxed_executor.c"
@@ -54,7 +55,7 @@ foreach(WRTC_WORKER_SOURCE native_worker_abi.h native_worker_record.h
     "${WRTC_WORKER_BYTES}0};\n")
 endforeach()
 
-add_library(wrtc-compiler-core STATIC boxed_codegen.c boxed_executor.c
+add_library(wrtc-compiler-core STATIC aot_codegen.c boxed_codegen.c boxed_executor.c
   boxed_module.c compiler_core.c lowering.c native_runtime.c generator.c
   native_class.c native_class_generator.c native_operation.c native_storage.c
   native_storage_codegen.c native_worker_record.c native_worker_executor.c native_kernel.c
