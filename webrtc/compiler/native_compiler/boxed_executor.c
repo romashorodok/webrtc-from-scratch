@@ -81,13 +81,22 @@ void wrtc_native_allocation_free(WrtcNativeAllocationCategory category) {
         allocation_values_free(&region->values[(size_t)category]);
 }
 
-void wrtc_native_allocation_region_enter(const char *name) {
+void wrtc_native_allocation_region_enter_cached(const char *name,
+                                                size_t *cached_index) {
     WrtcNativeAllocationRegion *region = NULL;
     size_t index;
     if (name == NULL) return;
+    if (cached_index != NULL && *cached_index != 0u &&
+        *cached_index <= wrtc_native_allocation_region_count) {
+        region = &wrtc_native_allocation_regions[*cached_index - 1u];
+        if (region->name != NULL && strcmp(region->name, name) == 0)
+            goto push;
+        region = NULL;
+    }
     for (index = 0u; index < wrtc_native_allocation_region_count; index++)
         if (strcmp(wrtc_native_allocation_regions[index].name, name) == 0) {
             region = &wrtc_native_allocation_regions[index];
+            if (cached_index != NULL) *cached_index = index + 1u;
             break;
         }
     if (region == NULL &&
@@ -95,10 +104,17 @@ void wrtc_native_allocation_region_enter(const char *name) {
         region = &wrtc_native_allocation_regions[
             wrtc_native_allocation_region_count++];
         region->name = name;
+        if (cached_index != NULL)
+            *cached_index = wrtc_native_allocation_region_count;
     }
+push:
     if (wrtc_native_allocation_region_depth < WRTC_ALLOCATION_REGION_DEPTH)
         wrtc_native_allocation_region_stack[
             wrtc_native_allocation_region_depth++] = region;
+}
+
+void wrtc_native_allocation_region_enter(const char *name) {
+    wrtc_native_allocation_region_enter_cached(name, NULL);
 }
 
 void wrtc_native_allocation_region_leave(void) {
@@ -354,6 +370,34 @@ static int initialize_expression(WrtcPyExprIR *expression,
             PyUnicode_InternFromString(expression->operation);
         if (expression->cached_attribute_name == NULL) return -1;
     }
+    if (expression->kind == WRTC_PY_EXPR_CALL &&
+        expression->cached_call_target == NULL &&
+        expression->child_count != 0u) {
+        WrtcPyExprIR *callable = &expression->children[0];
+        PyObject *candidate = NULL;
+        if (callable->kind == WRTC_PY_EXPR_NAME && callable->operation != NULL) {
+            candidate = PyDict_GetItemString(globals, callable->operation);
+            if (candidate != NULL &&
+                (PyType_Check(candidate) || PyFunction_Check(candidate) ||
+                 PyCFunction_Check(candidate)))
+                expression->cached_call_target = Py_NewRef(candidate);
+        } else if (callable->kind == WRTC_PY_EXPR_ATTRIBUTE &&
+                   callable->operation != NULL &&
+                   callable->child_count == 1u &&
+                   callable->children[0].kind == WRTC_PY_EXPR_NAME &&
+                   callable->children[0].operation != NULL) {
+            PyObject *owner = PyDict_GetItemString(
+                globals, callable->children[0].operation);
+            if (owner != NULL && (PyModule_Check(owner) || PyType_Check(owner))) {
+                candidate = PyObject_GetAttrString(owner, callable->operation);
+                if (candidate == NULL) return -1;
+                if (PyCallable_Check(candidate))
+                    expression->cached_call_target = candidate;
+                else
+                    Py_DECREF(candidate);
+            }
+        }
+    }
     for (index = 0u; index < expression->child_count; index++)
         if (initialize_expression(&expression->children[index], globals) < 0)
             return -1;
@@ -389,8 +433,60 @@ static void clear_expression(WrtcPyExprIR *expression) {
     Py_CLEAR(expression->cached_constant);
     Py_CLEAR(expression->cached_keyword_names);
     Py_CLEAR(expression->cached_attribute_name);
+    Py_CLEAR(expression->cached_call_target);
     for (index = 0u; index < expression->child_count; index++)
         clear_expression(&expression->children[index]);
+}
+
+static int traverse_expression(WrtcPyExprIR *expression, visitproc visit,
+                               void *arg) {
+    size_t index;
+    Py_VISIT(expression->cached_constant);
+    Py_VISIT(expression->cached_keyword_names);
+    Py_VISIT(expression->cached_attribute_name);
+    Py_VISIT(expression->cached_call_target);
+    for (index = 0u; index < expression->child_count; index++) {
+        int status = traverse_expression(&expression->children[index],
+                                         visit, arg);
+        if (status != 0) return status;
+    }
+    return 0;
+}
+
+static int traverse_statements(WrtcPyStmtIR *statements, size_t count,
+                               visitproc visit, void *arg) {
+    size_t statement_index, expression_index;
+    for (statement_index = 0u; statement_index < count; statement_index++) {
+        WrtcPyStmtIR *statement = &statements[statement_index];
+        int status;
+        for (expression_index = 0u;
+             expression_index < statement->expression_count;
+             expression_index++) {
+            status = traverse_expression(
+                &statement->expressions[expression_index], visit, arg);
+            if (status != 0) return status;
+        }
+        status = traverse_statements(statement->body, statement->body_count,
+                                     visit, arg);
+        if (status != 0) return status;
+        status = traverse_statements(statement->orelse,
+                                     statement->orelse_count, visit, arg);
+        if (status != 0) return status;
+        status = traverse_statements(statement->finalbody,
+                                     statement->finalbody_count, visit, arg);
+        if (status != 0) return status;
+        status = traverse_statements(statement->handlers,
+                                     statement->handler_count, visit, arg);
+        if (status != 0) return status;
+    }
+    return 0;
+}
+
+int wrtc_boxed_suite_traverse(WrtcPySuiteIR *suite, visitproc visit,
+                              void *arg) {
+    if (suite == NULL) return 0;
+    return traverse_statements(suite->statements, suite->statement_count,
+                               visit, arg);
 }
 
 static void clear_statements(WrtcPyStmtIR *statements, size_t count) {
@@ -895,10 +991,9 @@ static PyObject *evaluate_impl(const WrtcPyExprIR *expression,
             first = evaluate(&expression->children[0], frame);
             if (first == NULL) return NULL;
             if (expression->cached_attribute_name == NULL) {
+                result = PyObject_GetAttrString(first, expression->operation);
                 Py_DECREF(first);
-                PyErr_SetString(PyExc_SystemError,
-                                "attribute-name cache is uninitialized");
-                return NULL;
+                return result;
             }
             result = tracked_get_attr(
                 first, expression->cached_attribute_name);
@@ -1059,10 +1154,10 @@ static int assign_target(const WrtcPyExprIR *target, PyObject *value,
             owner = evaluate(&target->children[0], frame);
             if (owner == NULL) return -1;
             if (target->cached_attribute_name == NULL) {
+                status = PyObject_SetAttrString(
+                    owner, target->operation, value);
                 Py_DECREF(owner);
-                PyErr_SetString(PyExc_SystemError,
-                                "attribute-name cache is uninitialized");
-                return -1;
+                return status;
             }
             status = PyObject_SetAttr(
                 owner, target->cached_attribute_name, value);

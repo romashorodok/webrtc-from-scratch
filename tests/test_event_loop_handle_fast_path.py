@@ -71,6 +71,50 @@ def _profile_handle_run(callback: Callable[[], None]) -> int:
     return calls
 
 
+def _profile_handle_construction(callback: Callable[[], None]) -> tuple[int, int]:
+    counts = {asyncio.Handle.__init__.__code__: 0,
+              asyncio.TimerHandle.__init__.__code__: 0}
+
+    def profile(frame: FrameType, event: str, arg: object) -> None:
+        del arg
+        if event == "call" and frame.f_code in counts:
+            counts[frame.f_code] += 1
+
+    previous = sys.getprofile()
+    sys.setprofile(profile)
+    try:
+        callback()
+    finally:
+        sys.setprofile(previous)
+    return tuple(counts.values())  # type: ignore[return-value]
+
+
+def test_exact_handle_construction_avoids_python_init(
+    native_module: object,
+) -> None:
+    loop = native_module.new_event_loop()  # type: ignore[attr-defined]
+    marker = contextvars.ContextVar("constructor-marker", default="outer")
+    context = contextvars.copy_context()
+    context.run(marker.set, "captured")
+    created: list[asyncio.Handle] = []
+
+    def construct() -> None:
+        created.append(loop.call_soon(marker.get, context=context))
+        created.append(loop.call_at(loop.time() + 60.0, marker.get,
+                                    context=context))
+
+    try:
+        assert _profile_handle_construction(construct) == (0, 0)
+        handle, timer = created
+        assert type(handle) is asyncio.Handle
+        assert type(timer) is asyncio.TimerHandle
+        assert handle._context is context
+        assert timer._context is context
+        assert timer._scheduled
+    finally:
+        loop.close()
+
+
 def test_exact_handle_and_timer_avoid_python_run_frame(native_module: object) -> None:
     loop = native_module.new_event_loop()  # type: ignore[attr-defined]
     trace: list[object] = []
@@ -331,3 +375,25 @@ def test_callback_refcount_and_context_gc_stress_isolated(
         timeout=120,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_zz_monkeypatched_handle_init_forces_construction_fallback(
+    native_module: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run last: changing a pinned type version permanently deopts this artifact."""
+    loop = native_module.new_event_loop()  # type: ignore[attr-defined]
+    original = asyncio.Handle.__init__
+    calls = 0
+
+    def patched(self: asyncio.Handle, *args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        original(self, *args, **kwargs)
+
+    try:
+        monkeypatch.setattr(asyncio.Handle, "__init__", patched)
+        handle = loop.call_soon(lambda: None)
+        assert calls == 1
+        assert type(handle) is asyncio.Handle
+    finally:
+        loop.close()

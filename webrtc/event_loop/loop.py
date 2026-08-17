@@ -225,8 +225,6 @@ class WebRTCSelectorEventLoop(asyncio.SelectorEventLoop):
         context: contextvars.Context | None,
     ) -> asyncio.Handle:
         handle = asyncio.Handle(callback, args, self, context=context)
-        if handle._source_traceback:
-            handle._source_traceback.pop()
         self._ready.append(handle)
         return handle
 
@@ -264,8 +262,6 @@ class WebRTCSelectorEventLoop(asyncio.SelectorEventLoop):
         context: contextvars.Context | None,
     ) -> asyncio.TimerHandle:
         timer = asyncio.TimerHandle(when, callback, args, self, context=context)
-        if timer._source_traceback:
-            timer._source_traceback.pop()
         heapq.heappush(self._scheduled, timer)
         timer._scheduled = True
         return timer

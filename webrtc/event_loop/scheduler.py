@@ -77,7 +77,9 @@ class ReactorScheduler:
         timeout = loop._scheduled[0]._when - loop.time()
         if not timeout > 0.0:
             timeout = 0.0
-        return min(timeout, MAXIMUM_SELECT_TIMEOUT)
+        if timeout > MAXIMUM_SELECT_TIMEOUT:
+            timeout = MAXIMUM_SELECT_TIMEOUT
+        return timeout
 
     @pymeta.region(pymeta.required, effects=pymeta.effects(owner="reactor", suspend=pymeta.never))
     def process_selector_events(
@@ -114,8 +116,7 @@ class ReactorScheduler:
         else:
             deadline = now + loop._clock_resolution
         while loop._scheduled:
-            handle = loop._scheduled[0]
-            if handle._when >= deadline:
+            if loop._scheduled[0]._when >= deadline:
                 break
             handle = heapq.heappop(loop._scheduled)
             handle._scheduled = False
@@ -150,13 +151,76 @@ class ReactorScheduler:
             else:
                 handle._run()
 
-    @pymeta.region(pymeta.required, effects=pymeta.effects(owner="reactor", suspend=pymeta.never))
+    @pymeta.region(
+        pymeta.required,
+        effects=pymeta.effects(owner="reactor", suspend=pymeta.never),
+        call_returns={
+            "loop.time": pinned_semantics("monotonic_clock"),
+            "math.ulp": pinned_semantics("float_ulp"),
+        },
+    )
     def run_once(self, loop: "WebRTCSelectorEventLoop") -> None:
-        self.remove_cancelled_timers(loop)
+        # Keep the per-iteration scheduler graph in one required region.  The
+        # component methods above remain independently callable reference
+        # operations, but calling each one here would create a separate AOT
+        # frame and sever scalar propagation around the selector boundary.
+        if (
+            len(loop._scheduled) > _MIN_SCHEDULED_TIMER_HANDLES
+            and loop._timer_cancelled_count / len(loop._scheduled)
+            > _MIN_CANCELLED_TIMER_HANDLES_FRACTION
+        ):
+            _compact_cancelled_timers(loop._scheduled)
+            loop._timer_cancelled_count = 0
+        else:
+            while loop._scheduled and loop._scheduled[0]._cancelled:
+                cancelled = heapq.heappop(loop._scheduled)
+                cancelled._scheduled = False
+                loop._timer_cancelled_count = loop._timer_cancelled_count - 1
+
         loop._command_inbox.merge_into(loop)
-        timeout = self.compute_timeout(loop)
+
+        if loop._ready or loop._stopping:
+            timeout = 0.0
+        elif not loop._scheduled:
+            timeout = None
+        else:
+            timeout = loop._scheduled[0]._when - loop.time()
+            if not timeout > 0.0:
+                timeout = 0.0
+            if timeout > MAXIMUM_SELECT_TIMEOUT:
+                timeout = MAXIMUM_SELECT_TIMEOUT
+
         events = loop._selector.select(timeout)
-        self.process_selector_events(loop, events)
-        loop._packet_workers.drain_results()
-        self.promote_due_timers(loop)
+        for key, mask in events:
+            reader, writer = key.data
+            if mask & selectors.EVENT_READ and reader is not None:
+                if reader._cancelled:
+                    loop._remove_reader(key.fileobj)
+                else:
+                    loop._ready.append(reader)
+            if mask & selectors.EVENT_WRITE and writer is not None:
+                if writer._cancelled:
+                    loop._remove_writer(key.fileobj)
+                else:
+                    loop._ready.append(writer)
+
+        # The common loop configuration has no packet workers.  Avoid entering
+        # an otherwise empty required region on every selector iteration; the
+        # immutable scheduler configuration keeps this branch stable.
+        if self._config.packet_workers:
+            loop._packet_workers.drain_results()
+
+        now = loop.time()
+        ulp = math.ulp(now)
+        if ulp > loop._clock_resolution:
+            deadline = now + ulp
+        else:
+            deadline = now + loop._clock_resolution
+        while loop._scheduled:
+            if loop._scheduled[0]._when >= deadline:
+                break
+            handle = heapq.heappop(loop._scheduled)
+            handle._scheduled = False
+            loop._ready.append(handle)
+
         self.run_ready_snapshot(loop)

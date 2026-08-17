@@ -68,6 +68,8 @@ typedef struct WrtcPyExprIR {
     PyObject *cached_keyword_names;
     /* Interned attribute spelling used by vectorcall-method lowering. */
     PyObject *cached_attribute_name;
+    /* Unbound callable resolved from a private generated global or module. */
+    PyObject *cached_call_target;
 } WrtcPyExprIR;
 
 typedef enum {

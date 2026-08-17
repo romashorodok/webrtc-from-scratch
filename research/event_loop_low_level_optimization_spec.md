@@ -1,5 +1,9 @@
 # Python-Metalanguage Event-Loop Optimization Specification
 
+> The next timer-path compiler stage is specified by the
+> [Frame-Free Scheduler Superregion Implementation Specification](event_loop_scheduler_superregion_spec.md).
+> That focused document is normative where it is more specific.
+
 ## Status
 
 This document specifies a Python-first implementation of the optimized

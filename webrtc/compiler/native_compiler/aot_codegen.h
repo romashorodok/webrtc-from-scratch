@@ -16,7 +16,8 @@ int wrtc_aot_program_complete(const WrtcNativeClassProgram *program);
 int wrtc_aot_program_direct_complete(
     const WrtcNativeClassProgram *program,
     const WrtcNativeOperationTable *operations);
-int wrtc_aot_emit_runtime(FILE *file);
+int wrtc_aot_emit_runtime(FILE *file,
+                          const WrtcNativeClassProgram *program);
 int wrtc_aot_emit_region(FILE *file, size_t class_index, size_t region_index,
                          const WrtcNativeRegionIR *region,
                          const WrtcNativeClassProgram *program,

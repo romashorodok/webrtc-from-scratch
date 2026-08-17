@@ -37,6 +37,73 @@ static const WrtcNativeCallEdgeIR *call_edge(
     const AotEmitter *emitter, const WrtcPyExprIR *expression);
 static size_t slot_index(const AotEmitter *emitter, const char *name);
 
+static int shared_frame_call(const AotEmitter *emitter,
+                             const WrtcPyExprIR *expression,
+                             const WrtcNativeCallEdgeIR *edge) {
+    const WrtcNativeRegionIR *target;
+    size_t index;
+    if (edge == NULL || edge->target_class != emitter->class_index ||
+        edge->target_region >=
+            emitter->program->classes[edge->target_class].region_count ||
+        expression == NULL || expression->kind != WRTC_PY_EXPR_CALL ||
+        expression->child_count == 0u ||
+        expression->keyword_count != 0u)
+        return 0;
+    target = &emitter->program->classes[edge->target_class]
+                  .regions[edge->target_region];
+    if (target->signature->parameter_count !=
+        expression->positional_count + 1u)
+        return 0;
+    for (index = 0u; index < target->signature->parameter_count; index++) {
+        const WrtcPyExprIR *argument =
+            index == 0u ? &expression->children[0].children[0]
+                        : &expression->children[index];
+        if (argument->kind != WRTC_PY_EXPR_NAME ||
+            argument->operation == NULL ||
+            strcmp(argument->operation,
+                   target->signature->parameters[index].name) != 0 ||
+            slot_index(emitter, argument->operation) != index)
+            return 0;
+    }
+    for (index = 0u; index < target->body->local_count; index++)
+        if (slot_index(emitter, target->body->local_names[index]) !=
+            target->signature->parameter_count + index)
+            return 0;
+    return 1;
+}
+
+static int cacheable_global_call(const AotEmitter *emitter,
+                                 const WrtcPyExprIR *expression) {
+    const WrtcPyExprIR *callable, *owner;
+    if (expression == NULL || expression->kind != WRTC_PY_EXPR_CALL ||
+        expression->child_count == 0u)
+        return 0;
+    callable = &expression->children[0];
+    if (callable->kind == WRTC_PY_EXPR_NAME)
+        return callable->operation != NULL &&
+               slot_index(emitter, callable->operation) == (size_t)-1;
+    if (callable->kind != WRTC_PY_EXPR_ATTRIBUTE ||
+        callable->child_count != 1u)
+        return 0;
+    owner = &callable->children[0];
+    return owner->kind == WRTC_PY_EXPR_NAME && owner->operation != NULL &&
+           slot_index(emitter, owner->operation) == (size_t)-1;
+}
+
+static int program_has_capability(const WrtcNativeClassProgram *program,
+                                  unsigned capability) {
+    size_t class_index, region_index;
+    if (program == NULL) return 0;
+    for (class_index = 0u; class_index < program->class_count; class_index++)
+        for (region_index = 0u;
+             region_index < program->classes[class_index].region_count;
+             region_index++)
+            if ((program->classes[class_index].regions[region_index]
+                     .capabilities & capability) != 0u)
+                return 1;
+    return 0;
+}
+
 static const char *aot_final_type_name(const char *annotation,
                                        char *buffer, size_t capacity) {
     const char *start, *end, *dot;
@@ -514,14 +581,10 @@ int wrtc_aot_region_direct_supported(
     region = &program->classes[class_index].regions[region_index];
     if (!wrtc_aot_region_supported(region))
         return 0;
-    /* Direct graph promotion is intentionally scoped to the event-loop
-     * scheduling closure.  Other required subsystems keep their independently
-     * proven compatibility/kernel tiers until their own graph is complete. */
-    if (strcmp(program->classes[class_index].name,
-               "WebRTCSelectorEventLoop") != 0 &&
-        strcmp(program->classes[class_index].name, "ReactorScheduler") != 0 &&
-        strcmp(program->classes[class_index].name, "CommandInbox") != 0 &&
-        strcmp(program->classes[class_index].name, "PacketWorkerPool") != 0)
+    /* Direct eligibility is an IR property, never an application-name
+     * allowlist.  Preferred regions retain their compatibility tier; required
+     * regions promote only when every storage operation below is proven. */
+    if (region->policy != WRTC_REGION_REQUIRED)
         return 0;
     for (index = 0u; index < operations->operation_count; index++) {
         const WrtcNativeOperationIR *operation = &operations->operations[index];
@@ -606,36 +669,53 @@ int wrtc_aot_program_has_regions(const WrtcNativeClassProgram *program) {
     return 0;
 }
 
-int wrtc_aot_emit_runtime(FILE *file) {
+int wrtc_aot_emit_runtime(FILE *file,
+                          const WrtcNativeClassProgram *program) {
+    size_t class_index, region_index, slot_count = 1u;
     if (file == NULL) return -1;
-    return fputs(
+    if (program != NULL)
+        for (class_index = 0u; class_index < program->class_count;
+             class_index++)
+            for (region_index = 0u;
+                 region_index < program->classes[class_index].region_count;
+                 region_index++) {
+                const WrtcNativeRegionIR *region =
+                    &program->classes[class_index].regions[region_index];
+                size_t required = region->signature->parameter_count +
+                                  region->body->local_count;
+                if (required > slot_count) slot_count = required;
+            }
+    if (slot_count > WRTC_AOT_SLOT_LIMIT) return -1;
+    if (fputs(
         "#if defined(__GNUC__)||defined(__clang__)\n"
         "#define WRTC_AOT_UNUSED __attribute__((unused))\n"
         "#else\n#define WRTC_AOT_UNUSED\n#endif\n"
-        "#define WRTC_REGION_SLOT_COUNT 64u\n"
+        "#define WRTC_REGION_SLOT_COUNT ", file) < 0 ||
+        fprintf(file, "%zuu\n", slot_count) < 0 ||
+        fputs(
         "typedef struct{PyObject*values[WRTC_REGION_SLOT_COUNT];"
         "int64_t scalar_i[WRTC_REGION_SLOT_COUNT];"
         "double scalar_d[WRTC_REGION_SLOT_COUNT];uint64_t scalar_mask;"
         "uint64_t initialized_mask;uint64_t owned_mask;PyObject*globals;"
         "PyObject*return_value;const WrtcBoxedNativeHooks*hooks;}"
         "WrtcRegionFrame;"
-        "void wafc(WrtcRegionFrame*f){size_t i=0u;uint64_t m=f->owned_mask;"
+        "static inline void wafc(WrtcRegionFrame*f){size_t i=0u;uint64_t m=f->owned_mask;"
         "while(m){if((m&UINT64_C(1))!=0u)Py_DECREF(f->values[i]);"
         "m>>=1u;i++;}Py_XDECREF(f->return_value);}"
-        "int wafb(WrtcRegionFrame*f,size_t i,PyObject*v,int owned){"
+        "static inline int wafb(WrtcRegionFrame*f,size_t i,PyObject*v,int owned){"
         "uint64_t b=UINT64_C(1)<<i;if(i>=WRTC_REGION_SLOT_COUNT){"
         "PyErr_SetString(PyExc_SystemError,\"AOT frame slot overflow\");"
         "return -1;}if((f->owned_mask&b)!=0u)Py_DECREF(f->values[i]);"
         "f->values[i]=v;f->initialized_mask|=b;if(owned)f->owned_mask|=b;"
         "else f->owned_mask&=~b;return 0;}"
-        "int wafs(WrtcRegionFrame*f,size_t i,PyObject*v){"
+        "static inline int wafs(WrtcRegionFrame*f,size_t i,PyObject*v){"
         "Py_INCREF(v);if(wafb(f,i,v,1)<0){Py_DECREF(v);return -1;}return 0;}"
-        "PyObject*wafl(WrtcRegionFrame*f,size_t i,const char*n){"
+        "static inline PyObject*wafl(WrtcRegionFrame*f,size_t i,const char*n){"
         "uint64_t b=UINT64_C(1)<<i;if((f->initialized_mask&b)==0u){"
         "PyErr_Format(PyExc_UnboundLocalError,\"cannot access local variable "
         "'%s' where it is not associated with a value\",n);return NULL;}"
         "return Py_NewRef(f->values[i]);}"
-        "PyObject*wafg(WrtcRegionFrame*f,const char*n){PyObject*v,*b;"
+        "static inline PyObject*wafg(WrtcRegionFrame*f,const char*n){PyObject*v,*b;"
         "v=PyDict_GetItemString(f->globals,n);if(v)return Py_NewRef(v);"
         "if(PyErr_Occurred())return NULL;b=PyDict_GetItemString(f->globals,"
         "\"__builtins__\");if(!b)b=PyEval_GetBuiltins();"
@@ -644,7 +724,8 @@ int wrtc_aot_emit_runtime(FILE *file) {
         "if(v)return PyDict_Check(b)?Py_NewRef(v):v;if(PyErr_Occurred())"
         "return NULL;PyErr_Format(PyExc_NameError,\"name '%s' is not defined\","
         "n);return NULL;}\n",
-        file) < 0 ? -1 : 0;
+        file) < 0) return -1;
+    return 0;
 }
 
 static int add_slot(AotEmitter *emitter, const char *name) {
@@ -1299,7 +1380,12 @@ static int emit_expression(AotEmitter *emitter,
     }
     emitter->expressions[emitter->expression_count] = expression;
     emitter->expression_ids[emitter->expression_count++] = id;
-    if (fputs(expression->kind == WRTC_PY_EXPR_NAME
+    if (fputs(expression->kind == WRTC_PY_EXPR_NAME ||
+                      (emitter->direct &&
+                       (emitter->region->capabilities &
+                        (WRTC_REGION_FIFO | WRTC_REGION_MIN_HEAP)) != 0u &&
+                       (expression->kind == WRTC_PY_EXPR_ATTRIBUTE ||
+                        expression->kind == WRTC_PY_EXPR_CALL))
                   ? "static inline PyObject*WRTC_AOT_UNUSED "
                   : "static PyObject*WRTC_AOT_UNUSED ", file) < 0 ||
         function_prefix(file, emitter, "wae", id) < 0 ||
@@ -1756,6 +1842,169 @@ native_fail:
         case WRTC_PY_EXPR_CALL: {
             const size_t count = expression->positional_count +
                                  expression->keyword_count;
+            const WrtcNativeCallEdgeIR *native_direct =
+                direct_call(emitter, expression);
+            /* A required call whose value feeds another expression must use
+             * the same guard-free internal ABI as a call statement.  The old
+             * path fell through to VectorcallMethod, re-entering the public
+             * wrapper and materializing a bound result at the hottest graph
+             * joins (for example timeout computation and scheduling ingress). */
+            if (native_direct != NULL && expression->child_count != 0u &&
+                expression->children[0].kind == WRTC_PY_EXPR_ATTRIBUTE &&
+                expression->children[0].child_count == 1u) {
+                const WrtcPyExprIR *receiver_expression =
+                    &expression->children[0].children[0];
+                const size_t receiver_id =
+                    expression_id(emitter, receiver_expression);
+                const size_t receiver_slot =
+                    receiver_expression->kind == WRTC_PY_EXPR_NAME
+                        ? slot_index(emitter, receiver_expression->operation)
+                        : (size_t)-1;
+                const char *entry =
+                    native_direct->target_class == emitter->class_index &&
+                            native_direct->target != NULL &&
+                            strncmp(native_direct->target, "self.", 5u) == 0
+                        ? "wu" : "wv";
+                if (shared_frame_call(emitter, expression, native_direct)) {
+                    if (fprintf(file,
+                                "PyObject*r=NULL;if(wj%zu_%zu(f,&r)<0)"
+                                "return NULL;return r;}",
+                                native_direct->target_class,
+                                native_direct->target_region) < 0)
+                        goto fail;
+                    break;
+                }
+                if (receiver_id == (size_t)-1 ||
+                    fprintf(file,
+                            "PyObject*recv=NULL,*a[%zu]={0},*r=NULL;"
+                            "unsigned char own_a[%zu]={0};int recv_owned=0;"
+                            "size_t i;",
+                            count == 0u ? 1u : count,
+                            count == 0u ? 1u : count) < 0)
+                    goto fail;
+                if (receiver_slot != (size_t)-1 &&
+                    !scalar_representation(
+                        emitter->slot_representations[receiver_slot])) {
+                    if (fprintf(file,
+                                "if((f->initialized_mask&(UINT64_C(1)<<%zu))"
+                                "==0u){PyErr_SetString(PyExc_UnboundLocalError,"
+                                "\"uninitialized direct-call receiver\");"
+                                "return NULL;}recv=f->values[%zu];",
+                                receiver_slot, receiver_slot) < 0)
+                        goto fail;
+                } else if (fputs("recv=", file) < 0 ||
+                           function_prefix(file, emitter, "wae",
+                                           receiver_id) < 0 ||
+                           fputs("(f,&e->children[0].children[0]);"
+                                 "if(!recv)return NULL;recv_owned=1;",
+                                 file) < 0) {
+                    goto fail;
+                }
+                for (index = 0u; index < count; index++) {
+                    const WrtcPyExprIR *argument =
+                        &expression->children[index + 1u];
+                    const size_t argument_id = expression_id(emitter, argument);
+                    const size_t argument_slot =
+                        argument->kind == WRTC_PY_EXPR_NAME
+                            ? slot_index(emitter, argument->operation)
+                            : (size_t)-1;
+                    if (argument_id == (size_t)-1) goto fail;
+                    if (argument_slot != (size_t)-1 &&
+                        !scalar_representation(
+                            emitter->slot_representations[argument_slot])) {
+                        if (fprintf(file,
+                                    "if((f->initialized_mask&"
+                                    "(UINT64_C(1)<<%zu))==0u){"
+                                    "PyErr_SetString(PyExc_UnboundLocalError,"
+                                    "\"uninitialized direct-call argument\");"
+                                    "goto done;}a[%zu]=f->values[%zu];",
+                                    argument_slot, index, argument_slot) < 0)
+                            goto fail;
+                    } else if (fprintf(file, "a[%zu]=", index) < 0 ||
+                               function_prefix(file, emitter, "wae",
+                                               argument_id) < 0 ||
+                               fprintf(file,
+                                       "(f,&e->children[%zu]);if(!a[%zu])"
+                                       "goto done;own_a[%zu]=1u;",
+                                       index + 1u, index, index) < 0) {
+                        goto fail;
+                    }
+                }
+                if (fprintf(file,
+                            "if(%s%zu_%zu(recv,a,%zu,e->cached_keyword_names,"
+                            "&r)<0)r=NULL;done:for(i=0u;i<%zu;i++)"
+                            "if(own_a[i])Py_DECREF(a[i]);if(recv_owned)"
+                            "Py_DECREF(recv);return r;}",
+                            entry, native_direct->target_class,
+                            native_direct->target_region,
+                            expression->positional_count, count) < 0)
+                    goto fail;
+                break;
+            }
+            if (cacheable_global_call(emitter, expression)) {
+                if (fprintf(file,
+                            "if(e->cached_call_target){PyObject*a[%zu]={0},"
+                            "*r=NULL;unsigned char "
+                            "own_a[%zu]={0};size_t i;",
+                            count == 0u ? 1u : count,
+                            count == 0u ? 1u : count) < 0)
+                    goto fail;
+                for (index = 0u; index < count; index++) {
+                    const WrtcPyExprIR *argument =
+                        &expression->children[index + 1u];
+                    const size_t argument_slot =
+                        argument->kind == WRTC_PY_EXPR_NAME
+                            ? slot_index(emitter, argument->operation)
+                            : (size_t)-1;
+                    if (argument_slot != (size_t)-1 &&
+                        !scalar_representation(
+                            emitter->slot_representations[argument_slot])) {
+                        if (fprintf(file,
+                                    "if((f->initialized_mask&"
+                                    "(UINT64_C(1)<<%zu))==0u){"
+                                    "PyErr_SetString(PyExc_UnboundLocalError,"
+                                    "\"uninitialized cached-call argument\");"
+                                    "goto cached_done_%zu;}a[%zu]="
+                                    "f->values[%zu];",
+                                    argument_slot, id, index,
+                                    argument_slot) < 0)
+                            goto fail;
+                    } else if (fprintf(file, "a[%zu]=", index) < 0 ||
+                               emit_eval_child(file, emitter,
+                                               children[index + 1u],
+                                               index + 1u) < 0 ||
+                               fprintf(file,
+                                       ";if(!a[%zu])goto cached_done_%zu;"
+                                       "own_a[%zu]=1u;",
+                                       index, id, index) < 0) {
+                        goto fail;
+                    }
+                }
+                if ((emitter->direct &&
+                     fputs("wrtc_native_allocation_pause();", file) < 0) ||
+                    (program_has_capability(emitter->program,
+                                            WRTC_REGION_HANDLE_RUN)
+                         ? fprintf(file,
+                                   "r=PyType_Check(e->cached_call_target)?"
+                                   "whc(e->cached_call_target,a,%zu,"
+                                   "e->cached_keyword_names):"
+                                   "PyObject_Vectorcall(e->cached_call_target,"
+                                   "a,%zu,e->cached_keyword_names);",
+                                   expression->positional_count,
+                                   expression->positional_count)
+                         : fprintf(file,
+                                   "r=PyObject_Vectorcall("
+                                   "e->cached_call_target,a,%zu,"
+                                   "e->cached_keyword_names);",
+                                   expression->positional_count)) < 0 ||
+                    (emitter->direct &&
+                     fputs("wrtc_native_allocation_resume();", file) < 0) ||
+                    fprintf(file, "cached_done_%zu:", id) < 0 ||
+                    fprintf(file,
+                            "for(i=0u;i<%zu;i++)if(own_a[i])Py_DECREF(a[i]);"
+                            "return r;}", count) < 0)
+                    goto fail;
+            }
             if (expression->child_count != 0u &&
                 expression->children[0].kind == WRTC_PY_EXPR_ATTRIBUTE &&
                 expression->children[0].child_count == 1u) {
@@ -2070,7 +2319,7 @@ static int emit_target(AotEmitter *emitter, const WrtcPyExprIR *target,
                 return -1;
             }
     }
-    if (fputs("static int WRTC_AOT_UNUSED ", file) < 0 ||
+    if (fputs("static inline int WRTC_AOT_UNUSED ", file) < 0 ||
         function_prefix(file, emitter, "wat", id) < 0 ||
         fputs("(WrtcRegionFrame*f,const WrtcPyExprIR*t,PyObject*v){"
               "const WrtcPyExprIR*e=t;(void)e;", file) < 0)
@@ -2783,30 +3032,35 @@ int wrtc_aot_emit_region(FILE *file, size_t class_index, size_t region_index,
               "f.return_value=NULL;f.hooks=hooks;", file) < 0 ||
         fputs("if(!f.globals){PyErr_SetString(PyExc_SystemError,"
               "\"AOT globals are unavailable\");return -1;}"
-              "if(wafb(&f,0u,self,0)<0)goto done;", file) < 0)
+              "f.values[0]=self;f.initialized_mask|=UINT64_C(1);", file) < 0)
         return -1;
     if (vararg == (size_t)-1) {
         if (fprintf(file, "if(kwnames||nargs!=%zu){z=1;goto done;}",
                     region->signature->parameter_count - 1u) < 0)
             return -1;
         for (index = 1u; index < region->signature->parameter_count; index++)
-            if (fprintf(file, "if(wafb(&f,%zu,args[%zu],0)<0)goto done;",
-                        index, index - 1u) < 0)
+            if (fprintf(file,
+                        "f.values[%zu]=args[%zu];f.initialized_mask|="
+                        "UINT64_C(1)<<%zu;",
+                        index, index - 1u, index) < 0)
                 return -1;
     } else {
         const size_t required = vararg - 1u;
         if (fprintf(file, "if(nargs<%zu){z=1;goto done;}", required) < 0)
             return -1;
         for (index = 1u; index < vararg; index++)
-            if (fprintf(file, "if(wafb(&f,%zu,args[%zu],0)<0)goto done;",
-                        index, index - 1u) < 0)
+            if (fprintf(file,
+                        "f.values[%zu]=args[%zu];f.initialized_mask|="
+                        "UINT64_C(1)<<%zu;",
+                        index, index - 1u, index) < 0)
                 return -1;
         if (fprintf(file,
                     "{Py_ssize_t i,n=nargs-%zu;PyObject*t=PyTuple_New(n);"
                     "if(!t)goto done;for(i=0;i<n;i++)PyTuple_SET_ITEM(t,i,"
-                    "Py_NewRef(args[%zu+i]));if(wafb(&f,%zu,t,1)<0){"
-                    "Py_DECREF(t);goto done;}}",
-                    required, required, vararg) < 0)
+                    "Py_NewRef(args[%zu+i]));f.values[%zu]=t;"
+                    "f.initialized_mask|=UINT64_C(1)<<%zu;"
+                    "f.owned_mask|=UINT64_C(1)<<%zu;}",
+                    required, required, vararg, vararg, vararg) < 0)
             return -1;
         if (keyword_only != (size_t)-1) {
             if (fprintf(file,
@@ -2817,8 +3071,9 @@ int wrtc_aot_emit_region(FILE *file, size_t class_index, size_t region_index,
                 quote(file, region->signature->parameters[keyword_only].name) < 0 ||
                 fprintf(file,
                         "):1;if(eq<0)goto done;if(eq!=0){z=1;goto done;}"
-                        "v=args[nargs+i];}"
-                        "if(wafb(&f,%zu,v,0)<0)goto done;}", keyword_only) < 0)
+                        "v=args[nargs+i];}f.values[%zu]=v;"
+                        "f.initialized_mask|=UINT64_C(1)<<%zu;}",
+                        keyword_only, keyword_only) < 0)
                 return -1;
         } else if (fputs("if(kwnames){z=1;goto done;}", file) < 0) {
             return -1;
@@ -2834,6 +3089,22 @@ int wrtc_aot_emit_region(FILE *file, size_t class_index, size_t region_index,
               "Py_NewRef(Py_None);f.return_value=NULL;}else{"
               "Py_CLEAR(f.return_value);}z=0;done:wafc(&f);"
               "return z;}", file) < 0)
+        return -1;
+    if (fprintf(file,
+                "static inline int WRTC_AOT_UNUSED wj%zu_%zu("
+                "WrtcRegionFrame*f,PyObject**out){WrtcFlow flow="
+                "WRTC_FLOW_NORMAL;if(",
+                class_index, region_index) < 0 ||
+        function_prefix(file, &emitter, "was", root) < 0 ||
+        fprintf(file,
+                "(f,r%zu_%zu_suite.statements,&flow)<0)return -1;"
+                "if(flow==WRTC_FLOW_BREAK||flow==WRTC_FLOW_CONTINUE){"
+                "PyErr_SetString(PyExc_SyntaxError,\"loop control escaped "
+                "shared AOT region\");return -1;}if(out){*out="
+                "f->return_value?f->return_value:Py_NewRef(Py_None);"
+                "f->return_value=NULL;}else Py_CLEAR(f->return_value);"
+                "return 0;}",
+                class_index, region_index) < 0)
         return -1;
     return 0;
 }

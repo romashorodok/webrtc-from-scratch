@@ -70,8 +70,12 @@ int wrtc_boxed_bind_method(const WrtcBoxedSignature *signature, PyObject *self,
                            PyObject *const *args, Py_ssize_t nargs,
                            PyObject *keyword_names, PyObject **locals);
 int wrtc_boxed_suite_initialize(WrtcPySuiteIR *suite, PyObject *globals);
+int wrtc_boxed_suite_traverse(WrtcPySuiteIR *suite, visitproc visit,
+                              void *arg);
 void wrtc_boxed_suite_clear(WrtcPySuiteIR *suite);
 void wrtc_native_allocation_region_enter(const char *name);
+void wrtc_native_allocation_region_enter_cached(const char *name,
+                                                size_t *cached_index);
 void wrtc_native_allocation_region_leave(void);
 void wrtc_native_allocation_pause(void);
 void wrtc_native_allocation_resume(void);

@@ -98,6 +98,10 @@ measurements.
 | Typed external returns | — | 0.807 / 1.053 | 0.646 / 0.876 | — |
 | Native clock and float extrema | — | 0.883 / 1.162 | 0.814 / 0.898 | — |
 | Typed numeric control flow | — | 0.776 / 0.979 | 0.787 / 1.028 | — |
+| Return-call fusion and shared frames | — | 0.901 / 1.197 | 0.767 / 0.947 | — |
+| Exact Handle construction | — | 1.168 / 1.452 | 0.846 / 1.010 | — |
+| Cached accounting-region entry | — | 1.251 / 1.523 | 1.139 / 1.720 | — |
+| Fused timer iteration + inactive-worker skip | — | — | 0.870 / 1.161 | — |
 
 A focused five-triple, 0.2-second run measured ready at `0.757 / 0.973`
 and timers at `0.705 / 0.975`. Warmed native internal-allocation gates pass,
@@ -119,9 +123,50 @@ bound method and executes the ordinary Python call when overridden. A focused
 five-triple timer run before the final control-flow rewrite remained noisy at
 `0.737 / 0.978`; it did not justify the full acceptance suite.
 
-See [`webrtc/compiler/AGENTS.md`](webrtc/compiler/AGENTS.md) for the complete
-optimization ledger, rejected experiments, safety rules, and benchmark
-workflow.
+The latest ingress stage routes required calls used as values through the
+internal ABI, shares an existing object frame when caller and callee slot maps
+are identical, borrows local vectorcall arguments, and caches only unbound
+callables resolved from the generated private globals or modules.  It also
+sizes frames from the program instead of using 64 scalar and object slots for
+every region.  A 3-triple, 0.2-second preflight improved ready throughput to
+`0.901 / 1.197`; timers measured `0.767 / 0.947` and remained too noisy and too
+slow for the 15-triple acceptance run.  All warmed allocation and plateau
+gates passed; `performance_adopted` remains false.
+
+The constructor stage recognizes a pinned exact runtime type only after
+checking its identity, version tag, metaclass, member descriptors, call shape,
+argument containers, and debug state.  It then allocates the exact
+`Handle`/`TimerHandle` and initializes cached slot descriptors directly.  A
+constructor or descriptor monkeypatch, subclass, unusual call shape, or debug
+loop deoptimizes before allocation to the original vectorcall.  This removes
+the Python `__init__` frame in the normal scheduling path while preserving
+context capture and public object identity.
+
+Generated public wrappers now cache their allocation-accounting region index.
+Previously every tiny call linearly searched the complete region table with
+`strcmp`; after warmup accounting entry is one validated indexed push.  A
+longer 3-triple run measured ready throughput at `1.231 / 1.560`, with one-sided
+95% lower bounds of `1.205 / 1.445`, so the ready throughput gate now passes.
+The stable timer result was only `0.871 / 1.002`, however, so the full
+15-triple acceptance suite was not justified and `performance_adopted` remains
+false.  A borrowed child-frame experiment did not improve timers and was
+removed.
+
+The timer iteration now keeps cancellation cleanup, timeout arithmetic,
+selector dispatch, and due-timer promotion in one required source region, so
+the direct emitter preserves `double` timeout/deadline values across the
+selector boundary without four child-region frames.  Independently callable
+component methods remain available as the reference API.  The common
+zero-worker configuration also skips its empty worker-drain region.  Profiling
+reduced native `_run_once` self-time from roughly 23 ms to 19 ms per 499 timer
+iterations.  The final stable throughput preflight was `0.870 / 1.161` versus
+the earlier `0.871 / 1.002`: reference-relative performance improved, but the
+asyncio comparison remained flat and throughput still fails.  Direct heap-key
+slot caching and an empty-inbox atomic precheck were measured or rejected and
+were not retained.
+
+See [`webrtc/compiler/AGENTS.md`](webrtc/compiler/AGENTS.md) for the compact
+rules used when optimizing the compiler.
 
 ### Install
 ```bash
